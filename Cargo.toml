@@ -1,0 +1,54 @@
+[workspace]
+members = ["crates/normalize", "crates/planparse", "crates/core", "crates/dbmon"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Proprietary"
+
+[workspace.dependencies]
+# 워크스페이스 내부 크레이트
+dbmon-normalize = { path = "crates/normalize" }
+dbmon-planparse = { path = "crates/planparse" }
+dbmon-core = { path = "crates/core" }
+
+# 순수 크레이트(normalize/planparse)가 쓰는 것 — I/O 의존성 없음
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+
+# core
+async-trait = "0.1"
+thiserror = "2"
+
+# dbmon (bin) 전용
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+mysql_async = { version = "0.36", default-features = false, features = ["default-rustls"] }
+zeroize = { version = "1", features = ["derive"] }
+zstd = "0.13"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.9"
+regex = "1"
+futures = "0.3"
+rand = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+# 개발 반복 속도. 순수 크레이트 테스트가 대부분이라 opt-level 0 으로 충분하다.
+debug = 1

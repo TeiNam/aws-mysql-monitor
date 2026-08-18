@@ -1,0 +1,22 @@
+[package]
+name = "dbmon-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "도메인 타입 + 포트(trait). I/O 의존성 없음."
+
+[dependencies]
+dbmon-normalize.workspace = true
+serde.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

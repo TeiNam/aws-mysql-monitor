@@ -1,0 +1,34 @@
+[package]
+name = "dbmon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "aws-mysql-monitor 단일 바이너리"
+
+[[bin]]
+name = "dbmon"
+path = "src/main.rs"
+
+[dependencies]
+dbmon-core.workspace = true
+dbmon-normalize.workspace = true
+dbmon-planparse.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+toml.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+futures.workspace = true
+rand.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,14 @@
+[package]
+name = "dbmon-normalize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQL 정규화 + app_digest + 리터럴 마스킹. 순수 함수."
+
+[dependencies]
+sha2.workspace = true
+serde.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

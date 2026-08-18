@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+.env
+.env.local
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+
+# 프론트
+web/node_modules
+web/dist
+web/.vite
+
+# 로컬 개발 산출물
+/local
+build.log
+*.log

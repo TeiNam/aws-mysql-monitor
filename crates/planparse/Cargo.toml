@@ -1,0 +1,16 @@
+[package]
+name = "dbmon-planparse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EXPLAIN JSON 파싱, 플랜 정규화, 지문, 참조 테이블 추출. 순수 함수."
+
+[dependencies]
+dbmon-normalize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
