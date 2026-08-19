@@ -6,6 +6,7 @@
 //! 도메인 로직은 `dbmon-core` · `dbmon-normalize` · `dbmon-planparse` 에 있고,
 //! 이 크레이트는 **어댑터와 루프**만 담는다.
 
+pub mod aws;
 pub mod collector;
 pub mod config;
 pub mod health;
@@ -13,5 +14,6 @@ pub mod mysql;
 pub mod shutdown;
 pub mod store;
 pub mod telemetry;
+pub mod worker;
 
 pub use config::{Config, Role};

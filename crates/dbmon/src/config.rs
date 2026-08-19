@@ -38,6 +38,16 @@ pub enum Role {
 }
 
 impl Role {
+    /// 로그·리스 소유자 문자열에 쓴다.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Api => "api",
+            Self::Collector => "collector",
+            Self::Control => "control",
+        }
+    }
+
     pub fn runs_api(self) -> bool {
         matches!(self, Self::All | Self::Api)
     }
@@ -116,6 +126,13 @@ pub struct StorageConfig {
     pub config_table: String,
     #[serde(default)]
     pub plan_bucket: Option<String>,
+    /// DynamoDB 엔드포인트 재지정. **로컬 개발 전용.**
+    ///
+    /// `http://127.0.0.1:18000` 을 주면 DynamoDB Local 에 붙는다. SSO 가 만료돼도
+    /// 저장 경로를 돌릴 수 있다 — 이 프로젝트의 로컬 우선 원칙이다.
+    /// 프로덕션에서는 비워 둔다(SDK 가 리전에서 엔드포인트를 결정한다).
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +452,7 @@ fn default_document() -> toml::Value {
             data_table: String::new(),
             config_table: String::new(),
             plan_bucket: None,
+            endpoint_url: None,
         }),
     );
     toml::Value::Table(t)

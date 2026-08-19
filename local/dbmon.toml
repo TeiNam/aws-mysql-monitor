@@ -27,9 +27,10 @@ region = "ap-northeast-2"
 account_id = "000000000000"
 
 [storage]
-# DynamoDB Local 을 쓰려면 endpoint_url 을 함께 지정한다.
 data_table = "dbmon-data-local"
 config_table = "dbmon-config-local"
+# **DynamoDB Local.** SSO 가 만료돼도 저장 경로가 돈다.
+endpoint_url = "http://127.0.0.1:18000"
 
 [collector]
 # 로컬 컨테이너는 빠르므로 임계값을 낮춰 시나리오를 빨리 관측한다.

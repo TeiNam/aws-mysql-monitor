@@ -530,24 +530,29 @@ SQL 은 `PROCESSLIST.INFO` 에서 오므로 대상 DB 에 쿼리를 날릴 수 �
 
 ---
 
-## 가장 큰 남은 격차 — **수집 루프가 배선되지 않았다**
+## 배선 진행 — **리더 게이트가 실제로 돈다** (2026-08-19)
 
-359개 테스트가 통과하고 4라운드 리뷰를 거쳤지만, **`main.rs` 는 수집을 시작하지 않는다.**
+`main.rs` 가 이제 저장소를 조립하고 리더 게이트 루프를 띄운다. 실제 프로세스 두 개로 검증:
 
+```text
+worker-a: 리더 0회   worker-b: 리더 1회   합계 1        ← F1: 정확히 하나
+:8080 collect_leader=False ready=False                  ← standby 는 대상에서 빠진다
+:8081 collect_leader=True  ready=True
+리더에 SIGTERM → 리스 반납 1회 → 상대 인수 1초 (epoch 3)  ← TTL 60초를 기다리지 않는다
 ```
-$ grep -rn "detect_tick\|warm_if_needed" crates/ | grep -v tests/
-crates/dbmon/src/collector/mod.rs:323:    pub async fn warm_if_needed(&mut self) {
-   → 정의만 있고 호출부가 없다
-```
 
-`serve` 는 HTTP 서버(`/healthz`·`/readyz`)와 그레이스풀 셧다운만 돌린다. 즉 지금까지
-리뷰한 코드는 **단위·통합 테스트에서만 실행된다.** 실제로 돌려면 세 가지가 필요하다:
+**배선하지 않으면 보이지 않았던 결함을 하나 잡았다.** 처음 배선했을 때 셧다운 단계
+순서가 `lease → http` 였는데, `shutdown.trigger()` 가 `http` 단계에 있어서 `lease` 단계는
+**아직 아무도 멈추라고 하지 않은** 루프를 10초 기다리다 타임아웃했고 리스는 반납되지
+않았다. 단위 테스트로는 볼 수 없다 — 두 단계의 순서 문제다.
+
+남은 것:
 
 | # | 필요한 것 | 로드맵 | 상태 |
 |---|---|---|---|
 | 1 | ~~`SlowQueryStore` 구현 (DynamoDB)~~ | M2-4 | **완료 (2026-08-19).** `DynamoSlowQueryStore` + DynamoDB Local 통합 테스트 9건. AWS 자격증명 불필요 |
 | 2 | 샤드 리스 + 수집 리더 게이트 (F1) | M4-21 | **어댑터 완료 (2026-08-19).** `DynamoLeaseStore` + `target_shard_count(is_leader)`. 불변식 `합계 = 64 또는 0` 을 코드가 강제하고 테스트가 워커 1~10대에서 확인한다. 남은 것: 수집 루프에 배선 |
-| 3 | RDS 인스턴스 탐색 | M2-5 | `InstanceRegistry` 페이크만 있다 |
+| 3 | RDS 인스턴스 탐색 | M2-5 | **필터 완료.** T-37 판정을 순수 함수로 분리해 AWS 없이 전수 검증(9건) — prd VPC·미지 VPC·이름 거부·태그 AND. 남은 것: `DescribeDBInstances` 호출과 레지스트리 저장 |
 
 ### M2-4 가 리뷰로는 알 수 없던 것을 두 개 잡았다
 
