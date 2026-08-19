@@ -18,7 +18,7 @@
 mod support;
 
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Value};
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Value};
 use support::{MYSQL84, ROOT, Target};
 
 /// 세션의 `Com_select` 값.
@@ -204,4 +204,53 @@ fn explain_rerun_emits_exactly_one_statement_for_validated_input() {
         "생성된 문장에 세미콜론이 있다: {stmt}"
     );
     let _ = Value::from(0); // mysql_async import 사용 표시
+}
+
+/// **풀에서 재획득한 커넥션에도 고정이 살아 있어야 한다.**
+///
+/// 3차에서 확인된 결함: `PoolOpts::default()` 는 `reset_connection: true` 이므로
+/// 커넥션 반납 시 `COM_RESET_CONNECTION` 이 나가 세션 변수가 **전역값으로 되돌아간다.**
+/// `mysql_async` 는 그 뒤 `setup` 만 다시 실행하고 `init` 은 실행하지 않는다.
+///
+/// 즉 위의 주입 테스트는 **첫 커넥션만** 검증하고 있었다. 이 테스트는 풀을
+/// 프로덕션과 같은 방식으로 만들고 **획득 → 반납 → 재획득** 을 반복해서 본다.
+#[tokio::test]
+async fn session_pins_survive_pool_reuse() {
+    // 프로덕션과 같은 풀 구성. `TargetMysql::connect` 이 하는 것과 같다.
+    let constraints = PoolConstraints::new(1, 1).expect("제약");
+    let opts: Opts = OptsBuilder::from_opts(support::opts(MYSQL84, ROOT))
+        .pool_opts(PoolOpts::default().with_constraints(constraints))
+        .setup(vec![dbmon::mysql::sql::session_init(3_000)])
+        .into();
+    let pool = Pool::new(opts);
+
+    for i in 1..=4 {
+        let Ok(mut conn) = pool.get_conn().await else {
+            eprintln!("건너뜀: MySQL 컨테이너 없음");
+            return;
+        };
+        let row: Option<(String, u64, String)> = conn
+            .query_first(
+                "SELECT @@session.sql_mode, @@session.max_execution_time, \
+                 @@session.transaction_isolation",
+            )
+            .await
+            .expect("세션 변수 조회");
+        let (mode, max_exec, iso) = row.expect("행");
+
+        assert_eq!(
+            mode, "",
+            "획득 #{i}: sql_mode 고정이 풀렸다 → 주입이 다시 열린다"
+        );
+        assert_eq!(
+            max_exec, 3_000,
+            "획득 #{i}: max_execution_time 이 풀렸다 → 프로덕션 DB 에 서버측 상한이 없다"
+        );
+        assert_eq!(iso, "READ-COMMITTED", "획득 #{i}: 격리 수준이 풀렸다");
+
+        drop(conn);
+        // 반납 후 recycler 가 `COM_RESET_CONNECTION` 을 보낼 시간을 준다.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    }
+    let _ = pool.disconnect().await;
 }

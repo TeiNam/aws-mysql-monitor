@@ -289,6 +289,27 @@ pub trait TargetDb: Send + Sync {
     async fn warm(&self) -> Result<()> {
         self.ping().await
     }
+
+    /// 대상 인스턴스의 **전역** `sql_mode`.
+    ///
+    /// 우리 세션은 `sql_mode=''` 로 고정한다(주입 방어). 그런데 SQL 은 앱 세션에서
+    /// 오고 그 세션의 모드는 우리가 통제하지 않는다. 모드가 다르면 **같은 문자열을
+    /// 다르게 파싱한다** — 8.4.11 실측:
+    ///
+    /// ```text
+    /// SET sql_mode='ANSI_QUOTES';
+    /// SELECT COUNT(*) FROM orders WHERE "status" = 'PAID';   → 15000  ("status" = 식별자)
+    /// SET sql_mode='';
+    /// SELECT COUNT(*) FROM orders WHERE "status" = 'PAID';   → 0      ("status" = 문자열)
+    /// ```
+    ///
+    /// 후자를 EXPLAIN 하면 `Zero rows (Impossible WHERE)` 가 나온다. 그걸 정확한 플랜으로
+    /// 저장하면 운영자는 **존재하지 않는 쿼리의 플랜**을 보게 된다.
+    ///
+    /// 기본 구현은 빈 문자열 — 위험 없음으로 본다.
+    async fn target_sql_mode(&self) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 #[cfg(test)]

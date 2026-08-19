@@ -420,6 +420,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "dbmon",
  "dbmon-core",
  "dbmon-normalize",
  "dbmon-planparse",

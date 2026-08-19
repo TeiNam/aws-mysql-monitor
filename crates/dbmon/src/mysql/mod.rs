@@ -92,6 +92,9 @@ impl Timeouts {
     /// 설정값에서 만든다. **`detect_total` 은 파생값이다** — 상수로 두면
     /// `detect_timeout_ms` 설정이 조용히 무시된다(M27 과 같은 부류).
     ///
+    /// `detect_total`(tick 예산)이 `connect` 보다 **작은 것이 정상**이다. 연결 수립은
+    /// [`TargetMysql::warm`] 이 tick 밖에서 처리한다.
+    ///
     /// `connect` 보다 크게 잡는 이유는 `detect_total` 문서에 있다: 작으면 콜드 경로에서
     /// 연결 수립이 매번 취소되어 `probe` 가 영구히 실패할 수 있다.
     pub fn derive(
@@ -124,6 +127,12 @@ pub struct TargetMysql {
 
 impl TargetMysql {
     /// 풀을 만든다. **연결은 지연 생성**이므로 이 호출은 네트워크를 타지 않는다.
+    ///
+    /// ⚠ **프로덕션 조립은 [`Self::from_config`] 를 쓴다.** 이 생성자는
+    /// `detect_limit` 을 기본값으로 두고 타임아웃을 호출자가 만들게 하므로,
+    /// 설정을 조용히 무시하는 경로가 된다 — 실제로 그런 상태였다(2차 M2).
+    /// 테스트에서만 쓴다.
+    #[cfg(any(test, feature = "testing"))]
     pub fn connect(base: Opts, timeouts: Timeouts, label: impl Into<String>) -> Result<Self> {
         Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label)
     }
@@ -148,7 +157,7 @@ impl TargetMysql {
         Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label)
     }
 
-    pub fn connect_with_limit(
+    fn connect_with_limit(
         base: Opts,
         timeouts: Timeouts,
         detect_limit: u64,
@@ -310,8 +319,31 @@ fn pool(base: Opts, min: usize, max: usize, query_timeout: Duration) -> Result<P
     let mut builder = mysql_async::OptsBuilder::from_opts(base);
     builder = builder
         .pool_opts(PoolOpts::default().with_constraints(constraints))
-        // 커넥션 수립 직후 세션을 초기화한다. 매 쿼리마다 보내지 않는다.
-        .init(vec![sql::session_init(query_timeout.as_millis() as u64)]);
+        // **`setup` 이다. `init` 이 아니다.**
+        //
+        // `PoolOpts::default()` 는 `reset_connection: true` 이므로 커넥션이 풀로 돌아갈 때마다
+        // `COM_RESET_CONNECTION` 이 나간다. 그건 세션 변수를 **전역값으로 되돌리고**,
+        // `mysql_async` 는 그 뒤 `setup` 명령만 다시 실행한다 — `init` 은 실행하지 않는다.
+        //
+        // 로컬 MySQL 8.4.11 에 같은 풀 설정으로 4회 획득/반납한 실측:
+        //
+        // ```text
+        // .init  #1: sql_mode=""                    max_exec=3000 iso=READ-COMMITTED
+        // .init  #2: sql_mode="ONLY_FULL_GROUP_BY…" max_exec=0    iso=REPEATABLE-READ
+        // .setup #2: sql_mode=""                    max_exec=3000 iso=READ-COMMITTED
+        // ```
+        //
+        // 잃는 것이 세 개다:
+        //
+        // | 변수 | 잃으면 |
+        // |---|---|
+        // | `sql_mode` | `NO_BACKSLASH_ESCAPES` 를 상속해 **주입이 다시 열린다** (2차 C-1) |
+        // | `max_execution_time` | **0 = 무제한.** 프로덕션 DB 에 서버측 상한이 사라진다 |
+        // | `transaction_isolation` | `REPEATABLE-READ` — 긴 스냅샷이 undo 를 붙잡는다 |
+        //
+        // 즉 2차의 `sql_mode` 고정이 **첫 쿼리에만** 적용되고 있었다.
+        // `with_reset_connection(false)` 로도 되지만 그건 커넥션 위생을 포기하는 것이라 나쁘다.
+        .setup(vec![sql::session_init(query_timeout.as_millis() as u64)]);
     Ok(Pool::new(Opts::from(builder)))
 }
 

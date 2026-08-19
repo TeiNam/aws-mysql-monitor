@@ -169,10 +169,14 @@ async fn repeated_probe_failure_keeps_the_loop_alive() {
 
 /// **연결 수립은 tick 밖에서 일어나야 한다.**
 ///
-/// 예산 충돌의 해법이 `warm()` 이므로, 실패 후 그게 실제로 표시되고 실행되는지 확인한다.
-/// 표시만 하고 아무도 부르지 않으면 이 수정은 무효다 (M2 와 같은 부류의 실수).
+/// `detect_total`(tick 예산 800ms) 이 `connect`(5초) 보다 작은 것이 정당한 근거는
+/// "연결 수립은 `warm()` 이 tick 밖에서 한다" 는 것이다. 그 근거가 성립하려면
+/// **연결 실패가 실제로 warm 을 다시 트리거해야** 한다.
+///
+/// 이전 판은 `fail_full_sql` 로 검증했는데, 연결 문제는 `probe` 에서 드러난다 —
+/// 즉 이름이 약속한 보장을 테스트가 전혀 건드리지 않았다 (vacuous).
 #[tokio::test]
-async fn probe_failure_marks_the_pool_for_rewarming() {
+async fn probe_failure_retriggers_warm() {
     let db = FakeTargetDb::new().with_threads(&[(1, 3)]);
     let store = Arc::new(FakeSlowQueryStore::default());
     let clock = FakeClock::new(1_755_500_400_000);
@@ -184,17 +188,109 @@ async fn probe_failure_marks_the_pool_for_rewarming() {
         params(),
     );
 
-    // 기동 직후에는 warm 이 필요하다.
+    // 기동 시 한 번 warm 한다.
     c.warm_if_needed().await;
+    assert_eq!(c.db().warm_calls(), 1, "기동 warm 이 실행돼야 한다");
+
+    // 연결이 끊겼다. probe 가 획득 타임아웃으로 5회 실패한다.
+    c.db_mut().fail_probe(5);
+    for i in 0..5 {
+        assert!(
+            c.detect_tick().await.is_err(),
+            "tick{i}: probe 실패는 Err 로 올라와야 한다"
+        );
+        c.warm_if_needed().await;
+        clock.advance(1_000);
+    }
+
+    assert!(
+        c.db().warm_calls() > 1,
+        "probe 실패가 warm 을 다시 트리거하지 않았다 — 콜드 풀이 영구히 회복되지 않는다"
+    );
+
+    // 복구되면 tick 이 다시 성공한다.
+    let t = c.detect_tick().await.expect("복구 tick");
+    assert_eq!(t.candidates, 1);
+}
+
+/// 심층 조회 실패도 warm 을 표시한다 (다른 경로, 같은 보장).
+#[tokio::test]
+async fn deep_probe_failure_also_marks_warm() {
+    let db = FakeTargetDb::new().with_threads(&[(1, 3)]);
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store,
+        clock.clone(),
+        params(),
+    );
+    c.warm_if_needed().await;
+    let before = c.db().warm_calls();
 
     c.db_mut().fail_full_sql(1);
     c.detect_tick().await.expect("tick");
-
-    // 실패가 warm 필요를 표시했는지 — `warm_if_needed` 가 실제로 어댑터를 부르는지로 본다.
-    let before = c.db().warm_calls();
     c.warm_if_needed().await;
+
     assert!(
         c.db().warm_calls() > before,
-        "실패 후 warm 이 호출되지 않았다 — 표시만 하고 아무도 안 부르면 무효다"
+        "심층 조회 실패가 warm 을 표시하지 않았다"
     );
+}
+
+/// **어휘 발산이 있으면 플랜을 정확하다고 표시하면 안 된다.**
+///
+/// 우리 세션은 `sql_mode=''` 로 고정하는데(주입 방어) SQL 은 앱 세션에서 온다.
+/// 앱이 `ANSI_QUOTES` 로 돌면 `"status"` 를 식별자로 보고 우리는 문자열로 본다 —
+/// 8.4.11 실측으로 같은 쿼리가 15,000행 vs 0행이었다. 그 상태의 플랜은
+/// `Zero rows (Impossible WHERE)` 이고, 그걸 정확한 플랜으로 저장하면 운영자는
+/// **존재하지 않는 쿼리의 플랜**을 본다.
+#[tokio::test]
+async fn lexical_divergence_downgrades_plan_exactness() {
+    use dbmon_core::ports::target_db::ExplainOutcome;
+    use dbmon_core::slow_query::PlanSource;
+
+    for (mode, expect) in [
+        ("", PlanSource::Rerun),
+        ("ANSI_QUOTES", PlanSource::RerunAsSelect),
+        (
+            "NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES",
+            PlanSource::RerunAsSelect,
+        ),
+        ("ONLY_FULL_GROUP_BY", PlanSource::Rerun),
+    ] {
+        let db = FakeTargetDb::new().with_threads(&[(1, 3)]);
+        db.set_sql_mode(mode);
+        *db.full.lock().unwrap() = vec![dbmon_core::ports::target_db::FullSqlRow {
+            id: 1,
+            db: Some("shop".into()),
+            user: Some("app".into()),
+            host: Some("10.0.3.44".into()),
+            time_secs: 3,
+            info: Some("SELECT a FROM t WHERE id = 1".into()),
+        }];
+        *db.explain.lock().unwrap() = Some(ExplainOutcome::Plan(
+            r#"{"query_block":{"table":{"table_name":"t","access_type":"ALL"}}}"#.into(),
+        ));
+
+        let store = std::sync::Arc::new(FakeSlowQueryStore::default());
+        let clock = FakeClock::new(1_755_500_400_000);
+        let mut c = InstanceCollector::new(
+            instance("orders-prd-01"),
+            db,
+            store.clone(),
+            clock,
+            params(),
+        );
+        c.warm_if_needed().await; // 여기서 sql_mode 를 읽는다
+        c.detect_tick().await.expect("tick");
+
+        let saved = store.all();
+        let q = saved.iter().find(|q| q.thread_id == 1).expect("레코드");
+        assert_eq!(
+            q.plan.source, expect,
+            "sql_mode={mode:?} 에서 plan_source 가 틀렸다"
+        );
+    }
 }

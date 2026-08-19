@@ -13,6 +13,11 @@
 //! `--test-threads=1` 이 필요하다 — 여러 테스트가 동시에 장기 실행 쿼리를 걸면
 //! processlist 측정이 서로 간섭한다.
 
+// **장기 실행 쿼리를 `ROOT` 로 만든다.** `it_collector` 의 `reset_targets` 가
+// `USER <> 'root'` 인 쿼리를 모두 죽이는데, 이 바이너리는 그 락(`exclusive_target`)을
+// 잡지 않는다 — 그리고 그 락은 **테스트 바이너리를 넘지 않으므로** 잡아도 소용없다.
+// `ROOT` 로 붙으면 리셋 대상에서 제외된다. 측정 대상은 텍스트 길이·다이제스트이므로
+// 실행 계정은 결과에 영향이 없다.
 mod support;
 
 use mysql_async::prelude::*;
@@ -43,7 +48,7 @@ async fn m1_1_information_schema_processlist_info_is_not_truncated() {
     for target_bytes in [4_096usize, 16_384, 65_536, 1_048_576] {
         let sql = long_running_sql(target_bytes, 3.0);
         let actual = sql.len();
-        let Some(running) = start_long_query(MYSQL84, LOADGEN, sql).await else {
+        let Some(running) = start_long_query(MYSQL84, ROOT, sql).await else {
             eprintln!("[skip] 장기 실행 쿼리를 시작할 수 없다");
             return;
         };
@@ -132,7 +137,7 @@ async fn m1_1b_sql_text_length_follows_parameter() {
         let limit = var(probe, "performance_schema_max_sql_text_length")
             .await
             .unwrap_or_default();
-        let Some(running) = start_long_query(target, LOADGEN, sql.clone()).await else {
+        let Some(running) = start_long_query(target, ROOT, sql.clone()).await else {
             return;
         };
         let m = measure_text_lengths(probe, running.connection_id).await;
@@ -193,7 +198,7 @@ async fn m1_2_explain_for_connection_covers_dml() {
 
     let mut rows = Vec::new();
     for (label, statements) in cases {
-        let Some(running) = start_long_statements(MYSQL84, LOADGEN, statements).await else {
+        let Some(running) = start_long_statements(MYSQL84, ROOT, statements).await else {
             return;
         };
         let id = running.connection_id;
@@ -297,7 +302,7 @@ async fn m1_2b_explain_failure_error_codes() {
     ));
 
     // ③ EXPLAIN 불가 문장 실행 중 → ER_EXPLAIN_NOT_SUPPORTED (3012 기대)
-    let Some(running) = start_long_query(MYSQL84, LOADGEN, "DO SLEEP(4)").await else {
+    let Some(running) = start_long_query(MYSQL84, ROOT, "DO SLEEP(4)").await else {
         return;
     };
     let r = probe

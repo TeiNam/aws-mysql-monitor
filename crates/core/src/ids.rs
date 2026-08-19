@@ -141,7 +141,8 @@ impl From<InstanceId> for String {
 }
 
 /// `<account>/<region>/<db_cluster_identifier>` — Aurora 클러스터.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` 는 결정론적 병합에 필요하다 (R43).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ClusterId(String);
 

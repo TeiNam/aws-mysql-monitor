@@ -104,19 +104,13 @@ pub fn plan_query(sql: &str) -> Option<PlanQuery> {
     let end = trimmed_end(sql, &toks, &spans);
 
     match kw {
-        "SELECT" => Some(PlanQuery {
-            sql: sql[spans[first].start..end].to_string(),
-            is_exact: true,
-        }),
+        "SELECT" => Some(strip_resource_hints(sql, &toks, &spans, first, end)),
         // `WITH` 는 첫 키워드만으로 판정할 수 없다. `WITH c AS (...) UPDATE t ...` 는
         // MySQL 8 의 유효 문법이고, 그걸 원문 그대로 통과시키면 **관측 도구가 EXPLAIN 을
         // 붙여 DML 을 서버로 보낸다.** `classify` 는 이미 괄호 깊이를 보고 `Update` 로
         // 정확히 판정하는데 여기서 그 결과를 쓰지 않았다 — 방어가 배선되지 않았다.
         "WITH" => match crate::stmt_type::classify(&toks) {
-            StatementType::Select => Some(PlanQuery {
-                sql: sql[spans[first].start..end].to_string(),
-                is_exact: true,
-            }),
+            StatementType::Select => Some(strip_resource_hints(sql, &toks, &spans, first, end)),
             // CTE 뒤의 DML 은 재작성 대상이 아니다(어느 절이 조건절인지 이 코드는 모른다).
             // 플랜을 포기한다 — 잘못된 문장을 보내는 것보다 낫다.
             _ => None,
@@ -125,6 +119,79 @@ pub fn plan_query(sql: &str) -> Option<PlanQuery> {
         "DELETE" => rewrite_delete(sql, &toks, &spans, first, end),
         "INSERT" | "REPLACE" => rewrite_insert(sql, &toks, &spans, first, end),
         _ => None,
+    }
+}
+
+/// **자원 제어 힌트를 제거한다.** 그건 우리가 대상 DB 에 걸어 둔 유일한 서버측 상한을
+/// 공격자가 무력화하는 수단이다.
+///
+/// `plan_query` 는 옵티마이저 힌트(`/*+ ... */`)를 의도적으로 통과시킨다 — 힌트가 플랜을
+/// 바꾸므로 보존해야 정확한 플랜이 나온다. 그런데 힌트 중 두 종류는 플랜이 아니라
+/// **실행 자원**을 바꾼다. 8.4.11 실측:
+///
+/// ```text
+/// SET SESSION max_execution_time = 1000;
+/// SELECT SLEEP(2)                                        → 1 (죽었다)
+/// SELECT /*+ MAX_EXECUTION_TIME(600000) */ SLEEP(2)      → 0 (완료됐다)
+/// SELECT /*+ SET_VAR(max_execution_time=0) */ @@SESSION.max_execution_time → 0
+/// ```
+///
+/// SQL 은 `PROCESSLIST.INFO` 에서 온다 — 대상 인스턴스에 쿼리를 날릴 수 있는 누구나
+/// 힌트를 통제한다. `Timeouts::query` 는 클라이언트를 취소할 뿐 서버 작업은 계속되므로,
+/// `max_execution_time` 이 유일한 서버측 바운드다.
+///
+/// | 힌트 | 처리 | 이유 |
+/// |---|---|---|
+/// | `MAX_EXECUTION_TIME(n)` | 제거, `is_exact` 유지 | 런타임 상한이라 플랜에 영향 없다 |
+/// | `SET_VAR(...)` | 제거, **`is_exact = false`** | `optimizer_switch` 등으로 플랜을 바꿀 수 있다 |
+/// | 그 외 (`INDEX`, `JOIN_ORDER`, `NO_ICP` …) | 보존 | 플랜을 결정하므로 있어야 정확하다 |
+fn strip_resource_hints(
+    sql: &str,
+    toks: &[Tok],
+    spans: &[std::ops::Range<usize>],
+    first: usize,
+    end: usize,
+) -> PlanQuery {
+    let start = spans[first].start;
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut plan_may_differ = false;
+
+    for (i, t) in toks.iter().enumerate() {
+        let Tok::Hint(body) = t else { continue };
+        let upper = body.to_ascii_uppercase();
+        let has_set_var = upper.contains("SET_VAR");
+        let has_max_exec = upper.contains("MAX_EXECUTION_TIME");
+        if !has_set_var && !has_max_exec {
+            continue;
+        }
+        plan_may_differ |= has_set_var;
+        // 스팬은 `/*+` 부터 `*/` 까지다.
+        let span = &spans[i];
+        if span.start >= start && span.end <= end {
+            cuts.push(span.clone());
+        }
+    }
+
+    if cuts.is_empty() {
+        return PlanQuery {
+            sql: sql[start..end].to_string(),
+            is_exact: true,
+        };
+    }
+
+    cuts.sort_by_key(|r| r.start);
+    let mut out = String::with_capacity(end - start);
+    let mut cursor = start;
+    for cut in cuts {
+        if cut.start > cursor {
+            out.push_str(&sql[cursor..cut.start]);
+        }
+        cursor = cut.end.max(cursor);
+    }
+    out.push_str(&sql[cursor..end]);
+    PlanQuery {
+        sql: out,
+        is_exact: !plan_may_differ,
     }
 }
 
@@ -240,6 +307,75 @@ fn join_sql(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **자원 제어 힌트를 서버로 보내면 안 된다.**
+    ///
+    /// 8.4.11 실측: `max_execution_time=1000` 세션에서 `SELECT SLEEP(2)` 는 죽지만
+    /// `SELECT /*+ MAX_EXECUTION_TIME(600000) */ SLEEP(2)` 는 완료된다.
+    /// SQL 은 `PROCESSLIST.INFO` 에서 오므로 대상 DB 에 쿼리를 날릴 수 있는 누구나
+    /// 우리 서버측 상한을 통제한다.
+    #[test]
+    fn resource_control_hints_are_stripped() {
+        let cases: &[(&str, bool)] = &[
+            ("SELECT /*+ MAX_EXECUTION_TIME(600000) */ a FROM t", true),
+            (
+                "SELECT /*+ SET_VAR(max_execution_time=0) */ a FROM t",
+                false,
+            ),
+            (
+                "SELECT /*+ SET_VAR(optimizer_switch='mrr=off') */ a FROM t",
+                false,
+            ),
+            // 소문자·혼합 대소문자도 막아야 한다.
+            ("SELECT /*+ max_execution_time(9) */ a FROM t", true),
+            (
+                "SELECT /*+ Set_Var(sql_mode='ANSI_QUOTES') */ a FROM t",
+                false,
+            ),
+        ];
+        for (sql, expect_exact) in cases {
+            let q = plan_query(sql).unwrap_or_else(|| panic!("거부되면 안 된다: {sql}"));
+            let upper = q.sql.to_ascii_uppercase();
+            assert!(
+                !upper.contains("MAX_EXECUTION_TIME") && !upper.contains("SET_VAR"),
+                "자원 힌트가 남았다: {}",
+                q.sql
+            );
+            assert!(q.sql.contains("FROM t"), "본문이 사라졌다: {}", q.sql);
+            assert_eq!(
+                q.is_exact, *expect_exact,
+                "SET_VAR 는 플랜을 바꿀 수 있으므로 exact 가 아니다: {sql}"
+            );
+        }
+    }
+
+    /// **플랜을 결정하는 힌트는 보존해야 한다.** 지우면 다른 플랜이 나온다.
+    #[test]
+    fn plan_shaping_hints_are_preserved() {
+        for sql in [
+            "SELECT /*+ NO_ICP(t) */ a FROM t WHERE id = 1",
+            "SELECT /*+ JOIN_ORDER(a, b) */ * FROM a JOIN b USING (id)",
+            "SELECT /*+ INDEX(t idx_x) */ a FROM t",
+            "SELECT /*+ NO_MERGE(d) */ * FROM (SELECT 1) d",
+        ] {
+            let q = plan_query(sql).expect("통과해야 한다");
+            assert_eq!(q.sql, sql, "힌트가 변경됐다");
+            assert!(q.is_exact);
+        }
+    }
+
+    /// 자원 힌트가 여러 개거나 다른 힌트와 섞여 있어도 정확히 그것만 제거한다.
+    #[test]
+    fn mixed_hints_keep_only_the_safe_ones() {
+        let sql = "SELECT /*+ NO_ICP(t) */ /*+ MAX_EXECUTION_TIME(9) */ a FROM t WHERE id = 1";
+        let q = plan_query(sql).expect("통과");
+        assert!(q.sql.contains("NO_ICP"), "플랜 힌트가 사라졌다: {}", q.sql);
+        assert!(
+            !q.sql.to_ascii_uppercase().contains("MAX_EXECUTION_TIME"),
+            "자원 힌트가 남았다: {}",
+            q.sql
+        );
+    }
 
     /// **버전 조건 주석을 서버로 보내면 안 된다.**
     ///

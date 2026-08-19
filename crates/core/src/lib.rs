@@ -34,6 +34,8 @@ pub mod clock_offset;
 pub mod digest;
 pub mod env;
 pub mod error;
+// **프로덕션 빌드에서는 컴파일되지 않는다.** 이유는 Cargo.toml 의 `testing` 피처 설명에 있다.
+#[cfg(any(test, feature = "testing"))]
 pub mod fakes;
 pub mod ids;
 pub mod inflight;

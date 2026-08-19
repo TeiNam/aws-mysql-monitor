@@ -168,6 +168,11 @@ pub struct InFlightTracker {
     /// 상한 때문에 강제 확정된 누적 건수. **관측 가능해야 한다** — 조용히 버리면
     /// 왜 레코드가 사라지는지 알 수 없다.
     pub evicted_total: u64,
+    /// 이번 tick 에 관측된 엔트리만으로 상한을 넘긴 횟수.
+    ///
+    /// 관측 중인 실행을 버리지 않기로 했으므로 이 경우 상한을 일시적으로 넘는다.
+    /// 0 이 아니면 `max_entries` 나 `detect_limit` 설정을 재검토해야 한다.
+    pub over_cap_ticks: u64,
 }
 
 /// 기본 최대 추적 시간. 이걸 넘기면 강제 확정한다.
@@ -216,6 +221,7 @@ impl InFlightTracker {
             max_plan_attempts,
             max_entries: DEFAULT_MAX_ENTRIES,
             evicted_total: 0,
+            over_cap_ticks: 0,
         }
     }
 
@@ -255,16 +261,18 @@ impl InFlightTracker {
         list_truncated: bool,
     ) -> TickResult {
         let mut result = TickResult::default();
-        let mut seen: Vec<u64> = Vec::with_capacity(observations.len());
+        // **`BTreeSet` 이다.** `Vec` + `contains` 는 O(엔트리 × 관측) 이고, 크기 상한이
+        // 50,000 이라 그 곱이 커졌다 — 릴리스 실측으로 50,000 × 10,000 tick 이 48ms 였다.
+        // 정렬 집합이면 O(엔트리 × log 관측) 이다.
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
         for obs in observations {
             // **DB 출력은 신뢰할 수 없는 입력이다.** 같은 tick 에 동일 `thread_id` 가
             // 두 번 오면 방금 만든 엔트리를 `ThreadReused` 로 즉시 확정해 쓰레기
             // 레코드를 만든다. 첫 관측만 쓴다.
-            if seen.contains(&obs.thread_id) {
+            if !seen.insert(obs.thread_id) {
                 continue;
             }
-            seen.push(obs.thread_id);
             match self.entries.get_mut(&obs.thread_id) {
                 Some(existing) => {
                     // 조건 2·3·4 를 확인한다. 하나라도 깨지면 다른 실행이다.
@@ -332,17 +340,42 @@ impl InFlightTracker {
         }
 
         // **크기 상한.** 시간 상한만으로는 잘린 tick 이 지속될 때 캐시를 묶지 못한다.
-        // 가장 오래 추적한 것부터 확정한다 — 새 관측보다 오래된 것이 끝났을 확률이 높다.
-        while self.entries.len() > self.max_entries {
-            let oldest = self
+        //
+        // # 이번 tick 에 관측된 것은 축출하지 않는다
+        //
+        // 처음 구현은 "가장 오래 추적한 것부터" 였는데 두 가지가 깨졌다:
+        //
+        // 1. **`min_by_key` 를 `while` 안에서 돌려 O(n²)** 였다. 릴리스 실측으로
+        //    50,000 엔트리에서 10,000건 축출이 **2.6초** — tick 예산 800ms 의 3배다.
+        //    동기 코드라 같은 tokio 워커의 다른 인스턴스까지 굶는다.
+        // 2. 아직 실행 중인 스레드를 축출하면 다음 tick 에 **새 엔트리로 다시 생기고**
+        //    `started_at_ms` 가 재계산돼 `record_id` 가 달라진다 → 한 실행이 여러
+        //    레코드로 쪼개진다(1차 H5 재발). 실측: tick 지터 ±120ms 에서 11.1%.
+        //
+        // 그래서 **이번 tick 에 보이지 않은 것만** 축출 대상으로 삼는다. 그것들은 이미
+        // 사라졌거나 `LIMIT` 컷 아래로 밀린 것이고, 어느 쪽이든 다음 tick 에 다시
+        // 관측되면 새 실행으로 보는 것이 맞다.
+        //
+        // 한 번의 정렬로 필요한 만큼만 고른다 — O(n log n) 이고 tick 당 한 번이다.
+        if self.entries.len() > self.max_entries {
+            let excess = self.entries.len() - self.max_entries;
+            let mut candidates: Vec<(EpochMs, u64)> = self
                 .entries
                 .iter()
-                .min_by_key(|(_, t)| t.first_observed_at_ms)
-                .map(|(id, _)| *id);
-            let Some(id) = oldest else { break };
-            if let Some(t) = self.entries.remove(&id) {
-                self.evicted_total += 1;
-                result.finalized.push((t, FinalizeReason::Evicted));
+                .filter(|(id, _)| !seen.contains(id))
+                .map(|(id, t)| (t.first_observed_at_ms, *id))
+                .collect();
+            candidates.sort_unstable();
+            for (_, id) in candidates.into_iter().take(excess) {
+                if let Some(t) = self.entries.remove(&id) {
+                    self.evicted_total += 1;
+                    result.finalized.push((t, FinalizeReason::Evicted));
+                }
+            }
+            // 이번 tick 에 관측된 것만으로 상한을 넘었다면 줄일 수 없다. 관측 중인 실행을
+            // 버리는 것보다 상한을 일시적으로 넘기는 편이 낫다 — 관측 가능하게 남긴다.
+            if self.entries.len() > self.max_entries {
+                self.over_cap_ticks += 1;
             }
         }
 
@@ -442,13 +475,13 @@ mod tests {
         );
     }
 
-    /// 축출은 **가장 오래 추적한 것부터**여야 한다. 새로 관측된 것을 버리면
-    /// 방금 시작한 쿼리가 즉시 확정된다.
+    /// 축출 대상은 **이번 tick 에 보이지 않은 것 중 가장 오래된 것**이다.
     #[test]
-    fn eviction_removes_the_oldest_entry_first() {
+    fn eviction_removes_the_oldest_unseen_entry() {
         let mut t = InFlightTracker::default().with_max_entries(2);
         t.tick(&[obs(1, 3, Some("a"))], 1_000, &no_offset(), true);
         t.tick(&[obs(2, 3, Some("b"))], 2_000, &no_offset(), true);
+        // 3번이 새로 보인다. 1·2 는 이번 tick 에 없다 → 오래된 1번이 축출된다.
         let r = t.tick(&[obs(3, 3, Some("c"))], 3_000, &no_offset(), true);
 
         let evicted: Vec<u64> = r
@@ -457,8 +490,68 @@ mod tests {
             .filter(|(_, reason)| *reason == FinalizeReason::Evicted)
             .map(|(tr, _)| tr.thread_id)
             .collect();
-        assert_eq!(evicted, vec![1], "가장 먼저 관측된 1번이 축출돼야 한다");
+        assert_eq!(evicted, vec![1], "보이지 않는 것 중 가장 오래된 1번");
         assert!(t.get(3).is_some(), "방금 관측된 것을 버리면 안 된다");
+    }
+
+    /// **관측 중인 실행은 축출하지 않는다.**
+    ///
+    /// 축출하면 다음 tick 에 새 엔트리로 다시 생기고 `started_at_ms` 가 재계산돼
+    /// `record_id` 가 달라진다 → 한 실행이 여러 레코드로 쪼개진다 (1차 H5 재발).
+    #[test]
+    fn currently_observed_entries_are_never_evicted() {
+        let mut t = InFlightTracker::default().with_max_entries(2);
+        // 상한 2인데 이번 tick 에 3개가 모두 관측된다.
+        let obs3 = [
+            obs(1, 3, Some("a")),
+            obs(2, 3, Some("b")),
+            obs(3, 3, Some("c")),
+        ];
+        let r = t.tick(&obs3, 1_000, &no_offset(), true);
+
+        assert!(
+            r.finalized.is_empty(),
+            "관측 중인 실행을 축출했다 — record_id 가 흔들린다"
+        );
+        assert_eq!(t.len(), 3, "상한을 일시적으로 넘기는 것이 맞다");
+        assert_eq!(t.over_cap_ticks, 1, "넘긴 사실이 관측 가능해야 한다");
+
+        // 같은 스레드가 계속 보이면 record_id 근거(started_at_ms)가 불변이어야 한다.
+        let started_before: Vec<i64> = (1..=3).map(|i| t.get(i).unwrap().started_at_ms).collect();
+        t.tick(&obs3, 2_100, &no_offset(), true);
+        let started_after: Vec<i64> = (1..=3).map(|i| t.get(i).unwrap().started_at_ms).collect();
+        assert_eq!(
+            started_before, started_after,
+            "started_at_ms 가 재계산되면 record_id 가 달라진다"
+        );
+    }
+
+    /// 축출이 **한 번의 정렬**로 끝나야 한다. `min_by_key` 를 루프 안에서 돌리면
+    /// 50,000 엔트리에서 10,000건 축출이 릴리스 빌드로 2.6초 — tick 예산의 3배다.
+    #[test]
+    fn eviction_is_not_quadratic() {
+        let mut t = InFlightTracker::default().with_max_entries(2_000);
+        // 4,000개를 채운다 (아무도 이번 tick 에 보이지 않게 만든다).
+        for chunk in 0..8 {
+            let obs_batch: Vec<Observation> = (0..500)
+                .map(|i| obs(chunk * 500 + i, 3, Some("d")))
+                .collect();
+            t.tick(&obs_batch, 1_000 + chunk as i64 * 1_000, &no_offset(), true);
+        }
+        assert!(t.len() >= 2_000);
+
+        let start = std::time::Instant::now();
+        let r = t.tick(&[obs(99_999, 3, Some("z"))], 100_000, &no_offset(), true);
+        let elapsed = start.elapsed();
+
+        assert!(t.len() <= 2_000, "상한이 지켜지지 않았다 ({})", t.len());
+        assert!(!r.finalized.is_empty(), "축출이 일어나야 하는 상황이다");
+        // 디버그 빌드라 넉넉히 잡는다. O(n²) 면 여기서 몇 초가 걸린다.
+        assert!(
+            elapsed.as_millis() < 500,
+            "축출이 {}ms 걸렸다 — O(n²) 로 돌아갔을 수 있다",
+            elapsed.as_millis()
+        );
     }
 
     /// `Evicted` 는 `TooLong` 과 구분돼야 한다 — `long_running` 오탐을 막는다.

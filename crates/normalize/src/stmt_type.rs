@@ -3,7 +3,9 @@
 use crate::lexer::Tok;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` 는 **결정론적 병합**에 필요하다. 두 레코드가 서로 다른 실제 분류를 들고 있으면
+// 도착 순서와 무관하게 같은 값을 골라야 한다 (R43).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum StatementType {
     Select,

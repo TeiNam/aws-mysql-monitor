@@ -341,6 +341,191 @@ SELECT * FROM orders WHERE memo = '\'; SELECT 31337 AS pwned; SELECT 1 -- '
 
 ---
 
+---
+
+## 3차 (2026-08-19) — 리뷰어 2명
+
+대상은 2차가 바꾼 코드. **2차 수정 중 2건이 CRITICAL 결함이었다.** 두 리뷰어가 독립적으로
+같은 두 건에 도달했다.
+
+### 3.1 CRITICAL — 2차의 `sql_mode` 고정이 **첫 쿼리에만** 적용됐다 (✅)
+
+`PoolOpts::default()` 는 `reset_connection: true` 다. 커넥션이 풀로 돌아갈 때마다
+`COM_RESET_CONNECTION` 이 나가 세션 변수가 **전역값으로 되돌아가고**, `mysql_async` 는
+그 뒤 `setup` 명령만 재실행한다 — `init` 은 하지 않는다. 같은 풀 설정으로 4회 획득/반납한 실측:
+
+```text
+.init  #1: sql_mode=""                    max_exec=3000 iso=READ-COMMITTED
+.init  #2: sql_mode="ONLY_FULL_GROUP_BY…" max_exec=0    iso=REPEATABLE-READ
+.init  #3~4: (동일)
+.setup #1~4: sql_mode="" max_exec=3000 iso=READ-COMMITTED
+```
+
+**세 가지를 동시에 잃었다:**
+
+| 변수 | 잃으면 |
+|---|---|
+| `sql_mode` | `NO_BACKSLASH_ESCAPES` 상속 → **2차 C-1 주입이 2번째 쿼리부터 다시 열린다** |
+| `max_execution_time` | **0 = 무제한.** 프로덕션 DB 에 서버측 상한이 사라진다 |
+| `transaction_isolation` | `REPEATABLE-READ` — 긴 스냅샷이 undo 를 붙잡는다 |
+
+수정: `.init(` → `.setup(` 한 단어. 회귀 테스트는 **획득 → 반납 → 재획득** 을 4회 반복한다.
+2차 테스트는 `Conn::new` 로 단일 커넥션만 봤기 때문에 아무것도 검증하지 못했다.
+
+### 3.2 CRITICAL — 2차의 `mask_label` 이 리터럴을 그대로 유출했다 (✅)
+
+2차에서 `operation`/`heading` 의 가독성(M6)을 위해 인용부호를 직접 훑는 스캐너를 썼다.
+**이스케이프를 몰랐다.** 실제 8.4.11 플랜 출력:
+
+| 입력 | 2차 출력 | `redactions` |
+|---|---|---|
+| `Filter: (t.memo = 'It\'s a secret')` | `Filter: (t.memo = ?s a secret?` | **0** |
+| `Filter: (t.blob = 0x536563726574)` | `Filter: (t.blob = ?x536563726574)` | **0** |
+| `Filter: (t.a = 'p\'q' and t.b = 'topsecret')` | `Filter: (t.a = ?q?topsecret?` | **0** |
+
+`0x536563726574` 는 `Secret` 이다. 랜덤 퍼징에서 **30.1%** 가 유출됐고, `redactions` 를
+올리지 않으므로 1차 L1 과 **똑같이 무성**이었다. `LABEL_KEYS` 가 `EXPR_KEYS` 보다 먼저
+검사되므로 fail-closed 휴리스틱도 우회했다.
+
+수정: **직접 훑기를 버리고 렉서를 쓴다.** 렉서는 `\'`·`''`·`0x`·`b'`·지수 표기를 이미
+정확히 처리한다. 토큰 스팬을 받아 리터럴 구간만 `?` 로 바꾸고 나머지는 원문을 복사하므로
+가독성도 유지된다:
+
+```text
+Limit: 10 row(s)                     → Limit: ? row(s)
+Table scan on t1  (cost=1.25 rows=5) → Table scan on t1  (cost=? rows=?)
+Filter: (t.memo = 'It\'s a secret')  → Filter: (t.memo = ?)
+```
+
+닫히지 않은 인용부호는 경계를 알 수 없으므로 `REDACTED` + `redactions += 1` 로 **fail-closed**
+한다 — 이전 구현에는 그 경로가 아예 없었다. `heading` 이 두 목록에 중복돼 `EXPR_KEYS` 쪽이
+죽은 코드였던 것도 고쳤고, 중복을 막는 테스트를 넣었다.
+
+### 3.3 HIGH — 우리가 앱과 SQL 을 다르게 파싱한 플랜을 "정확" 으로 저장했다 (✅)
+
+`sql_mode=''` 고정은 주입 방어로는 옳지만, SQL 은 **앱 세션**에서 오고 그 모드는 통제하지
+못한다. 8.4.11 실측:
+
+```text
+SET sql_mode='ANSI_QUOTES';
+SELECT COUNT(*) FROM orders WHERE "status" = 'PAID';   → 15000   ("status" = 식별자)
+SET sql_mode='';
+SELECT COUNT(*) FROM orders WHERE "status" = 'PAID';   → 0       ("status" = 문자열)
+
+EXPLAIN 결과: operation = "Zero rows (Impossible WHERE)"
+```
+
+15,000행을 스캔하는 쿼리를 조사하는 운영자가 "Zero rows" 플랜을 **정확한 플랜으로** 보게
+된다. 수정: `TargetDb::target_sql_mode()` 를 `warm()` 시점(tick 밖)에 읽어 캐시하고,
+`ANSI_QUOTES`·`NO_BACKSLASH_ESCAPES` 가 있으면 `PlanSource::RerunAsSelect` 로 강등한다
+(UI 가 "근사" 배지를 붙인다). 읽기 실패도 위험으로 본다 — 모르는 상태에서 정확하다고
+표시하는 것보다 근사가 안전하다.
+
+### 3.4 HIGH — 2차의 `.or(other.ended_at_ms)` 가 모순을 만들고, 제거하면 사실을 잃었다 (✅)
+
+2차 H4' 는 duration 과 종료 시각을 한 쌍으로 반환하게 했지만 `.or()` 폴백이 **패자의**
+종료 시각을 되가져왔다. 1,296 쌍 중 810 쌍이 모순이었고, 그중에 **유일하게 배선된 경로**가 있다:
+
+```text
+선행 저장: TIMER_WAIT 4.4초(실행 중) → duration=4,400 Timer  ended=None
+확정:      관측 TIME 5초             → duration=5,000 Polled ended=start+5,000
+병합:      duration=4,400 + ended=start+5,000 → 구간 5,000 vs duration 4,400
+```
+
+`.or()` 를 그냥 지웠더니 **관측한 종료 시각을 잃었다** (`it_collector` 가 잡았다).
+둘 다 틀렸다 — **종료를 아는 순간 duration 은 추정이 아니라 구간이다.** 최종 규칙:
+
+| 상황 | duration | ended_at |
+|---|---|---|
+| 슬로우로그 있음 | 그 측정값 (권위) | `min_opt` |
+| 종료 관측됨 | **`ended − started`** (사실) | `min_opt` |
+| 종료 미관측 | 관측된 최대값 (하한) | `None` |
+
+`min_opt` 를 **모든 분기에서** 쓰는 것이 결합법칙의 조건이다 — 슬로우로그 분기만
+`.or()` 로 두면 `merge(merge(a,b),c) != merge(a,merge(b,c))` 다(실측).
+
+### 3.5 HIGH — 2차의 축출이 O(n²) 이고 `record_id` 를 흔들었다 (✅)
+
+| 한 tick 축출 건수 | 릴리스 측정 |
+|---|---|
+| 250 (문서의 시나리오) | 56.9 ms |
+| 5,000 | 749 ms |
+| 10,000 (`detect_limit` 최대) | **2.6 초** |
+
+tick 예산은 800ms 다. 동기 코드라 같은 tokio 워커의 다른 인스턴스까지 굶는다.
+게다가 **실행 중인** 스레드를 축출하면 다음 tick 에 새 엔트리로 생기고 `started_at_ms` 가
+재계산돼 `record_id` 가 달라진다 → 한 실행이 여러 레코드로(1차 H5 재발, 지터 ±120ms 에서 11.1%).
+
+수정: **이번 tick 에 보이지 않은 것만** 축출 대상으로 삼고, 한 번의 정렬로 필요한 만큼만
+고른다. 관측 중인 것만으로 상한을 넘으면 상한을 일시적으로 넘기고 `over_cap_ticks` 로
+관측 가능하게 남긴다 — 관측 중인 실행을 버리는 것보다 낫다. `seen` 은 `BTreeSet` 으로.
+
+### 3.6 HIGH — 2차의 `scrub` 축약형 예외가 유출 경로였다 (✅)
+
+"양옆이 알파벳이면 축약형" 규칙이 MySQL 의 **문자 접두 리터럴**을 통과시켰다:
+
+```text
+Cannot convert x'topsecret' to utf8mb4        → Cannot convert x'topsecret'?'
+Incorrect string value for memo: _binary'S3CRET' → … _binary'S3CRET'?'
+```
+
+`x'…'`, `b'…'`, `N'…'`, `_binary'…'`, `_utf8mb4'…'` 가 실재한다. 10,976 형태 중 1,844 유출.
+
+첫 수정(뒤쪽 알파벳 1~2자 제한)으로도 `_binary'S3CRET'` 이 통과했다 — 접미가 `S` + 숫자다.
+**영문 축약형 접미는 닫힌 집합**(`s t d m re ll ve`)이므로 열거하고 **단어 경계**를 요구한다.
+`x'topsecret'` 은 접미 `t` 뒤가 `o` 라 리터럴로 판정된다.
+
+### 3.7 MEDIUM — 공격자가 우리 서버측 상한을 무력화한다 (✅)
+
+`plan_query` 는 옵티마이저 힌트를 의도적으로 통과시킨다(플랜을 바꾸므로 보존해야 한다).
+그런데 힌트 중 둘은 플랜이 아니라 **실행 자원**을 바꾼다. 8.4.11 실측:
+
+```text
+SET SESSION max_execution_time = 1000;
+SELECT SLEEP(2)                                    → 1  (죽었다)
+SELECT /*+ MAX_EXECUTION_TIME(600000) */ SLEEP(2)  → 0  (완료됐다)
+SELECT /*+ SET_VAR(max_execution_time=0) */ …      → 상한 0
+```
+
+SQL 은 `PROCESSLIST.INFO` 에서 오므로 대상 DB 에 쿼리를 날릴 수 있는 누구나 힌트를
+통제한다. `Timeouts::query` 는 클라이언트만 취소하므로 `max_execution_time` 이 유일한
+서버측 바운드다. 수정: 자원 힌트만 스팬 단위로 제거하고 플랜 힌트는 보존한다.
+`SET_VAR` 은 `optimizer_switch` 로 플랜도 바꿀 수 있어 `is_exact = false` 로 강등한다.
+
+### 3.8 나머지 (전부 ✅)
+
+| # | 결함 | 처리 |
+|---|---|---|
+| C3-5 | **2차의 `warm()` 이 자기 시나리오에서 발동하지 않았다.** 연결 문제는 `probe` 에서 드러나는데 `needs_warm` 은 `prefetch_save` 실패에서만 표시됐다. 내 테스트는 `fail_full_sql` 을 썼으므로 **이름이 약속한 보장을 전혀 건드리지 않았다** (vacuous) | `probe` 실패도 표시. 페이크에 `fail_probe` 추가하고 테스트를 실제 시나리오로 교체 |
+| C3-8 | `statement_type`(`Other` 가 자리표), `mysql_digest`, `cluster_id`, `schema_name`, `db_user`, `db_host`, `owner_worker`, `abandoned_reason`, `engine_version` 이 순서 의존 | `pick_statement_type`·`pick_opt_str`·`pick_str` 을 결정론적으로. `StatementType`·`ClusterId` 에 `Ord` 추가 |
+| C3-7 | 같은 텍스트인데 절단·손실 플래그가 도착 순서로 결정됐다 | 길이 동률이면 플래그를 `AND` 로 결합. 두 플래그는 "배제할 수 없었다" 는 뜻이므로 한쪽이 배제했으면 배제된 것이다 |
+| C3-9 | 절단 폴백이 `digest_text` 라 `plan_query` 가 항상 거부 → **실패가 보장된 EXPLAIN** 이 `plan_attempts` 를 소모하고 3회 뒤 영구 포기 | 폴백을 무손실 `stmt.sql_text` 로 |
+| C3-10 | 인프라 게이트 2개가 무의미했다: `doc.contains("64")` 는 `64배 개선`·`u64`·`86400` 에 걸려 4·8·16·256·1024 로도 통과했고, `find("days")` 는 부분 문자열이라 `noncurrent_days = 37` 을 `ttl35` 로 읽었다 | `SHARD_COUNT = 64` 문맥을 요구. `expiration` 블록을 이름 경계로 찾고 정확히 `days` 인자만 읽는다. **주입 실험 3종으로 확인** |
+| C3-11 | `m1_capture` 가 락을 잡지 않아 `it_collector` 의 `reset_targets` 에 죽는다(잠재) | `ROOT` 로 실행 — 리셋이 `USER <> 'root'` 로 제외한다. 락이 바이너리를 넘지 않는다는 사실을 `support` 에 명시 |
+| LOW-1 | `sql_text_lossy` 에 `serde(default)` 가 없어 이전 레코드 역직렬화가 실패한다 | 추가 |
+| LOW-2 | `fakes` 가 게이트 없이 `pub` — `TargetDb` 페이크가 배선되면 "정상" 을 보고하며 아무것도 수집하지 않는다 | `#[cfg(any(test, feature = "testing"))]` + dev-dependency. 프로덕션 바이너리에서 컴파일되지 않는다 |
+| LOW-3 | `aws_kms_key_policy` 에 `prevent_destroy` 가 없어 정책만 지워질 수 있다(키는 30일 대기) | 키와 같은 보호. `arn:aws:` 하드코딩을 `data.aws_partition` 으로 |
+| MEDIUM-2 | **2차의 M2 가 재발했다** — `from_config` 의 호출부가 여전히 0개고 `connect` 가 `pub` 이라 다음 사람이 그걸 잡는다 | `connect` 를 `testing` 피처로, `connect_with_limit` 을 비공개로. `from_config` 가 유일한 공개 경로다 |
+| C3-12 | `derive` 주석이 "`connect` 보다 크게 잡는다" 는 낡은 서술을 유지 | 갱신 |
+
+### 3.9 대칭성 검사를 4.25M 쌍으로 확대
+
+2차의 29,646 쌍은 **모든 변형이 같은 `sql_text` 를 공유해서** 길이 동률 경로와 플래그
+짝짓기를 한 번도 지나지 않았다. 축을 추가해 **4,252,986 쌍**을 검사하고, 별도로
+**결합법칙 46,656 삼중**을 검사한다(3소스 병합 F5 가 좌측 폴드다).
+
+### 3.10 리뷰어가 확인한 "2차가 맞았다"
+
+`Tok::Param` 거부는 과잉 거부가 아니다(합법적 `?` 9형태 전부 통과, 그리고 **서버측
+프리페어드는 `PROCESSLIST.INFO` 에 `?` 를 보이지 않는다** — MySQL 이 전개한다).
+`sql_mode=''` 가 `ONLY_FULL_GROUP_BY` 를 없애는 것은 이득이다(EXPLAIN 이 상위집합을 받고
+우리는 쓰기를 하지 않는다). `NO_BACKSLASH_ESCAPES`·`ANSI_QUOTES` 가 **유일한 어휘 발산**이다.
+숫자 마스킹의 `is_estimate_key` allowlist 는 8.4 가 내는 모든 숫자 키에 대해 정확하다.
+`mask_label`·`scrub`·`next_quote` 는 패닉 없고 UTF-8 안전하다(합계 80만+ 퍼징).
+`LOAD DATA LOCAL INFILE` 파일 탈취는 이중 차단으로 불가.
+
+---
+
 ## 잔여 항목 (다음 라운드)
 
 > **1차 마무리 (2026-08-19)**: 아래 중 취소선이 그어진 10건은 1차에서 처리했다.

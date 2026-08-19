@@ -261,6 +261,10 @@ pub struct SlowQuery {
     ///
     /// 이 플래그가 없으면 운영자가 저장된 SQL 을 복사해 재현할 때 **다른 쿼리**가 되고
     /// 왜 다른지 알 수 없다. UI 는 이 값이 참이면 경고를 붙인다.
+    ///
+    /// `default` 를 두는 이유: 이 필드가 없던 시절의 레코드가 아카이브·DynamoDB 에 남아
+    /// 있을 수 있다. 없으면 역직렬화가 통째로 실패한다 (스키마 버전 하위호환).
+    #[serde(default)]
     pub sql_text_lossy: bool,
     /// **선행 저장 시점의 정책을 고정한다** (F2 / A3-2). 확정 시에도 이 정책을 쓴다.
     pub literal_policy: LiteralPolicy,

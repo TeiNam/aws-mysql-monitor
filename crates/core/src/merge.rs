@@ -27,6 +27,7 @@ use crate::slow_query::{
     CaptureSource, DurationSource, ExecStats, LiteralPolicy, PlanBundle, SlowQuery, SlowQueryState,
 };
 use crate::time::EpochMs;
+use dbmon_normalize::StatementType;
 
 /// 두 레코드를 병합한다. `existing` 이 이미 저장된 쪽이다.
 ///
@@ -36,7 +37,9 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
     // 그 방식은 (a) 미완결 `Timer` 가 완결 `Polled` 를 이기게 만들고(62초 → 2.1초),
     // (b) 동률일 때 `existing` 이 이겨 `merge(a,b) != merge(b,a)` 가 됐다.
     // 이제 속성마다 그 속성에 맞는 규칙으로 병합한다.
-    let duration = merge_duration(existing, incoming);
+    // `started_at_ms` 를 먼저 정한다 — `merge_duration` 이 구간 계산에 쓴다.
+    let started_at_ms = existing.started_at_ms.min(incoming.started_at_ms);
+    let duration = merge_duration(existing, incoming, started_at_ms);
     let digest = merge_digest(existing, incoming);
 
     // 정책은 **먼저 기록된 쪽**을 고정한다. 두 레코드의 `literal_policy_at_ms` 중 이른 쪽.
@@ -62,31 +65,19 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         // 키와 신원 — 먼저 저장된 쪽을 유지한다.
         record_id: existing.record_id.clone(),
         instance_id: existing.instance_id.clone(),
-        cluster_id: existing
-            .cluster_id
-            .clone()
-            .or_else(|| incoming.cluster_id.clone()),
+        cluster_id: pick_opt_str(&existing.cluster_id, &incoming.cluster_id),
         env: existing.env,
         engine: existing.engine,
         engine_version: pick_str(&existing.engine_version, &incoming.engine_version),
         state: merge_state(existing.state, incoming.state),
 
         thread_id: existing.thread_id,
-        schema_name: existing
-            .schema_name
-            .clone()
-            .or_else(|| incoming.schema_name.clone()),
-        db_user: existing
-            .db_user
-            .clone()
-            .or_else(|| incoming.db_user.clone()),
-        db_host: existing
-            .db_host
-            .clone()
-            .or_else(|| incoming.db_host.clone()),
+        schema_name: pick_opt_str(&existing.schema_name, &incoming.schema_name),
+        db_user: pick_opt_str(&existing.db_user, &incoming.db_user),
+        db_host: pick_opt_str(&existing.db_host, &incoming.db_host),
 
         // 시각 — 더 이른 시작, 더 정확한 종료.
-        started_at_ms: existing.started_at_ms.min(incoming.started_at_ms),
+        started_at_ms,
         // `started_at_ms` 와 같은 규칙(더 이른 쪽)이어야 한다. `or` 로 두면 두 필드가
         // 어긋나 `coarse < precise` 같은 모순 조합이 나온다.
         started_at_ms_precise: min_opt(
@@ -114,27 +105,20 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         // 깨진다 (예: app_digest=aaaa 인데 algo_version=2).
         app_digest: digest.0.clone(),
         digest_algo_version: digest.1,
-        mysql_digest: existing
-            .mysql_digest
-            .clone()
-            .or_else(|| incoming.mysql_digest.clone()),
-        statement_type: existing.statement_type,
+        mysql_digest: pick_opt_str(&existing.mysql_digest, &incoming.mysql_digest),
+        // **`Other` 는 자리표다.** 텍스트가 없으면 분류할 수 없어 `Other` 가 된다.
+        // `app_digest` 의 `unknown-` 과 같은 부류인데 2차에서 그쪽만 고쳤다.
+        statement_type: pick_statement_type(existing.statement_type, incoming.statement_type),
         is_nested: existing.is_nested || incoming.is_nested,
 
         stats: merge_stats(&existing.stats, &incoming.stats),
         plan: merge_plan(&existing.plan, &incoming.plan),
         capture_source: merge_capture_source(existing.capture_source, incoming.capture_source),
 
-        owner_worker: existing
-            .owner_worker
-            .clone()
-            .or_else(|| incoming.owner_worker.clone()),
+        owner_worker: pick_opt_str(&existing.owner_worker, &incoming.owner_worker),
         owner_epoch: existing.owner_epoch.max(incoming.owner_epoch),
         last_seen_at_ms: existing.last_seen_at_ms.max(incoming.last_seen_at_ms),
-        abandoned_reason: existing
-            .abandoned_reason
-            .clone()
-            .or_else(|| incoming.abandoned_reason.clone()),
+        abandoned_reason: pick_opt_str(&existing.abandoned_reason, &incoming.abandoned_reason),
         long_running: existing.long_running || incoming.long_running,
     }
 }
@@ -183,7 +167,25 @@ fn merge_sql_text<'a>(
         }
     }
     match (usable(a, policy), usable(b, policy)) {
-        (Some(x), Some(y)) => Some(if y.text.len() > x.text.len() { y } else { x }),
+        (Some(x), Some(y)) => Some(match x.text.len().cmp(&y.text.len()) {
+            std::cmp::Ordering::Less => y,
+            std::cmp::Ordering::Greater => x,
+            // **길이가 같으면 플래그를 결합한다.** `existing` 우선으로 두면 같은 텍스트가
+            // 도착 순서에 따라 다른 배지를 받는다.
+            //
+            // 두 플래그는 "이 관측으로는 **배제할 수 없었다**" 는 뜻이다(예: IS 행이 없어
+            // 절단 여부를 판정할 근거가 없었다). 같은 텍스트를 본 다른 관측이 배제할 수
+            // 있었다면 배제된 것이다 → `AND` 다.
+            //
+            // 진짜 절단(65,535바이트)이면 두 관측이 같은 텍스트를 보므로 양쪽 다 `true` 라
+            // `AND` 도 `true` 다. 즉 이 규칙이 절단을 놓치지 않는다.
+            std::cmp::Ordering::Equal => ChosenText {
+                // 길이가 같고 정책도 같으므로 어느 쪽 텍스트든 동일하다.
+                text: x.text.min(y.text),
+                truncated: x.truncated && y.truncated,
+                lossy: x.lossy && y.lossy,
+            },
+        }),
         (Some(x), None) => Some(x),
         (None, Some(y)) => Some(y),
         (None, None) => None,
@@ -224,38 +226,75 @@ struct ChosenText<'a> {
 ///
 /// 정확도 순위(`duration_rank`)는 **완결성**을 담지 못한다. 그래서 `slowlog` 여부만
 /// 순위로 쓰고, in-flight 관측끼리는 크기로 비교한다.
-fn merge_duration(a: &SlowQuery, b: &SlowQuery) -> (i64, DurationSource, Option<EpochMs>) {
-    let pick = |q: &SlowQuery, other: &SlowQuery| {
-        // 채택한 쪽에 종료 시각이 없으면 다른 쪽 것을 쓴다(없는 것보다 낫다).
-        (
-            q.duration_ms,
-            q.duration_source,
-            q.ended_at_ms.or(other.ended_at_ms),
-        )
-    };
+fn merge_duration(
+    a: &SlowQuery,
+    b: &SlowQuery,
+    started_at_ms: EpochMs,
+) -> (i64, DurationSource, Option<EpochMs>) {
     let authoritative = |q: &SlowQuery| q.duration_source == DurationSource::Slowlog;
+
+    // ① 슬로우로그가 있으면 **duration 과 종료 시각을 한 쌍으로** 가져온다.
+    //    완결된 실행의 권위 있는 측정값이므로 크기와 무관하게 이긴다.
+    // **종료 시각은 어느 분기에서든 같은 규칙으로 고른다: `min_opt`.**
+    //
+    // 슬로우로그 분기에서만 `.or(other)` 를 쓰면 결합법칙이 깨진다 — 실측:
+    //
+    // ```text
+    // a=Polled/end=401000, b=Polled/end=462000, c=Slowlog/end=None
+    //   merge(merge(a,b),c) → end=401000     (a,b 가 min 으로 401000 을 정한 뒤 슬로우로그가 이어받음)
+    //   merge(a,merge(b,c)) → end=462000     (b,c 가 or 로 462000 을 정함)
+    // ```
+    //
+    // `min` 은 교환·결합법칙을 모두 만족한다. 어느 순서로 합쳐도 "가장 이른 관측된 종료" 다.
+    let ended_at_ms = min_opt(a.ended_at_ms, b.ended_at_ms);
+
+    // ① 슬로우로그의 `duration_ms` 는 실제 측정값이므로 구간보다 신뢰한다.
+    //    이 경우만 `duration != ended - started` 가 될 수 있고, 의도된 예외다.
     match (authoritative(a), authoritative(b)) {
-        (true, false) => return pick(a, b),
-        (false, true) => return pick(b, a),
-        _ => {}
+        (true, false) => return (a.duration_ms, a.duration_source, ended_at_ms),
+        (false, true) => return (b.duration_ms, b.duration_source, ended_at_ms),
+        (true, true) => {
+            let d = a.duration_ms.max(b.duration_ms);
+            return (d, DurationSource::Slowlog, ended_at_ms);
+        }
+        (false, false) => {}
     }
-    // 둘 다 슬로우로그이거나 둘 다 in-flight → 큰 쪽.
+
+    // ② 종료를 관측했으면 그건 **사실**이다. 버리지 않는다.
+    //
+    // `.or(other.ended_at_ms)` 로 패자의 종료 시각을 되가져오면 승자의 duration 과
+    // 섞여 `duration != ended - started` 가 된다. 반대로 승자에게 종료 시각이 없다고
+    // `None` 으로 두면 **관측한 사실을 잃는다** — 확정 경로가 정확히 그 모양이다
+    // (선행 저장은 `ended=None`, 확정은 `ended=Some`).
+    //
+    // 둘 다 틀렸다. 종료를 아는 순간 duration 은 추정이 아니라 **구간**이다.
+    if let Some(end) = ended_at_ms {
+        let span = end - started_at_ms;
+        if span >= 0 {
+            // 종료 시각을 제공한 관측의 출처를 쓴다 — 그게 끝을 확정한 관측이다.
+            let source = [a, b]
+                .into_iter()
+                .filter(|q| q.ended_at_ms == Some(end))
+                .map(|q| q.duration_source)
+                .max_by_key(|s| duration_rank(*s))
+                .unwrap_or(DurationSource::Polled);
+            return (span, source, ended_at_ms);
+        }
+        // 음수 구간은 시계 문제다. 구간을 신뢰할 수 없으니 관측된 최대값으로 돌아간다.
+    }
+
+    // ③ 종료를 못 봤다 → 두 관측 모두 하한이므로 큰 쪽이 참에 가깝다.
     match a.duration_ms.cmp(&b.duration_ms) {
-        std::cmp::Ordering::Less => pick(b, a),
-        std::cmp::Ordering::Greater => pick(a, b),
-        // **동률에서도 결정론적이어야 한다.** `a` 우선으로 두면 `merge(a,b) != merge(b,a)` 이고,
-        // 그건 이 함수가 고치려던 결함과 같은 부류다. 정확도 순위로 가르고, 그것도 같으면
-        // 이른 종료 시각을 쓴다(탐지는 지연되므로 이른 쪽이 참에 가깝다).
+        std::cmp::Ordering::Less => (b.duration_ms, b.duration_source, ended_at_ms),
+        std::cmp::Ordering::Greater => (a.duration_ms, a.duration_source, ended_at_ms),
         std::cmp::Ordering::Equal => {
-            match duration_rank(a.duration_source).cmp(&duration_rank(b.duration_source)) {
-                std::cmp::Ordering::Less => pick(b, a),
-                std::cmp::Ordering::Greater => pick(a, b),
-                std::cmp::Ordering::Equal => (
-                    a.duration_ms,
-                    a.duration_source,
-                    min_opt(a.ended_at_ms, b.ended_at_ms),
-                ),
-            }
+            // 동률에서도 결정론적이어야 한다 (R43).
+            let source = if duration_rank(a.duration_source) >= duration_rank(b.duration_source) {
+                a.duration_source
+            } else {
+                b.duration_source
+            };
+            (a.duration_ms, source, ended_at_ms)
         }
     }
 }
@@ -284,6 +323,30 @@ fn merge_digest(a: &SlowQuery, b: &SlowQuery) -> (String, u32) {
             a.app_digest.clone().min(b.app_digest.clone()),
             a.digest_algo_version,
         ),
+    }
+}
+
+/// 두 문장 종류 중 **실제 분류값**을 고른다.
+///
+/// `Other` 는 "텍스트가 없어 분류하지 못했다" 는 자리표다. 값으로 취급하면 뒤늦게
+/// 도착한 슬로우로그의 진짜 분류를 이긴다 — `app_digest` 의 `unknown-` 과 같은 부류다.
+fn pick_statement_type(a: StatementType, b: StatementType) -> StatementType {
+    match (a == StatementType::Other, b == StatementType::Other) {
+        (true, false) => b,
+        (false, true) => a,
+        // 둘 다 실제 값이면서 다르면 같은 실행이 아닐 수 있다. 결정론적으로 고른다.
+        _ => a.min(b),
+    }
+}
+
+/// 두 `Option` 중 하나를 **결정론적으로** 고른다.
+///
+/// `or_else` 는 둘 다 `Some` 이고 값이 다를 때 `existing` 을 고르므로 교환법칙을
+/// 만족하지 않는다. 이 필드들은 "먼저 저장된 쪽 유지" 가 문서화된 의도가 아니다.
+fn pick_opt_str<T: Ord + Clone>(a: &Option<T>, b: &Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y).clone()),
+        (x, y) => x.clone().or_else(|| y.clone()),
     }
 }
 
@@ -372,11 +435,16 @@ fn merge_capture_source(a: CaptureSource, b: CaptureSource) -> CaptureSource {
     if a == b { a } else { CaptureSource::Merged }
 }
 
+/// 두 문자열 중 하나를 **결정론적으로** 고른다. 빈 문자열은 "없음" 이다.
+///
+/// 이전 구현은 "`a` 가 비지 않으면 `a`" 였고 그건 교환법칙을 만족하지 않는다 —
+/// 2차 H3 가 `merge_digest` 에서 그 함정을 기록했지만 이 함수 자체는 그대로였고,
+/// `engine_version` 이 여기에 의존한다(인스턴스가 유지보수 중 버전을 올리면 갈린다).
 fn pick_str(a: &str, b: &str) -> String {
-    if a.is_empty() {
-        b.to_string()
-    } else {
-        a.to_string()
+    match (a.is_empty(), b.is_empty()) {
+        (true, false) => b.to_string(),
+        (false, true) => a.to_string(),
+        _ => a.min(b).to_string(),
     }
 }
 
@@ -440,6 +508,157 @@ mod tests {
         }
     }
 
+    /// **결합법칙.** 3소스 병합(F5)은 좌측 폴드로 합쳐지므로 순서가 결과를 바꾸면 안 된다.
+    ///
+    /// 실측: `.or(other.ended_at_ms)` 폴백이 있을 때 46,656 삼중 중 2,880 이 깨졌고
+    /// 좌측 폴드의 도착 순서 4,320 가지가 서로 다른 `ended_at_ms` 를 냈다.
+    #[test]
+    fn merge_is_associative() {
+        use DurationSource::*;
+        let start = base().started_at_ms;
+        let mut variants = Vec::new();
+        for d in [1_000i64, 4_000, 62_000] {
+            for src in [Polled, Timer, Slowlog] {
+                for e in [None, Some(start + 1_000), Some(start + 62_000)] {
+                    for dg in ["9f2c1a", "unknown-1"] {
+                        variants.push(SlowQuery {
+                            duration_ms: d,
+                            duration_source: src,
+                            ended_at_ms: e,
+                            app_digest: dg.into(),
+                            ..base()
+                        });
+                    }
+                }
+            }
+        }
+
+        let key = |q: &SlowQuery| {
+            (
+                q.duration_ms,
+                q.duration_source,
+                q.ended_at_ms,
+                q.app_digest.clone(),
+                q.statement_type,
+            )
+        };
+
+        let mut checked = 0usize;
+        for a in &variants {
+            for b in &variants {
+                for c in &variants {
+                    let left = merge(&merge(a, b), c);
+                    let right = merge(a, &merge(b, c));
+                    checked += 1;
+                    assert_eq!(
+                        key(&left),
+                        key(&right),
+                        "결합법칙 위반:\n  a={:?}ms/{:?}/{:?}\n  b={:?}ms/{:?}/{:?}\n  c={:?}ms/{:?}/{:?}",
+                        a.duration_ms,
+                        a.duration_source,
+                        a.ended_at_ms,
+                        b.duration_ms,
+                        b.duration_source,
+                        b.ended_at_ms,
+                        c.duration_ms,
+                        c.duration_source,
+                        c.ended_at_ms,
+                    );
+                }
+            }
+        }
+        assert!(checked > 45_000, "삼중 조합이 너무 적다 ({checked})");
+    }
+
+    /// **`duration_ms` 는 관측된 구간과 모순되지 않아야 한다.**
+    ///
+    /// 실측: `.or(other.ended_at_ms)` 폴백이 승자의 duration 과 패자의 종료 시각을 섞어
+    /// 1,296 쌍 중 810 쌍이 모순이었다. 그중에 **유일하게 배선된 경로**가 있다.
+    #[test]
+    fn duration_never_contradicts_the_observed_span() {
+        use DurationSource::*;
+        let start = base().started_at_ms;
+
+        // 선행 저장 + 확정 — 지금 실제로 도는 경로다.
+        let pre = SlowQuery {
+            duration_ms: 4_400,
+            duration_source: Timer,
+            ended_at_ms: None,
+            state: SlowQueryState::InFlight,
+            ..base()
+        };
+        let fin = SlowQuery {
+            duration_ms: 5_000,
+            duration_source: Polled,
+            ended_at_ms: Some(start + 5_000),
+            state: SlowQueryState::Finalized,
+            ..base()
+        };
+        for (a, b, label) in [(&pre, &fin, "선행→확정"), (&fin, &pre, "확정→선행")] {
+            let m = merge(a, b);
+            if let Some(end) = m.ended_at_ms {
+                assert_eq!(
+                    m.duration_ms,
+                    end - m.started_at_ms,
+                    "{label}: duration({}) 과 구간({}) 이 모순이다",
+                    m.duration_ms,
+                    end - m.started_at_ms
+                );
+            }
+        }
+
+        // 전수 검사 — duration 과 종료 시각이 모두 다른 모든 조합.
+        let durations = [1_000i64, 4_000, 62_000];
+        let sources = [Polled, Timer, Slowlog];
+        let ends = [
+            None,
+            Some(start + 1_000),
+            Some(start + 4_000),
+            Some(start + 62_000),
+        ];
+        let mut variants = Vec::new();
+        for d in durations {
+            for src in sources {
+                for e in ends {
+                    variants.push(SlowQuery {
+                        duration_ms: d,
+                        duration_source: src,
+                        ended_at_ms: e,
+                        ..base()
+                    });
+                }
+            }
+        }
+        let mut inconsistent = 0usize;
+        let mut lost_end = 0usize;
+        for a in &variants {
+            for b in &variants {
+                let m = merge(a, b);
+                match m.ended_at_ms {
+                    // 종료를 알면 `duration == ended - started` 여야 한다.
+                    // 슬로우로그는 권위 있는 쌍이므로 예외다.
+                    Some(end) if m.duration_source != Slowlog => {
+                        if m.duration_ms != end - m.started_at_ms {
+                            inconsistent += 1;
+                        }
+                    }
+                    Some(_) => {}
+                    // **관측한 종료를 잃으면 안 된다.** 한쪽이라도 봤으면 남아야 한다.
+                    None => {
+                        if a.ended_at_ms.is_some() || b.ended_at_ms.is_some() {
+                            lost_end += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            inconsistent, 0,
+            "{inconsistent} 쌍에서 duration 이 구간과 어긋난다"
+        );
+        assert_eq!(lost_end, 0, "{lost_end} 쌍에서 관측한 종료 시각을 잃었다");
+    }
+
     /// **R43 전수 검사.** 손으로 고른 한 쌍으로는 대칭성을 확인할 수 없다 —
     /// 1차·2차 리뷰가 모두 "고쳤다" 고 한 뒤에도 비대칭이 남아 있었다.
     ///
@@ -456,6 +675,19 @@ mod tests {
         let states = [InFlight, Finalized, Abandoned];
         let ends = [None, Some(1_755_500_404_000i64), Some(1_755_500_462_000)];
         let digests = ["9f2c1a", "aaaa1111", "unknown-8842119"];
+        // **3차에서 추가한 축.** 이전 판은 모든 변형이 같은 `sql_text` 를 공유해서
+        // 길이 동률 경로와 플래그 짝짓기를 한 번도 지나지 않았다.
+        let texts: [(Option<&str>, bool, bool); 4] = [
+            (Some("SELECT a FROM t"), false, false),
+            (Some("SELECT a FROM t WHERE x ="), true, false),
+            (Some("SELECT a FROM t"), false, true),
+            (None, false, false),
+        ];
+        let stypes = [
+            StatementType::Select,
+            StatementType::Update,
+            StatementType::Other,
+        ];
 
         let mut variants = Vec::new();
         for d in durations {
@@ -463,14 +695,22 @@ mod tests {
                 for st in states {
                     for e in ends {
                         for dg in digests {
-                            variants.push(SlowQuery {
-                                duration_ms: d,
-                                duration_source: src,
-                                state: st,
-                                ended_at_ms: e,
-                                app_digest: dg.into(),
-                                ..base()
-                            });
+                            for (txt, trunc, lossy) in texts {
+                                for sty in stypes {
+                                    variants.push(SlowQuery {
+                                        duration_ms: d,
+                                        duration_source: src,
+                                        state: st,
+                                        ended_at_ms: e,
+                                        app_digest: dg.into(),
+                                        sql_text: txt.map(str::to_string),
+                                        sql_text_truncated: trunc,
+                                        sql_text_lossy: lossy,
+                                        statement_type: sty,
+                                        ..base()
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -485,19 +725,26 @@ mod tests {
                 checked += 1;
 
                 // 문서화된 순서 의존 필드는 제외하고 비교한다.
+                // 13개를 넘으면 튜플에 `PartialEq`/`Debug` 가 없다. 둘로 나눈다.
                 let strip = |q: &SlowQuery| {
                     (
-                        q.duration_ms,
-                        q.duration_source,
-                        q.ended_at_ms,
-                        q.state,
-                        q.app_digest.clone(),
-                        q.digest_algo_version,
-                        q.stats,
-                        q.sql_text_truncated,
-                        q.sql_text_lossy,
-                        q.started_at_ms,
-                        q.started_at_ms_precise,
+                        (
+                            q.duration_ms,
+                            q.duration_source,
+                            q.ended_at_ms,
+                            q.state,
+                            q.app_digest.clone(),
+                            q.digest_algo_version,
+                            q.stats,
+                        ),
+                        (
+                            q.sql_text.clone(),
+                            q.sql_text_truncated,
+                            q.sql_text_lossy,
+                            q.statement_type,
+                            q.started_at_ms,
+                            q.started_at_ms_precise,
+                        ),
                     )
                 };
                 assert_eq!(
@@ -521,9 +768,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            checked, 29_646,
-            "조합 수가 바뀌었다 — 축을 늘렸으면 이 값도 갱신한다"
+        assert!(
+            checked > 4_000_000,
+            "조합 수가 줄었다 ({checked}) — 축이 사라졌는지 확인한다"
         );
     }
 
@@ -805,12 +1052,27 @@ mod tests {
 
     #[test]
     fn same_source_takes_max_duration() {
+        // **종료를 관측하지 못한 경우에만** 최대값 규칙이 적용된다.
+        // 둘 다 in-flight 관측이면 각각이 하한이므로 큰 쪽이 참에 가깝다.
         let mut a = base();
         a.duration_ms = 4000;
+        a.ended_at_ms = None;
         let mut b = base();
         b.duration_ms = 6000;
+        b.ended_at_ms = None;
         assert_eq!(merge(&a, &b).duration_ms, 6000);
         assert_eq!(merge(&b, &a).duration_ms, 6000);
+        assert_eq!(merge(&a, &b).ended_at_ms, None);
+
+        // 종료를 관측했으면 duration 은 추정이 아니라 **구간**이다.
+        let mut c = base();
+        c.duration_ms = 6000; // 폴링 추정
+        c.ended_at_ms = Some(base().started_at_ms + 4_000); // 관측된 종료
+        let m = merge(&c, &c);
+        assert_eq!(
+            m.duration_ms, 4_000,
+            "종료를 알면 구간이 duration 이다 — 추정값보다 정확하다"
+        );
     }
 
     #[test]

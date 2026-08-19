@@ -346,6 +346,8 @@ impl Config {
             }
         }
 
+        // `detect_timeout_ms` 가 tick 예산보다 크면 **바깥 상한이 항상 먼저 발동**해
+        // 설정이 조용히 무시된다. 아래 검증이 그걸 막는다 (M27/M3 와 같은 부류).
         if c.detect_timeout_ms > tick_budget {
             return Err(err(
                 "collector.detect_timeout_ms",

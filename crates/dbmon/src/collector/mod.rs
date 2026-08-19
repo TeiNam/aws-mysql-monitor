@@ -111,6 +111,12 @@ pub struct InstanceCollector<D, S, C> {
     epoch: Option<u64>,
     /// 다음 기회에 연결 풀을 다시 채워야 한다. 기동 직후에도 참이다.
     needs_warm: bool,
+    /// 대상의 `sql_mode` 가 **우리와 문자열 경계를 다르게 본다.**
+    ///
+    /// `ANSI_QUOTES` 또는 `NO_BACKSLASH_ESCAPES` 가 있으면 같은 SQL 문자열을 앱과 우리가
+    /// 다르게 파싱한다. 그 상태로 얻은 플랜은 **다른 쿼리의 플랜**이므로 정확하다고
+    /// 표시할 수 없다 ([`TargetDb::target_sql_mode`]).
+    lexical_divergence: bool,
     /// `FOR CONNECTION` 이 권한 부족으로 실패했다. 이후 시도하지 않는다.
     for_connection_denied: bool,
     /// `probe` 가 0행이라 DB 시각을 못 받은 연속 횟수.
@@ -142,6 +148,7 @@ where
             params,
             epoch: None,
             needs_warm: true,
+            lexical_divergence: false,
             for_connection_denied: false,
             ticks_without_db_time: AtomicU64::new(0),
         }
@@ -173,10 +180,21 @@ where
         let mut stats = TickStats::default();
         let now_ms = self.clock.now_ms();
 
-        let probe = self
+        // **실패하면 warm 을 표시한다.** `detect_total`(tick 예산 800ms)이
+        // `connect`(5초)보다 작은 것이 정당한 근거는 "연결 수립을 `warm()` 이 tick 밖에서
+        // 한다" 는 것이다. 그런데 연결 문제는 바로 이 `probe` 에서 드러나므로, 여기서
+        // 표시하지 않으면 콜드 상태가 영구히 회복되지 않는다 — 2차 M4 가 그대로 재발한다.
+        let probe = match self
             .db
             .probe(self.params.slow_threshold_secs, &self.excludes)
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                self.needs_warm = true;
+                return Err(e);
+            }
+        };
         stats.candidates = probe.rows.len();
         stats.detect_truncated = probe.truncated;
 
@@ -310,9 +328,42 @@ where
             Ok(()) => {
                 self.needs_warm = false;
                 tracing::debug!(instance = %self.instance.id, "연결 풀 준비됨");
+                // 같은 기회에 어휘 발산 위험을 갱신한다. tick 밖이므로 비용이 자유롭다.
+                self.refresh_lexical_divergence().await;
             }
             Err(e) => {
                 tracing::warn!(instance = %self.instance.id, error = %e, "연결 풀 준비 실패");
+            }
+        }
+    }
+
+    /// 대상의 `sql_mode` 를 읽어 어휘 발산 위험을 갱신한다.
+    ///
+    /// 실패하면 **위험이 있다고 본다** — 모르는 상태에서 정확하다고 표시하는 것보다
+    /// 근사로 표시하는 편이 안전하다.
+    async fn refresh_lexical_divergence(&mut self) {
+        const RISKY: [&str; 2] = ["ANSI_QUOTES", "NO_BACKSLASH_ESCAPES"];
+        match self.db.target_sql_mode().await {
+            Ok(mode) => {
+                let upper = mode.to_ascii_uppercase();
+                let risky = RISKY.iter().any(|m| upper.contains(m));
+                if risky != self.lexical_divergence {
+                    tracing::info!(
+                        instance = %self.instance.id,
+                        sql_mode = %mode,
+                        risky,
+                        "대상 sql_mode 어휘 발산 위험 갱신"
+                    );
+                }
+                self.lexical_divergence = risky;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    instance = %self.instance.id,
+                    error = %e,
+                    "sql_mode 를 읽지 못했다 — 플랜을 근사로 표시한다"
+                );
+                self.lexical_divergence = true;
             }
         }
     }
@@ -459,9 +510,15 @@ where
                 true
             }
         });
-        // PS 의 무손실 텍스트도 절단될 수 있다(1,024바이트). 그건 `plan_query` 가
-        // 대부분 걸러내지만, 여기서는 IS 가 없을 때의 차선으로만 쓴다.
-        let sql = is_sql.or_else(|| stmt.and_then(|s| s.digest_text.as_deref()));
+        // **폴백은 PS 의 무손실 `SQL_TEXT` 다.**
+        //
+        // 예전에는 `digest_text` 로 폴백했는데 거기엔 `?`·`(...)` 자리표가 남아 있어
+        // `plan_query` 가 거부한다(2차 M5) → 폴백이 **항상 실패**하면서 `plan_attempts` 를
+        // 소모했다. 3회 뒤에는 그 항목이 영구히 "플랜 없음" 으로 굳는다.
+        //
+        // `stmt.sql_text` 는 실제 실행 가능한 SQL 이다(1,024바이트에서 잘릴 수 있고,
+        // 잘리면 `plan_query` 가 대부분 걸러낸다). 이쪽이 의도에 맞다.
+        let sql = is_sql.or_else(|| stmt.and_then(|s| s.sql_text.as_deref()));
         let Some(sql) = sql else {
             stats.plans_failed += 1;
             return PlanResult::failed(PlanFailure::NoStatement);
@@ -474,7 +531,9 @@ where
 
         match self.db.explain_rerun(&pq.sql).await {
             Ok(ExplainOutcome::Plan(json)) => {
-                if pq.is_exact {
+                // **어휘 발산이 있으면 정확하다고 표시할 수 없다.** 앱과 우리가 같은
+                // 문자열을 다르게 파싱하므로, 얻은 플랜은 다른 쿼리의 플랜이다.
+                if pq.is_exact && !self.lexical_divergence {
                     stats.plans_rerun += 1;
                     PlanResult::plan(json, PlanSource::Rerun)
                 } else {

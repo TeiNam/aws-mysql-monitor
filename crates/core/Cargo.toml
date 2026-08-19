@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 description = "도메인 타입 + 포트(trait). I/O 의존성 없음."
 
+[features]
+# **페이크를 프로덕션 조립에서 격리한다.**
+#
+# `fakes` 는 `TargetDb`(수집 입구)와 `SlowQueryStore`(저장) 구현을 담고 있다.
+# 실수로 배선되면 수집기가 "정상" 을 보고하면서 아무것도 수집하지 않는다.
+# `#[cfg(test)]` 만으로는 부족하다 — 통합 테스트가 크레이트 밖에서 쓴다.
+testing = []
+
 [dependencies]
 dbmon-normalize.workspace = true
 serde.workspace = true

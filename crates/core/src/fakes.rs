@@ -554,12 +554,16 @@ pub struct FakeTargetDb {
     pub full: Mutex<Vec<FullSqlRow>>,
     /// `stmt_current` 가 돌려줄 행.
     pub stmts: Mutex<Vec<StmtCurrentRow>>,
+    /// `probe` 를 앞으로 n 번 실패시킨다. **연결 실패를 재현한다.**
+    fail_probe: AtomicUsize,
     /// `full_sql` 을 앞으로 n 번 실패시킨다.
     fail_full_sql: AtomicUsize,
     /// `stmt_current` 를 앞으로 n 번 실패시킨다.
     fail_stmt_current: AtomicUsize,
     /// `explain_*` 결과.
     pub explain: Mutex<Option<ExplainOutcome>>,
+    /// 대상의 전역 `sql_mode`. 어휘 발산 테스트가 여기에 값을 넣는다.
+    pub sql_mode: Mutex<String>,
     /// 호출 횟수 (경로가 실제로 돌았는지 확인용).
     pub full_sql_calls: AtomicUsize,
     pub explain_calls: AtomicUsize,
@@ -605,8 +609,18 @@ impl FakeTargetDb {
     }
 
     /// `warm` 이 몇 번 호출됐는가. **표시만 하고 아무도 부르지 않는 실수**를 잡는다.
+    /// 대상의 전역 `sql_mode` 를 설정한다.
+    pub fn set_sql_mode(&self, mode: &str) {
+        *self.sql_mode.lock().unwrap() = mode.to_string();
+    }
+
     pub fn warm_calls(&self) -> usize {
         self.warm_calls.load(Ordering::SeqCst)
+    }
+
+    /// `probe` 를 앞으로 n 번 실패시킨다. `acquire()` 의 연결 획득 타임아웃과 같은 형태다.
+    pub fn fail_probe(&self, n: usize) {
+        self.fail_probe.store(n, Ordering::SeqCst);
     }
 
     pub fn fail_full_sql(&self, n: usize) {
@@ -629,6 +643,12 @@ impl FakeTargetDb {
 #[async_trait]
 impl TargetDb for FakeTargetDb {
     async fn probe(&self, _threshold_secs: u32, _excludes: &Excludes) -> Result<ProbeResult> {
+        if Self::should_fail(&self.fail_probe) {
+            return Err(DomainError::Unavailable {
+                dependency: "target-mysql",
+                reason: "probe: 연결 획득 타임아웃".into(),
+            });
+        }
         Ok(ProbeResult {
             rows: self.rows.lock().unwrap().clone(),
             truncated: self.truncated.load(Ordering::SeqCst),
@@ -706,5 +726,9 @@ impl TargetDb for FakeTargetDb {
     async fn warm(&self) -> Result<()> {
         self.warm_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn target_sql_mode(&self) -> Result<String> {
+        Ok(self.sql_mode.lock().unwrap().clone())
     }
 }

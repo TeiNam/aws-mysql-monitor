@@ -97,15 +97,58 @@ pub fn scrub(input: &str) -> String {
 /// **메시지가 `Can'?'` 하나로 붕괴한다.** 운영자가 "연결 거부"와 "접근 거부"를
 /// 구분할 수 없게 되는데, 그건 이 도구의 자가진단 전체를 무력화한다.
 ///
-/// 판정 규칙: `'` 의 **양옆이 모두 ASCII 알파벳**이면 축약형이다. 인용부호는
-/// 값을 감싸므로 최소 한쪽이 공백·괄호·문장 끝이다. `'s`·`'t`·`'re`·`'ll` 를
-/// 열거하지 않는 이유는 새 형태가 나올 때 다시 벌어지기 때문이다.
+/// # 예외를 좁혀야 한다 — 넓은 규칙은 유출 경로다
+///
+/// "양옆이 알파벳이면 축약형" 으로 두면 MySQL 의 **문자 접두 리터럴**이 통과한다.
+/// 여는 인용부호를 건너뛰면 `first` 가 닫는 쪽으로 밀려 `last > first` 가 깨지고,
+/// "인용부호 하나" 분기가 그 앞을 **전부 남긴다**:
+///
+/// ```text
+/// IN : Cannot convert x'topsecret' to utf8mb4
+/// OUT: Cannot convert x'topsecret'?'          ← 유출
+/// IN : Duplicate entry a'kim@example.com' for key 'k'
+/// OUT: Duplicate entry a'kim@example.com'?'   ← 유출
+/// ```
+///
+/// 같은 형태가 `_binary'…'`, `N'…'`, `_utf8mb4'…'`, `b'…'`, `X'…'` 로 실재한다.
+///
+/// 그래서 **뒤쪽을 1~2 글자로 제한한다.** 영문 축약형은 `'s`·`'t`·`'re`·`'ll`·`'ve`·`'d`
+/// 이므로 인용부호 뒤 알파벳이 3자 이상이면 축약형이 아니다.
+/// `x'topsecret'` 는 뒤가 9자라 인용부호로 판정된다.
+fn is_english_contraction(bytes: &[u8], i: usize) -> bool {
+    // 영문 축약형 접미는 **닫힌 집합**이다. 휴리스틱보다 열거가 안전하다 —
+    // "알파벳 1~2자" 규칙은 `_binary'S3CRET'` 를 통과시켰다(접미가 `S` + 숫자다).
+    const SUFFIXES: [&[u8]; 7] = [b"s", b"t", b"d", b"m", b"re", b"ll", b"ve"];
+
+    if bytes[i] != b'\'' || i == 0 {
+        return false;
+    }
+    // 앞은 알파벳이어야 한다 (`doesn` + `'`).
+    if !bytes[i - 1].is_ascii_alphabetic() {
+        return false;
+    }
+    let rest = &bytes[i + 1..];
+    SUFFIXES.iter().any(|suf| {
+        if !rest.len().ge(&suf.len()) {
+            return false;
+        }
+        // 대소문자 무시 — MySQL 메시지는 소문자지만 방어적으로 둔다.
+        if !rest[..suf.len()].eq_ignore_ascii_case(suf) {
+            return false;
+        }
+        // **접미 뒤가 단어 경계여야 한다.** 아니면 리터럴 내용이다:
+        //   `doesn't exist`   → 접미 `t`, 다음 ` `        → 축약형
+        //   `x'topsecret'`    → 접미 `t`, 다음 `o`        → 리터럴
+        //   `_binary'S3CRET'` → 접미 `S`, 다음 `3`        → 리터럴
+        rest.get(suf.len())
+            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+    })
+}
+
+/// 판정은 [`is_english_contraction`] 이 한다.
 fn next_quote(input: &str, from: usize, backward: bool) -> Option<usize> {
     const QUOTES: [char; 3] = ['\'', '"', '`'];
     let bytes = input.as_bytes();
-    let is_alpha = |i: usize| bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic());
-    let is_contraction =
-        |i: usize| bytes[i] == b'\'' && i > 0 && is_alpha(i - 1) && is_alpha(i + 1);
 
     let indices: Box<dyn Iterator<Item = usize>> = if backward {
         Box::new((0..from).rev())
@@ -117,7 +160,7 @@ fn next_quote(input: &str, from: usize, backward: bool) -> Option<usize> {
             continue;
         }
         let c = input[i..].chars().next()?;
-        if QUOTES.contains(&c) && !is_contraction(i) {
+        if QUOTES.contains(&c) && !is_english_contraction(bytes, i) {
             return Some(i);
         }
     }
@@ -188,6 +231,59 @@ pub fn init(json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **MySQL 의 문자 접두 리터럴이 축약형 예외를 통과하면 안 된다.**
+    ///
+    /// `x'…'`, `b'…'`, `N'…'`, `_binary'…'`, `_utf8mb4'…'` 는 실재하는 형태다.
+    /// 여는 인용부호를 축약형으로 오판하면 `first` 가 닫는 쪽으로 밀리고
+    /// "인용부호 하나" 분기가 그 앞을 **전부 남긴다**.
+    #[test]
+    fn letter_prefixed_literals_are_not_mistaken_for_contractions() {
+        let cases = [
+            ("Cannot convert x'topsecret' to utf8mb4", "topsecret"),
+            (
+                "Duplicate entry a'kim@example.com' for key 'k'",
+                "kim@example.com",
+            ),
+            ("Incorrect string value for memo: _binary'S3CRET'", "S3CRET"),
+            ("Data truncated: N'S3CRET'", "S3CRET"),
+            ("near _ascii'S3CRET' at line 1", "S3CRET"),
+            ("value b'0110secret'", "0110secret"),
+            ("O'Brien secret9", "secret9"),
+        ];
+        for (input, secret) in cases {
+            let out = scrub(input);
+            assert!(
+                !out.contains(secret),
+                "유출: {secret}\n  입력: {input}\n  출력: {out}"
+            );
+        }
+    }
+
+    /// 좁힌 예외가 **진짜 축약형을 계속 통과시켜야** 한다.
+    /// 못 통과시키면 진단이 다시 붕괴한다.
+    #[test]
+    fn real_contractions_still_preserve_the_diagnostic() {
+        let cases = [
+            (
+                "Can't connect to MySQL server on 'db.internal'",
+                "Can't connect",
+            ),
+            ("Table 'shop.t' doesn't exist", "doesn't exist"),
+            ("user isn't allowed: 'kim' rejected", "isn't allowed"),
+            ("we've seen 'x' before", "we've seen"),
+            ("they're using 'y'", "they're using"),
+            ("it'll fail on 'z'", "it'll fail"),
+            ("I'd avoid 'w'", "I'd avoid"),
+        ];
+        for (input, must_keep) in cases {
+            let out = scrub(input);
+            assert!(
+                out.contains(must_keep),
+                "진단이 사라졌다: {must_keep}\n  입력: {input}\n  출력: {out}"
+            );
+        }
+    }
 
     /// **영문 축약형의 어포스트로피를 인용부호로 보면 메시지가 붕괴한다.**
     ///

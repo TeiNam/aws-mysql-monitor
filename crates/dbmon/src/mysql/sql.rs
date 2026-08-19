@@ -183,6 +183,12 @@ pub const STATEMENT_DIGEST: &str = "/* dbmon:selfdigest */ SELECT STATEMENT_DIGE
 ///
 /// `transaction_isolation='READ-COMMITTED'` 는 우리 조회가 다른 세션의 잠금·스냅샷에
 /// 영향을 주지 않게 한다. `SET SESSION` 이므로 대상 DB 전역 설정을 바꾸지 않는다.
+/// 대상 인스턴스의 **전역** `sql_mode`. 앱 세션이 상속하는 값이다.
+///
+/// 세션 값(`@@session.sql_mode`)이 아니라 전역 값을 본다 — 우리 세션은 `''` 로
+/// 고정했으므로 세션 값은 항상 비어 있다.
+pub const GLOBAL_SQL_MODE: &str = "/* dbmon:sqlmode */ SELECT @@global.sql_mode";
+
 pub fn session_init(query_timeout_ms: u64) -> String {
     // **`sql_mode` 를 고정한다. 이것은 보안 통제다.**
     //

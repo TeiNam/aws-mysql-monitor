@@ -21,22 +21,45 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{} 를 읽을 수 없다: {e}", p.display()))
 }
 
-/// `id = "<name>"` 블록 안의 `days = N` 을 찾는다.
+/// `id = "<name>"` 블록의 `expiration { days = N }` 을 찾는다.
+///
+/// **`find("days")` 로는 안 된다.** 부분 문자열이라 `noncurrent_days`·`transition { days }`
+/// 에 먼저 걸린다. 주입 실험으로 확인: `noncurrent_days = 37` 을 앞에 넣으면 `ttl35 = 37` 로
+/// 읽히면서 모든 단정이 통과했다. **조용히 틀린 값을 읽는 게이트는 게이트가 아니다.**
 fn lifecycle_days(tf: &str, rule_id: &str) -> u32 {
     let needle = format!("id     = \"{rule_id}\"");
     let start = tf
         .find(&needle)
         .unwrap_or_else(|| panic!("lifecycle 규칙 {rule_id} 를 찾을 수 없다"));
     let tail = &tf[start..];
-    let d = tail
-        .find("days")
-        .unwrap_or_else(|| panic!("{rule_id} 규칙에 days 가 없다"));
-    tail[d..]
-        .split('=')
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("{rule_id} 의 days 를 파싱할 수 없다"))
+    // `expiration` 블록 안의 `days` 만 본다. **블록 이름을 정확히 맞춘다** —
+    // `"expiration {"` 로 찾으면 `noncurrent_version_expiration {` 에 먼저 걸린다.
+    let exp = tail
+        .match_indices("expiration {")
+        .find(|(i, _)| {
+            // 앞 글자가 식별자 문자면 다른 블록 이름의 일부다.
+            tail[..*i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("{rule_id} 규칙에 expiration 블록이 없다"));
+    let block = &tail[exp..];
+    let close = block
+        .find('}')
+        .unwrap_or_else(|| panic!("{rule_id} 의 expiration 블록이 닫히지 않았다"));
+    let inner = &block[..close];
+    // 정확히 `days` 라는 이름의 인자만 받는다.
+    inner
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == "days").then(|| v.trim())
+        })
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{rule_id} 의 expiration.days 를 파싱할 수 없다"))
 }
 
 /// **항목 TTL 이 참조하는 S3 객체의 Lifecycle 보다 길면 안 된다** (04 §2.3 불변식).
@@ -86,11 +109,19 @@ fn retention_tiers_are_strictly_increasing() {
 /// 두 워커가 같은 샤드를 소유한다 (F1 불변식 `ShardsOwned 합계 = 64 또는 0`).
 #[test]
 fn shard_count_matches_the_design_document() {
+    // **`doc.contains("64")` 는 무의미하다.** `64배 개선`·`u64`·`86400초` 에 걸린다.
+    // 주입 실험으로 확인: 4·8·16·32·256·1024 로 바꿔도 통과했다.
+    // 샤드를 명시하는 문맥을 찾아야 한다.
     let doc = read("docs/05-collector.md");
     let n = dbmon_core::ports::stores::SHARD_COUNT;
+    let patterns = [
+        format!("SHARD_COUNT = {n}"),
+        format!("SHARD_COUNT({n})"),
+        format!("샤드 수 = SHARD_COUNT({n})"),
+    ];
     assert!(
-        doc.contains(&format!("{n}")),
-        "05-collector.md 에 샤드 수 {n} 이 없다"
+        patterns.iter().any(|p| doc.contains(p)),
+        "05-collector.md 에 샤드 수 {n} 을 명시하는 문맥이 없다. 찾은 패턴: {patterns:?}"
     );
     // 2의 거듭제곱이어야 리샤딩이 단순하다.
     assert!(

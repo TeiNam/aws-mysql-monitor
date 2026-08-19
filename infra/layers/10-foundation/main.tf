@@ -29,6 +29,8 @@ data "aws_region" "current" {}
 
 # **기존 VPC 는 data source 로만 참조한다.**
 # resource 로 관리하면 destroy 가 다른 워크로드를 지운다 (infra/README.md 참조).
+data "aws_partition" "current" {}
+
 data "aws_vpc" "target" {
   id = var.vpc_id
 }
@@ -67,7 +69,7 @@ data "aws_iam_policy_document" "kms_data" {
     effect = "Allow"
     principals {
       type        = "AWS"
-      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${local.account_id}:root"]
     }
     actions   = ["kms:*"]
     resources = ["*"]
@@ -94,7 +96,9 @@ data "aws_iam_policy_document" "kms_data" {
     condition {
       test     = "ArnLike"
       variable = "kms:EncryptionContext:aws:logs:arn"
-      values   = ["arn:aws:logs:${data.aws_region.current.region}:${local.account_id}:log-group:*"]
+      values = [
+        "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${local.account_id}:log-group:*",
+      ]
     }
   }
 }
@@ -102,6 +106,13 @@ data "aws_iam_policy_document" "kms_data" {
 resource "aws_kms_key_policy" "data" {
   key_id = aws_kms_key.data.id
   policy = data.aws_iam_policy_document.kms_data.json
+
+  # **키와 같은 보호를 받아야 한다.** 키에만 `prevent_destroy` 를 걸면 정책만 지워지는
+  # 상태가 만들어진다: `AllowCloudWatchLogs` statement 가 사라지면 CMK 로 암호화한
+  # 로그 그룹이 동작을 멈추는데, 키는 `prevent_destroy` + 30일 삭제 대기라 되돌릴 수 없다.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_kms_alias" "data" {

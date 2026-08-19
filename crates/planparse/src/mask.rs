@@ -89,7 +89,6 @@ const EXPR_KEYS: &[&str] = &[
     // v2 는 재작성된 문장 전문을 담고, const-table 최적화 시 **실제 행 데이터**까지 넣는다.
     // 지금은 휴리스틱이 잡지만 가장 리터럴을 많이 담는 키이므로 명시한다.
     "query",
-    "heading",
     "lookup_condition",
     "sort_fields",
     "index_condition",
@@ -126,46 +125,62 @@ pub const REDACTED: &str = "<redacted>";
 
 /// 산문형 라벨에서 **리터럴만** 지운다. 나머지는 바이트 단위로 보존한다.
 ///
-/// 지우는 것:
-/// - 인용부호로 감싼 구간 → `?`
-/// - **독립** 숫자 → `?` (식별자에 붙은 숫자는 남긴다: `t1`, `idx_2`)
+/// # 손으로 쓴 스캐너를 버리고 렉서를 쓴다
 ///
-/// 판정: 숫자 앞이 식별자 문자(`[A-Za-z_]` 또는 숫자)면 식별자의 일부다.
-/// `cost=1.25` 는 앞이 `=` 이므로 리터럴, `t1` 은 앞이 `t` 이므로 식별자다.
-fn mask_label(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\'' || c == b'"' {
-            // 닫는 같은 부호까지(없으면 끝까지) 버린다.
-            out.push('?');
-            i += 1;
-            while i < b.len() && b[i] != c {
-                i += 1;
-            }
-            i += 1; // 닫는 부호
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let prev_is_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
-                i += 1;
-            }
-            if prev_is_ident {
-                out.push_str(&s[start..i]);
-            } else {
-                out.push('?');
-            }
-            continue;
-        }
-        // 멀티바이트 문자를 쪼개지 않는다.
-        let ch = s[i..].chars().next().expect("경계 확인됨");
-        out.push(ch);
-        i += ch.len_utf8();
+/// 2차에서 인용부호를 직접 훑는 스캐너를 썼는데 이스케이프를 몰라서 **리터럴이 그대로
+/// 새어 나갔다.** `redactions` 도 올리지 않아 아무도 알아채지 못하는 형태였다(1차 L1 과 동형):
+///
+/// ```text
+/// IN : Filter: (t.memo = 'It\'s a secret')
+/// OUT: Filter: (t.memo = ?s a secret?          ← "secret" 유출, redactions=0
+/// IN : Filter: (t.blob = 0x536563726574)
+/// OUT: Filter: (t.blob = ?x536563726574)       ← 16진수가 "Secret" 이다
+/// ```
+///
+/// 랜덤 퍼징에서 30.1% 가 유출됐다. 렉서는 `\'`·`''`·`0x`·`b'`·지수 표기를 **이미**
+/// 정확히 처리하므로, 직접 훑는 대신 **토큰 스팬**을 받아 리터럴 구간만 치환한다.
+/// 라벨의 가독성(대소문자·공백)은 리터럴 밖 원문을 그대로 복사해 유지한다.
+///
+/// ```text
+/// IN : Limit: 10 row(s)                        OUT: Limit: ? row(s)
+/// IN : Table scan on t1  (cost=1.25 rows=5)    OUT: Table scan on t1  (cost=? rows=?)
+/// ```
+///
+/// # 애매하면 포기한다 (fail-closed)
+///
+/// 인용부호가 닫히지 않았으면 리터럴 경계를 알 수 없다. 그때는 [`REDACTED`] 를 반환하고
+/// `redactions` 를 올린다 — 이전 구현에는 이 경로가 아예 없었다.
+fn mask_label(s: &str, redactions: &mut usize) -> String {
+    use dbmon_normalize::lexer::{Lexer, Tok};
+
+    let (toks, spans, unterminated) = Lexer::new(s).tokenize_with_spans();
+    if unterminated {
+        // 닫히지 않은 인용부호 → 어디까지가 리터럴인지 알 수 없다.
+        *redactions += 1;
+        return REDACTED.to_string();
     }
+
+    // 리터럴 토큰의 바이트 구간을 `?` 로 바꾸고 나머지는 원문을 복사한다.
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    for (tok, span) in toks.iter().zip(spans.iter()) {
+        let is_literal = matches!(
+            tok,
+            Tok::Placeholder | Tok::IntroducedLiteral | Tok::Param | Tok::Ellipsis
+        );
+        if !is_literal {
+            continue;
+        }
+        if span.start < cursor || span.end > s.len() {
+            // 스팬이 어긋났다 — 신뢰할 수 없으므로 전체를 버린다.
+            *redactions += 1;
+            return REDACTED.to_string();
+        }
+        out.push_str(&s[cursor..span.start]);
+        out.push('?');
+        cursor = span.end;
+    }
+    out.push_str(&s[cursor..]);
     out
 }
 
@@ -241,7 +256,7 @@ fn mask_str(key: Option<&str>, s: &str, redactions: &mut usize) -> String {
         return s.to_string();
     }
     if LABEL_KEYS.contains(&k) {
-        return mask_label(s);
+        return mask_label(s, redactions);
     }
     if EXPR_KEYS.contains(&k) || may_contain_literal(s) {
         let (masked, ok) = mask_expression(s);
@@ -275,6 +290,86 @@ fn may_contain_literal(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **이스케이프된 인용부호와 MySQL 수치 리터럴 형태 전부에서 유출이 없어야 한다.**
+    ///
+    /// 2차의 손으로 쓴 스캐너는 이 다섯 중 다섯을 모두 유출했고 `redactions` 도 0 이었다.
+    /// 실제 8.4.11 플랜 출력에서 나오는 형태다.
+    #[test]
+    fn label_masking_handles_every_mysql_literal_form() {
+        let cases: &[(&str, &str)] = &[
+            (r"Filter: (t.memo = 'It\'s a secret')", "secret"),
+            (r#"Filter: (t.memo = "say \"hunter2\" now")"#, "hunter2"),
+            // 16진수는 디코드하면 "Secret" 이다.
+            ("Filter: (t.blob = 0x536563726574)", "536563726574"),
+            // 이스케이프가 짝을 뒤집으면 **다음** 리터럴이 통째로 드러났다.
+            (r"Filter: (t.a = 'p\'q' and t.b = 'topsecret')", "topsecret"),
+            ("Filter: (t.b = 0b0101)", "0101"),
+            ("Filter: (t.c = 1.5e10)", "5e10"),
+            ("Filter: (t.d = 0X4A)", "4A"),
+            (r"Filter: (t.e = b'0110')", "0110"),
+            // 연속 인용부호 이스케이프.
+            ("Filter: (t.f = 'a''b secret2')", "secret2"),
+        ];
+        for (input, must_not_survive) in cases {
+            let plan = serde_json::json!({ "query_plan": { "operation": input } });
+            let (masked, _) = mask_plan(&plan);
+            let got = serde_json::to_string(&masked).expect("직렬화");
+            assert!(
+                !got.contains(must_not_survive),
+                "리터럴 유출: {must_not_survive}\n  입력: {input}\n  출력: {got}"
+            );
+        }
+    }
+
+    /// 닫히지 않은 인용부호는 **경계를 알 수 없으므로 전체를 버린다** (fail-closed).
+    /// 이전 구현에는 이 경로가 아예 없었다.
+    #[test]
+    fn unterminated_quote_in_label_fails_closed() {
+        let plan = serde_json::json!({
+            "query_plan": { "operation": "Filter: (t.a = 'unclosed secret3" }
+        });
+        let (masked, redactions) = mask_plan(&plan);
+        let got = serde_json::to_string(&masked).expect("직렬화");
+        assert!(!got.contains("secret3"), "유출: {got}");
+        assert!(got.contains(REDACTED), "REDACTED 로 대체되지 않았다: {got}");
+        assert_eq!(redactions, 1, "관측 가능해야 한다 — 조용히 버리면 안 된다");
+    }
+
+    /// `heading` 은 `LABEL_KEYS` 에만 있어야 한다. 양쪽에 두면 `EXPR_KEYS` 쪽이
+    /// 죽은 코드가 되고, 주석이 실제 동작을 설명하지 않게 된다.
+    #[test]
+    fn label_keys_and_expr_keys_do_not_overlap() {
+        let dup: Vec<&&str> = LABEL_KEYS
+            .iter()
+            .filter(|k| EXPR_KEYS.contains(k))
+            .collect();
+        assert!(dup.is_empty(), "두 목록에 겹치는 키가 있다: {dup:?}");
+    }
+
+    /// 패닉하지 않아야 한다 — 릴리스 빌드는 `panic = "abort"` 라 한 번이면 컨테이너가 죽는다.
+    #[test]
+    fn label_masking_never_panics() {
+        let alphabet = [
+            '\'', '"', '`', '\\', '0', 'x', 'b', 'e', '.', ' ', '(', ')', '한', '📊',
+        ];
+        let mut count = 0usize;
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    for d in alphabet {
+                        let input: String = [a, b, c, d].iter().collect();
+                        let plan = serde_json::json!({ "query_plan": { "operation": input } });
+                        let (masked, _) = mask_plan(&plan);
+                        // 출력이 유효한 UTF-8 문자열이어야 한다.
+                        let _ = serde_json::to_string(&masked).expect("직렬화");
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, alphabet.len().pow(4));
+    }
 
     /// **라벨은 읽을 수 있어야 한다.** SQL 정규화기를 적용하면 리터럴은 사라지지만
     /// 대소문자·공백이 뒤섞여 화면에서 쓸 수 없게 된다.

@@ -10,6 +10,11 @@ description = "aws-mysql-monitor 단일 바이너리"
 name = "dbmon"
 path = "src/main.rs"
 
+[features]
+# 테스트 전용 생성자를 노출한다. 통합 테스트(`tests/`)는 별도 크레이트이므로
+# `#[cfg(test)]` 만으로는 보이지 않는다.
+testing = []
+
 [dependencies]
 dbmon-core.workspace = true
 dbmon-normalize.workspace = true
@@ -36,3 +41,8 @@ sha2.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+# 통합 테스트만 페이크와 테스트 전용 생성자를 본다. 프로덕션 바이너리는 못 본다.
+dbmon-core = { workspace = true, features = ["testing"] }
+dbmon = { path = ".", features = ["testing"] }
