@@ -3,7 +3,7 @@
 작업 중 이동으로 중단했다. **이 문서만 읽으면 이어서 할 수 있게** 검증된 사실과
 미확인 항목을 구분해 적는다.
 
-브랜치: `feat/m0-foundation` · 마지막 커밋 `fa80adb` · **변경 19개 파일 커밋 안 됨**
+브랜치: `feat/m0-foundation` · 마지막 커밋 `7454766` (코드 전부 커밋됨, 푸시 안 함)
 
 ---
 
@@ -88,44 +88,56 @@ status qps=8.98 thr_run=3 lock=0 gap=-
 
 ## 3. ⚠ 다음에 가장 먼저 할 일
 
-### 3.1 `slowq` 방송이 오는지 확인되지 않았다 (최우선)
+### 3.1 `slowq` 방송 도착 확인 (최우선, 단 결함 아님)
 
-지표(`status`)는 왔지만 **슬로우 쿼리(`slowq`) 방송은 한 번도 관측하지 못했다.**
-저장소 데코레이터 단위 테스트는 통과하는데(`a_stored_record_is_broadcast`),
-실제 프로세스에서 확인이 안 됐다.
+> 이 절의 초판은 "제품 결함일 수 있다" 는 톤이었다. **틀렸다.** 원인은 테스트
+> 하네스였고, 아래에 정정해 뒀다. 초판을 믿고 없는 결함을 쫓지 말 것.
 
-재현 절차:
+**남은 일은 하나다**: 수집기가 잡은 슬로우 쿼리가 WS `slowq` 메시지로 도착하는지
+한 번 보는 것. 그 앞 단계는 전부 확인됐다.
+
+| 단계 | 상태 |
+|---|---|
+| 수집기가 느린 쿼리를 탐지하는가 | ✅ `candidates=1` 관측 (23:20:27~30) |
+| `BroadcastingStore` 가 방송하는가 | ✅ 단위 테스트 (`a_stored_record_is_broadcast`) |
+| WS 가 구독자에게 전달하는가 | ✅ `status` 로 같은 경로 관측됨 |
+| **`slowq` 메시지 실제 도착** | ❓ 마지막 테스트가 중단돼 미확인 |
+
+재현 절차 — **두 함정을 피해야 한다**:
 
 ```bash
 # 1. 격리 테이블로 리더를 잡는다 (아래 3.3 참고 — dbmon-data-local 은 다른
 #    컨테이너가 리스를 쥐고 있다)
+#
+#    ⚠ 로그 필터는 `RUST_LOG` 이 아니라 `DBMON_LOG` 다 (telemetry.rs:257).
+#      RUST_LOG 로 주면 조용히 무시되고 info 레벨만 나온다.
 DBMON_TARGET_PASSWORD=dbmon-local-monitor \
 DBMON__STORAGE__DATA_TABLE=dbmon-data-wstest \
 AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \
+DBMON_LOG=dbmon=trace \
   ./target/release/dbmon --config local/dbmon.toml --log-pretty serve
 
-# 2. WS 를 붙이고 (스크립트는 /tmp/ws-live.mjs 에 있었다 — 아래 부록 A 에 전문)
+# 2. WS 를 붙인다 (스크립트 전문은 부록 A)
 node ws-live.mjs
 
-# 3. 느린 쿼리를 하나 만든다
-docker exec dbmon-dev-mysql84-1 mysql -uloadgen -pdbmon-local-loadgen -D shop \
-  -e "SELECT /* ws-demo */ SLEEP(6);"
+# 3. 느린 쿼리를 만든다.
+#    ⚠ `docker exec` 에 **`-d` 가 필요하다.** 없으면 셸이 완료를 기다려
+#      WS 관측 창과 겹치지 않는다 — 이 세션에서 두 번 이것 때문에
+#      "방송이 안 온다" 고 오진했다.
+docker exec -d dbmon-dev-mysql84-1 mysql -uloadgen -pdbmon-local-loadgen -D shop \
+  -e "SELECT /* ws-demo */ SLEEP(7);"
 ```
 
-확인해야 할 것 — **순서대로 좁힐 것**:
+`slowq` 가 그래도 안 오면 좁힐 순서:
 
-1. `dbmon-data-wstest` 에 새 `SQ#` 레코드가 들어오는가?
-   (중단 시점에는 레코드가 1개뿐이고 그건 23:00 에 시작된 **오래된 in_flight**
-   레코드였다 — 즉 SLEEP(6) 자체가 캡처되지 않았을 가능성이 높다)
-2. 캡처가 됐는데 방송이 안 됐는가? → `Hub::publish_slow_query` 의 키와
-   구독 키가 어긋나는지 본다 (`slowq:env=dev`)
-3. `BroadcastingStore` 가 실제로 배선됐는가? → `build_stores` 가 감싸고 있고
-   `AppSlowQueryStore` 별칭을 쓰므로 구조적으로는 보장되지만, **실행으로 확인한
-   적이 없다**
+1. `dbmon-data-wstest` 에 새 `SQ#` 레코드가 들어왔는가 (저장 자체를 확인)
+2. `Hub::publish_slow_query` 의 키와 구독 키가 맞는가 (`slowq:env=dev`)
+3. `ws.rs` 의 `subscribed.contains(&key)` 비교가 맞는가
 
 > ⚠ **함정**: `SELECT ... FROM orders o JOIN order_items i ... WHERE SLEEP(4)=0`
 > 형태로 테스트하지 말 것. `SLEEP` 이 **조인 행마다** 평가돼 12만 행 × 4초 =
-> 며칠이 걸린다. 이 세션에서 두 번 걸렸다. `SELECT SLEEP(6);` 처럼 스칼라로 쓴다.
+> 며칠이 걸린다. 이 세션에서 두 번 걸렸고, 한 번은 `KILL` 로 정리했다.
+> `SELECT SLEEP(7);` 처럼 스칼라로 쓴다.
 
 ### 3.2 React SPA — 스캐폴딩만 됐다
 
@@ -153,8 +165,8 @@ Dockerfile 에 **노드 빌더 스테이지 추가**가 필요하다. 런타임 
 |---|---|---|
 | `dbmon-web` 컨테이너 (`dbmon:round8`) | **실행 중**, `dbmon-data-local` 의 수집 리더 리스를 쥐고 있다 | 이 세션에서 만든 게 아니라 손대지 않았다. 정리 여부는 사용자 판단 |
 | `dbmon-dev-dbmon-1` (컴포즈 `monitor` 프로파일) | 실행 중, `role=api`, HEALTHCHECK `unhealthy` | **원인 미확인** — 컨테이너 안 `dbmon healthcheck` 가 왜 실패하는지 봐야 한다 |
-| `dbmon-data-wstest` 테이블 | 이 세션에서 만든 격리 테이블 | 필요 없으면 삭제 |
-| `dbmon-dev-mysql84-1` 의 장기 실행 쿼리 | 23:00 시작된 조인+SLEEP 이 아직 돌 수 있다 | `SHOW PROCESSLIST` 로 확인 후 `KILL` |
+| `dbmon-data-wstest` 테이블 | 이 세션에서 만든 격리 테이블. 호스트 dbmon 이 이걸로 떠 있을 수 있다 | 필요 없으면 삭제 |
+| `dbmon-dev-mysql84-1` 의 장기 실행 쿼리 | 정리됨 (932초짜리 조인+SLEEP 을 `KILL`) | — |
 
 `just` 가 이 머신에 **설치돼 있지 않다.** 그래서 justfile 타깃(`docker-up`,
 `docker-down` 포함)은 **실행으로 검증되지 않았다.** 컴포즈 명령은 직접 실행해 확인했다.
@@ -190,13 +202,28 @@ dev 폴백 코드는 있는데 justfile·local/dbmon.toml·docker-compose 어디
 없었다. 그래서 문서대로 따라 하면 4.2 의 패닉을 만난다.
 → 세 곳에 모두 넣고 이유를 주석으로 남겼다.
 
-### 4.4 `0` 을 센티널로 쓴 것 (테스트가 잡음)
+### 4.4 진단을 두 번 틀리게 만든 하네스 문제 (결함 아님, 기록용)
+
+제품 결함이 아니라 **내 테스트 방법**이 틀려서 없는 결함을 쫓았다. 같은 함정에
+다시 빠지지 않도록 남긴다.
+
+- **로그 필터 환경변수가 `DBMON_LOG` 다** (`telemetry.rs:257`). `RUST_LOG` 로
+  주면 조용히 무시된다. 그래서 "수집 tick 로그가 하나도 없다 → 수집기가 안
+  돈다" 로 오진했다. 실제로는 1초마다 정상 tick 중이었다.
+- **`docker exec` 에 `-d` 가 없으면** 셸이 쿼리 완료를 기다려 WS 관측 창과
+  겹치지 않는다. "느린 쿼리를 쐈는데 방송이 안 온다" 의 진짜 이유였다.
+
+이 프로젝트에서 반복되는 유형이다 — 앞서 `kill` 이 래퍼 서브셸을 때린 일,
+포트를 쥔 좀비 프로세스, 열려 있는 슬로우로그 파일을 `rm` 한 일과 같은 계열.
+**"관측되지 않음" 을 "동작하지 않음" 으로 읽기 전에 관측 경로를 먼저 의심한다.**
+
+### 4.5 `0` 을 센티널로 쓴 것 (테스트가 잡음)
 
 `MetricsSampler.last_sampled_at_ms: EpochMs = 0` 이 "아직 샘플링 안 함" 을
 의미하게 했는데 `0` 은 유효한 `EpochMs` 다. `now_ms = 0` 인 테스트가 잡았다.
 → `Option<EpochMs>`.
 
-### 4.5 임베드 화면이 prd 에서도 서빙됐다
+### 4.6 임베드 화면이 prd 에서도 서빙됐다
 
 정적 HTML 이라 데이터는 안 새지만 T-01 의 인증 예외가 하나 늘고, prd 에서는
 인증을 통과할 수 없으니 **깨진 화면**이다.
@@ -274,7 +301,8 @@ ECS 는 태스크마다 `ECS_CONTAINER_METADATA_URI_V4` 를 주입하므로 **�
 
 ## 부록 A. WS 확인 스크립트
 
-`web/` 밖에 두면 잃어버리므로 여기 남긴다. `node ws-live.mjs` 로 돌린다.
+`web/` 밖에 두면 잃어버리므로 여기 남긴다. `node ws-live.mjs` 로 돌리고,
+느린 쿼리는 **`docker exec -d`** 로 쏜다(§3.1 함정 참고).
 
 ```js
 const ws = new WebSocket("ws://127.0.0.1:8080/api/ws");
