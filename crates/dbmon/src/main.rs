@@ -190,6 +190,95 @@ async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> 
     out
 }
 
+/// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
+const ORPHAN_SWEEP_LIMIT: usize = 500;
+
+/// 슬로우로그 소스를 만든다.
+///
+/// 로컬 파일이 설정돼 있으면(dev 전용) 그걸 쓴다 — SSO 가 만료돼도 백필 경로를
+/// 끝까지 돌릴 수 있다. 그 외에는 CloudWatch Logs 다([05 §8.3]).
+async fn build_slowlog_fetcher(config: &Config) -> Arc<dyn dbmon::slowlog::SlowLogFetcher> {
+    use aws_config::BehaviorVersion;
+
+    if let Some(path) = &config.collector.slowlog_file {
+        tracing::info!(%path, "슬로우로그 소스: 로컬 파일 (dev)");
+        return Arc::new(dbmon::slowlog::FileFetcher::new(path));
+    }
+    let sdk = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(config.aws.region.clone()))
+        .load()
+        .await;
+    tracing::info!("슬로우로그 소스: CloudWatch Logs");
+    Arc::new(dbmon::slowlog::CloudWatchFetcher::new(
+        aws_sdk_cloudwatchlogs::Client::new(&sdk),
+    ))
+}
+
+/// 슬로우로그 백필 한 라운드.
+///
+/// **한 인스턴스의 실패가 나머지를 막지 않는다.** 백필은 과거를 채우는 일이고,
+/// 한 인스턴스의 로그 그룹이 없다고 전체가 멈추면 안 된다.
+async fn backfill_round(
+    fetcher: &Arc<dyn dbmon::slowlog::SlowLogFetcher>,
+    store: &Arc<dbmon::store::DynamoSlowQueryStore>,
+    instances: &[dbmon_core::instance::Instance],
+    config: &Config,
+    now_ms: i64,
+) -> dbmon::slowlog::source::BackfillStats {
+    use dbmon::slowlog::source::{BackfillStats, backfill};
+
+    let min_ms = (config.collector.slow_threshold_secs as i64) * 1000;
+    let mut total = BackfillStats::default();
+
+    for instance in instances.iter().filter(|i| i.is_collectible()) {
+        // 체크포인트 없이 도는 첫 구현이다 — 병합이 멱등이므로 안전하고,
+        // 구간은 백필 주기의 2배로 제한해 같은 데이터를 무한히 다시 읽지 않는다.
+        let since_ms = now_ms - (config.collector.backfill_secs as i64) * 2_000;
+        let chunk = match fetcher.fetch(&instance.id, since_ms).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    instance = %instance.id.as_str(),
+                    error = %telemetry::Scrubbed(&e),
+                    "슬로우로그를 가져올 수 없다 — 이 인스턴스를 건너뛴다"
+                );
+                continue;
+            }
+        };
+        let parsed = dbmon::slowlog::parse(&chunk.text, min_ms);
+        if !parsed.skipped.is_empty() {
+            tracing::debug!(
+                instance = %instance.id.as_str(),
+                skipped = ?parsed.skip_counts(),
+                "슬로우로그 엔트리를 건너뛰었다"
+            );
+        }
+        match backfill(
+            Arc::clone(store),
+            &parsed.entries,
+            instance,
+            // **설정값을 쓴다.** 하드코딩하면 실시간 경로와 백필의 정책이 갈리고,
+            // 한쪽만 원문을 저장하는 상태가 조용히 만들어진다.
+            config.collector.literal_policy,
+            now_ms,
+        )
+        .await
+        {
+            Ok(s) => {
+                total.merged += s.merged;
+                total.unnormalizable += s.unnormalizable;
+                total.errors += s.errors;
+            }
+            Err(e) => tracing::warn!(
+                instance = %instance.id.as_str(),
+                error = %telemetry::Scrubbed(&e),
+                "백필 실패 — 다음 주기에 재시도한다"
+            ),
+        }
+    }
+    total
+}
+
 /// 탐색 **조회** 단계 — `DescribeDBInstances` → T-37 필터 → 도메인 매핑.
 ///
 /// # 이 단계만 취소해도 안전하다
@@ -521,6 +610,18 @@ struct CollectDeps {
     /// 쓰게 되고 정상인 1대가 나머지 499대의 실패를 가린다. 리더 루프가 최솟값을
     /// 골라 준비 상태에 올린다.
     freshness: dbmon::collect_loop::CollectFreshness,
+    /// 이 태스크가 속한 리스의 `epoch`. **저장 레코드의 펜싱 근거다** (F4).
+    ///
+    /// # 스냅샷이어도 되는 이유
+    ///
+    /// 리더를 잃으면 리더 루프가 매 tick `abort_all()` 한다. 즉 **태스크는 자기
+    /// epoch 보다 오래 살 수 없다** — 리스를 잃고 다시 잡으면 epoch 가 올라가고
+    /// 태스크도 새로 뜬다. `LeaderGate::refresh` 가 상실과 재획득을 같은 호출에서
+    /// 하지 않으므로(상실 시 `held=None` 으로 반환) 최소 한 tick 의 간격이 보장된다.
+    ///
+    /// ⚠ 그 불변식이 깨지면(예: 상실 즉시 재획득) 이 값이 낡은다. `abort_all` 이
+    /// 리더 상실 경로에 있는 것이 이 스냅샷의 전제다.
+    epoch: Option<u64>,
     /// 셧다운 신호. **협조적 종료에 필요하다** — `abort()` 만으로 멈추면
     /// `drain()` 이 불리지 않아 `in_flight` 유령이 남는다.
     shutdown: Arc<Shutdown>,
@@ -615,7 +716,7 @@ fn spawn_instance_collector(
             slow_threshold_secs: deps.config.collector.slow_threshold_secs,
             deep_probe_limit: deps.config.collector.deep_probe_limit as usize,
             try_for_connection: true,
-            literal_policy: dbmon_core::slow_query::LiteralPolicy::Masked,
+            literal_policy: deps.config.collector.literal_policy,
             monitor_db_user: db_user.clone(),
             worker_id: deps.worker_id.clone(),
         };
@@ -626,6 +727,10 @@ fn spawn_instance_collector(
             SystemClock,
             params,
         );
+        // **리스 epoch 를 계승한다.** 이게 없으면 저장되는 모든 레코드의
+        // `owner_epoch` 가 `None` 이고, F4 고아 판정의 펜싱 근거가 비어 있다.
+        // `restore` 는 이 배선이 생길 때까지 비테스트 호출부가 없었다.
+        collector.restore(None, deps.epoch);
 
         let mut last_refresh_attempt_ms: i64 = 0;
 
@@ -787,6 +892,8 @@ fn spawn_leader_loop(
         worker_id: worker_id.clone(),
         shutdown: Arc::clone(&shutdown),
         freshness: dbmon::collect_loop::CollectFreshness::new(),
+        // 리더가 되기 전에는 epoch 가 없다. 태스크를 띄우는 시점에 채운다.
+        epoch: None,
     };
 
     Some(tokio::spawn(async move {
@@ -797,8 +904,13 @@ fn spawn_leader_loop(
         // **마지막 탐색 시각.** 0 이면 리더가 된 직후 한 번 돈다 — 5분을 기다리면
         // 배포 직후 목록이 비어 있고, 그건 장애로 보인다.
         let mut last_discovery_ms: i64 = 0;
+        // 고아 스윕(F4)·백필은 탐색과 **다른 시간축**이다.
+        let mut last_sweep_ms: i64 = 0;
+        let mut last_backfill_ms: i64 = 0;
         // 인스턴스별 수집 태스크. **리더만 갖는다.**
         let mut tasks = CollectTasks::new();
+        // 슬로우로그 소스는 리더가 될 때까지 만들지 않는다(탐색기와 같은 이유).
+        let mut fetcher: Option<Arc<dyn dbmon::slowlog::SlowLogFetcher>> = None;
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -929,7 +1041,13 @@ fn spawn_leader_loop(
                         // 토큰을 발급하고 풀을 만들고 몇 ms 뒤 abort 된다.
                         match stores.registry.list().await {
                             Ok(instances) => {
-                                tasks.reconcile(&instances, &collect_deps).await;
+                                // **현재 리스의 epoch 를 태스크에 심는다** (F4 펜싱).
+                                // 저장 레코드의 `owner_epoch` 가 이 값이다.
+                                let deps = CollectDeps {
+                                    epoch: gate.epoch(),
+                                    ..collect_deps.clone()
+                                };
+                                tasks.reconcile(&instances, &deps).await;
                                 // 사라진 인스턴스를 신선도 맵에서 잊는다 — 안 잊으면
                                 // 최솟값이 영구히 과거에 고정된다.
                                 collect_deps.freshness.retain(&tasks.running());
@@ -943,6 +1061,65 @@ fn spawn_leader_loop(
                                 error = %telemetry::Scrubbed(&e),
                                 "등록부를 읽을 수 없다 — 태스크 집합을 유지한다"
                             ),
+                        }
+                    }
+                }
+
+                // ── 고아 in_flight 스윕 (F4) ─────────────────────────────────
+                //
+                // `drain()` 은 **정상 종료**만 덮는다. 급사·SIGKILL·리더 교체로
+                // 사라진 워커의 레코드는 이 스윕만 덮는다 — 없으면 TTL(35일)까지
+                // 화면에 유령 쿼리로 남는다.
+                if now_ms - last_sweep_ms >= (config.collector.orphan_sweep_secs as i64) * 1000 {
+                    last_sweep_ms = now_ms;
+                    let threshold =
+                        dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
+                    match dbmon::orphan::sweep(
+                        Arc::clone(&stores.slow_query),
+                        &collect_deps.worker_id,
+                        now_ms,
+                        threshold,
+                        ORPHAN_SWEEP_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok(s) if s.scanned > 0 => tracing::info!(
+                            scanned = s.scanned,
+                            abandoned = s.abandoned,
+                            alive = s.alive,
+                            mine = s.mine,
+                            errors = s.errors,
+                            "고아 스윕"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            error = %telemetry::Scrubbed(&e),
+                            "고아 스윕 실패 — 다음 주기에 재시도한다"
+                        ),
+                    }
+                }
+
+                // ── 슬로우로그 백필 ──────────────────────────────────────────
+                //
+                // **실행별 정확 지표의 유일한 출처다** ([19 §G2]). 실시간 경로는
+                // `rows_examined` 를 줄 수 없다 — 실행 중에는 0 이기 때문이다.
+                if now_ms - last_backfill_ms >= (config.collector.backfill_secs as i64) * 1000 {
+                    last_backfill_ms = now_ms;
+                    if fetcher.is_none() {
+                        fetcher = Some(build_slowlog_fetcher(&config).await);
+                    }
+                    if let (Some(f), Ok(instances)) =
+                        (fetcher.as_ref(), stores.registry.list().await)
+                    {
+                        let s = backfill_round(f, &stores.slow_query, &instances, &config, now_ms)
+                            .await;
+                        if s.merged > 0 || s.errors > 0 {
+                            tracing::info!(
+                                merged = s.merged,
+                                unnormalizable = s.unnormalizable,
+                                errors = s.errors,
+                                "슬로우로그 백필"
+                            );
                         }
                     }
                 }
@@ -1022,6 +1199,26 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         discovery_interval_secs = config.discovery.interval_secs,
         "기동"
     );
+
+    // **리터럴 정책을 기동 로그에 알린다** (FR-CAP-07 / OPEN-Q-15).
+    //
+    // 코드 기본값(`masked`)이 FR-CAP-07 의 `prd → full_restricted` 와 다르다.
+    // 의도된 이탈이지만 **조용해서는 안 된다** — prd 에서 샘플 쿼리가 동작하지
+    // 않는 이유가 여기 있고, 그걸 모르면 "기능이 깨졌다" 로 오해한다.
+    {
+        use dbmon_core::slow_query::LiteralPolicy;
+        let policy = config.collector.literal_policy;
+        if config.deployment_env == dbmon_core::env::Env::Prd && policy == LiteralPolicy::Masked {
+            tracing::warn!(
+                policy = ?policy,
+                "prd 리터럴 정책이 masked 다 — FR-DGS-06(실행 가능한 샘플 쿼리)이 \
+                 동작하지 않는다. FR-CAP-07 은 full_restricted 를 규정하지만 \
+                 OPEN-Q-15(조직 규정 판단)가 미해소이므로 되돌릴 수 있는 쪽을 기본값으로 둔다"
+            );
+        } else {
+            tracing::info!(policy = ?policy, env = %config.deployment_env, "리터럴 저장 정책");
+        }
+    }
 
     // **CA 번들 만료 감시** (07 §3.3).
     //

@@ -164,6 +164,53 @@ pub struct CollectorConfig {
     pub digest_threshold_ms: i64,
     /// 모니터링 DB 계정명. 자기 제외의 기준 ([05 §10](../../../docs/05-collector.md)).
     pub monitor_db_user: String,
+    /// 고아 `in_flight` 스윕 주기 (초). 기본 5분 ([05 §4.5](../../../docs/05-collector.md) F4).
+    #[serde(default = "default_orphan_sweep_secs")]
+    pub orphan_sweep_secs: u64,
+    /// 슬로우로그 백필 주기 (초). 기본 1분.
+    ///
+    /// 실행별 정확 지표의 유일한 출처이므로([19 §G2]) 너무 느리면 화면의 지표가
+    /// 오래 비어 있다. 너무 빠르면 CloudWatch Logs API 레이트 리밋에 걸린다.
+    #[serde(default = "default_backfill_secs")]
+    pub backfill_secs: u64,
+    /// 리터럴 저장 정책 (FR-CAP-07, [OPEN-Q-15](../../../docs/OPEN-QUESTIONS.md)).
+    ///
+    /// # 왜 기본값이 `masked` 인가 — 의도된 이탈이다
+    ///
+    /// FR-CAP-07 은 `prd → full_restricted` 를 규정한다. 근거는 타당하다: **저장 시점
+    /// 마스킹은 되돌릴 수 없고**, 노출 시점 통제는 되돌릴 수 있으면서 동등하게 안전하다.
+    ///
+    /// 그런데 그 선택은 "운영 데이터의 리터럴을 이 시스템에 저장해도 되는가" 라는
+    /// **조직 규정 판단**에 달려 있고(OPEN-Q-15), 그건 코드가 답할 수 없다.
+    /// 그리고 두 방향의 실수 비용이 비대칭이다:
+    ///
+    /// | 잘못된 기본값 | 되돌리는 방법 |
+    /// |---|---|
+    /// | `masked` 인데 `full_restricted` 여야 했다 | 설정 한 줄 → **이후 데이터는 원문** |
+    /// | `full_restricted` 인데 `masked` 여야 했다 | **불가능** — 이미 저장된 리터럴은 남는다 |
+    ///
+    /// 그래서 **되돌릴 수 있는 쪽을 기본값으로** 둔다. 기제는 준비돼 있고 전환은
+    /// 실제로 한 줄이다. 대가는 FR-DGS-06(복사해서 바로 실행하는 샘플 쿼리)이
+    /// prd 에서 동작하지 않는 것이고, 기동 로그가 그 사실을 매번 알린다.
+    #[serde(default = "default_literal_policy")]
+    pub literal_policy: dbmon_core::slow_query::LiteralPolicy,
+    /// 로컬 슬로우로그 파일 경로. **개발 전용** — 있으면 CloudWatch 대신 이걸 읽는다.
+    ///
+    /// SSO 가 만료돼도 백필 경로를 끝까지 돌릴 수 있게 한다.
+    #[serde(default)]
+    pub slowlog_file: Option<String>,
+}
+
+fn default_literal_policy() -> dbmon_core::slow_query::LiteralPolicy {
+    dbmon_core::slow_query::LiteralPolicy::Masked
+}
+
+fn default_orphan_sweep_secs() -> u64 {
+    300
+}
+
+fn default_backfill_secs() -> u64 {
+    60
 }
 
 impl Default for CollectorConfig {
@@ -183,6 +230,10 @@ impl Default for CollectorConfig {
             digest_top_n: 200,
             digest_threshold_ms: 100,
             monitor_db_user: "dbmon".into(),
+            literal_policy: default_literal_policy(),
+            orphan_sweep_secs: default_orphan_sweep_secs(),
+            backfill_secs: default_backfill_secs(),
+            slowlog_file: None,
         }
     }
 }
@@ -531,6 +582,19 @@ impl Config {
                 crate::aws::auth_token::TARGET_PASSWORD_ENV,
                 "deployment_env=dev 가 아닌 배포에 폴백 비밀번호가 주입돼 있다 — \
                  태스크 정의에서 제거하고 값을 로테이션한다",
+            ));
+        }
+
+        // **로컬 슬로우로그 파일은 `dev` 에서만 허용한다.**
+        //
+        // prd 에서 켜지면 CloudWatch 대신 파일을 읽어 **백필이 조용히 아무것도
+        // 하지 않는다** — 실행별 정확 지표가 영구히 비고, 원인은 "지표가 없다" 로만
+        // 보인다.
+        if self.deployment_env != Env::Dev && self.collector.slowlog_file.is_some() {
+            return Err(err(
+                "collector.slowlog_file",
+                "로컬 슬로우로그 파일은 deployment_env=dev 에서만 쓴다 \
+                 (prd 는 CloudWatch Logs 를 읽는다)",
             ));
         }
 

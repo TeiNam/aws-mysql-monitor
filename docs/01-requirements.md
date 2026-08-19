@@ -94,7 +94,7 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | FR-CAP-04 | 쿼리의 시작·종료를 추적한다. 종료 시 관측된 최대 실행시간을 확정값으로 저장한다 | P0 |
 | FR-CAP-05 | 폴링 사이에 끝난 쿼리는 미관측을 허용하되, 미관측 구간의 존재를 **다이제스트 스냅샷으로 보정**한다(FR-DGS) | P0 |
 | FR-CAP-06 | 제외 규칙: 스키마·계정·호스트·SQL 정규식 패턴별로 수집 제외를 설정할 수 있다. 기본 제외는 `mysql`/`information_schema`/`performance_schema`/`sys` 스키마와 `rdsadmin`/`system user`/`event_scheduler`/모니터링 계정. 1세대 태그 `real_time_slow_sql`은 `dbmon:enabled`로 대체하되, 기존 태그도 읽어 마이그레이션을 돕는다 | P0 |
-| FR-CAP-07 | 리터럴 값 저장 정책을 인스턴스별로 설정할 수 있다: `full` / `full_restricted`(저장하되 조회를 operator 이상 + 감사) / `masked` / `off`. **기본값은 prd → `full_restricted`, stg·dev → `full`.** 저장 시점 마스킹은 되돌릴 수 없으므로 노출 통제를 우선한다([08 §6.1](08-security-auth.md)).<br>⚠ **코드의 현재 기본값은 전 환경 `masked` 다.** [OPEN-Q-15](OPEN-QUESTIONS.md) 가 미해소인 상태에서 prd 리터럴 저장을 기본값으로 켜는 것은 소급 취소가 불가능하므로 보수적으로 두었다. 결정되면 한 줄로 바꾼다 | P0 |
+| FR-CAP-07 | 리터럴 값 저장 정책을 인스턴스별로 설정할 수 있다: `full` / `full_restricted`(저장하되 조회를 operator 이상 + 감사) / `masked` / `off`. **기본값은 prd → `full_restricted`, stg·dev → `full`.** 저장 시점 마스킹은 되돌릴 수 없으므로 노출 통제를 우선한다([08 §6.1](08-security-auth.md)).<br>⚠ **코드의 현재 기본값은 전 환경 `masked` 다** (`collector.literal_policy`). prd 리터럴 저장은 소급 취소가 불가능하므로, [OPEN-Q-15](OPEN-QUESTIONS.md) 의 조직 판단이 끝나기 전까지 **되돌릴 수 있는 쪽**에 선다. 전환은 설정 한 줄이고, prd + `masked` 조합이면 기동 시 `warn` 이 FR-DGS-06 영향을 알린다. 실시간 경로와 슬로우로그 백필이 같은 값을 쓴다 | P0 |
 | FR-CAP-08 | 동일 스레드ID 재사용에 의한 오탐을 방지한다(스레드ID + 시작시각 + 다이제스트 조합으로 식별) | P0 |
 | FR-CAP-09 | 대상 DB에 어떤 스키마 오브젝트도 생성하지 않는다. 실행하는 문장은 SELECT / SHOW / EXPLAIN 계열로 제한한다 | P0 |
 | FR-CAP-10 | 수집기가 대상 DB에 주는 부하를 스스로 측정해 노출한다(초당 쿼리 수, 평균 응답시간, 연결 수). **자기 식별은 모니터링 계정 이름으로 한다** — MySQL 다이제스트는 주석을 제거하므로 `/* dbmon: */` 주석으로는 식별할 수 없다([ADR-005](03-decisions.md)) | P1 |
@@ -406,7 +406,7 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | C-23 | MySQL 다이제스트 정규화는 **주석을 제거한다** | `/* dbmon: */` 주석으로 자기 쿼리를 식별할 수 없다. 계정 이름으로 식별 |
 | C-24 | `sys` 뷰의 `waiting_query`/`blocking_query`는 `statement_truncate_len`(기본 64자)으로 절단된다 | 락 화면의 전문 SQL은 `information_schema.PROCESSLIST` 2차 조회로 얻는다 |
 | C-25 | `COLUMN_STATISTICS` 히스토그램은 `ANALYZE TABLE ... UPDATE HISTOGRAM`을 실행한 컬럼에만 존재 | 대부분 비어 있다. 어드바이저 품질의 전제로 삼지 않는다 |
-| C-26 | RDS 슬로우로그의 `# Time:`은 **문장 완료 시각** | 시작 시각은 `SET timestamp` 또는 `Time − Query_time`으로 유도 |
+| C-26 | RDS 슬로우로그의 `# Time:`은 **문장 완료 시각** — **실측 확인** ([19 §G3](19-m1-findings.md)) | 시작 시각은 **`Time − Query_time`** 을 쓴다(소수점까지). `SET timestamp` 은 초 단위로 내림되므로 ±2초 병합 창에서 최대 1초를 낭비한다 |
 | C-27 | Cognito Pre Token Generation V1은 **ID 토큰에만** `cognito:groups`를 주입한다 | access token으로 인가하려면 실제 그룹 멤버십(`AdminAddUserToGroup`) 또는 트리거 V2(상위 요금제) 필요 → [OPEN-Q-18](OPEN-QUESTIONS.md) |
 | C-28 | **개발계 계정(123456789012)에 프로덕션 워크로드가 함께 있다** — `prd-lla-vpc`(10.3.0.0/16)에 실행 중 EC2 1대 | 계정 전역 설정 변경 금지. 리소스 이름·태그로 구분. IAM 스코핑을 dev에서 좁힌다 ([18 §6](18-dev-environment.md)) |
 | C-29 | `dev-vpc-01` 프라이빗 서브넷의 `0.0.0.0/0` 라우트가 **blackhole**이다 (NAT 삭제, 라우트 잔존) | dev 앱은 퍼블릭 서브넷 + 퍼블릭 IP + 인바운드 0 SG로 배치. NAT를 만들지 않는다 |
