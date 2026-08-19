@@ -160,27 +160,63 @@ fn mask_label(s: &str, redactions: &mut usize) -> String {
         return REDACTED.to_string();
     }
 
-    // 리터럴 토큰의 바이트 구간을 `?` 로 바꾸고 나머지는 원문을 복사한다.
     let mut out = String::with_capacity(s.len());
     let mut cursor = 0usize;
     for (tok, span) in toks.iter().zip(spans.iter()) {
-        let is_literal = matches!(
-            tok,
-            Tok::Placeholder | Tok::IntroducedLiteral | Tok::Param | Tok::Ellipsis
-        );
-        if !is_literal {
-            continue;
-        }
         if span.start < cursor || span.end > s.len() {
-            // 스팬이 어긋났다 — 신뢰할 수 없으므로 전체를 버린다.
             *redactions += 1;
             return REDACTED.to_string();
         }
-        out.push_str(&s[cursor..span.start]);
-        out.push('?');
+        // **토큰 사이의 간격은 공백뿐이어야 한다.**
+        //
+        // 렉서는 주석을 토큰으로 만들지 않고 **버린다.** 버려진 바이트는 스팬 사이의
+        // 간격에 남고, 그 간격을 원문 복사하면 주석 안의 리터럴이 그대로 나간다.
+        // MySQL 8.4.11 이 이걸 실제로 만든다 — v2 의 `operation` 은 테이블 별칭을
+        // **백틱 없이** 출력하므로 공격자가 별칭을 `c/*` 로 지으면 라벨의 나머지가
+        // 주석이 된다:
+        //
+        // ```text
+        // SELECT name FROM customers AS `c/*` WHERE email >= 'victim-ssn-...@example.com'
+        //   → "operation": "Index range scan on c/* using uk_customers_email
+        //                   over ('victim-ssn-...@example.com' <= email), ..."
+        // ```
+        //
+        // 닫히지 않은 `/*` 는 `unterminated` 를 세우지 않으므로 위 가드도 발동하지 않았다.
+        // 퍼징에서 19.2% 가 이 경로로 유출됐다.
+        //
+        // 대상 DB 에 쿼리를 날릴 수 있는 누구나 별칭을 고른다 — 의도적 exfiltration 수단이다.
+        let gap = &s[cursor..span.start];
+        if !gap.chars().all(char::is_whitespace) {
+            *redactions += 1;
+            return REDACTED.to_string();
+        }
+        out.push_str(gap);
+
+        let is_literal = matches!(
+            tok,
+            Tok::Placeholder
+                | Tok::IntroducedLiteral
+                | Tok::Param
+                | Tok::Ellipsis
+                // 힌트 **본문**에 리터럴이 들어간다 (`SET_VAR(sql_mode='...')`).
+                // 라벨에 힌트가 나올 일은 없지만, 별칭으로 `/*+` 를 만들 수 있다.
+                | Tok::Hint(_)
+        );
+        if is_literal {
+            out.push('?');
+        } else {
+            out.push_str(&s[span.start..span.end]);
+        }
         cursor = span.end;
     }
-    out.push_str(&s[cursor..]);
+
+    // 마지막 토큰 뒤의 꼬리도 공백뿐이어야 한다.
+    let tail = &s[cursor..];
+    if !tail.chars().all(char::is_whitespace) {
+        *redactions += 1;
+        return REDACTED.to_string();
+    }
+    out.push_str(tail);
     out
 }
 

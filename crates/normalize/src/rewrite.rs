@@ -153,38 +153,65 @@ fn strip_resource_hints(
     end: usize,
 ) -> PlanQuery {
     let start = spans[first].start;
-    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+    // (스팬, 대체 문자열) — 대체가 `None` 이면 힌트 주석을 통째로 지운다.
+    let mut edits: Vec<(std::ops::Range<usize>, Option<String>)> = Vec::new();
     let mut plan_may_differ = false;
 
     for (i, t) in toks.iter().enumerate() {
         let Tok::Hint(body) = t else { continue };
-        let upper = body.to_ascii_uppercase();
-        let has_set_var = upper.contains("SET_VAR");
-        let has_max_exec = upper.contains("MAX_EXECUTION_TIME");
-        if !has_set_var && !has_max_exec {
+        let (kept, removed_any, removed_set_var) = filter_hint_body(body);
+        if !removed_any {
             continue;
         }
-        plan_may_differ |= has_set_var;
-        // 스팬은 `/*+` 부터 `*/` 까지다.
+        plan_may_differ |= removed_set_var;
         let span = &spans[i];
-        if span.start >= start && span.end <= end {
-            cuts.push(span.clone());
+        if span.start < start || span.end > end {
+            continue;
         }
+        // **남은 힌트를 보존한다.** MySQL 은 한 주석에 힌트 여러 개를 허용하므로
+        // 주석을 통째로 지우면 플랜 힌트까지 사라진다. 8.4.11 실측:
+        //
+        // ```text
+        // /*+ NO_RANGE_OPTIMIZATION(orders PRIMARY) MAX_EXECUTION_TIME(600000) */
+        //   있음: access_type=index  key=idx_orders_customer  rows=60023
+        //   통째로 지움: access_type=range  key=PRIMARY  rows=100
+        // ```
+        //
+        // 그걸 `is_exact = true` 로 저장하면 60,023행 스캔 쿼리를 100행 플랜으로 보여준다.
+        let replacement = kept
+            .as_ref()
+            .filter(|k| !k.trim().is_empty())
+            .map(|k| format!("/*+{k}*/"));
+        edits.push((span.clone(), replacement));
     }
 
-    if cuts.is_empty() {
+    if edits.is_empty() {
         return PlanQuery {
             sql: sql[start..end].to_string(),
             is_exact: true,
         };
     }
 
-    cuts.sort_by_key(|r| r.start);
+    edits.sort_by_key(|(r, _)| r.start);
     let mut out = String::with_capacity(end - start);
     let mut cursor = start;
-    for cut in cuts {
+    for (cut, replacement) in edits {
         if cut.start > cursor {
             out.push_str(&sql[cursor..cut.start]);
+        }
+        match replacement {
+            Some(text) => out.push_str(&text),
+            // **공백 한 칸을 넣는다.** 아무것도 넣지 않으면 양옆 문자가 붙어
+            // 다른 토큰이 된다. 8.4.11 실측 — 둘 다 유효한 문장이다:
+            //
+            // ```text
+            // 원문:   SELECT a FROM t WHERE x = 5 -/*+ MAX_EXECUTION_TIME(9) */- 3   (x = 8)
+            // 접합후: SELECT a FROM t WHERE x = 5 -- 3                              (x = 5)
+            // ```
+            //
+            // `-` + `-` 가 라인 주석이 되어 뒤가 조용히 사라진다.
+            // `SELECT/*+h*/a` → `SELECTa` 도 같은 원인이다.
+            None => out.push(' '),
         }
         cursor = cut.end.max(cursor);
     }
@@ -192,6 +219,71 @@ fn strip_resource_hints(
     PlanQuery {
         sql: out,
         is_exact: !plan_may_differ,
+    }
+}
+
+/// 힌트 본문에서 **자원 제어 힌트만** 걸러낸다.
+///
+/// 반환: `(남은 본문, 제거했는가, SET_VAR 를 제거했는가)`.
+/// 남은 본문이 `None` 이면 전부 자원 힌트였다는 뜻이다.
+fn filter_hint_body(body: &str) -> (Option<String>, bool, bool) {
+    /// 플랜이 아니라 **실행 자원**을 바꾸는 힌트.
+    const RESOURCE_HINTS: [&str; 3] = ["SET_VAR", "MAX_EXECUTION_TIME", "RESOURCE_GROUP"];
+
+    let b = body.as_bytes();
+    let mut kept = String::with_capacity(body.len());
+    let mut removed_any = false;
+    let mut removed_set_var = false;
+    let mut i = 0usize;
+
+    while i < b.len() {
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            kept.push(body[i..].chars().next().expect("경계"));
+            i += body[i..].chars().next().expect("경계").len_utf8();
+            continue;
+        }
+        // 식별자를 읽는다.
+        let name_start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        let name = &body[name_start..i];
+        // 이름 뒤의 공백을 건너뛰고 `(` 인지 본다 (`SET_VAR ( ... )` 도 유효하다).
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let is_resource = RESOURCE_HINTS.iter().any(|h| name.eq_ignore_ascii_case(h));
+        if !(is_resource && j < b.len() && b[j] == b'(') {
+            kept.push_str(name);
+            continue;
+        }
+        // 괄호를 균형 맞춰 건너뛴다.
+        let mut depth = 0usize;
+        let mut k = j;
+        while k < b.len() {
+            match b[k] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        k += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        removed_any = true;
+        removed_set_var |= name.eq_ignore_ascii_case("SET_VAR");
+        i = k;
+    }
+
+    if removed_any {
+        (Some(kept), true, removed_set_var)
+    } else {
+        (None, false, false)
     }
 }
 
@@ -307,6 +399,81 @@ fn join_sql(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **한 주석에 자원 힌트와 플랜 힌트가 섞여 있으면 플랜 힌트를 보존해야 한다.**
+    ///
+    /// MySQL 은 한 주석에 힌트 여러 개를 허용한다. 통째로 지우면 플랜이 달라진다 —
+    /// 8.4.11 실측: `NO_RANGE_OPTIMIZATION` 이 있으면 `rows=60023`, 없으면 `rows=100`.
+    /// 그걸 `is_exact = true` 로 저장하면 운영자가 완전히 다른 플랜을 본다.
+    #[test]
+    fn combined_hints_keep_the_plan_shaping_ones() {
+        let q = plan_query(
+            "SELECT /*+ NO_RANGE_OPTIMIZATION(orders PRIMARY) MAX_EXECUTION_TIME(600000) */ \
+             COUNT(*) FROM orders WHERE id BETWEEN 1 AND 100",
+        )
+        .expect("통과");
+        assert!(
+            q.sql.contains("NO_RANGE_OPTIMIZATION"),
+            "플랜 힌트가 사라졌다: {}",
+            q.sql
+        );
+        assert!(
+            !q.sql.to_ascii_uppercase().contains("MAX_EXECUTION_TIME"),
+            "자원 힌트가 남았다: {}",
+            q.sql
+        );
+        assert!(q.is_exact, "플랜 힌트가 남았으므로 정확하다");
+        // 힌트 주석 형태가 유지돼야 서버가 인식한다.
+        assert!(q.sql.contains("/*+"), "힌트 주석이 깨졌다: {}", q.sql);
+    }
+
+    /// **절단 자리에 공백을 넣어야 한다.** 아무것도 넣지 않으면 양옆이 붙어
+    /// 다른 토큰이 된다 — 8.4.11 실측으로 둘 다 유효한 문장이다:
+    ///
+    /// ```text
+    /// 5 -/*+ MAX_EXECUTION_TIME(9) */- 3  → 2
+    /// 5 -- 3                              → 5   (뒤가 라인 주석으로 사라진다)
+    /// ```
+    #[test]
+    fn cutting_a_hint_does_not_join_adjacent_tokens() {
+        let q = plan_query("SELECT a FROM t WHERE x = 5 -/*+ MAX_EXECUTION_TIME(9) */- 3")
+            .expect("통과");
+        assert!(
+            !q.sql.contains("--"),
+            "라인 주석이 만들어져 뒤가 사라진다: {}",
+            q.sql
+        );
+        assert!(
+            q.sql.contains("- 3") || q.sql.contains("-  - 3"),
+            "{}",
+            q.sql
+        );
+
+        // 공백 없는 형태도 토큰이 붙으면 안 된다.
+        let q = plan_query("SELECT/*+ MAX_EXECUTION_TIME(9) */a FROM t").expect("통과");
+        assert!(!q.sql.contains("SELECTa"), "토큰이 접합됐다: {}", q.sql);
+    }
+
+    /// `RESOURCE_GROUP` 도 자원 힌트다. 모니터링 롤에 `RESOURCE_GROUP_USER` 가 붙으면
+    /// 공격자가 우리 EXPLAIN 스레드를 스로틀 그룹에 묶을 수 있다.
+    #[test]
+    fn resource_group_hint_is_stripped() {
+        let q = plan_query("SELECT /*+ RESOURCE_GROUP(throttled) */ a FROM t").expect("통과");
+        assert!(
+            !q.sql.to_ascii_uppercase().contains("RESOURCE_GROUP"),
+            "RESOURCE_GROUP 이 남았다: {}",
+            q.sql
+        );
+    }
+
+    /// 자원 힌트만 있던 주석은 통째로 사라지고, 문장은 여전히 유효해야 한다.
+    #[test]
+    fn hint_comment_with_only_resource_hints_is_removed_entirely() {
+        let q = plan_query("SELECT /*+ MAX_EXECUTION_TIME(9) */ a FROM t").expect("통과");
+        assert!(!q.sql.contains("/*+"), "빈 힌트 주석이 남았다: {}", q.sql);
+        assert!(q.sql.contains("SELECT") && q.sql.contains("FROM t"));
+        assert!(q.is_exact);
+    }
 
     /// **자원 제어 힌트를 서버로 보내면 안 된다.**
     ///

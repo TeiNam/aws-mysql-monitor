@@ -181,14 +181,14 @@ pub const STATEMENT_DIGEST: &str = "/* dbmon:selfdigest */ SELECT STATEMENT_DIGE
 /// `max_execution_time` 은 **SELECT 에만** 적용된다. `SHOW`·`EXPLAIN FOR CONNECTION` 에는
 /// 걸리지 않으므로 클라이언트 타임아웃이 최후 방어선이다([05 §5](../../../../docs/05-collector.md)).
 ///
-/// `transaction_isolation='READ-COMMITTED'` 는 우리 조회가 다른 세션의 잠금·스냅샷에
-/// 영향을 주지 않게 한다. `SET SESSION` 이므로 대상 DB 전역 설정을 바꾸지 않는다.
 /// 대상 인스턴스의 **전역** `sql_mode`. 앱 세션이 상속하는 값이다.
 ///
 /// 세션 값(`@@session.sql_mode`)이 아니라 전역 값을 본다 — 우리 세션은 `''` 로
 /// 고정했으므로 세션 값은 항상 비어 있다.
 pub const GLOBAL_SQL_MODE: &str = "/* dbmon:sqlmode */ SELECT @@global.sql_mode";
 
+/// `transaction_isolation='READ-COMMITTED'` 는 우리 조회가 다른 세션의 잠금·스냅샷에
+/// 영향을 주지 않게 한다. `SET SESSION` 이므로 대상 DB 전역 설정을 바꾸지 않는다.
 pub fn session_init(query_timeout_ms: u64) -> String {
     // **`sql_mode` 를 고정한다. 이것은 보안 통제다.**
     //

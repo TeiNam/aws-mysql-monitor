@@ -359,7 +359,7 @@ async fn m1_4_for_connection_is_denied_to_least_privilege_accounts() {
     let mut root = conn_or_skip!(MYSQL84, ROOT);
     let Some(running) = start_long_query(
         MYSQL84,
-        LOADGEN,
+        ROOT,
         "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id \
          WHERE o.status = 'PENDING' AND SLEEP(5) = 0",
     )
@@ -578,7 +578,7 @@ async fn m1_17_innodb_lock_waits_columns_and_truncation() {
     // SQL 을 64자보다 길게 만들어 절단을 관찰한다.
     let blocker = start_long_statements(
         MYSQL84,
-        LOADGEN,
+        ROOT,
         vec![
             "START TRANSACTION".into(),
             "UPDATE lock_arena SET val = val + 1 WHERE id = 1".into(),
@@ -588,7 +588,7 @@ async fn m1_17_innodb_lock_waits_columns_and_truncation() {
     .await;
     let waiter = start_long_statements(
         MYSQL84,
-        LOADGEN,
+        ROOT,
         vec![
             "START TRANSACTION".into(),
             "UPDATE lock_arena SET val = val + 100 /* 이 주석은 SQL 을 64자보다 길게 만들기 위한 것이다 */ WHERE id = 1".into(),

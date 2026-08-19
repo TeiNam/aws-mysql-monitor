@@ -29,11 +29,12 @@ data "aws_region" "current" {}
 
 # **기존 VPC 는 data source 로만 참조한다.**
 # resource 로 관리하면 destroy 가 다른 워크로드를 지운다 (infra/README.md 참조).
-data "aws_partition" "current" {}
-
 data "aws_vpc" "target" {
   id = var.vpc_id
 }
+
+# ARN 파티션. `aws` / `aws-cn` / `aws-us-gov` 를 하드코딩하지 않는다.
+data "aws_partition" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id

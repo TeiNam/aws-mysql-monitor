@@ -116,8 +116,7 @@ pub fn scrub(input: &str) -> String {
 /// 이므로 인용부호 뒤 알파벳이 3자 이상이면 축약형이 아니다.
 /// `x'topsecret'` 는 뒤가 9자라 인용부호로 판정된다.
 fn is_english_contraction(bytes: &[u8], i: usize) -> bool {
-    // 영문 축약형 접미는 **닫힌 집합**이다. 휴리스틱보다 열거가 안전하다 —
-    // "알파벳 1~2자" 규칙은 `_binary'S3CRET'` 를 통과시켰다(접미가 `S` + 숫자다).
+    // 영문 축약형 접미는 **닫힌 집합**이다.
     const SUFFIXES: [&[u8]; 7] = [b"s", b"t", b"d", b"m", b"re", b"ll", b"ve"];
 
     if bytes[i] != b'\'' || i == 0 {
@@ -127,22 +126,54 @@ fn is_english_contraction(bytes: &[u8], i: usize) -> bool {
     if !bytes[i - 1].is_ascii_alphabetic() {
         return false;
     }
+
+    // **MySQL 의 도입자(introducer)가 앞에 있으면 리터럴이다.**
+    //
+    // 접미만 보는 규칙은 값이 축약형 접미 + 비영숫자로 시작하면 통과한다:
+    //
+    // ```text
+    // x's,kim@example.com'  → 접미 `s`, 다음 `,` → 축약형으로 오판 → 유출
+    // ```
+    //
+    // 접미 규칙을 더 좁히는 방향은 값의 내용에 의존하므로 끝이 없다. 대신 **앞쪽**을
+    // 본다 — 인용부호 앞의 단어가 도입자면 그건 항상 리터럴이다. 도입자 집합은
+    // MySQL 문법이 정한 닫힌 집합이고 값과 무관하다.
+    if preceding_word_is_introducer(bytes, i) {
+        return false;
+    }
+
     let rest = &bytes[i + 1..];
     SUFFIXES.iter().any(|suf| {
-        if !rest.len().ge(&suf.len()) {
+        if rest.len() < suf.len() {
             return false;
         }
-        // 대소문자 무시 — MySQL 메시지는 소문자지만 방어적으로 둔다.
         if !rest[..suf.len()].eq_ignore_ascii_case(suf) {
             return false;
         }
-        // **접미 뒤가 단어 경계여야 한다.** 아니면 리터럴 내용이다:
-        //   `doesn't exist`   → 접미 `t`, 다음 ` `        → 축약형
-        //   `x'topsecret'`    → 접미 `t`, 다음 `o`        → 리터럴
-        //   `_binary'S3CRET'` → 접미 `S`, 다음 `3`        → 리터럴
+        // 접미 뒤가 단어 경계여야 한다 (`doesn't exist` 의 `t` + 공백).
         rest.get(suf.len())
             .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
     })
+}
+
+/// 인용부호 앞의 단어가 MySQL **리터럴 도입자**인가.
+///
+/// `x'41'`(16진수), `b'01'`(비트), `n'…'`(국가 문자셋), `_binary'…'`·`_utf8mb4'…'`
+/// (문자셋 도입자). 전부 문법이 정한 닫힌 집합이므로 값의 내용에 의존하지 않는다.
+fn preceding_word_is_introducer(bytes: &[u8], quote: usize) -> bool {
+    const INTRODUCERS: [&[u8]; 3] = [b"x", b"b", b"n"];
+
+    // 인용부호 앞의 식별자 토큰을 뒤로 읽는다.
+    let mut start = quote;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    let word = &bytes[start..quote];
+    // `_` 로 시작하면 문자셋 도입자다 (`_binary`, `_utf8mb4`, `_latin1`, …).
+    if word.first() == Some(&b'_') {
+        return true;
+    }
+    INTRODUCERS.iter().any(|p| word.eq_ignore_ascii_case(p))
 }
 
 /// 판정은 [`is_english_contraction`] 이 한다.
@@ -250,6 +281,34 @@ mod tests {
             ("near _ascii'S3CRET' at line 1", "S3CRET"),
             ("value b'0110secret'", "0110secret"),
             ("O'Brien secret9", "secret9"),
+        ];
+        for (input, secret) in cases {
+            let out = scrub(input);
+            assert!(
+                !out.contains(secret),
+                "유출: {secret}\n  입력: {input}\n  출력: {out}"
+            );
+        }
+    }
+
+    /// **값이 축약형 접미로 시작해도 리터럴이어야 한다.**
+    ///
+    /// 접미 규칙만으로는 `x's,kim@…'` 이 통과한다(접미 `s`, 다음 `,` → 단어 경계).
+    /// 접미를 더 좁히는 방향은 값의 내용에 의존해 끝이 없다. 대신 **앞쪽**의 도입자를 본다.
+    #[test]
+    fn introducer_prefixed_literals_never_look_like_contractions() {
+        let cases = [
+            (
+                "Cannot convert x's,kim@example.com' to utf8mb4",
+                "kim@example.com",
+            ),
+            ("value x't.secret1'", "secret1"),
+            ("value b'd)secret2'", "secret2"),
+            ("value N've/secret3'", "secret3"),
+            ("value _binary'd)secret4'", "secret4"),
+            ("value _utf8mb4's;secret5'", "secret5"),
+            ("value x'm secret6'", "secret6"),
+            ("value X'll,secret7'", "secret7"),
         ];
         for (input, secret) in cases {
             let out = scrub(input);

@@ -254,3 +254,45 @@ async fn session_pins_survive_pool_reuse() {
     }
     let _ = pool.disconnect().await;
 }
+
+/// **포트의 기본 구현에 의존하는 통제는 무력화된다.**
+///
+/// 이 클래스의 결함이 세 라운드 연속 나왔다:
+/// - 2차 M2: `connect_with_limit` 호출부 0개 → `detect_limit` 설정 무시
+/// - 3차 MEDIUM-2: `from_config` 호출부 0개
+/// - 4차 HIGH-1: `target_sql_mode` 가 `impl` 이 아니라 **doc 주석**에 들어갔다
+///   → 트레이트 기본값(`""`)이 반환되어 "위험 없음" 으로 판정
+///
+/// 그래서 실제 어댑터가 **서버에서 값을 가져오는지** 확인한다. 기본 구현이 남아 있으면
+/// 빈 문자열이 오므로 이 테스트가 실패한다.
+#[tokio::test]
+async fn adapter_reads_real_sql_mode_not_the_port_default() {
+    use dbmon_core::ports::target_db::TargetDb;
+
+    let opts = support::opts(MYSQL84, ROOT);
+    let Ok(db) = dbmon::mysql::TargetMysql::connect(
+        opts,
+        dbmon::mysql::Timeouts::default(),
+        "local-mysql84",
+    ) else {
+        eprintln!("건너뜀: 풀 생성 실패");
+        return;
+    };
+
+    let Ok(mode) = db.target_sql_mode().await else {
+        eprintln!("건너뜀: MySQL 컨테이너 없음");
+        return;
+    };
+
+    // 서버의 전역 sql_mode 와 비교한다. 로컬 컨테이너는 기본값이라 비어 있지 않다.
+    assert!(
+        !mode.is_empty(),
+        "빈 문자열이 왔다 — 포트 기본 구현이 그대로 남아 있어 어휘 발산 통제가 무력하다"
+    );
+    // 우리 세션은 `''` 로 고정하므로 **세션** 값과 달라야 한다. 전역을 읽는다는 증거다.
+    assert!(
+        mode.contains("STRICT_TRANS_TABLES") || mode.contains("ONLY_FULL_GROUP_BY"),
+        "전역 sql_mode 로 보이지 않는다: {mode:?}"
+    );
+    db.disconnect().await;
+}

@@ -93,10 +93,7 @@ impl Timeouts {
     /// `detect_timeout_ms` 설정이 조용히 무시된다(M27 과 같은 부류).
     ///
     /// `detect_total`(tick 예산)이 `connect` 보다 **작은 것이 정상**이다. 연결 수립은
-    /// [`TargetMysql::warm`] 이 tick 밖에서 처리한다.
-    ///
-    /// `connect` 보다 크게 잡는 이유는 `detect_total` 문서에 있다: 작으면 콜드 경로에서
-    /// 연결 수립이 매번 취소되어 `probe` 가 영구히 실패할 수 있다.
+    /// [`TargetMysql::warm`] 이 tick 밖에서 처리하므로 tick 안에서는 warm 커넥션만 집는다.
     pub fn derive(
         connect_ms: u64,
         detect_ms: u64,
@@ -576,6 +573,18 @@ impl TargetDb for TargetMysql {
     async fn ping(&self) -> Result<()> {
         let _: Vec<u8> = self.query_hot(sql::PING.to_string(), Vec::new()).await?;
         Ok(())
+    }
+
+    /// 대상의 전역 `sql_mode`. 어휘 발산 판정에 쓴다.
+    ///
+    /// **포트의 기본 구현(빈 문자열)에 의존하면 통제가 무력화된다** — 빈 문자열은
+    /// "위험 없음" 으로 해석되므로, 이 메서드가 없으면 `ANSI_QUOTES` 대상의 플랜이
+    /// 계속 "정확" 으로 저장된다. 실제로 3차에서 그 상태였다(편집이 doc 주석에 들어갔다).
+    async fn target_sql_mode(&self) -> Result<String> {
+        let rows: Vec<String> = self
+            .query_hot(sql::GLOBAL_SQL_MODE.to_string(), Vec::new())
+            .await?;
+        Ok(rows.into_iter().next().unwrap_or_default())
     }
 }
 
