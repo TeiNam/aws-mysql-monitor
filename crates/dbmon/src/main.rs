@@ -145,7 +145,6 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
     let client = aws_sdk_dynamodb::Client::new(&sdk);
 
     Ok(Stores {
-        sdk: sdk.clone(),
         slow_query: Arc::new(dbmon::store::DynamoSlowQueryStore::new(
             client.clone(),
             config.storage.data_table.clone(),
@@ -163,9 +162,6 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
 
 /// 조립된 저장소들. 인자 5개를 넘기는 대신 묶는다.
 struct Stores {
-    /// 인증 공급자 조립에 쓴다. **DynamoDB 로컬 경로의 더미 자격증명이 아니라**
-    /// 대상 리전 자격증명이 필요하므로 `build_auth` 가 리전을 다시 지정한다.
-    sdk: aws_config::SdkConfig,
     slow_query: Arc<dbmon::store::DynamoSlowQueryStore>,
     lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
     registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
@@ -303,32 +299,80 @@ async fn discover(
     outcome
 }
 
-/// 대상 접속 비밀을 발급하는 주체. 배포 환경에 따라 갈린다.
+/// 대상 접속 비밀을 발급하는 주체를 **리전별로** 만든다.
+///
+/// # 왜 리전별인가
+///
+/// IAM DB Auth 토큰은 **대상 인스턴스의 리전**으로 서명해야 한다([07 §3.1]).
+/// 배포 리전으로 서명하면 `Access denied` 가 되고, 원인이 IAM 정책처럼 보여 추적이
+/// 오래 걸린다. `target_regions` 가 여러 개면 공급자도 여러 개다.
+///
+/// 처음에는 `config.aws.region` 하나로 만들었다 — 크로스 리전 대상이 전부 거부되는
+/// 배선이었다.
+///
+/// # dev 폴백
 ///
 /// **`dev` + 환경변수가 있을 때만 고정 비밀번호를 쓴다.** 두 조건이 모두 필요하다 —
 /// 환경변수만 보면 prd 태스크에 그 변수가 새어 들어갔을 때 IAM 대신 비밀번호로
 /// 붙으려 하고, 실패 원인이 "인증 실패" 로만 보인다.
-fn build_auth(
-    config: &Config,
-    region: &str,
-    sdk: &aws_config::SdkConfig,
-) -> Arc<dyn AuthTokenProvider> {
+async fn build_auth(config: &Config) -> TargetAuth {
+    use aws_config::BehaviorVersion;
     use dbmon::aws::auth_token::{IamAuthTokenProvider, StaticPasswordProvider};
 
     if config.deployment_env == dbmon_core::env::Env::Dev {
         if let Some(p) = StaticPasswordProvider::from_env() {
             tracing::info!("대상 인증: 고정 비밀번호 (dev 폴백)");
-            return Arc::new(p);
+            return TargetAuth::Shared(Arc::new(p));
         }
     }
-    tracing::info!(%region, "대상 인증: IAM DB Auth");
-    // **대상 인스턴스의 리전으로 서명한다.** 앱 배포 리전으로 서명하면 거부된다.
-    Arc::new(IamAuthTokenProvider::new(
-        sdk.credentials_provider()
-            .expect("SDK 자격증명 공급자")
-            .clone(),
-        region,
-    ))
+
+    let mut by_region: std::collections::BTreeMap<String, Arc<dyn AuthTokenProvider>> =
+        std::collections::BTreeMap::new();
+    for region in config.target_regions() {
+        // **저장소용 SDK 설정을 재사용하지 않는다.** 로컬 개발 경로에서 그쪽은
+        // 더미 자격증명(`local`/`local`)을 들고 있어 토큰이 조용히 무효해진다.
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.clone()))
+            .load()
+            .await;
+        match sdk.credentials_provider() {
+            Some(creds) => {
+                by_region.insert(
+                    region.clone(),
+                    Arc::new(IamAuthTokenProvider::new(creds.clone(), region.clone())),
+                );
+            }
+            // 여기서 패닉하지 않는다 — 기동은 되고 `/readyz` 와 로그가 사유를 보고한다.
+            None => tracing::error!(
+                %region,
+                "자격증명 공급자가 없다 — 이 리전의 대상에 접속할 수 없다"
+            ),
+        }
+    }
+    tracing::info!(regions = ?by_region.keys().collect::<Vec<_>>(), "대상 인증: IAM DB Auth");
+    TargetAuth::PerRegion(by_region)
+}
+
+/// 대상 인증 공급자 묶음.
+#[derive(Clone)]
+enum TargetAuth {
+    /// dev 폴백 — 리전과 무관하다.
+    Shared(Arc<dyn AuthTokenProvider>),
+    /// IAM DB Auth — **리전마다 다른 공급자.**
+    PerRegion(std::collections::BTreeMap<String, Arc<dyn AuthTokenProvider>>),
+}
+
+impl TargetAuth {
+    /// 이 인스턴스의 리전에 맞는 공급자.
+    ///
+    /// 없으면 `None` 이다 — **다른 리전 공급자로 대신하지 않는다.** 그러면 서명이
+    /// 틀린 토큰으로 접속을 시도하고 실패 원인이 IAM 정책처럼 보인다.
+    fn for_region(&self, region: &str) -> Option<Arc<dyn AuthTokenProvider>> {
+        match self {
+            Self::Shared(p) => Some(Arc::clone(p)),
+            Self::PerRegion(m) => m.get(region).cloned(),
+        }
+    }
 }
 
 /// 인스턴스별 수집 태스크 집합.
@@ -347,6 +391,25 @@ impl CollectTasks {
         self.handles.keys().cloned().collect()
     }
 
+    /// **끝난 태스크를 걷어낸다.** 이게 없으면 인스턴스가 영구히 수집되지 않는다.
+    ///
+    /// 수집 태스크는 첫 인증 실패·연결 옵션 구성 실패에서 `return` 한다. 그런데
+    /// `JoinHandle` 은 맵에 남으므로 `running()` 이 그 인스턴스를 "돌고 있다" 로 보고,
+    /// `to_start = desired - running` 에서 빠진다 — **다시 띄울 기회가 영원히 오지
+    /// 않는다.** IAM 정책이 잠깐 잘못됐다가 고쳐져도 그 인스턴스는 죽은 채로 남는다.
+    fn reap_finished(&mut self) -> Vec<String> {
+        let dead: Vec<String> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dead {
+            self.handles.remove(id);
+        }
+        dead
+    }
+
     /// 목표 집합에 맞춰 태스크를 띄우고 죽인다.
     ///
     /// **교집합은 건드리지 않는다.** 죽이고 다시 띄우면 진행 중 캐시가 사라져
@@ -357,6 +420,16 @@ impl CollectTasks {
         deps: &CollectDeps,
     ) {
         use dbmon::collect_loop::{desired_ids, index_by_id, task_delta};
+
+        // 끝난 태스크를 먼저 걷어낸다 — 그래야 아래 `to_start` 가 그것들을 다시 띄운다.
+        let dead = self.reap_finished();
+        if !dead.is_empty() {
+            tracing::warn!(
+                count = dead.len(),
+                instances = ?dead,
+                "수집 태스크가 스스로 종료했다 — 다시 띄운다"
+            );
+        }
 
         let desired = desired_ids(instances);
         let delta = task_delta(&self.running(), &desired);
@@ -393,9 +466,11 @@ impl CollectTasks {
 #[derive(Clone)]
 struct CollectDeps {
     store: Arc<dbmon::store::DynamoSlowQueryStore>,
-    auth: Arc<dyn AuthTokenProvider>,
+    auth: TargetAuth,
     config: Arc<Config>,
     worker_id: String,
+    /// 수집 tick 성공을 기록한다 (FR-OPS-09 `CollectStaleness`).
+    readiness: Arc<Readiness>,
 }
 
 /// 인스턴스 하나의 수집 루프를 띄운다.
@@ -423,10 +498,21 @@ fn spawn_instance_collector(
         let db_user = deps.config.collector.monitor_db_user.clone();
         let label = instance.id.as_str().to_string();
 
+        // **인스턴스의 리전으로 서명하는 공급자를 고른다.** 없으면 접속하지 않는다 —
+        // 다른 리전 공급자로 대신하면 서명이 틀린 토큰으로 붙으려 하고, 실패 원인이
+        // IAM 정책처럼 보여 추적이 오래 걸린다.
+        let Some(auth) = deps.auth.for_region(instance.id.region()) else {
+            tracing::error!(
+                instance = %label,
+                region = %instance.id.region(),
+                "이 리전의 인증 공급자가 없다 — 수집하지 않는다"
+            );
+            return;
+        };
+
         // 첫 연결. 실패하면 잠시 뒤 재시도한다 — 태스크를 끝내면 이 인스턴스는
         // 다음 탐색(5분)까지 수집되지 않는다.
-        let mut secret = match deps
-            .auth
+        let mut secret = match auth
             .token(
                 instance.endpoint.as_deref().unwrap_or_default(),
                 instance.port,
@@ -478,11 +564,11 @@ fn spawn_instance_collector(
         );
 
         loop {
+            let tick_started = std::time::Instant::now();
             // 토큰이 만료에 가까우면 연결만 갈아 끼운다.
             let now_ms = SystemClock.now_ms();
             if secret.needs_refresh(now_ms, REFRESH_MARGIN_MS) {
-                match deps
-                    .auth
+                match auth
                     .token(
                         instance.endpoint.as_deref().unwrap_or_default(),
                         instance.port,
@@ -516,19 +602,43 @@ fn spawn_instance_collector(
             collector.warm_if_needed().await;
 
             match collector.detect_tick().await {
-                Ok(stats) => tracing::trace!(
-                    instance = %label,
-                    candidates = stats.candidates,
-                    finalized = stats.finalized,
-                    "수집 tick"
-                ),
+                Ok(stats) => {
+                    // **성공한 tick 만 신선도를 갱신한다.**
+                    //
+                    // 처음에는 태스크 집합을 맞출 때(5분마다) 기록했다. 그러면 모든
+                    // tick 이 실패해도 `CollectStaleness`(FR-OPS-09)가 정상으로 보인다 —
+                    // 헬스체크가 감시하려는 바로 그 상황을 놓친다.
+                    deps.readiness.record_collect_ok(SystemClock.now_ms());
+                    tracing::trace!(
+                        instance = %label,
+                        candidates = stats.candidates,
+                        finalized = stats.finalized,
+                        "수집 tick"
+                    );
+                }
                 Err(e) => tracing::warn!(
                     instance = %label,
                     error = %telemetry::Scrubbed(&e),
                     "수집 tick 실패"
                 ),
             }
-            tokio::time::sleep(tick).await;
+            // **소요 시간을 뺀 만큼만 쉰다.**
+            //
+            // `sleep(tick)` 을 그냥 쓰면 실제 주기가 `tick + tick 소요` 가 된다 —
+            // 800ms 짜리 tick 이면 1초 케이던스가 1.8초로 늘어나고, 탐지 해상도가
+            // 조용히 절반이 된다. 그건 "임계값 2초 쿼리를 놓친다" 로 나타난다.
+            let elapsed = tick_started.elapsed();
+            tokio::time::sleep(tick.saturating_sub(elapsed)).await;
+            if elapsed > tick {
+                // 예산을 넘겼다. 쉬지 않고 바로 다음 tick 으로 간다 — 다만 조용히
+                // 넘어가면 해상도 저하를 알 수 없다.
+                tracing::debug!(
+                    instance = %label,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    tick_ms = tick.as_millis() as u64,
+                    "tick 이 주기를 넘겼다 — 탐지 해상도가 떨어진다"
+                );
+            }
         }
     })
 }
@@ -558,6 +668,7 @@ fn spawn_leader_loop(
     config: &Config,
     worker_id: String,
     stores: Stores,
+    auth: TargetAuth,
     readiness: Arc<Readiness>,
     shutdown: Arc<Shutdown>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -575,16 +686,16 @@ fn spawn_leader_loop(
 
     let interval = tick_interval(config.collector.detect_interval_ms);
     let discovery_interval = Duration::from_secs(config.discovery.interval_secs);
-    let deployment_region = config.aws.region.clone();
     // **`Arc` 로 든다.** `select!` 팔에 참조를 넘기면 `implementation of Send is not
     // general enough` 로 컴파일이 깨진다 — 참조 인자에 대해 `for<'a>` Send 를
     // 증명해야 하기 때문이다.
     let config = Arc::new(config.clone());
     let collect_deps = CollectDeps {
         store: Arc::clone(&stores.slow_query),
-        auth: build_auth(&config, &deployment_region, &stores.sdk),
+        auth,
         config: Arc::clone(&config),
         worker_id: worker_id.clone(),
+        readiness: Arc::clone(&readiness),
     };
 
     Some(tokio::spawn(async move {
@@ -709,7 +820,6 @@ fn spawn_leader_loop(
                         Ok(instances) => {
                             tasks.reconcile(&instances, &collect_deps).await;
                             let collecting = tasks.running().len();
-                            readiness.record_collect_ok(SystemClock.now_ms());
                             tracing::info!(
                                 collecting,
                                 registered = instances.len(),
@@ -848,10 +958,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             }
             let worker_id = worker_id(&config);
             tracing::info!(%worker_id, "워커 식별자");
+            // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
+            let auth = build_auth(&config).await;
             spawn_leader_loop(
                 &config,
                 worker_id,
                 stores,
+                auth,
                 readiness.clone(),
                 shutdown.clone(),
             )
