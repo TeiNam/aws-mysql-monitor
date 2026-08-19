@@ -10,7 +10,14 @@ cd "$(dirname "$0")/.."
 BUNDLE=crates/dbmon/assets/rds-global-bundle.pem
 SRC=crates/dbmon/src/mysql/connect.rs
 
-command -v openssl >/dev/null || { echo "건너뜀: openssl 이 없다"; exit 0; }
+# **CI 에서는 건너뛰지 않는다.** 이미지에서 openssl 이 빠지면 검사가 사라진 것을
+# 아무도 모른다. 로컬에서는 건너뛰어도 된다.
+if ! command -v openssl >/dev/null; then
+  if [ -n "${CI:-}" ]; then
+    echo "FAIL openssl 이 없다 — CI 에서는 이 검사를 건너뛸 수 없다"; exit 1
+  fi
+  echo "건너뜀: openssl 이 없다"; exit 0
+fi
 [ -s "$BUNDLE" ] || { echo "FAIL 번들이 없거나 비었다: $BUNDLE"; exit 1; }
 
 COMPUTED=$(python3 - "$BUNDLE" <<'PY'
@@ -24,14 +31,41 @@ for b in blocks:
     out = subprocess.run(["openssl", "x509", "-noout", "-enddate"],
                          input=b, capture_output=True, text=True)
     m = re.search(r"notAfter=(.*)", out.stdout)
-    if m:
-        dates.append(datetime.datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z"))
-print(min(dates).date().isoformat() if dates else "NONE")
+    if not m:
+        # **일부 파싱 실패를 조용히 넘기지 않는다.** 넘기면 최솟값이 실제보다
+        # 늦어져 만료 감시가 무의미해진다.
+        print("PARSE_FAIL"); raise SystemExit
+    dates.append(datetime.datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z"))
+assert len(dates) == len(blocks), f"인증서 {len(blocks)}개 중 {len(dates)}개만 읽었다"
+print(min(dates).date().isoformat())
 PY
 )
 
 DECLARED=$(grep -o 'CA_BUNDLE_EARLIEST_EXPIRY_DAY: &str = "[0-9-]*"' "$SRC" \
            | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}')
+
+if [ "$COMPUTED" = "PARSE_FAIL" ] || [ "$COMPUTED" = "NONE" ]; then
+  echo "FAIL 번들에서 인증서를 읽을 수 없다 — 파일이 손상됐다"; exit 1
+fi
+
+# **개수와 다이제스트도 대조한다.** 만료일만 보면 만료가 더 늦은 CA 를 덧붙이는
+# 변경을 통과시킨다 — 그게 실제 공격 방향이다(삭제가 아니라 추가).
+COUNT=$(grep -c 'BEGIN CERTIFICATE' "$BUNDLE")
+WANT_COUNT=$(grep -o 'RDS_CA_BUNDLE_CERT_COUNT: usize = [0-9]*' "$SRC" | grep -o '[0-9]*$')
+if [ "$COUNT" != "$WANT_COUNT" ]; then
+  echo "FAIL 인증서 개수가 다르다 (번들 $COUNT, 상수 $WANT_COUNT)"; exit 1
+fi
+
+if command -v shasum >/dev/null; then
+  DIGEST=$(shasum -a 256 "$BUNDLE" | cut -d' ' -f1)
+  WANT_DIGEST=$(grep -o '"[0-9a-f]\{64\}"' "$SRC" | tr -d '"' | head -1)
+  if [ "$DIGEST" != "$WANT_DIGEST" ]; then
+    echo "FAIL 번들 다이제스트가 다르다"
+    echo "  번들: $DIGEST"
+    echo "  상수: $WANT_DIGEST"
+    exit 1
+  fi
+fi
 
 if [ "$COMPUTED" != "$DECLARED" ]; then
   echo "FAIL 번들의 최소 만료일과 상수가 다르다"

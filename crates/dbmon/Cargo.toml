@@ -21,6 +21,7 @@ aws-config.workspace = true
 aws-sdk-dynamodb.workspace = true
 aws-sdk-rds.workspace = true
 aws-sigv4.workspace = true
+percent-encoding.workspace = true
 aws-credential-types.workspace = true
 aws-smithy-runtime-api.workspace = true
 serde_dynamo.workspace = true

@@ -861,6 +861,7 @@ dependencies = [
  "futures",
  "hex",
  "mysql_async",
+ "percent-encoding",
  "rand",
  "serde",
  "serde_dynamo",

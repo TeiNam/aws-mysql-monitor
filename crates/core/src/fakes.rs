@@ -359,11 +359,19 @@ impl InstanceRegistry for FakeInstanceRegistry {
 #[derive(Default)]
 pub struct FakeLeaseStore {
     leases: Mutex<BTreeMap<String, Lease>>,
+    /// 남은 갱신 실패 횟수. **저장소 장애를 재현한다** — 그 상태에서 만료 시점에
+    /// 리더를 그만두는지가 중복 수집 방지의 마지막 장치다.
+    renew_failures: Mutex<usize>,
 }
 
 impl FakeLeaseStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 다음 `n` 회 `renew` 를 저장소 오류로 실패시킨다.
+    pub fn fail_next_renewals(&self, n: usize) {
+        *self.renew_failures.lock().unwrap() = n;
     }
 }
 
@@ -388,6 +396,16 @@ impl LeaseStore for FakeLeaseStore {
     }
 
     async fn renew(&self, lease: &Lease, now_ms: EpochMs) -> Result<Option<Lease>> {
+        {
+            let mut fails = self.renew_failures.lock().unwrap();
+            if *fails > 0 {
+                *fails -= 1;
+                return Err(DomainError::Unavailable {
+                    dependency: "dynamodb",
+                    reason: "테스트 주입 실패".into(),
+                });
+            }
+        }
         let mut m = self.leases.lock().unwrap();
         match m.get(&lease.key) {
             // owner 와 epoch 가 모두 일치해야 한다. 하나라도 다르면 이미 빼앗겼다.

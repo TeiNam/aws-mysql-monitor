@@ -96,7 +96,25 @@ impl RdsDiscovery {
             engine: db.engine().unwrap_or_default().to_string(),
             engine_version: db.engine_version().unwrap_or_default().to_string(),
             status: db.db_instance_status().unwrap_or_default().to_string(),
-            endpoint_address: db.endpoint().and_then(|e| e.address()).map(str::to_string),
+            // **RDS 엔드포인트 형태가 아니면 버린다.**
+            //
+            // `disable_built_in_roots(true)` 로 신뢰를 좁혀도 "Amazon RDS CA 가 서명한
+            // 아무 호스트" 까지만 좁혀진다. 등록부에 들어가기 전에 형태를 확인하는
+            // 것이 첫 방어선이고, `mysql::connect` 가 쓸 때 한 번 더 본다.
+            endpoint_address: db
+                .endpoint()
+                .and_then(|e| e.address())
+                .filter(|a| {
+                    let ok = a.to_ascii_lowercase().ends_with(".rds.amazonaws.com");
+                    if !ok {
+                        tracing::warn!(
+                            endpoint_suffix = %a.rsplit('.').take(2).collect::<Vec<_>>().join("."),
+                            "RDS 엔드포인트 형태가 아니다 — 버린다"
+                        );
+                    }
+                    ok
+                })
+                .map(str::to_string),
             // SDK 는 i32 다. 포트 범위를 벗어나면 버린다 — 잘라 쓰면 엉뚱한 포트로 붙는다.
             endpoint_port: db
                 .endpoint()
@@ -221,6 +239,42 @@ mod tests {
         assert_eq!(disco().to_raw(&db).endpoint_port, None);
     }
 
+    /// **RDS 엔드포인트 형태가 아니면 버린다** (2차 리뷰 M-6 의 첫 방어선).
+    ///
+    /// RDS CA 전용 신뢰는 "Amazon RDS CA 가 서명한 아무 호스트" 까지만 좁힌다 —
+    /// 다른 AWS 고객의 인스턴스도 그 CA 로 서명돼 있다. 등록부에 들이지 않는 것이
+    /// 방어선을 하나로 만든다.
+    #[test]
+    fn non_rds_endpoints_are_dropped() {
+        for bad in [
+            "attacker.example",
+            "evil-rds.amazonaws.com",
+            "10.0.0.5",
+            "localhost",
+        ] {
+            let db = DbInstance::builder()
+                .db_instance_identifier("x")
+                .endpoint(Endpoint::builder().address(bad).port(3306).build())
+                .build();
+            assert_eq!(
+                disco().to_raw(&db).endpoint_address,
+                None,
+                "{bad} 를 대상 엔드포인트로 받았다"
+            );
+        }
+        // 정상 형태는 유지한다 (대소문자 무시).
+        for ok in [
+            "orders-01.abc.ap-northeast-2.rds.amazonaws.com",
+            "ORDERS-01.ABC.AP-NORTHEAST-2.RDS.AMAZONAWS.COM",
+        ] {
+            let db = DbInstance::builder()
+                .db_instance_identifier("x")
+                .endpoint(Endpoint::builder().address(ok).port(3306).build())
+                .build();
+            assert_eq!(disco().to_raw(&db).endpoint_address.as_deref(), Some(ok));
+        }
+    }
+
     /// 태그가 여러 개면 전부 옮긴다. 값 없는 태그도 키는 남긴다(필수 태그 검사용).
     #[test]
     fn maps_all_tags_including_valueless() {
@@ -271,7 +325,12 @@ mod tests {
             .engine("mysql")
             .engine_version("8.4.6")
             .db_subnet_group(DbSubnetGroup::builder().vpc_id("vpc-dev").build())
-            .endpoint(Endpoint::builder().address("h").port(3306).build())
+            .endpoint(
+                Endpoint::builder()
+                    .address("orders-dev-01.abc.ap-northeast-2.rds.amazonaws.com")
+                    .port(3306)
+                    .build(),
+            )
             .tag_list(Tag::builder().key("env").value("dev").build())
             .build();
         let raw = disco().to_raw(&db);

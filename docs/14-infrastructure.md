@@ -623,8 +623,11 @@ docker-compose.yml
 
 .env.local
   AWS_PROFILE=dev-sso          # SSO 프로파일로 실제 AWS 읽기 (RDS 탐색 등)
-  DBMON_DYNAMO_ENDPOINT=http://localhost:8000
-  DBMON_TARGET_AUTH=password   # 로컬 MySQL 은 IAM 인증 불가
+  # DynamoDB Local. 설정 키는 `storage.endpoint_url` 이고 `dev` + 루프백만 허용된다.
+  DBMON__STORAGE__ENDPOINT_URL=http://127.0.0.1:18000
+  # 로컬 MySQL 은 IAM 인증을 지원하지 않으므로 고정 비밀번호로 붙는다.
+  # `deployment_env=dev` 여야 적용된다. 비-dev 배포에 남아 있으면 기동이 거부된다.
+  DBMON_TARGET_PASSWORD=dbmon-local-monitor
   DBMON_ARCHIVE_ENABLED=false
   DBMON_AI_ENABLED=false
 ```

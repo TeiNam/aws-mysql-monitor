@@ -77,6 +77,21 @@ impl<P: ProvideCredentials + Send + Sync> AuthTokenProvider for IamAuthTokenProv
     }
 }
 
+/// SigV4 가 규정하는 unreserved 문자 집합: `A-Z a-z 0-9 - _ . ~`.
+///
+/// 그 외 **모든** 바이트를 `%XX` 로 인코딩한다. 직접 판정을 적지 않고
+/// `percent_encoding` 에 맡긴다 — 이 프로젝트에서 손으로 적은 문자 판정이
+/// 반복해서 구멍을 냈다.
+const SIGV4_UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+fn encode(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, SIGV4_UNRESERVED).to_string()
+}
+
 fn epoch_ms(t: SystemTime) -> Result<EpochMs> {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -120,6 +135,20 @@ pub fn presign(
     let (instructions, _) = signed.into_parts();
 
     // 서명이 붙은 쿼리 파라미터를 URL 에 합친다.
+    //
+    // # ⚠ 반드시 퍼센트 인코딩한다
+    //
+    // `instructions.params()` 는 **디코딩된 원문**을 준다. 반면 서명은 canonical
+    // query 위에서 계산됐고 그쪽은 퍼센트 인코딩돼 있다. 원문을 그대로 이어 붙이면
+    // **토큰이 자기 서명과 정합하지 않는다.**
+    //
+    // 특히 `X-Amz-Security-Token` 은 base64 라 `+`·`/`·`=` 를 담는다. 쿼리 문자열의
+    // `+` 는 서버측에서 공백으로 디코딩되므로 서명 대상(`%2B`)과 값이 달라진다.
+    // ECS 태스크 롤은 **항상** 임시 자격증명이므로 프로덕션의 정상 경로가 전부 깨진다.
+    //
+    // 처음에 `format!("{k}={v}")` 로 붙였고, 골든 벡터가 장기 자격증명(세션 토큰
+    // 없음)이라 통과했다. `aws rds generate-db-auth-token` 과 **토큰 문자열 전체**를
+    // 비교하니 드러났다 — 서명 16진수만 비교하면 이 차이가 보이지 않는다.
     let mut query = vec![
         ("Action".to_string(), "connect".to_string()),
         ("DBUser".to_string(), db_user.to_string()),
@@ -127,7 +156,20 @@ pub fn presign(
     for (name, value) in instructions.params() {
         query.push((name.to_string(), value.to_string()));
     }
-    let query: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    // **서명을 마지막에 둔다.** presigned URL 의 관례이고 AWS CLI 의 출력 순서다.
+    //
+    // 서명 자체는 정렬된 canonical query 위에서 계산되므로 방출 순서는 검증에
+    // 영향을 주지 않는다. 그래도 CLI 와 **바이트 단위로** 같게 두는 이유는
+    // 교차 검증 오라클을 정확하게 만들기 위해서다 — 순서까지 같으면 앞으로 어떤
+    // 차이가 생겨도 `scripts/verify-iam-token.sh` 가 즉시 잡는다.
+    const SIGNATURE_KEY: &str = "X-Amz-Signature";
+    query.sort_by(|(a, _), (b, _)| {
+        (a == SIGNATURE_KEY, a.as_str()).cmp(&(b == SIGNATURE_KEY, b.as_str()))
+    });
+    let query: Vec<String> = query
+        .iter()
+        .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+        .collect();
 
     // **스킴을 뗀다.** `https://` 를 붙여 보내면 서버가 거부한다.
     Ok(format!("{host}:{port}/?{}", query.join("&")))
@@ -344,19 +386,17 @@ mod tests {
         assert_eq!(token(), token());
     }
 
-    /// **골든 벡터.** 위 단정들은 "문서대로 생겼는가" 만 본다 — 서명이 AWS 와 같은
-    /// 값인지는 독립 구현과 대조해야 알 수 있다.
+    /// **골든 벡터.** 위 단정들은 "문서대로 생겼는가" 만 본다 — 값이 AWS 와 같은지는
+    /// 독립 구현과 대조해야 알 수 있다.
     ///
-    /// 이 값을 만든 알고리즘은 `aws rds generate-db-auth-token` 과 **바이트 단위로
-    /// 일치**함을 확인했다(같은 초에 생성한 쌍의 `X-Amz-Signature` 가 동일). 재확인은
-    /// `scripts/verify-iam-token.sh` 로 언제든 돌릴 수 있다.
-    ///
-    /// 즉 이 상수는 자기 참조가 아니라 **외부 오라클로 검증된 기준점**이다.
+    /// 이 값들은 `aws rds generate-db-auth-token` 과 **호스트·파라미터·서명이 전부
+    /// 일치**함을 확인한 결과다(`scripts/verify-iam-token.sh`). 파라미터 순서는
+    /// 계약이 아니라서 정규화 후 비교한다 — CLI 는 정렬하지 않는다.
     #[test]
     fn matches_the_aws_cli_golden_vector() {
         const GOLDEN: &str = "orders-01.abc.ap-northeast-2.rds.amazonaws.com:3306/?\
 Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
-&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20260815/ap-northeast-2/rds-db/aws4_request\
+&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260815%2Fap-northeast-2%2Frds-db%2Faws4_request\
 &X-Amz-Date=20260815T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host\
 &X-Amz-Signature=7183880a453b7100fcdf0b0b63c0246732337bc4974475bbe94f5515945ac35c";
         assert_eq!(
@@ -366,7 +406,77 @@ Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
         );
     }
 
-    /// 시각이 다르면 서명이 달라야 한다 (`X-Amz-Date` 가 서명에 들어간다).
+    /// **임시 자격증명 골든 벡터 — 이게 프로덕션의 정상 경로다.**
+    ///
+    /// ECS 태스크 롤은 항상 임시 자격증명이고 base64 세션 토큰에 `+`·`/`·`=` 가 있다.
+    /// 처음에는 쿼리 값을 인코딩하지 않아 **모든 프로덕션 토큰이 자기 서명과
+    /// 정합하지 않았다.** 장기 자격증명만 있는 골든 벡터로는 그 결함이 통과한다.
+    #[test]
+    fn matches_the_aws_cli_for_temporary_credentials() {
+        let temp = Credentials::new(
+            "ASIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("FwoGZXIvYXdzEBYaDG+abc/def=ghi".into()),
+            None,
+            "test",
+        );
+        let t = presign(
+            &temp,
+            "ap-northeast-2",
+            "orders-01.abc.ap-northeast-2.rds.amazonaws.com",
+            3306,
+            "dbmon",
+            fixed_time(),
+        )
+        .expect("서명");
+
+        const GOLDEN: &str = "orders-01.abc.ap-northeast-2.rds.amazonaws.com:3306/?\
+Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
+&X-Amz-Credential=ASIAIOSFODNN7EXAMPLE%2F20260815%2Fap-northeast-2%2Frds-db%2Faws4_request\
+&X-Amz-Date=20260815T000000Z&X-Amz-Expires=900\
+&X-Amz-Security-Token=FwoGZXIvYXdzEBYaDG%2Babc%2Fdef%3Dghi&X-Amz-SignedHeaders=host\
+&X-Amz-Signature=9c948580c20fcfcefa2e80e54ec759e4cc2c10959460a858efa2035b5a7e5564";
+        assert_eq!(t, GOLDEN);
+    }
+
+    /// **쿼리 값이 퍼센트 인코딩돼야 한다.**
+    ///
+    /// 서명은 인코딩된 canonical query 위에서 계산된다. 원문을 그대로 내보내면
+    /// 토큰이 자기 서명과 정합하지 않는다.
+    #[test]
+    fn query_values_are_percent_encoded() {
+        let temp = Credentials::new(
+            "ASIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("a+b/c=d".into()),
+            None,
+            "test",
+        );
+        let t = presign(
+            &temp,
+            "ap-northeast-2",
+            "h.rds.amazonaws.com",
+            3306,
+            "dbmon",
+            fixed_time(),
+        )
+        .expect("서명");
+
+        assert!(
+            t.contains("X-Amz-Security-Token=a%2Bb%2Fc%3D"),
+            "세션 토큰이 인코딩되지 않았다 — ECS 태스크 롤로는 접속할 수 없다: {t}"
+        );
+        // `X-Amz-Credential` 의 `/` 도 인코딩된다.
+        assert!(
+            t.contains("%2Frds-db%2Faws4_request"),
+            "자격증명 범위가 인코딩되지 않았다: {t}"
+        );
+        // 쿼리 부분에 원문 `+` 가 남아 있으면 안 된다 — 서버가 공백으로 디코딩한다.
+        let query = t.split_once("/?").expect("쿼리").1;
+        assert!(!query.contains('+'), "인코딩되지 않은 + 가 남았다: {query}");
+    }
+
+    /// 시각이 다르면 서명이 달라야 한다    /// 시각이 다르면 서명이 달라야 한다 (`X-Amz-Date` 가 서명에 들어간다).
     #[test]
     fn time_is_part_of_the_signed_request() {
         let later = presign(
@@ -418,13 +528,22 @@ Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
     }
 
     /// 폴백 비밀번호는 만료되지 않아야 한다 — 다만 **오버플로 없이**.
+    ///
+    /// 처음 쓴 테스트는 `now=1.8e12` 로 불러서 `i64::MAX` 여도 통과했다 — 이름이
+    /// 주장하는 것을 검사하지 않았다(2차 리뷰가 지적). `i64::MAX` 근처에서 부른다.
     #[tokio::test]
     async fn static_password_never_needs_refresh_without_overflowing() {
         let p = StaticPasswordProvider::new("dbmon-local-monitor");
         let s = p.token("127.0.0.1", 13306, "dbmon").await.expect("토큰");
         assert_eq!(s.expose(), "dbmon-local-monitor");
-        // `i64::MAX` 였다면 `now + margin` 에서 오버플로로 패닉한다(디버그 빌드).
         assert!(!s.needs_refresh(1_800_000_000_000, 5 * 60_000));
+
+        // **여기가 요점이다.** 만료값이 `i64::MAX` 면 `now + margin` 이 오버플로한다.
+        // 만료값이 유한하면 큰 `now` 에서도 그냥 "갱신 필요" 로 답한다.
+        assert!(
+            s.needs_refresh(i64::MAX - 1_000_000, 5 * 60_000),
+            "먼 미래에서 갱신 판정이 오버플로 없이 동작해야 한다"
+        );
     }
 
     /// 빈 환경변수는 "설정되지 않음" 으로 본다 — 빈 비밀번호로 접속을 시도하면
@@ -440,14 +559,42 @@ Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
         assert!(StaticPasswordProvider::from_value(Some("pw".into())).is_some());
     }
 
-    /// 만료 여유는 [`TOKEN_TTL_SECS`] 안에서 계산돼야 한다.
-    #[test]
-    fn expiry_matches_the_documented_ttl() {
+    /// **공급자가 만드는 만료 시각이 TTL 과 맞아야 한다.**
+    ///
+    /// 처음 쓴 테스트는 `ExpiringSecret` 을 직접 만들어 검사해서 `token()` 안의
+    /// `epoch_ms(now) + TOKEN_TTL_SECS * 1000` 을 **한 줄도 커버하지 않았다**
+    /// (2차 리뷰가 지적). `* 1000` 을 빼면 만료가 즉시라 갱신 루프가 매 tick 돈다.
+    #[tokio::test]
+    async fn the_provider_sets_expiry_from_the_documented_ttl() {
         assert_eq!(TOKEN_TTL_SECS, 900, "RDS 상한은 15분이다");
-        let expires_at = 1_000 + (TOKEN_TTL_SECS as i64) * 1000;
-        let s = ExpiringSecret::new(Secret::new("t".into()), expires_at);
-        // 연결 수립 직전 5분 여유로 갱신 판단.
-        assert!(!s.needs_refresh(1_000, 5 * 60_000));
-        assert!(s.needs_refresh(expires_at - 60_000, 5 * 60_000));
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("시계")
+            .as_millis() as i64;
+        let provider = IamAuthTokenProvider::new(creds(), "ap-northeast-2");
+        let secret = provider
+            .token("h.rds.amazonaws.com", 3306, "dbmon")
+            .await
+            .expect("토큰");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("시계")
+            .as_millis() as i64;
+
+        let ttl_ms = (TOKEN_TTL_SECS as i64) * 1000;
+        // 발급 시각이 [before, after] 안이므로 만료도 그 구간 + TTL 안이다.
+        assert!(
+            !secret.needs_refresh(before, 0),
+            "발급 직후인데 이미 만료로 판정된다 — TTL 계산이 틀렸다"
+        );
+        assert!(
+            !secret.needs_refresh(before + ttl_ms - 1_000, 0),
+            "TTL 이 문서보다 짧다 — 갱신 루프가 매 tick 돈다"
+        );
+        assert!(
+            secret.needs_refresh(after + ttl_ms + 1, 0),
+            "TTL 이 문서보다 길다 — 만료된 토큰으로 접속을 시도한다"
+        );
     }
 }

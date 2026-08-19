@@ -17,8 +17,10 @@
 //! [`InstanceCollector`]: crate::collector::InstanceCollector
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use dbmon_core::instance::Instance;
+use dbmon_core::time::EpochMs;
 
 /// 수집 태스크가 있어야 하는 인스턴스들.
 ///
@@ -51,6 +53,53 @@ pub fn task_delta(running: &BTreeSet<String>, desired: &BTreeSet<String>) -> Tas
     TaskDelta {
         to_start: desired.difference(running).cloned().collect(),
         to_stop: running.difference(desired).cloned().collect(),
+    }
+}
+
+/// 인스턴스별 마지막 수집 성공 시각.
+///
+/// # 왜 전역 값 하나로는 안 되는가
+///
+/// `Readiness` 는 `last_collect_ok_ms` 를 `AtomicI64` 하나로 들고 있다. 모든 태스크가
+/// 거기에 쓰면 **정상인 1대가 나머지 499대의 실패를 가린다** — 만료 토큰으로 새
+/// 커넥션이 전부 실패하는 인스턴스가 있어도 `CollectStaleness`(FR-OPS-09)는 끝까지
+/// 초록이다. 헬스체크가 감시하려는 바로 그 상황을 놓친다.
+///
+/// 그래서 인스턴스별로 기록하고 **최솟값**을 신선도로 올린다. 한 대라도 밀리면
+/// 신선도가 밀린다.
+#[derive(Debug, Default, Clone)]
+pub struct CollectFreshness {
+    per_instance: Arc<Mutex<BTreeMap<String, EpochMs>>>,
+}
+
+impl CollectFreshness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 이 인스턴스의 tick 이 성공했다.
+    pub fn record(&self, instance_id: &str, now_ms: EpochMs) {
+        if let Ok(mut m) = self.per_instance.lock() {
+            m.insert(instance_id.to_string(), now_ms);
+        }
+    }
+
+    /// 더 이상 수집하지 않는 인스턴스를 잊는다.
+    ///
+    /// **없으면 최솟값이 영구히 과거에 고정된다** — 삭제된 인스턴스의 마지막 성공
+    /// 시각이 계속 최솟값이 되어 신선도가 회복되지 않는다.
+    pub fn retain(&self, live: &BTreeSet<String>) {
+        if let Ok(mut m) = self.per_instance.lock() {
+            m.retain(|id, _| live.contains(id.as_str()));
+        }
+    }
+
+    /// **가장 오래된** 성공 시각. 수집 중인 인스턴스가 없으면 `None`.
+    pub fn oldest(&self) -> Option<EpochMs> {
+        self.per_instance
+            .lock()
+            .ok()
+            .and_then(|m| m.values().copied().min())
     }
 }
 
@@ -155,6 +204,49 @@ mod tests {
         let d = task_delta(&ids(&["a", "b"]), &BTreeSet::new());
         assert_eq!(d.to_stop, vec!["a".to_string(), "b".to_string()]);
         assert!(d.to_start.is_empty());
+    }
+
+    /// **한 대라도 밀리면 신선도가 밀려야 한다.**
+    ///
+    /// 전역 값 하나면 정상인 1대가 나머지의 실패를 가린다 — FR-OPS-09 가 감시하려는
+    /// 상황을 놓친다.
+    #[test]
+    fn freshness_reports_the_slowest_instance() {
+        let f = CollectFreshness::new();
+        f.record("a", 1_000);
+        f.record("b", 5_000);
+        assert_eq!(f.oldest(), Some(1_000), "가장 오래된 성공을 보고해야 한다");
+
+        // 빠른 쪽이 계속 성공해도 느린 쪽이 밀려 있으면 신선도는 밀린 값이다.
+        f.record("b", 9_000);
+        assert_eq!(f.oldest(), Some(1_000));
+
+        // 느린 쪽이 회복되면 신선도도 회복된다.
+        f.record("a", 8_000);
+        assert_eq!(f.oldest(), Some(8_000));
+    }
+
+    /// **사라진 인스턴스를 잊어야 한다.**
+    ///
+    /// 안 잊으면 삭제된 인스턴스의 마지막 성공 시각이 영구히 최솟값이 되어
+    /// 신선도가 회복되지 않는다 — 헬스체크가 영구히 실패한다.
+    #[test]
+    fn freshness_forgets_instances_that_are_no_longer_collected() {
+        let f = CollectFreshness::new();
+        f.record("gone", 1_000);
+        f.record("live", 9_000);
+        f.retain(&ids(&["live"]));
+        assert_eq!(
+            f.oldest(),
+            Some(9_000),
+            "사라진 인스턴스가 신선도를 영구히 잡아 둔다"
+        );
+    }
+
+    /// 수집 중인 인스턴스가 없으면 신선도를 말할 수 없다.
+    #[test]
+    fn freshness_is_none_when_nothing_is_collected() {
+        assert_eq!(CollectFreshness::new().oldest(), None);
     }
 
     #[test]

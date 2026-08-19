@@ -498,6 +498,42 @@ impl Config {
         //
         // `prd` 를 예외로 두는 이유: prd 배포는 계정 전체를 수집하는 것이 의도다.
         // 그 의도를 밝히려면 `deployment_env` 를 명시적으로 `prd` 로 적어야 한다.
+        // **`monitor_db_user` 는 영숫자·`_`·`-` 만 허용한다.**
+        //
+        // 이 값은 IAM 토큰의 **서명 대상 URI** 에 보간된다
+        // (`?Action=connect&DBUser=<user>`). `#` 이 들어가면 그 뒤가 프래그먼트로
+        // 취급돼 `DBUser` 가 서명 대상에서 빠지고, `&` 는 파라미터를 주입한다.
+        // 증상은 언제나 `Access denied` 이고 원인이 IAM 정책처럼 보인다.
+        //
+        // MySQL 사용자명은 `@`·`#`·`%`·공백·비ASCII 를 허용하므로 경계에서 좁힌다.
+        if !self
+            .collector
+            .monitor_db_user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(err(
+                "collector.monitor_db_user",
+                "영숫자·`_`·`-` 만 쓴다 — IAM 토큰의 서명 대상 URI 에 보간되므로 \
+                 예약문자가 서명을 깨뜨린다",
+            ));
+        }
+
+        // **비-dev 배포에 폴백 비밀번호가 주입돼 있으면 거부한다.**
+        //
+        // 게이트 자체는 정확하다(`build_auth` 가 dev 를 요구한다). 문제는 **관측**이다 —
+        // 조용히 무시하면 그 변수가 거기 있는 줄 아무도 모르고, 아무도 로테이션하지
+        // 않는다. 기동을 막아 존재를 드러낸다.
+        if self.deployment_env != Env::Dev
+            && std::env::var_os(crate::aws::auth_token::TARGET_PASSWORD_ENV).is_some()
+        {
+            return Err(err(
+                crate::aws::auth_token::TARGET_PASSWORD_ENV,
+                "deployment_env=dev 가 아닌 배포에 폴백 비밀번호가 주입돼 있다 — \
+                 태스크 정의에서 제거하고 값을 로테이션한다",
+            ));
+        }
+
         // **엔드포인트 재지정은 `dev` + 루프백에서만 허용한다.**
         //
         // `endpoint_url` 이 설정되면 조립부가 더미 자격증명을 넣는다(로컬 개발 경로).
@@ -1013,6 +1049,36 @@ config_table = "dbmon-config"
         c.storage.endpoint_url = Some("http://127.0.0.1:18000".into());
         c.validate()
             .expect("dev 에서 막혔다 — 로컬 개발을 할 수 없다");
+    }
+
+    /// **`monitor_db_user` 에 예약문자를 막는다.**
+    ///
+    /// IAM 토큰의 서명 대상 URI 에 보간되므로 `#`·`&`·`%`·공백이 서명을 깨뜨린다.
+    /// 증상은 `Access denied` 이고 원인이 IAM 정책처럼 보인다.
+    #[test]
+    fn monitor_db_user_rejects_uri_reserved_characters() {
+        for bad in [
+            "db#mon",
+            "db&DBUser=root",
+            "db%mon",
+            "db mon",
+            "dbmon@host",
+            "디비몬",
+        ] {
+            let mut c = prd_config();
+            c.collector.monitor_db_user = bad.into();
+            let Err(e) = c.validate() else {
+                panic!("{bad:?} 가 통과했다");
+            };
+            assert_eq!(e.field, "collector.monitor_db_user", "{bad:?}");
+        }
+        // 정상 형태는 통과한다.
+        for ok in ["dbmon", "db_mon", "db-mon", "dbmon2"] {
+            let mut c = prd_config();
+            c.collector.monitor_db_user = ok.into();
+            c.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} 가 막혔다: {e}"));
+        }
     }
 
     /// 탐색 주기는 기본 5분이다 (FR-DSC-02).

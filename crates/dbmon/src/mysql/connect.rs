@@ -43,6 +43,28 @@ pub const RDS_CA_BUNDLE: &[u8] = include_bytes!("../../assets/rds-global-bundle.
 /// CI 검사가 싸다. 관측 결과는 같다 — 90일 미만이면 경고가 나온다.
 pub const CA_BUNDLE_EARLIEST_EXPIRY_DAY: &str = "2061-05-18";
 
+/// 번들의 SHA-256. **번들을 갱신하면 이 값도 함께 고친다.**
+///
+/// # 왜 만료일만으로는 부족한가
+///
+/// `with_disable_built_in_roots(true)` 로 신뢰를 좁힌 대가로 **이 파일 하나가 유일한
+/// 트러스트 앵커 집합**이 됐다. 공격은 삭제가 아니라 **추가**다 — 자기 CA 를 번들에
+/// 한 장 덧붙이면 모든 대상 접속을 MITM 할 수 있고, `mysql_clear_password` 로
+/// IAM 토큰이 그쪽으로 평문 전달된다.
+///
+/// 그런데 만료일 검사(`CA_BUNDLE_EARLIEST_EXPIRY_DAY`)는 **추가를 통과시킨다** —
+/// 만료가 더 늦은 CA 를 붙이면 최솟값이 바뀌지 않는다. 인증서 개수 하한
+/// (`count > 50`)도 마찬가지다.
+///
+/// 다이제스트를 박으면 번들 변경이 **반드시 한 줄 상수 변경을 수반**한다. 리뷰어가
+/// 볼 대상이 165KB diff 가 아니라 한 줄이 된다.
+pub const RDS_CA_BUNDLE_SHA256: &str =
+    "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3";
+
+/// 번들에 든 인증서 개수. 개수만으로는 부족하지만(위 참조) 다이제스트와 함께 두면
+/// "무엇이 바뀌었나" 를 즉시 말해 준다.
+pub const RDS_CA_BUNDLE_CERT_COUNT: usize = 108;
+
 /// 90일 미만이면 경고 (07 §3.3).
 pub const CA_WARN_DAYS: i64 = 90;
 /// 30일 미만이면 critical.
@@ -59,7 +81,16 @@ pub enum CaBundleHealth {
 
 /// 번들 상태를 판정한다. **순수 함수** — `now_ms` 를 받는다.
 pub fn ca_bundle_health(now_ms: i64) -> CaBundleHealth {
-    let Some(expiry_ms) = day_to_epoch_ms(CA_BUNDLE_EARLIEST_EXPIRY_DAY) else {
+    ca_bundle_health_for(now_ms, CA_BUNDLE_EARLIEST_EXPIRY_DAY)
+}
+
+/// 만료일을 **인자로** 받는 형태.
+///
+/// 상수를 읽는 형태만 두면 "상수가 깨지면 fail-closed" 를 테스트할 수 없다 —
+/// 실제로 그 테스트가 `ca_bundle_health` 를 부르지도 않는 공허한 것이었다
+/// (2차 리뷰가 지적).
+pub fn ca_bundle_health_for(now_ms: i64, expiry_day: &str) -> CaBundleHealth {
+    let Some(expiry_ms) = day_to_epoch_ms(expiry_day) else {
         // 상수가 깨졌다. 만료로 취급한다 — fail-closed.
         return CaBundleHealth::Expired;
     };
@@ -113,6 +144,24 @@ pub fn target_opts(
             ),
         })?;
 
+    // **엔드포인트 형태를 확인한다 (등록부를 신뢰하지 않는 두 번째 방어선).**
+    //
+    // `with_disable_built_in_roots(true)` 는 신뢰를 좁히지만 "Amazon RDS CA 가 서명한
+    // **아무** 호스트" 까지만 좁힌다 — 다른 AWS 고객의 RDS 인스턴스도 그 CA 로
+    // 서명돼 있으므로 TLS 검증을 정상 통과한다.
+    //
+    // `endpoint` 는 DynamoDB 등록부를 왕복한다. 등록부에 쓸 수 있는 공격자가 이 값을
+    // 자기 계정의 RDS 로 바꾸면, IAM 경로는 토큰이 그 호스트로 서명되므로 자기
+    // 보호가 되지만 **고정 비밀번호 경로는 평문으로 전달된다.**
+    //
+    // 그래서 탐색이 넣을 때(`aws::discovery`)와 쓸 때(여기) 두 번 본다.
+    if !is_valid_target_host(host, deployment_env) {
+        return Err(DomainError::InvalidInput {
+            field: "endpoint".into(),
+            reason: format!("{}: 대상 호스트 형태가 아니다", instance.id.as_str()),
+        });
+    }
+
     let builder = OptsBuilder::default()
         .ip_or_hostname(host.to_string())
         .tcp_port(instance.port)
@@ -120,28 +169,67 @@ pub fn target_opts(
         .pass(Some(secret.to_string()))
         // **DB 를 고정하지 않는다.** 대상마다 스키마가 다르고, 우리 쿼리는
         // `information_schema`·`performance_schema` 만 본다.
-        .db_name(None::<String>)
-        // IAM 토큰은 서버가 `mysql_clear_password` 플러그인을 요구한다.
-        // TLS 위에서만 쓰이므로 평문 전송이 노출되지 않는다.
-        .secure_auth(false);
+        .db_name(None::<String>);
+    // ⚠ `secure_auth(false)` 를 쓰지 않는다. **이름이 오해를 부르는 손잡이다.**
+    //
+    // `mysql_async` 에서 `secure_auth` 는 "`mysql_old_password` 플러그인을 막는가"
+    // 이고 기본값이 `true` 다. `false` 로 두면 얻는 것 없이 pre-4.1 의 깨진
+    // 8바이트 스크램블을 **다시 허용하는 다운그레이드**만 열린다.
+    //
+    // `mysql_clear_password`(IAM 토큰이 요구하는 것)를 켜는 것은
+    // `enable_cleartext_plugin` 이고 기본값이 `false` 다 — 꺼진 상태에서 서버가
+    // auth switch 를 보내면 `DriverError::CleartextPluginDisabled` 로 즉시 끊긴다.
+    //
+    // 처음에 이 둘을 혼동해서 **IAM DB Auth 가 한 커넥션도 성립할 수 없는** 상태로
+    // 배선했다. 로컬은 `caching_sha2_password` 라 이 분기를 타지 않아 가려졌고,
+    // 통합 테스트도 고정 비밀번호를 쓴다. 실제 RDS 에 붙어야 드러난다.
 
     let builder = match tls_mode(host, deployment_env) {
-        TlsMode::RdsCa => builder.ssl_opts(Some(
-            SslOpts::default()
-                // **RDS CA 만 신뢰한다.** 내장 루트를 끄면 신뢰 범위가 좁아진다.
-                //
-                // `PathOrBuf` 는 `mysql_async` 가 재수출하지 않으므로 타입을 적을 수
-                // 없다. `From<&'static [u8]>` 이 있어 `.into()` 로 넘긴다 —
-                // 파일로 떨어뜨리지 않으므로 디스크에 CA 가 남지 않는다.
-                .with_root_certs(vec![RDS_CA_BUNDLE.into()])
-                .with_disable_built_in_roots(true),
-        )),
+        TlsMode::RdsCa => builder
+            .ssl_opts(Some(
+                SslOpts::default()
+                    // **RDS CA 만 신뢰한다.** 내장 루트를 끄면 신뢰 범위가 좁아진다.
+                    //
+                    // `PathOrBuf` 는 `mysql_async` 가 재수출하지 않으므로 타입을 적을
+                    // 수 없다. `From<&'static [u8]>` 이 있어 `.into()` 로 넘긴다 —
+                    // 파일로 떨어뜨리지 않으므로 디스크에 CA 가 남지 않는다.
+                    .with_root_certs(vec![RDS_CA_BUNDLE.into()])
+                    .with_disable_built_in_roots(true),
+            ))
+            // **이 팔 안에 두는 것이 강제 지점이다.**
+            //
+            // RDS 의 `AWSAuthenticationPlugin` 은 `mysql_clear_password` 로 스위치한다.
+            // 즉 토큰이 평문으로 전송되므로 **검증된 TLS 위에서만** 켜야 한다.
+            // 주석으로 "TLS 위에서만 쓰인다" 고 적는 대신 위치로 강제한다 —
+            // 주석은 지켜지지 않고 위치는 지켜진다.
+            .enable_cleartext_plugin(true),
         // 로컬 컨테이너. TLS 를 쓰지 않는다 — 자체 서명 인증서를 신뢰하는 것보다
         // 아예 쓰지 않는 것이 정직하고, 루프백 밖으로 나가지 않는다.
+        //
+        // **평문 구간에서는 cleartext 플러그인을 켜지 않는다.** 켜면 dev 비밀번호가
+        // 암호화 없이 전송된다. 로컬 MySQL 은 `caching_sha2_password` 를 쓰므로
+        // 필요도 없다.
         TlsMode::PlaintextLoopback => builder.ssl_opts(None),
     };
 
     Ok(Opts::from(builder))
+}
+
+/// RDS 엔드포인트 도메인 접미.
+const RDS_HOST_SUFFIX: &str = ".rds.amazonaws.com";
+
+/// 접속해도 되는 호스트 형태인가.
+///
+/// 프로덕션 경로는 RDS 엔드포인트만 허용한다. `dev` + 루프백은 로컬 컨테이너용으로
+/// 허용한다 — 그쪽은 [`tls_mode`] 가 이미 판정하는 조건과 같다.
+pub fn is_valid_target_host(host: &str, deployment_env: Env) -> bool {
+    if deployment_env == Env::Dev && is_loopback_host(host) {
+        return true;
+    }
+    // 대소문자를 무시한다 — DNS 이름은 대소문자를 구분하지 않는다.
+    let lower = host.to_ascii_lowercase();
+    // 접미만 보면 `evil-rds.amazonaws.com` 이 통과할 수 있으므로 점을 포함해 본다.
+    lower.ends_with(RDS_HOST_SUFFIX) && lower.len() > RDS_HOST_SUFFIX.len()
 }
 
 /// 이 접속에 어떤 TLS 를 쓸 것인가.
@@ -172,7 +260,12 @@ fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    // `trim_*_matches` 는 대괄호를 **반복** 제거해 `[[::1]]` 도 통과시킨다.
+    // `strip_*` 는 한 겹만 벗기고 짝이 맞아야 한다 — 의도를 코드가 말한다.
+    let trimmed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     trimmed
         .parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_loopback())
@@ -276,6 +369,94 @@ mod tests {
         }
     }
 
+    /// **RDS 엔드포인트가 아닌 호스트는 거부한다.**
+    ///
+    /// RDS CA 전용 신뢰는 "Amazon RDS CA 가 서명한 아무 호스트" 까지만 좁힌다 —
+    /// 다른 AWS 고객의 인스턴스도 그 CA 로 서명돼 있다. 등록부가 오염되면
+    /// 고정 비밀번호가 그쪽으로 평문 전달된다.
+    #[test]
+    fn only_rds_endpoints_are_accepted_in_production() {
+        for bad in [
+            "attacker.example",
+            "evil-rds.amazonaws.com",
+            "rds.amazonaws.com.attacker.example",
+            ".rds.amazonaws.com",
+            "127.0.0.1",
+            "10.0.0.5",
+        ] {
+            let i = instance(Some(bad));
+            assert!(
+                target_opts(&i, "dbmon", "s", Env::Prd).is_err(),
+                "{bad} 를 대상으로 받았다"
+            );
+        }
+        // 정상 RDS 엔드포인트는 통과한다 (대소문자 무시).
+        for ok in [
+            "orders-01.abc.ap-northeast-2.rds.amazonaws.com",
+            "ORDERS-01.ABC.AP-NORTHEAST-2.RDS.AMAZONAWS.COM",
+        ] {
+            let i = instance(Some(ok));
+            target_opts(&i, "dbmon", "s", Env::Prd).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+    }
+
+    /// dev + 루프백은 허용한다 — 로컬 컨테이너가 대상이다.
+    #[test]
+    fn dev_loopback_hosts_are_accepted() {
+        for ok in ["127.0.0.1", "localhost", "::1"] {
+            let i = instance(Some(ok));
+            target_opts(&i, "dbmon", "pw", Env::Dev).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        // prd 에서는 같은 호스트가 거부된다.
+        assert!(target_opts(&instance(Some("127.0.0.1")), "dbmon", "pw", Env::Prd).is_err());
+    }
+
+    /// **`Opts` 의 `Debug` 는 비밀번호를 평문으로 담는다.**
+    ///
+    /// 직관과 반대라서 근거를 테스트로 남긴다. `mysql_async::Opts` 는 `derive(Debug)`
+    /// 이고 `pass: Option<String>` 이 가려지지 않는다(같은 크레이트의
+    /// `ChangeUserOpts` 는 수동 `Debug` 로 가린다 — 즉 `Opts` 는 의도적으로 안 가린다).
+    ///
+    /// 그래서 **`Opts`/`Pool` 을 품은 타입에 `derive(Debug)` 를 붙이면 안 된다.**
+    /// `TargetMysql` 이 `Debug` 를 파생하지 않는 이유가 이것이고, 그 사실을 아래
+    /// 정적 검사가 지킨다.
+    #[test]
+    fn opts_debug_leaks_the_password_so_never_print_it() {
+        let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
+        let opts = target_opts(&i, "dbmon", "super-secret-token", Env::Prd).expect("옵션");
+        assert!(
+            format!("{opts:?}").contains("super-secret-token"),
+            "mysql_async 가 `Opts` 의 Debug 를 가리도록 바뀌었다 — 이 테스트와 \
+             `TargetMysql` 의 Debug 금지 주석을 갱신한다"
+        );
+    }
+
+    /// **`Opts`/`Pool` 을 품은 타입은 `Debug` 를 파생하지 않는다.**
+    ///
+    /// 위 테스트가 보여 준 대로 그 순간 IAM 토큰이 로그로 나간다. 소스를 읽어
+    /// 확인한다 — 이 크레이트에서 이미 쓰는 정적 검사 방식이다(`adapter_never_scans`).
+    #[test]
+    fn no_type_holding_a_pool_derives_debug() {
+        let src = include_str!("mod.rs");
+        let code = src.split("#[cfg(test)]").next().expect("본문");
+        // `TargetMysql` 선언 앞의 attribute 를 확인한다.
+        let decl = code
+            .find("pub struct TargetMysql")
+            .expect("TargetMysql 선언");
+        let before = &code[decl.saturating_sub(200)..decl];
+        assert!(
+            !before.contains("derive") || !before.contains("Debug"),
+            "TargetMysql 이 Debug 를 파생한다 — Opts 안의 비밀번호가 로그로 나간다"
+        );
+        // `{opts:?}` / `?opts` 로 찍는 곳이 없어야 한다.
+        for pattern in ["{opts:?}", "?opts", "{opts:#?}"] {
+            assert!(
+                !code.contains(pattern),
+                "`{pattern}` 이 있다 — Opts 의 Debug 는 비밀번호를 담는다"
+            );
+        }
+    }
+
     /// 엔드포인트가 없으면 옵션을 만들 수 없다 — 조용히 빈 호스트로 붙으면 안 된다.
     #[test]
     fn missing_endpoint_is_an_error_not_an_empty_host() {
@@ -298,6 +479,56 @@ mod tests {
         assert!(opts.ssl_opts().is_some(), "프로덕션인데 TLS 가 없다");
     }
 
+    /// **IAM 토큰은 `mysql_clear_password` 로 전송된다 — 켜져 있어야 한다.**
+    ///
+    /// 꺼져 있으면 서버의 auth switch 에서 `CleartextPluginDisabled` 로 끊겨
+    /// **RDS IAM DB Auth 가 한 커넥션도 성립하지 못한다.** 처음에
+    /// `secure_auth(false)`(전혀 다른 손잡이)를 써서 그 상태였다.
+    #[test]
+    fn rds_targets_enable_the_cleartext_plugin_over_tls() {
+        let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
+        let opts = target_opts(&i, "dbmon", "tok", Env::Prd).expect("옵션");
+        assert!(
+            opts.enable_cleartext_plugin(),
+            "cleartext 플러그인이 꺼져 있다 — IAM 토큰으로 접속할 수 없다"
+        );
+        assert!(opts.ssl_opts().is_some(), "평문인데 cleartext 를 켰다");
+    }
+
+    /// **평문 구간에서는 cleartext 플러그인을 켜지 않는다.**
+    ///
+    /// 켜면 dev 비밀번호가 암호화 없이 전송된다. TLS 여부와 cleartext 여부가
+    /// 같은 `match` 팔에서 결정되는 것이 그 강제 장치다.
+    #[test]
+    fn plaintext_targets_never_enable_the_cleartext_plugin() {
+        let i = instance(Some("127.0.0.1"));
+        let opts = target_opts(&i, "dbmon", "pw", Env::Dev).expect("옵션");
+        assert!(opts.ssl_opts().is_none());
+        assert!(
+            !opts.enable_cleartext_plugin(),
+            "평문 구간에서 cleartext 를 켰다 — 비밀번호가 암호화 없이 전송된다"
+        );
+    }
+
+    /// **`mysql_old_password` 다운그레이드를 열지 않는다.**
+    ///
+    /// `secure_auth` 기본값 `true` 를 유지해야 한다. `false` 면 손상된 서버·MITM 이
+    /// pre-4.1 스크램블로 스위치를 요구할 때 클라이언트가 응한다.
+    #[test]
+    fn the_old_password_downgrade_stays_closed() {
+        for (host, env) in [
+            ("orders-01.abc.ap-northeast-2.rds.amazonaws.com", Env::Prd),
+            ("127.0.0.1", Env::Dev),
+        ] {
+            let i = instance(Some(host));
+            let opts = target_opts(&i, "dbmon", "s", env).expect("옵션");
+            assert!(
+                opts.secure_auth(),
+                "{host}: mysql_old_password 다운그레이드가 열려 있다"
+            );
+        }
+    }
+
     /// 로컬 대상은 TLS 없이 만들어져야 한다.
     #[test]
     fn loopback_dev_target_has_no_tls() {
@@ -307,12 +538,29 @@ mod tests {
         assert!(opts.ssl_opts().is_none());
     }
 
-    /// **CA 번들이 실제로 임베드돼야 한다.** 빈 파일이면 모든 TLS 접속이 실패한다.
+    /// **CA 번들의 다이제스트를 핀한다.**
+    ///
+    /// 개수 하한(`count > 50`)만 두면 **CA 를 한 장 덧붙이는 공격을 통과시킨다** —
+    /// 그게 실제 공격 방향이다(삭제가 아니라 추가). 만료일 검사도 만료가 더 늦은
+    /// CA 에는 반응하지 않는다. 다이제스트가 유일하게 추가를 잡는다.
     #[test]
-    fn ca_bundle_is_embedded_and_looks_like_a_bundle() {
+    fn ca_bundle_matches_its_pinned_digest() {
+        use sha2::{Digest, Sha256};
+
+        let actual = format!("{:x}", Sha256::digest(RDS_CA_BUNDLE));
+        assert_eq!(
+            actual, RDS_CA_BUNDLE_SHA256,
+            "CA 번들이 바뀌었다 — 의도한 갱신이면 RDS_CA_BUNDLE_SHA256 과 \
+             RDS_CA_BUNDLE_CERT_COUNT 를 함께 고친다. 의도하지 않았다면 \
+             누가 트러스트 앵커를 추가했는지 확인한다"
+        );
+
         let text = std::str::from_utf8(RDS_CA_BUNDLE).expect("PEM 은 UTF-8 이다");
         let count = text.matches("-----BEGIN CERTIFICATE-----").count();
-        assert!(count > 50, "인증서가 {count}개뿐이다 — 번들이 잘렸다");
+        assert_eq!(
+            count, RDS_CA_BUNDLE_CERT_COUNT,
+            "인증서 개수가 바뀌었다 (기대 {RDS_CA_BUNDLE_CERT_COUNT}, 실제 {count})"
+        );
         assert_eq!(
             count,
             text.matches("-----END CERTIFICATE-----").count(),
@@ -366,10 +614,18 @@ mod tests {
     }
 
     /// 상수가 깨지면 **만료로 취급**해야 한다 (fail-closed).
+    ///
+    /// 처음 쓴 테스트는 `ca_bundle_health` 를 부르지 않아서 `else` 팔을
+    /// `Ok { days_left: i64::MAX }` 로 바꿔도 통과했다(2차 리뷰가 지적).
     #[test]
     fn a_broken_expiry_constant_fails_closed() {
-        // `day_to_epoch_ms` 가 `None` 인 경우를 직접 확인한다.
-        assert_eq!(day_to_epoch_ms("깨진값"), None);
+        for broken in ["깨진값", "", "2026-13-01", "not-a-date"] {
+            assert_eq!(
+                ca_bundle_health_for(0, broken),
+                CaBundleHealth::Expired,
+                "{broken:?} 에서 fail-closed 하지 않았다"
+            );
+        }
         // 상수 자체는 유효해야 한다.
         assert!(day_to_epoch_ms(CA_BUNDLE_EARLIEST_EXPIRY_DAY).is_some());
     }

@@ -366,9 +366,20 @@ where
     ///
     /// 그래서 연결만 갈아 끼우고 추적기·시계 보정은 유지한다. 새 풀은 콜드이므로
     /// `needs_warm` 을 세워 다음 tick 밖에서 채운다.
-    pub fn replace_db(&mut self, db: D) {
-        self.db = db;
+    ///
+    /// # 이전 연결을 **돌려준다** — 호출부가 정리해야 한다
+    ///
+    /// 그냥 드롭하면 커넥션이 `COM_QUIT` 없이 사라져 **감시 대상 DB 의
+    /// `Aborted_clients` 가 오르고 에러 로그가 오염된다.** 인스턴스당 10분마다
+    /// 풀 2개씩이면 "대상에 부하를 주지 않는다" 는 주장과 정면으로 부딪친다.
+    ///
+    /// `TargetDb` 포트에는 close 가 없다(그게 맞다 — 도메인 개념이 아니다).
+    /// 그래서 반환해 **구체 타입을 아는 호출부가** `disconnect().await` 하게 한다.
+    /// 반환값을 무시하면 `#[must_use]` 가 경고한다.
+    #[must_use = "이전 연결을 반드시 정리해야 한다 — 드롭하면 대상 DB 에 Aborted_clients 가 쌓인다"]
+    pub fn replace_db(&mut self, db: D) -> D {
         self.needs_warm = true;
+        std::mem::replace(&mut self.db, db)
     }
 
     pub async fn warm_if_needed(&mut self) {

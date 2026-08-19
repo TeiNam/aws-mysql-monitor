@@ -47,8 +47,20 @@ impl<L: LeaseStore, C: Clock> LeaderGate<L, C> {
     }
 
     /// 이 워커가 지금 수집 리더인가.
+    ///
+    /// # 보유한 리스의 만료를 **로컬 시계로도** 확인한다
+    ///
+    /// `renew` 가 저장소 오류로 실패하는 동안 우리는 리스를 "TTL 까지 유지" 한다.
+    /// 그런데 만료 시각을 보지 않으면 **만료 후에도 리더라고 믿는다** — 새 리더가
+    /// TTL 에 리스를 잡은 뒤에도 다음 성공 왕복까지(최대 갱신 주기 20초) 중복
+    /// 수집이 일어난다. 리스가 존재하는 이유가 바로 그 중복을 막는 것이다.
+    ///
+    /// GC 정지로 시계마저 못 믿는 경우는 펜싱 토큰이 필요하다(ADR-018) —
+    /// 하지만 **저장소 오류 케이스는 로컬 시계 비교만으로 닫힌다.**
     pub fn is_leader(&self) -> bool {
-        self.held.is_some()
+        self.held
+            .as_ref()
+            .is_some_and(|l| self.clock.now_ms() < l.expires_at_ms)
     }
 
     /// 소유해야 하는 샤드 수 (F1). 리더가 아니면 0 이다.
@@ -303,6 +315,35 @@ mod tests {
              두 리더가 생기고, 비멱등 쓰기(`mark_missing`)가 두 번 불린다",
             dbmon_core::ports::LEASE_TTL_MS
         );
+    }
+
+    /// **저장소 오류로 갱신이 계속 실패하면 만료 시점에 리더를 그만둔다.**
+    ///
+    /// 만료 시각을 보지 않으면 새 리더가 이미 리스를 잡은 뒤에도 중복 수집을 한다.
+    #[tokio::test]
+    async fn a_held_but_expired_lease_does_not_count_as_leadership() {
+        let store = Arc::new(FakeLeaseStore::default());
+        let clock = FakeClock::new(1_000);
+        let mut a = gate(store.clone(), clock.clone(), "worker-a");
+        a.refresh().await;
+        assert!(a.is_leader());
+
+        // 저장소가 죽었다 — 갱신이 실패한다.
+        store.fail_next_renewals(100);
+
+        // 갱신 주기가 와도 실패하므로 `held` 는 그대로다.
+        clock.advance(LEASE_RENEW_INTERVAL_MS + 1);
+        a.refresh().await;
+        assert!(a.is_leader(), "TTL 안에서는 유지한다");
+        assert_eq!(a.shards_owned(), dbmon_core::ports::SHARD_COUNT);
+
+        // **TTL 이 지나면 리더가 아니다.** 저장소에 못 물어봤어도 시계는 안다.
+        clock.advance(dbmon_core::ports::LEASE_TTL_MS);
+        assert!(
+            !a.is_leader(),
+            "만료된 리스로 리더라고 믿는다 — 새 리더와 중복 수집이 된다"
+        );
+        assert_eq!(a.shards_owned(), 0);
     }
 
     #[test]

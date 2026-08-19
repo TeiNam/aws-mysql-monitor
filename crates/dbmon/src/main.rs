@@ -397,7 +397,7 @@ impl CollectTasks {
     /// `JoinHandle` 은 맵에 남으므로 `running()` 이 그 인스턴스를 "돌고 있다" 로 보고,
     /// `to_start = desired - running` 에서 빠진다 — **다시 띄울 기회가 영원히 오지
     /// 않는다.** IAM 정책이 잠깐 잘못됐다가 고쳐져도 그 인스턴스는 죽은 채로 남는다.
-    fn reap_finished(&mut self) -> Vec<String> {
+    async fn reap_finished(&mut self) -> Vec<String> {
         let dead: Vec<String> = self
             .handles
             .iter()
@@ -405,7 +405,15 @@ impl CollectTasks {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &dead {
-            self.handles.remove(id);
+            // **패닉과 정상 종료를 구분한다.** `is_finished()` 가 참이므로 `await` 는
+            // 즉시 반환한다 — 비용 0 인데, 구분하지 않으면 패닉이 tracing(JSON)
+            // 스트림에 아예 나타나지 않는다(기본 패닉 훅은 stderr 로만 쓴다).
+            if let Some(h) = self.handles.remove(id)
+                && let Err(e) = h.await
+                && e.is_panic()
+            {
+                tracing::error!(instance = %id, "수집 태스크가 패닉했다");
+            }
         }
         dead
     }
@@ -422,7 +430,7 @@ impl CollectTasks {
         use dbmon::collect_loop::{desired_ids, index_by_id, task_delta};
 
         // 끝난 태스크를 먼저 걷어낸다 — 그래야 아래 `to_start` 가 그것들을 다시 띄운다.
-        let dead = self.reap_finished();
+        let dead = self.reap_finished().await;
         if !dead.is_empty() {
             tracing::warn!(
                 count = dead.len(),
@@ -453,12 +461,50 @@ impl CollectTasks {
         }
     }
 
-    /// 전부 중지한다 (셧다운).
+    /// **즉시** 전부 중지한다 — 리더를 잃었을 때 쓴다.
+    ///
+    /// 협조적 종료를 기다리지 않는다. 리더가 아닌데 계속 수집하면 새 리더와
+    /// 중복이고, 그건 진행 중 캐시를 잃는 것보다 나쁘다.
     fn abort_all(&mut self) {
         for (id, h) in std::mem::take(&mut self.handles) {
             h.abort();
-            tracing::debug!(instance = %id, "수집 태스크 중지 (종료)");
+            tracing::debug!(instance = %id, "수집 태스크 중지 (리더 상실)");
         }
+    }
+
+    /// **협조적으로** 전부 정리한다 — 셧다운에 쓴다.
+    ///
+    /// # `abort_all` 로는 `drain()` 이 불리지 않는다
+    ///
+    /// 각 태스크는 루프 top 에서 셧다운을 관측하면 `drain()` 으로 진행 중 레코드를
+    /// 확정하고 스스로 끝난다. 그런데 리더 루프가 **먼저 `abort()` 하면 그 경로에
+    /// 도달하지 못한다** — 실제로 그렇게 배선해서 종료 후에도 `in_flight` 가 1개
+    /// 남는 것을 확인했다. 태스크에 정리할 시간을 주는 것이 이 함수다.
+    ///
+    /// 예산을 넘긴 태스크는 abort 한다. 유령 몇 개가 남는 것이 종료가 막히는 것보다 낫다.
+    async fn drain_all(&mut self, budget: Duration) {
+        let handles = std::mem::take(&mut self.handles);
+        if handles.is_empty() {
+            return;
+        }
+        let count = handles.len();
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut aborted = 0usize;
+        for (id, h) in handles {
+            match tokio::time::timeout_at(deadline, h).await {
+                Ok(_) => {}
+                Err(_) => {
+                    // `timeout_at` 이 만료되면 future 를 드롭한다 — 태스크는 계속
+                    // 돌므로 명시적으로 abort 해야 한다.
+                    tracing::warn!(
+                        instance = %id,
+                        "수집 태스크가 정리 예산을 넘겼다 — 중단한다 (in_flight 가 남을 수 있다)"
+                    );
+                    aborted += 1;
+                }
+            }
+        }
+        tracing::info!(count, aborted, "수집 태스크 정리 완료");
     }
 }
 
@@ -469,8 +515,15 @@ struct CollectDeps {
     auth: TargetAuth,
     config: Arc<Config>,
     worker_id: String,
-    /// 수집 tick 성공을 기록한다 (FR-OPS-09 `CollectStaleness`).
-    readiness: Arc<Readiness>,
+    /// **인스턴스별** 마지막 성공 시각 (FR-OPS-09 `CollectStaleness`).
+    ///
+    /// `Readiness` 를 직접 들지 않는다 — 거기 쓰면 전역 값 하나에 모든 태스크가
+    /// 쓰게 되고 정상인 1대가 나머지 499대의 실패를 가린다. 리더 루프가 최솟값을
+    /// 골라 준비 상태에 올린다.
+    freshness: dbmon::collect_loop::CollectFreshness,
+    /// 셧다운 신호. **협조적 종료에 필요하다** — `abort()` 만으로 멈추면
+    /// `drain()` 이 불리지 않아 `in_flight` 유령이 남는다.
+    shutdown: Arc<Shutdown>,
 }
 
 /// 인스턴스 하나의 수집 루프를 띄운다.
@@ -493,10 +546,28 @@ fn spawn_instance_collector(
     let tick = Duration::from_millis(deps.config.collector.detect_interval_ms);
     // 토큰 만료 여유. 이보다 적게 남으면 풀을 갈아 끼운다.
     const REFRESH_MARGIN_MS: i64 = 5 * 60_000;
+    /// 갱신 **재시도** 하한.
+    ///
+    /// 갱신이 실패하면 `secret` 이 그대로이므로 `needs_refresh` 는 계속 참이다.
+    /// 하한이 없으면 남은 여유(5분) 동안 **매 tick** 토큰을 다시 요청한다 —
+    /// 인스턴스 500대면 워커 하나가 초당 500회 `provide_credentials()` 를 부르고,
+    /// 그 호출이 IMDS/STS 로 나가면 조절 폭풍이 된다.
+    const REFRESH_RETRY_MIN_MS: i64 = 30_000;
 
     tokio::spawn(async move {
         let db_user = deps.config.collector.monitor_db_user.clone();
         let label = instance.id.as_str().to_string();
+
+        // **엔드포인트를 먼저 확인한다.** 없으면 토큰을 요청하지 않는다 —
+        // 빈 호스트로 서명하면 STS 왕복만 낭비하고, 이어지는 오류가
+        // "연결 옵션 구성 실패" 로만 나와 실제 원인(엔드포인트 없음)을 가린다.
+        let Some(host) = instance.endpoint.clone() else {
+            tracing::warn!(
+                instance = %label,
+                "엔드포인트가 없다 — 수집하지 않는다 (생성 중이거나 정지 상태다)"
+            );
+            return;
+        };
 
         // **인스턴스의 리전으로 서명하는 공급자를 고른다.** 없으면 접속하지 않는다 —
         // 다른 리전 공급자로 대신하면 서명이 틀린 토큰으로 붙으려 하고, 실패 원인이
@@ -512,14 +583,7 @@ fn spawn_instance_collector(
 
         // 첫 연결. 실패하면 잠시 뒤 재시도한다 — 태스크를 끝내면 이 인스턴스는
         // 다음 탐색(5분)까지 수집되지 않는다.
-        let mut secret = match auth
-            .token(
-                instance.endpoint.as_deref().unwrap_or_default(),
-                instance.port,
-                &db_user,
-            )
-            .await
-        {
+        let mut secret = match auth.token(&host, instance.port, &db_user).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(instance = %label, error = %telemetry::Scrubbed(&e), "대상 인증 실패");
@@ -563,11 +627,33 @@ fn spawn_instance_collector(
             params,
         );
 
+        let mut last_refresh_attempt_ms: i64 = 0;
+
         loop {
+            // **셧다운이면 협조적으로 정리하고 나간다.**
+            //
+            // `abort()` 만으로 멈추면 `drain()` 이 불리지 않아, 선행 저장된 레코드가
+            // `state=in_flight` 로 남는다. F4 고아 스윕이 아직 없으므로 TTL(35일)까지
+            // 화면에 "실행 중" 으로 남는다 — 배포마다 유령이 쌓인다.
+            //
+            // 리스 상실 시에는 반대로 즉시 `abort()` 가 맞다(중복 수집 방지).
+            if deps.shutdown.is_triggered() {
+                let stats = collector.drain().await;
+                tracing::info!(
+                    instance = %label,
+                    finalized = stats.finalized,
+                    "종료 — 진행 중 레코드를 정리했다"
+                );
+                return;
+            }
+
             let tick_started = std::time::Instant::now();
             // 토큰이 만료에 가까우면 연결만 갈아 끼운다.
             let now_ms = SystemClock.now_ms();
-            if secret.needs_refresh(now_ms, REFRESH_MARGIN_MS) {
+            if secret.needs_refresh(now_ms, REFRESH_MARGIN_MS)
+                && now_ms - last_refresh_attempt_ms >= REFRESH_RETRY_MIN_MS
+            {
+                last_refresh_attempt_ms = now_ms;
                 match auth
                     .token(
                         instance.endpoint.as_deref().unwrap_or_default(),
@@ -578,7 +664,10 @@ fn spawn_instance_collector(
                 {
                     Ok(fresh) => match make_db(&fresh) {
                         Ok(db) => {
-                            collector.replace_db(db);
+                            // **이전 풀을 정리한다.** 드롭하면 커넥션이 COM_QUIT 없이
+                            // 사라져 감시 대상 DB 의 `Aborted_clients` 가 오른다.
+                            let old = collector.replace_db(db);
+                            old.disconnect().await;
                             secret = fresh;
                             tracing::debug!(instance = %label, "대상 인증 토큰 갱신");
                         }
@@ -603,12 +692,10 @@ fn spawn_instance_collector(
 
             match collector.detect_tick().await {
                 Ok(stats) => {
-                    // **성공한 tick 만 신선도를 갱신한다.**
-                    //
-                    // 처음에는 태스크 집합을 맞출 때(5분마다) 기록했다. 그러면 모든
-                    // tick 이 실패해도 `CollectStaleness`(FR-OPS-09)가 정상으로 보인다 —
-                    // 헬스체크가 감시하려는 바로 그 상황을 놓친다.
-                    deps.readiness.record_collect_ok(SystemClock.now_ms());
+                    // **성공한 tick 만 신선도를 갱신한다.** 그리고 **인스턴스별로** 쓴다 —
+                    // 전역 값 하나면 정상인 1대가 나머지 499대의 실패를 가린다.
+                    // 준비 상태에 올리는 것은 리더 루프가 최솟값으로 한다.
+                    deps.freshness.record(&label, SystemClock.now_ms());
                     tracing::trace!(
                         instance = %label,
                         candidates = stats.candidates,
@@ -689,13 +776,17 @@ fn spawn_leader_loop(
     // **`Arc` 로 든다.** `select!` 팔에 참조를 넘기면 `implementation of Send is not
     // general enough` 로 컴파일이 깨진다 — 참조 인자에 대해 `for<'a>` Send 를
     // 증명해야 하기 때문이다.
+    // 태스크 정리 예산. **셧다운 유예보다 작아야** 한다 — 크면 상위 단계가 먼저
+    // 타임아웃해 리스가 반납되지 않는다(그 결함을 이미 한 번 만들었다).
+    let drain_budget = Duration::from_secs((config.http.shutdown_grace_secs / 3).max(2));
     let config = Arc::new(config.clone());
     let collect_deps = CollectDeps {
         store: Arc::clone(&stores.slow_query),
         auth,
         config: Arc::clone(&config),
         worker_id: worker_id.clone(),
-        readiness: Arc::clone(&readiness),
+        shutdown: Arc::clone(&shutdown),
+        freshness: dbmon::collect_loop::CollectFreshness::new(),
     };
 
     Some(tokio::spawn(async move {
@@ -712,9 +803,13 @@ fn spawn_leader_loop(
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
             if shutdown.is_triggered() {
-                // **태스크를 먼저 멈춘다.** 리스를 반납한 뒤에도 돌고 있으면
+                // **태스크를 먼저 정리한다.** 리스를 반납한 뒤에도 돌고 있으면
                 // 다음 리더와 중복 수집이 된다.
-                tasks.abort_all();
+                //
+                // `abort_all` 이 아니라 `drain_all` 이다 — abort 하면 태스크가
+                // `drain()` 에 도달하지 못해 진행 중 레코드가 `in_flight` 유령으로
+                // 남는다(실제로 그 상태였다).
+                tasks.drain_all(drain_budget).await;
                 gate.release().await;
                 readiness.set_collect_leader(false);
                 return;
@@ -722,6 +817,12 @@ fn spawn_leader_loop(
 
             gate.refresh().await;
             readiness.set_collect_leader(gate.is_leader());
+
+            // **가장 오래된 인스턴스의 성공 시각**을 신선도로 올린다 (FR-OPS-09).
+            // 한 대라도 밀리면 신선도가 밀린다.
+            if let Some(oldest) = collect_deps.freshness.oldest() {
+                readiness.record_collect_ok(oldest);
+            }
 
             // **리더가 아니면 수집 태스크를 즉시 멈춘다.**
             //
@@ -739,6 +840,13 @@ fn spawn_leader_loop(
                     );
                     tasks.abort_all();
                 }
+                // **리더를 되찾으면 즉시 한 라운드 돈다.**
+                //
+                // `last_discovery_ms` 를 그대로 두면 다음 탐색 주기(기본 5분)까지
+                // `reconcile` 이 불리지 않는다. 리스를 잃을 때 태스크를 전부 멈췄으므로
+                // 그 사이 **수집 태스크가 0개인데 `/readyz` 는 리더라고 보고한다.**
+                // 리스 다툼이 5분보다 잦으면 수집이 한 번도 돌지 않는다.
+                last_discovery_ms = 0;
             } else {
                 let now_ms = SystemClock.now_ms();
                 if now_ms - last_discovery_ms >= discovery_interval.as_millis() as i64 {
@@ -809,27 +917,33 @@ fn spawn_leader_loop(
                                 "재조정 실패 — 다음 주기에 재시도한다"
                             ),
                         }
-                    }
 
-                    // ③ 수집 태스크 집합을 등록부에 맞춘다.
-                    //
-                    // 재조정 **뒤에** 한다 — 방금 `Excluded` 로 바뀐 인스턴스의
-                    // 태스크를 같은 라운드에서 내려야 한다. 앞에 두면 필터에서
-                    // 빠진 인스턴스를 5분 더 수집한다.
-                    match stores.registry.list().await {
-                        Ok(instances) => {
-                            tasks.reconcile(&instances, &collect_deps).await;
-                            let collecting = tasks.running().len();
-                            tracing::info!(
-                                collecting,
-                                registered = instances.len(),
-                                "수집 태스크 집합 갱신"
-                            );
+                        // ③ 수집 태스크 집합을 등록부에 맞춘다.
+                        //
+                        // 재조정 **뒤에** 한다 — 방금 `Excluded` 로 바뀐 인스턴스의
+                        // 태스크를 같은 라운드에서 내려야 한다. 앞에 두면 필터에서
+                        // 빠진 인스턴스를 5분 더 수집한다.
+                        //
+                        // **`if let Some(outcome)` 안이어야 한다.** 밖에 두면 셧다운으로
+                        // 조회가 취소된 라운드에서도 등록부를 읽고 새 태스크를 띄운다 —
+                        // 토큰을 발급하고 풀을 만들고 몇 ms 뒤 abort 된다.
+                        match stores.registry.list().await {
+                            Ok(instances) => {
+                                tasks.reconcile(&instances, &collect_deps).await;
+                                // 사라진 인스턴스를 신선도 맵에서 잊는다 — 안 잊으면
+                                // 최솟값이 영구히 과거에 고정된다.
+                                collect_deps.freshness.retain(&tasks.running());
+                                tracing::info!(
+                                    collecting = tasks.running().len(),
+                                    registered = instances.len(),
+                                    "수집 태스크 집합 갱신"
+                                );
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %telemetry::Scrubbed(&e),
+                                "등록부를 읽을 수 없다 — 태스크 집합을 유지한다"
+                            ),
                         }
-                        Err(e) => tracing::warn!(
-                            error = %telemetry::Scrubbed(&e),
-                            "등록부를 읽을 수 없다 — 태스크 집합을 유지한다"
-                        ),
                     }
                 }
             }
@@ -837,7 +951,7 @@ fn spawn_leader_loop(
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = shutdown.wait() => {
-                    tasks.abort_all();
+                    tasks.drain_all(drain_budget).await;
                     gate.release().await;
                     readiness.set_collect_leader(false);
                     return;
@@ -908,6 +1022,31 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         discovery_interval_secs = config.discovery.interval_secs,
         "기동"
     );
+
+    // **CA 번들 만료 감시** (07 §3.3).
+    //
+    // 이 판정 함수는 처음에 호출부가 없었다 — enum·함수·테스트를 다 만들고 아무도
+    // 부르지 않았다(2차 리뷰가 지적, 이 부류 9번째). 기동 로그가 유일한 소비자다.
+    {
+        use dbmon::mysql::connect::{CaBundleHealth, ca_bundle_health};
+        use dbmon_core::time::{Clock, SystemClock};
+        match ca_bundle_health(SystemClock.now_ms()) {
+            CaBundleHealth::Ok { days_left } => {
+                tracing::info!(days_left, "RDS CA 번들 유효")
+            }
+            CaBundleHealth::Warn { days_left } => tracing::warn!(
+                days_left,
+                "RDS CA 번들 만료가 90일 미만이다 — 번들을 갱신한다"
+            ),
+            CaBundleHealth::Critical { days_left } => tracing::error!(
+                days_left,
+                "RDS CA 번들 만료가 30일 미만이다 — 즉시 갱신한다"
+            ),
+            CaBundleHealth::Expired => {
+                tracing::error!("RDS CA 번들이 만료됐다 — 대상 TLS 접속이 실패한다")
+            }
+        }
+    }
 
     // ── HTTP 서버 ────────────────────────────────────────────────────────────
     // `/healthz` 와 `/readyz` 는 **역할과 무관하게** 항상 띄운다.
