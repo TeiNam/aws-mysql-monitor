@@ -171,9 +171,16 @@ pub struct RunningQuery {
     handle: Option<tokio::task::JoinHandle<()>>,
     /// `Drop` 이 서버 측 쿼리를 죽이는 데 쓴다.
     port: u16,
+    /// 명시적으로 정리했다 — `Drop` 은 아무것도 하지 않는다.
+    cleaned: bool,
 }
 
 impl RunningQuery {
+    /// 이미 정리했다고 표시한다 — `Drop` 이 중복 `KILL QUERY` 를 보내지 않는다.
+    pub fn mark_cleaned(&mut self) {
+        self.cleaned = true;
+    }
+
     /// 배경 태스크가 끝날 때까지 기다린다.
     pub async fn join(&mut self) {
         if let Some(h) = self.handle.take() {
@@ -193,6 +200,9 @@ impl Drop for RunningQuery {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if self.cleaned {
+            return;
         }
         let id = self.connection_id;
         let port = self.port;
@@ -255,6 +265,7 @@ pub async fn start_long_statements(
         connection_id,
         handle: Some(handle),
         port: target.port,
+        cleaned: false,
     })
 }
 
@@ -323,12 +334,18 @@ pub fn report(title: &str, rows: &[(String, String)]) {
 }
 
 /// 실행 중인 쿼리를 죽이고 태스크가 끝나기를 기다린다.
+/// 명시적으로 죽이고 기다린다.
+///
+/// `Drop` 이 한 번 더 `KILL QUERY` 를 보내지 않도록 `handle` 을 비워 둔다 —
+/// 두 번째 kill 은 `ER_NO_SUCH_THREAD`(1094)로 무해하지만 왕복 35ms 를 낭비한다.
 pub async fn kill_and_wait(mut r: RunningQuery) {
     if let Some(mut probe) = connect(MYSQL84, ROOT).await {
         kill_query(&mut probe, r.connection_id).await;
         let _ = probe.disconnect().await;
     }
     r.join().await;
+    // `Drop` 이 중복 kill 을 보내지 않게 한다 (이미 죽였다).
+    r.mark_cleaned();
     // 서버가 스레드를 정리할 시간을 준다 — 바로 tick 하면 아직 processlist 에 있다.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 }

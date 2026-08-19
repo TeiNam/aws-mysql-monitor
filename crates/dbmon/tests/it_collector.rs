@@ -455,10 +455,23 @@ async fn deep_probe_limit_caps_work() {
     let s = tick_until(&mut c, 10, |s| s.candidates >= 3).await;
     assert!(s.candidates >= 3, "3건을 동시에 탐지하지 못했다: {s:?}");
     assert_eq!(s.deep_probed, 1, "상한을 넘겼다: {s:?}");
-    assert_eq!(
-        s.deep_probe_skipped,
-        s.candidates - 1,
-        "건너뛴 수를 보고해야 한다: {s:?}"
+
+    // **`deep_probe_skipped == candidates - 1` 은 불변식이 아니다.**
+    //
+    // `deep_probe_skipped` 는 `needs_deep_probe` 초과분이고, 엔트리는
+    // `plan_attempts >= max_plan_attempts` 가 되면 후보로 남은 채 `needs_deep_probe` 에서
+    // 빠진다(`inflight.rs`). tick 이 여러 번 도는 동안 하나가 시도를 소진하면
+    // `skipped` 가 `candidates - 1` 보다 작아진다 — 릴리스 빌드가 더 빨라 tick 이 많이
+    // 돌므로 **릴리스에서만** 약 14% 실패했다.
+    //
+    // 실제로 확인할 것은 "상한이 지켜졌고 초과분이 보고된다" 다.
+    assert!(
+        s.deep_probe_skipped >= 1,
+        "상한을 넘은 후보가 있으면 건너뛴 수를 보고해야 한다: {s:?}"
+    );
+    assert!(
+        s.deep_probed + s.deep_probe_skipped <= s.candidates,
+        "심층 조회 + 건너뜀이 후보 수를 넘을 수 없다: {s:?}"
     );
 
     for r in running {

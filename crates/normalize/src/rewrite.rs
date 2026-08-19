@@ -225,7 +225,9 @@ fn strip_resource_hints(
 /// 힌트 본문에서 **자원 제어 힌트만** 걸러낸다.
 ///
 /// 반환: `(남은 본문, 제거했는가, SET_VAR 를 제거했는가)`.
-/// 남은 본문이 `None` 이면 전부 자원 힌트였다는 뜻이다.
+///
+/// 남은 본문이 `None` 인 것은 **아무것도 제거하지 않았다**는 뜻이다(호출자가 그 힌트를
+/// 건드리지 않고 넘긴다). 전부 자원 힌트였으면 `Some("")` 처럼 빈 본문이 온다.
 fn filter_hint_body(body: &str) -> (Option<String>, bool, bool) {
     /// 플랜이 아니라 **실행 자원**을 바꾸는 힌트.
     const RESOURCE_HINTS: [&str; 3] = ["SET_VAR", "MAX_EXECUTION_TIME", "RESOURCE_GROUP"];

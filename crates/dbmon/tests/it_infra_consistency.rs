@@ -37,9 +37,26 @@ fn lifecycle_days(tf: &str, rule_id: &str) -> u32 {
     let id_at = tf
         .find(&needle)
         .unwrap_or_else(|| panic!("lifecycle 규칙 {rule_id} 를 찾을 수 없다"));
-    // 규칙 블록은 다음 `\n  rule {` 또는 문서 끝까지다.
+    // 규칙 블록의 끝을 찾는다.
+    //
+    // **리터럴 `"\n  rule {"` 로는 안 된다.** 들여쓰기가 4칸·탭으로 바뀌거나
+    // `dynamic "rule"` 로 리팩터링되면 매칭이 사라지고 검색이 파일 끝까지 달려
+    // **다음 규칙의 값을 조용히 읽는다** (5차 실측: 4칸 들여쓰기에서 `ttl35` 가 405를 반환).
+    //
+    // 공백 수에 의존하지 않도록 `rule` 이라는 **단어**를 경계로 본다.
     let after = &tf[id_at..];
-    let block_end = after.find("\n  rule {").unwrap_or(after.len());
+    let block_end = after
+        .match_indices("rule")
+        .find(|(i, _)| {
+            let prev_ok = after[..*i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace());
+            let rest = after[*i + "rule".len()..].trim_start();
+            prev_ok && rest.starts_with('{')
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(after.len());
     let block = &after[..block_end];
 
     // `expiration {` 을 이름 경계로 찾는다 (`noncurrent_version_expiration` 배제).
@@ -56,6 +73,26 @@ fn lifecycle_days(tf: &str, rule_id: &str) -> u32 {
         })
         .map(|(i, _)| i)
         .unwrap_or_else(|| panic!("{rule_id} 규칙에 expiration 블록이 없다"));
+
+    // **`expiration` 블록이 정확히 하나여야 한다.** 둘 이상이면 어느 것을 읽는지
+    // 알 수 없고, 0개면 경계 탐색이 실패한 것이다. 어느 쪽이든 조용히 넘기지 않는다.
+    let exp_count = block
+        .match_indices("expiration")
+        .filter(|(i, _)| {
+            let prev_ok = block[..*i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            prev_ok
+                && block[*i + "expiration".len()..]
+                    .trim_start()
+                    .starts_with('{')
+        })
+        .count();
+    assert_eq!(
+        exp_count, 1,
+        "{rule_id} 규칙의 expiration 블록이 {exp_count}개다 — 경계 탐색이 잘못됐다"
+    );
 
     let open = block[exp..].find('{').expect("확인됨") + exp;
     let close = block[open..]

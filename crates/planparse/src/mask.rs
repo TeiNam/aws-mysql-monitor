@@ -221,7 +221,7 @@ fn mask_label(s: &str, redactions: &mut usize) -> String {
             // 백틱 자체는 허용한다. MySQL 이 라벨에서 식별자를 감쌀 때 쓰기 때문이다
             // (`` (`c/*`.email >= ?) ``). 위험한 것은 식별자 안의 `'`·`"` 다.
             let raw = &s[span.start..span.end];
-            if raw.contains('\'') || raw.contains('"') {
+            if !raw_matches_token_kind(raw) {
                 *redactions += 1;
                 return REDACTED.to_string();
             }
@@ -238,6 +238,46 @@ fn mask_label(s: &str, redactions: &mut usize) -> String {
     }
     out.push_str(tail);
     out
+}
+
+/// 토큰의 **원문 바이트가 그 토큰 종류와 일치하는가.**
+///
+/// # 다섯 번째 유출이 여기서 나왔다
+///
+/// `mask_label` 은 리터럴이 아닌 토큰의 원문을 그대로 복사해 가독성을 유지한다. 그게
+/// 안전한 전제는 **원문이 렉서가 분류한 종류와 같은 모양**일 때뿐이다. 짝 없는 백틱이
+/// 있으면 렉서는 그 뒤 전체를 **식별자 하나**로 삼키고, 원문 복사가 그 안의 리터럴을
+/// 내보낸다. 4차의 `'`·`"` 검사는 **인용부호 없는** 리터럴을 통과시켰다:
+///
+/// ```text
+/// IN : Filter: ` (t.c = 0x536563726574)  idx `
+/// OUT: 입력과 동일, redactions=0        ← 0x536563726574 = "Secret"
+/// ```
+///
+/// 숫자·16진수·실수 각각 2,197 조합 중 21건(1.0%)이 유출됐다. 인용된 값은 막혔으므로
+/// 4차 테스트는 자기가 방어하는 모양만 측정하고 있었다.
+///
+/// # 판정
+///
+/// 백틱 식별자만 임의 내용을 담을 수 있다 — 다른 종류는 렉서의 토큰 경계가 이미
+/// 모양을 제한한다. 그래서 백틱 안의 내용이 **식별자인지** 본다. 실제 MySQL 라벨은
+/// `` `c` ``·`` `email` ``·`` `한글컬럼` `` 처럼 단순한 이름을 쓰므로 가용성은 유지된다.
+///
+/// 공백이 든 컬럼명(`` `my col` ``)은 이 규칙에서 `REDACTED` 가 된다. 드물고, 안전한
+/// 방향이며, 라벨 하나를 잃는 것이 리터럴을 내보내는 것보다 낫다.
+fn raw_matches_token_kind(raw: &str) -> bool {
+    // 인용부호는 어느 종류에도 나올 수 없다.
+    if raw.contains('\'') || raw.contains('"') {
+        return false;
+    }
+    if !raw.starts_with('`') {
+        return true;
+    }
+    // 백틱 식별자: 내용이 식별자 문자로만 이뤄져야 한다.
+    let inner = raw.trim_matches('`');
+    inner
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// 플랜 JSON 전체에서 리터럴을 제거한다.
@@ -435,6 +475,76 @@ mod tests {
             }
         }
         assert_eq!(checked, noise.len().pow(3));
+    }
+
+    /// **인용부호 없는 리터럴도 살아남지 못한다.**
+    ///
+    /// 4차의 검사는 리터럴이 아닌 토큰의 원문에서 `\'`·`"` 만 걸렀다. 짝 없는 백틱이
+    /// 렉서로 하여금 뒤 전체를 **식별자 하나**로 삼키게 만들면, 그 안의 숫자·16진수·실수는
+    /// 인용부호가 없으므로 통과했다:
+    ///
+    /// ```text
+    /// IN : Filter: ` (t.c = 0x536563726574)  idx `
+    /// OUT: 입력과 동일, redactions=0        ← 0x536563726574 = "Secret"
+    /// ```
+    ///
+    /// 5차 실측으로 세 형태 각각 21/2,197 (1.0%) 유출.
+    #[test]
+    fn unquoted_literals_never_survive_either() {
+        // 16진수는 디코드하면 "Secret", 숫자는 주민번호 형태, 실수도 값이다.
+        const MARKERS: [&str; 3] = ["0x536563726574", "9001011234567", "1.5e300"];
+        let noise = [
+            "", " ", "/*", "*/", "--", "#", "`", "\\", "x", "_binary", "(", ")", "/*+",
+        ];
+
+        let mut checked = 0usize;
+        for marker in MARKERS {
+            for a in noise {
+                for b in noise {
+                    for c in noise {
+                        let label = format!("Filter: {a} (t.c = {marker}) {b} idx {c}");
+                        let plan = serde_json::json!({ "query_plan": { "operation": label } });
+                        let (masked, _) = mask_plan(&plan);
+                        let out = serde_json::to_string(&masked).expect("직렬화");
+                        assert!(
+                            !out.contains(marker),
+                            "인용 없는 리터럴 유출\n  라벨: {label}\n  출력: {out}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, MARKERS.len() * noise.len().pow(3));
+    }
+
+    /// **실서버 라벨은 여전히 온전히 읽혀야 한다.** 백틱 식별자를 통째로 막으면
+    /// 대부분의 v2 라벨이 `REDACTED` 가 되어 화면이 쓸모없어진다.
+    #[test]
+    fn real_mysql_labels_stay_fully_readable() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "Filter: ((`c`.email >= 'x@example.com') and (`c`.id < 500))",
+                "Filter: ((`c`.email >= ?) and (`c`.id < ?))",
+            ),
+            ("Filter: (`한글컬럼` = 'v')", "Filter: (`한글컬럼` = ?)"),
+            ("Limit: 10 row(s)", "Limit: ? row(s)"),
+            (
+                "Single-row index lookup on o using PRIMARY (id=5)",
+                "Single-row index lookup on o using PRIMARY (id=?)",
+            ),
+        ];
+        for (input, expected) in cases {
+            let plan = serde_json::json!({ "query_plan": { "operation": input } });
+            let (masked, redactions) = mask_plan(&plan);
+            let got = masked
+                .get("query_plan")
+                .and_then(|q| q.get("operation"))
+                .and_then(|o| o.as_str())
+                .expect("operation");
+            assert_eq!(got, *expected, "\n  입력: {input}");
+            assert_eq!(redactions, 0, "실서버 라벨이 REDACTED 됐다: {input}");
+        }
     }
 
     /// 같은 성질을 **`heading`** 과 알 수 없는 키에서도 확인한다.

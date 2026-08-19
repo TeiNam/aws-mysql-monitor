@@ -161,7 +161,14 @@ fn is_english_contraction(bytes: &[u8], i: usize) -> bool {
 /// `x'41'`(16진수), `b'01'`(비트), `n'…'`(국가 문자셋), `_binary'…'`·`_utf8mb4'…'`
 /// (문자셋 도입자). 전부 문법이 정한 닫힌 집합이므로 값의 내용에 의존하지 않는다.
 fn preceding_word_is_introducer(bytes: &[u8], quote: usize) -> bool {
-    const INTRODUCERS: [&[u8]; 3] = [b"x", b"b", b"n"];
+    // `x'41'`(16진수), `b'01'`(비트), `n'…'`(국가 문자셋),
+    // `date'…'`·`time'…'`·`timestamp'…'`(시간 리터럴).
+    //
+    // 4차는 앞의 셋만 넣고 "문법이 정한 닫힌 집합" 이라고 적었다 — **닫히지 않았다.**
+    // 5차 실측으로 `date's,kim@example.com'` 이 208/312 유출했다. 시간 리터럴의 값은
+    // 보통 숫자로 시작해 실제 도달성은 낮지만, 그 논거는 **값의 내용에 의존한다** —
+    // 4차 수정이 없애려던 바로 그 종류의 논거다.
+    const INTRODUCERS: [&[u8]; 6] = [b"x", b"b", b"n", b"date", b"time", b"timestamp"];
 
     // 인용부호 앞의 식별자 토큰을 뒤로 읽는다.
     let mut start = quote;
@@ -309,6 +316,13 @@ mod tests {
             ("value _utf8mb4's;secret5'", "secret5"),
             ("value x'm secret6'", "secret6"),
             ("value X'll,secret7'", "secret7"),
+            // 5차: 시간 리터럴 도입자가 빠져 있었다.
+            (
+                "Cannot convert date's,kim@example.com' to utf8mb4",
+                "kim@example.com",
+            ),
+            ("value time't.secret8'", "secret8"),
+            ("value TIMESTAMP'd)secret9'", "secret9"),
         ];
         for (input, secret) in cases {
             let out = scrub(input);

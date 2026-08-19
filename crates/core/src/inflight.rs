@@ -405,7 +405,16 @@ impl InFlightTracker {
         // `TIMER_WAIT` 는 피코초. `TIME` 의 초 단위 오차(최대 1초)를 없앤다.
         if let Some(ps) = timer_wait_ps {
             let elapsed_ms = (ps / 1_000_000_000) as i64;
-            t.started_at_ms_precise = Some(offset.to_db_time(observed_at_ms) - elapsed_ms);
+            // **조밀 추정보다 늦을 수 없다.** 두 값은 서로 다른 tick 의 `ClockOffset`
+            // EMA 를 쓰므로 오프셋이 걸으면 `precise > started_at_ms` 가 될 수 있고,
+            // 그러면 레코드가 "종료가 시작보다 이르다" 로 보인다
+            // (`display_started_at_ms()` 가 정밀값을 반환한다).
+            //
+            // 발생 지점에서 막는 것이 요점이다. 병합에서 막으려면 "내 정밀값이 **남의**
+            // 종료보다 이른가" 를 물어야 하는데 그건 지역적으로 판정할 수 없고,
+            // 병합 후 판정하면 결합법칙이 깨진다(4차 H1).
+            let precise = offset.to_db_time(observed_at_ms) - elapsed_ms;
+            t.started_at_ms_precise = Some(precise.min(t.started_at_ms));
         }
     }
 
@@ -758,6 +767,28 @@ mod tests {
         assert_eq!(t.get(1).unwrap().started_at_ms, 10_000 + 3_000 - 2_000);
         // 우리 시계 기준 최초 관측 시각은 그대로 보존한다 (고아 판정에 쓴다).
         assert_eq!(t.get(1).unwrap().first_observed_at_ms, 10_000);
+    }
+
+    /// **정밀 시작이 조밀 추정보다 늦을 수 없다.**
+    ///
+    /// 두 값은 서로 다른 tick 의 `ClockOffset` EMA 를 쓰므로 오프셋이 걸으면 역전된다.
+    /// 그러면 `display_started_at_ms()` 가 종료보다 늦은 시각을 반환해 운영자가
+    /// "종료가 시작보다 이른" 레코드를 본다.
+    #[test]
+    fn precise_start_never_exceeds_the_coarse_estimate() {
+        let mut t = InFlightTracker::default();
+        t.tick(&[obs(1, 4, None)], 10_000, &no_offset(), false);
+        let coarse = t.get(1).unwrap().started_at_ms;
+
+        // 오프셋이 +8초로 걸었다 — 정밀값이 조밀 추정보다 훨씬 늦어진다.
+        let stepped = ClockOffset::restored(8_000);
+        t.record_deep_probe(1, Some("d".into()), Some(1_000_000_000), 10_000, &stepped);
+
+        let precise = t.get(1).unwrap().started_at_ms_precise.expect("정밀값");
+        assert!(
+            precise <= coarse,
+            "정밀 시작({precise})이 조밀 추정({coarse})보다 늦다 — 레코드가 자기모순이 된다"
+        );
     }
 
     #[test]
