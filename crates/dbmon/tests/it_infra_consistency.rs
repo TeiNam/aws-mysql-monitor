@@ -27,35 +27,50 @@ fn read(rel: &str) -> String {
 /// 에 먼저 걸린다. 주입 실험으로 확인: `noncurrent_days = 37` 을 앞에 넣으면 `ttl35 = 37` 로
 /// 읽히면서 모든 단정이 통과했다. **조용히 틀린 값을 읽는 게이트는 게이트가 아니다.**
 fn lifecycle_days(tf: &str, rule_id: &str) -> u32 {
-    let needle = format!("id     = \"{rule_id}\"");
-    let start = tf
+    // **규칙 블록의 경계 안에서만 찾는다.**
+    //
+    // 이전 판은 `id = "<rule>"` 뒤에서 첫 `expiration {` 을 찾았다. 그 규칙에
+    // `expiration` 이 없으면 **다음 규칙의 것**을 읽는다 — 실측으로 `ttl35` 를 물었을 때
+    // `ttl400` 의 405를 돌려주면서 모든 단정이 통과했다. 조용히 틀린 값을 읽는 게이트는
+    // 게이트가 아니다.
+    let needle = format!("\"{rule_id}\"");
+    let id_at = tf
         .find(&needle)
         .unwrap_or_else(|| panic!("lifecycle 규칙 {rule_id} 를 찾을 수 없다"));
-    let tail = &tf[start..];
-    // `expiration` 블록 안의 `days` 만 본다. **블록 이름을 정확히 맞춘다** —
-    // `"expiration {"` 로 찾으면 `noncurrent_version_expiration {` 에 먼저 걸린다.
-    let exp = tail
-        .match_indices("expiration {")
+    // 규칙 블록은 다음 `\n  rule {` 또는 문서 끝까지다.
+    let after = &tf[id_at..];
+    let block_end = after.find("\n  rule {").unwrap_or(after.len());
+    let block = &after[..block_end];
+
+    // `expiration {` 을 이름 경계로 찾는다 (`noncurrent_version_expiration` 배제).
+    let exp = block
+        .match_indices("expiration")
         .find(|(i, _)| {
-            // 앞 글자가 식별자 문자면 다른 블록 이름의 일부다.
-            tail[..*i]
+            let prev_ok = block[..*i]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            // 뒤에 `{` 가 (공백을 건너뛰고) 와야 한다.
+            let rest = block[*i + "expiration".len()..].trim_start();
+            prev_ok && rest.starts_with('{')
         })
         .map(|(i, _)| i)
         .unwrap_or_else(|| panic!("{rule_id} 규칙에 expiration 블록이 없다"));
-    let block = &tail[exp..];
-    let close = block
+
+    let open = block[exp..].find('{').expect("확인됨") + exp;
+    let close = block[open..]
         .find('}')
-        .unwrap_or_else(|| panic!("{rule_id} 의 expiration 블록이 닫히지 않았다"));
-    let inner = &block[..close];
-    // 정확히 `days` 라는 이름의 인자만 받는다.
+        .unwrap_or_else(|| panic!("{rule_id} 의 expiration 블록이 닫히지 않았다"))
+        + open;
+    let inner = &block[open + 1..close];
+
+    // 정확히 `days` 라는 이름의 인자만. 주석(`#` 뒤)은 제거한다.
     inner
         .lines()
         .filter_map(|l| {
-            let (k, v) = l.split_once('=')?;
-            (k.trim() == "days").then(|| v.trim())
+            let code = l.split('#').next().unwrap_or(l);
+            let (k, v) = code.split_once('=')?;
+            (k.trim() == "days").then(|| v.trim().to_string())
         })
         .next()
         .and_then(|v| v.parse().ok())

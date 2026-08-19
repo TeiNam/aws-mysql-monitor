@@ -296,3 +296,42 @@ async fn adapter_reads_real_sql_mode_not_the_port_default() {
     );
     db.disconnect().await;
 }
+
+/// **제네릭 경계는 고유 메서드를 보지 못한다.**
+///
+/// `InstanceCollector<D: TargetDb>` 는 `self.db.warm()` 을 부른다. `warm` 이 고유
+/// 메서드면 그 호출은 **트레이트 기본 구현**으로 해소되고 어댑터 코드는 죽는다.
+/// 컴파일은 통과하므로 이 실수는 컴파일러가 잡지 못한다 (미배선 4번째 재발).
+///
+/// 그래서 **제네릭 함수를 통해** 부르고, 어댑터가 실제로 서버를 만졌는지 확인한다.
+#[tokio::test]
+async fn adapter_overrides_are_reached_through_generic_bounds() {
+    use dbmon_core::ports::target_db::TargetDb;
+
+    // 컬렉터와 같은 형태: 구체 타입을 모르는 제네릭 경계.
+    async fn through_bound<D: TargetDb>(db: &D) -> (Result<(), String>, String) {
+        let warm = db.warm().await.map_err(|e| e.to_string());
+        let mode = db.target_sql_mode().await.unwrap_or_default();
+        (warm, mode)
+    }
+
+    let Ok(db) = dbmon::mysql::TargetMysql::connect(
+        support::opts(MYSQL84, ROOT),
+        dbmon::mysql::Timeouts::default(),
+        "local-mysql84",
+    ) else {
+        return;
+    };
+
+    let (warm, mode) = through_bound(&db).await;
+    if warm.is_err() {
+        eprintln!("건너뜀: MySQL 컨테이너 없음");
+        return;
+    }
+    // 기본 구현이 쓰였다면 빈 문자열이 온다.
+    assert!(
+        !mode.is_empty(),
+        "제네릭 경계를 통과하니 트레이트 기본 구현이 쓰였다 — 어댑터 override 가 죽어 있다"
+    );
+    db.disconnect().await;
+}

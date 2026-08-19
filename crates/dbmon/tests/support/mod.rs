@@ -167,7 +167,57 @@ pub fn wide_digest_sql(column_count: usize) -> String {
 /// `EXPLAIN FOR CONNECTION` 을 걸 수 있다.
 pub struct RunningQuery {
     pub connection_id: u64,
-    pub handle: tokio::task::JoinHandle<()>,
+    /// `Drop` 이 `take()` 하므로 `Option` 이다.
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// `Drop` 이 서버 측 쿼리를 죽이는 데 쓴다.
+    port: u16,
+}
+
+impl RunningQuery {
+    /// 배경 태스크가 끝날 때까지 기다린다.
+    pub async fn join(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+    }
+}
+
+/// **단정 실패에도 서버 측 쿼리를 정리한다.**
+///
+/// 이전에는 성공 경로에서만 `kill_and_wait` 를 불렀다. 단정 하나가 실패하면
+/// `SLEEP(10)` 이 최대 10초 동안 서버에 남아 **다음 테스트가 그걸 후보로 본다** —
+/// 릴리스 빌드에서 `it_collector` 가 간헐적으로 실패한 원인 중 하나다.
+///
+/// `Drop` 은 async 를 쓸 수 없으므로 동기 커넥션으로 `KILL QUERY` 를 보낸다.
+impl Drop for RunningQuery {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+        let id = self.connection_id;
+        let port = self.port;
+        // 별도 스레드에서 동기 정리. 실패는 무시한다(이미 끝났을 수 있다).
+        let _ = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let target = Target {
+                    label: "cleanup",
+                    port,
+                    max_digest_length: 0,
+                };
+                if let Some(mut c) = connect(target, ROOT).await {
+                    let _ = c.query_drop(format!("KILL QUERY {id}")).await;
+                }
+            });
+        })
+        .join();
+    }
 }
 
 pub async fn start_long_query(
@@ -203,7 +253,8 @@ pub async fn start_long_statements(
     tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     Some(RunningQuery {
         connection_id,
-        handle,
+        handle: Some(handle),
+        port: target.port,
     })
 }
 
@@ -272,12 +323,12 @@ pub fn report(title: &str, rows: &[(String, String)]) {
 }
 
 /// 실행 중인 쿼리를 죽이고 태스크가 끝나기를 기다린다.
-pub async fn kill_and_wait(r: RunningQuery) {
+pub async fn kill_and_wait(mut r: RunningQuery) {
     if let Some(mut probe) = connect(MYSQL84, ROOT).await {
         kill_query(&mut probe, r.connection_id).await;
         let _ = probe.disconnect().await;
     }
-    let _ = r.handle.await;
+    r.join().await;
     // 서버가 스레드를 정리할 시간을 준다 — 바로 tick 하면 아직 processlist 에 있다.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 }
@@ -310,10 +361,11 @@ pub async fn reset_targets(target: Target) {
 ///
 /// # ⚠ 이 락은 **테스트 바이너리를 넘지 않는다**
 ///
-/// `static Mutex` 이므로 프로세스 안에서만 유효하다. `cargo test` 는 바이너리를 병렬로
-/// 돌리므로, 같은 대상에 장기 실행 쿼리를 만드는 **모든 바이너리**가 이 락을 잡아도
-/// 서로를 막지 못한다. 실제로 `it_injection` 이 이걸 잡았다가 `it_collector` 를
-/// 플래키하게 만들었다.
+/// `static Mutex` 이므로 프로세스 안에서만 유효하다. 같은 대상에 장기 실행 쿼리를 만드는
+/// **다른 바이너리**가 이 락을 잡아도 서로를 막지 못한다.
+///
+/// (`cargo test` 가 바이너리를 동시에 하나만 돌린다는 관측도 있지만, 그건 보장이 아니라
+/// 현재 동작이다. `--jobs` 나 향후 변경에 의존하지 않는다.)
 ///
 /// 규칙:
 /// - 장기 실행 쿼리를 만들고 그게 살아 있길 기대하는 테스트는 **`ROOT` 로 붙는다**

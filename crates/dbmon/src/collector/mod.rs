@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dbmon_core::clock_offset::ClockOffset;
 use dbmon_core::error::Result;
-use dbmon_core::inflight::{Identity, InFlightTracker, Observation};
+use dbmon_core::inflight::{FinalizeReason, Identity, InFlightTracker, Observation};
 use dbmon_core::instance::Instance;
 use dbmon_core::ports::target_db::{Excludes, ExplainOutcome, PlanFailure, TargetDb};
 use dbmon_core::ports::{SlowQueryStore, target_db::FullSqlRow, target_db::StmtCurrentRow};
@@ -54,6 +54,17 @@ pub struct TickStats {
     /// **심층 조회 자체가 실패했다** (권한·타임아웃). 0 이 아니면 이 tick 의 레코드에는
     /// SQL·지표가 없다 — "SQL 을 못 읽는 느린 쿼리" 와 "권한이 빠진 상태" 는 다르다.
     pub deep_probe_failed: usize,
+    /// 엔트리 수 상한에 걸려 강제 확정된 수.
+    ///
+    /// 0 이 아니면 동시 슬로우 쿼리가 추적 상한을 넘었다는 뜻이다. 카운터를 여기 두는
+    /// 이유: `InFlightTracker` 안에만 있으면 아무도 읽지 않고, 그러면 "관측 가능하다" 는
+    /// 주장이 성립하지 않는다.
+    pub evicted: usize,
+    /// 관측 중인 엔트리만으로 상한을 넘겨 상한을 일시적으로 초과했다.
+    ///
+    /// 관측 중인 실행을 버리지 않기로 했으므로 이 경우 캐시가 상한을 넘는다.
+    /// 참이면 `max_entries` 나 `collector.detect_limit` 설정을 재검토해야 한다.
+    pub over_entry_cap: bool,
     pub prefetch_saved: usize,
     pub finalized: usize,
     pub plans_for_connection: usize,
@@ -191,7 +202,12 @@ where
         {
             Ok(p) => p,
             Err(e) => {
-                self.needs_warm = true;
+                // **권한 오류에는 warm 을 표시하지 않는다.** 재연결로 해결되지 않으므로
+                // 매 tick `warm()` + `target_sql_mode()` 왕복을 낭비한다.
+                // 사람이 GRANT 를 고쳐야 하는 상태다.
+                if e.is_retryable() {
+                    self.needs_warm = true;
+                }
                 return Err(e);
             }
         };
@@ -235,6 +251,22 @@ where
         let tick = self
             .tracker
             .tick(&observations, now_ms, &self.offset, probe.truncated);
+
+        stats.evicted = tick
+            .finalized
+            .iter()
+            .filter(|(_, r)| *r == FinalizeReason::Evicted)
+            .count();
+        stats.over_entry_cap = self.tracker.is_over_cap();
+        if stats.evicted > 0 || stats.over_entry_cap {
+            tracing::warn!(
+                instance = %self.instance.id,
+                evicted = stats.evicted,
+                over_cap = stats.over_entry_cap,
+                tracked = self.tracker.len(),
+                "추적 상한에 걸렸다 — 동시 슬로우 쿼리가 상한을 넘었다"
+            );
+        }
 
         // ── 심층 조회 ──────────────────────────────────────────────────────
         // 느린 순으로 상한까지만. 나머지는 지표만 남는다.
@@ -366,6 +398,11 @@ where
                 self.lexical_divergence = true;
             }
         }
+    }
+
+    /// 추적 엔트리 상한을 바꾼다 (테스트용).
+    pub fn set_max_tracked_entries(&mut self, n: usize) {
+        self.tracker = InFlightTracker::default().with_max_entries(n);
     }
 
     /// 대상 DB 어댑터 (읽기).

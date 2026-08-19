@@ -39,7 +39,11 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
     // 이제 속성마다 그 속성에 맞는 규칙으로 병합한다.
     // `started_at_ms` 를 먼저 정한다 — `merge_duration` 이 구간 계산에 쓴다.
     let started_at_ms = existing.started_at_ms.min(incoming.started_at_ms);
-    let duration = merge_duration(existing, incoming, started_at_ms);
+    let started_at_ms_precise = min_opt(
+        existing.started_at_ms_precise,
+        incoming.started_at_ms_precise,
+    );
+    let duration = merge_duration(existing, incoming, started_at_ms, started_at_ms_precise);
     let digest = merge_digest(existing, incoming);
 
     // 정책은 **먼저 기록된 쪽**을 고정한다. 두 레코드의 `literal_policy_at_ms` 중 이른 쪽.
@@ -80,10 +84,7 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         started_at_ms,
         // `started_at_ms` 와 같은 규칙(더 이른 쪽)이어야 한다. `or` 로 두면 두 필드가
         // 어긋나 `coarse < precise` 같은 모순 조합이 나온다.
-        started_at_ms_precise: min_opt(
-            existing.started_at_ms_precise,
-            incoming.started_at_ms_precise,
-        ),
+        started_at_ms_precise,
         // **`duration_ms` 와 짝을 맞춘다.** 따로 고르면 레코드가 자기모순이 된다:
         // duration=62,000ms 인데 `ended_at - started_at = 4,000ms` 인 레코드가 나온다.
         // `dur_bucket`(GSI2PK)은 `duration_ms` 로 계산되고 UI 구간은 두 시각의 차로
@@ -230,26 +231,24 @@ fn merge_duration(
     a: &SlowQuery,
     b: &SlowQuery,
     started_at_ms: EpochMs,
+    started_at_ms_precise: Option<EpochMs>,
 ) -> (i64, DurationSource, Option<EpochMs>) {
     let authoritative = |q: &SlowQuery| q.duration_source == DurationSource::Slowlog;
 
-    // ① 슬로우로그가 있으면 **duration 과 종료 시각을 한 쌍으로** 가져온다.
-    //    완결된 실행의 권위 있는 측정값이므로 크기와 무관하게 이긴다.
-    // **종료 시각은 어느 분기에서든 같은 규칙으로 고른다: `min_opt`.**
+    // **레코드별로 종료 시각의 유효성을 판정한다.**
     //
-    // 슬로우로그 분기에서만 `.or(other)` 를 쓰면 결합법칙이 깨진다 — 실측:
+    // `ended_at_ms` 는 확정 tick 의 시각이고 `started_at_ms` 는 최초 관측 시각에서
+    // `TIME` 을 뺀 추정이다. 둘은 **다른 시점의 시계 오프셋**을 쓴다
+    // (`build.rs` 확정 시점 vs `inflight.rs` 최초 관측 시점). EMA 한 걸음이 tick 간격보다
+    // 크면 `ended < started` 가 되고, 그건 `ALERT_THRESHOLD_MS = 5_000` 이 존재하는 이유다.
     //
-    // ```text
-    // a=Polled/end=401000, b=Polled/end=462000, c=Slowlog/end=None
-    //   merge(merge(a,b),c) → end=401000     (a,b 가 min 으로 401000 을 정한 뒤 슬로우로그가 이어받음)
-    //   merge(a,merge(b,c)) → end=462000     (b,c 가 or 로 462000 을 정함)
-    // ```
-    //
-    // `min` 은 교환·결합법칙을 모두 만족한다. 어느 순서로 합쳐도 "가장 이른 관측된 종료" 다.
-    let ended_at_ms = min_opt(a.ended_at_ms, b.ended_at_ms);
+    // 그 상태의 종료 시각은 어떤 duration 과도 일관되지 않으므로 **무효로 본다.**
+    // 판정을 **레코드 자신의 시작 시각**으로 하는 것이 요점이다 — 병합된 시작
+    // (`min`) 으로 판정하면 이전에 무효였던 값이 유효해져 결합법칙이 깨진다.
+    let valid_end = |q: &SlowQuery| q.ended_at_ms.filter(|e| *e >= q.started_at_ms);
+    let ended_at_ms = min_opt(valid_end(a), valid_end(b));
 
     // ① 슬로우로그의 `duration_ms` 는 실제 측정값이므로 구간보다 신뢰한다.
-    //    이 경우만 `duration != ended - started` 가 될 수 있고, 의도된 예외다.
     match (authoritative(a), authoritative(b)) {
         (true, false) => return (a.duration_ms, a.duration_source, ended_at_ms),
         (false, true) => return (b.duration_ms, b.duration_source, ended_at_ms),
@@ -260,27 +259,26 @@ fn merge_duration(
         (false, false) => {}
     }
 
-    // ② 종료를 관측했으면 그건 **사실**이다. 버리지 않는다.
+    // ② 종료를 관측했으면 duration 은 추정이 아니라 **구간**이다.
     //
-    // `.or(other.ended_at_ms)` 로 패자의 종료 시각을 되가져오면 승자의 duration 과
-    // 섞여 `duration != ended - started` 가 된다. 반대로 승자에게 종료 시각이 없다고
-    // `None` 으로 두면 **관측한 사실을 잃는다** — 확정 경로가 정확히 그 모양이다
-    // (선행 저장은 `ended=None`, 확정은 `ended=Some`).
-    //
-    // 둘 다 틀렸다. 종료를 아는 순간 duration 은 추정이 아니라 **구간**이다.
+    // 구간의 기준은 **가장 정밀한 시작 시각**이다. `started_at_ms` 는 초 단위 `TIME` 에서
+    // 유도되지만 `started_at_ms_precise` 는 `TIMER_WAIT`(피코초) 보정값이다. 후자를 두고
+    // 전자를 쓰면 `TIMER_WAIT` 측정을 버리는 것이고, 저장된 duration 이 실제보다 짧아진다
+    // (실측 400ms). 그게 `Timer` 를 도입한 이유였다.
+    let span_base = started_at_ms_precise.unwrap_or(started_at_ms);
     if let Some(end) = ended_at_ms {
-        let span = end - started_at_ms;
+        let span = end - span_base;
         if span >= 0 {
-            // 종료 시각을 제공한 관측의 출처를 쓴다 — 그게 끝을 확정한 관측이다.
-            let source = [a, b]
-                .into_iter()
-                .filter(|q| q.ended_at_ms == Some(end))
-                .map(|q| q.duration_source)
-                .max_by_key(|s| duration_rank(*s))
-                .unwrap_or(DurationSource::Polled);
-            return (span, source, ended_at_ms);
+            // **`Span` 으로 표시한다.** `Timer` 로 표시하면 `TIMER_WAIT` 정밀도를 가진
+            // 것처럼 보이는데, 시작 시각 추정의 오차가 섞여 있다.
+            return (span, DurationSource::Span, ended_at_ms);
         }
-        // 음수 구간은 시계 문제다. 구간을 신뢰할 수 없으니 관측된 최대값으로 돌아간다.
+        // 정밀 시작이 종료보다 늦다 — 정밀값을 신뢰할 수 없다. 조밀값으로 재시도한다.
+        let coarse_span = end - started_at_ms;
+        if coarse_span >= 0 {
+            return (coarse_span, DurationSource::Span, ended_at_ms);
+        }
+        // `valid_end` 가 걸렀어야 하는 경우다. 도달하면 구간을 쓰지 않는다.
     }
 
     // ③ 종료를 못 봤다 → 두 관측 모두 하한이므로 큰 쪽이 참에 가깝다.
@@ -288,7 +286,6 @@ fn merge_duration(
         std::cmp::Ordering::Less => (b.duration_ms, b.duration_source, ended_at_ms),
         std::cmp::Ordering::Greater => (a.duration_ms, a.duration_source, ended_at_ms),
         std::cmp::Ordering::Equal => {
-            // 동률에서도 결정론적이어야 한다 (R43).
             let source = if duration_rank(a.duration_source) >= duration_rank(b.duration_source) {
                 a.duration_source
             } else {
@@ -476,8 +473,10 @@ mod tests {
 
         for (a, b, label) in [(&pre, &fin, "선행→확정"), (&fin, &pre, "확정→선행")] {
             let m = merge(a, b);
-            assert_eq!(m.duration_ms, 62_000, "{label}: 관측된 최대값이어야 한다");
-            assert_eq!(m.duration_source, DurationSource::Polled, "{label}");
+            assert_eq!(m.duration_ms, 62_000, "{label}: 관측된 구간이어야 한다");
+            // **`Span` 이다.** 종료를 관측했으므로 duration 은 추정이 아니라 구간이고,
+            // `Polled` 로 표시하면 초 단위 폴링값처럼 보인다.
+            assert_eq!(m.duration_source, DurationSource::Span, "{label}");
             // 레코드 내부 자기모순이 없어야 한다.
             let span = m.ended_at_ms.expect("종료 관측됨") - m.started_at_ms;
             assert_eq!(
@@ -657,6 +656,106 @@ mod tests {
             "{inconsistent} 쌍에서 duration 이 구간과 어긋난다"
         );
         assert_eq!(lost_end, 0, "{lost_end} 쌍에서 관측한 종료 시각을 잃었다");
+    }
+
+    /// **`ended < started` 인 레코드가 결합법칙을 깨뜨리면 안 된다.**
+    ///
+    /// `ended_at_ms` 는 확정 tick 의 시계 오프셋으로, `started_at_ms` 는 최초 관측 시점의
+    /// 오프셋으로 계산된다. EMA 한 걸음이 tick 간격보다 크면 음수 구간이 나온다
+    /// (`ALERT_THRESHOLD_MS = 5_000` 이 존재하는 이유다).
+    ///
+    /// 이전 판은 음수 구간에서 최대값으로 폴백하면서 **모순된 `ended_at_ms` 를 유지**했다.
+    /// 157,464 삼중 중 5,916 이 결합법칙을 깼고 11,664 쌍 중 2,448 이 모순이었다.
+    /// 기존 전수 테스트는 모든 종료 시각을 `start + 양수` 로 만들어 이 축을 보지 못했다.
+    #[test]
+    fn negative_spans_do_not_break_associativity_or_consistency() {
+        use DurationSource::*;
+        let s0 = base().started_at_ms;
+        let mut variants = Vec::new();
+        for dur in [1_000i64, 4_000] {
+            for src in [Polled, Timer, Slowlog] {
+                // **음수 구간을 포함한다** — 이게 빠졌던 축이다.
+                for end in [None, Some(s0 - 3_000), Some(s0), Some(s0 + 1_000)] {
+                    for start in [s0, s0 + 500] {
+                        variants.push(SlowQuery {
+                            duration_ms: dur,
+                            duration_source: src,
+                            ended_at_ms: end,
+                            started_at_ms: start,
+                            ..base()
+                        });
+                    }
+                }
+            }
+        }
+
+        let key = |q: &SlowQuery| (q.duration_ms, q.duration_source, q.ended_at_ms);
+        let mut assoc_bad = 0usize;
+        let mut inconsistent = 0usize;
+        for a in &variants {
+            for b in &variants {
+                // 일관성: 종료가 남아 있으면 duration 이 구간과 맞아야 한다.
+                let m = merge(a, b);
+                if let Some(end) = m.ended_at_ms {
+                    let span_base = m.started_at_ms_precise.unwrap_or(m.started_at_ms);
+                    if m.duration_source != Slowlog && m.duration_ms != end - span_base {
+                        inconsistent += 1;
+                    }
+                }
+                for c in &variants {
+                    if key(&merge(&merge(a, b), c)) != key(&merge(a, &merge(b, c))) {
+                        assoc_bad += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            inconsistent, 0,
+            "{inconsistent} 쌍에서 duration 이 구간과 어긋난다"
+        );
+        assert_eq!(assoc_bad, 0, "{assoc_bad} 삼중이 결합법칙을 깬다");
+    }
+
+    /// **정밀 시작 시각을 버리면 저장된 duration 이 짧아진다.**
+    ///
+    /// `started_at_ms` 는 초 단위 `TIME` 에서 유도되고 `started_at_ms_precise` 는
+    /// `TIMER_WAIT`(피코초) 보정값이다. 구간을 조밀값으로 계산하면 `TIMER_WAIT` 측정을
+    /// 버리는 것이고, 그게 `Timer` 를 도입한 이유였다.
+    #[test]
+    fn span_uses_the_precise_start_when_available() {
+        use DurationSource::*;
+        let s0 = base().started_at_ms;
+        let pre = SlowQuery {
+            started_at_ms: s0 - 4_000,
+            started_at_ms_precise: Some(s0 - 4_400),
+            duration_ms: 4_400,
+            duration_source: Timer,
+            ended_at_ms: None,
+            ..base()
+        };
+        let fin = SlowQuery {
+            started_at_ms: s0 - 4_000,
+            started_at_ms_precise: Some(s0 - 4_400),
+            duration_ms: 5_000,
+            duration_source: Polled,
+            ended_at_ms: Some(s0 + 1_200),
+            ..base()
+        };
+        for (a, b, label) in [(&pre, &fin, "선행→확정"), (&fin, &pre, "확정→선행")] {
+            let m = merge(a, b);
+            // TIMER_WAIT 기준 실제 duration = 4,400 + 1,200 = 5,600
+            assert_eq!(
+                m.duration_ms, 5_600,
+                "{label}: 정밀 시작을 쓰지 않아 duration 이 짧다"
+            );
+            assert_eq!(m.duration_source, Span, "{label}");
+            let precise = m.started_at_ms_precise.expect("정밀 시작이 보존돼야 한다");
+            assert_eq!(
+                m.duration_ms,
+                m.ended_at_ms.unwrap() - precise,
+                "{label}: 정밀 시작 기준으로 일관돼야 한다"
+            );
+        }
     }
 
     /// **R43 전수 검사.** 손으로 고른 한 쌍으로는 대칭성을 확인할 수 없다 —

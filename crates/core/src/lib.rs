@@ -28,7 +28,7 @@
 //! | [`secret`] | 로깅할 수 없는 값 |
 //! | [`error`] | 에러 체계, AWS 오류 분류 (F25) |
 //! | [`ports`] | trait 정의 |
-//! | [`fakes`] | 테스트용 인메모리 구현 = **두 번째 구현** |
+//! | `fakes` | 테스트용 인메모리 구현 = **두 번째 구현** |
 
 pub mod clock_offset;
 pub mod digest;

@@ -231,6 +231,11 @@ impl InFlightTracker {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    /// 엔트리 수가 상한을 넘었는가. **관측 중인 실행을 버리지 않기로 한 결과**다.
+    pub fn is_over_cap(&self) -> bool {
+        self.entries.len() > self.max_entries
+    }
+
     pub fn get(&self, thread_id: u64) -> Option<&Tracked> {
         self.entries.get(&thread_id)
     }

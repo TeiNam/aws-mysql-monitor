@@ -152,6 +152,14 @@ pub enum DurationSource {
     Polled,
     /// `events_statements_current.TIMER_WAIT` — 피코초 정밀.
     Timer,
+    /// **관측된 시작·종료 시각의 차**에서 유도했다.
+    ///
+    /// `polled`·`timer` 는 실행 **도중** 관측이라 하한이다. 종료를 관측하면 구간이
+    /// 그것들보다 정확하다 — 단, 시작 시각 추정의 오차를 물려받는다.
+    ///
+    /// 따로 두는 이유: 구간에서 유도한 값을 `timer` 로 표시하면 `TIMER_WAIT` 정밀도를
+    /// 가진 것처럼 보인다. 실제로는 시작 시각 추정의 오차가 섞여 있다.
+    Span,
     /// 슬로우로그 `Query_time` — 완료 후 기록된 정확값.
     Slowlog,
 }
@@ -161,6 +169,7 @@ impl DurationSource {
         match self {
             Self::Polled => "polled",
             Self::Timer => "timer",
+            Self::Span => "span",
             Self::Slowlog => "slowlog",
         }
     }
@@ -315,7 +324,9 @@ pub fn duration_rank(s: DurationSource) -> u8 {
     match s {
         DurationSource::Polled => 0,
         DurationSource::Timer => 1,
-        DurationSource::Slowlog => 2,
+        // 구간은 실행 전체를 덮으므로 도중 관측보다 낫다.
+        DurationSource::Span => 2,
+        DurationSource::Slowlog => 3,
     }
 }
 

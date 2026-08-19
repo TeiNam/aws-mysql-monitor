@@ -48,13 +48,13 @@ async fn m1_1_information_schema_processlist_info_is_not_truncated() {
     for target_bytes in [4_096usize, 16_384, 65_536, 1_048_576] {
         let sql = long_running_sql(target_bytes, 3.0);
         let actual = sql.len();
-        let Some(running) = start_long_query(MYSQL84, ROOT, sql).await else {
+        let Some(mut running) = start_long_query(MYSQL84, ROOT, sql).await else {
             eprintln!("[skip] 장기 실행 쿼리를 시작할 수 없다");
             return;
         };
         let m = measure_text_lengths(&mut probe, running.connection_id).await;
         kill_query(&mut probe, running.connection_id).await;
-        let _ = running.handle.await;
+        running.join().await;
 
         let fmt = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or("없음".into());
         rows.push((
@@ -137,12 +137,12 @@ async fn m1_1b_sql_text_length_follows_parameter() {
         let limit = var(probe, "performance_schema_max_sql_text_length")
             .await
             .unwrap_or_default();
-        let Some(running) = start_long_query(target, ROOT, sql.clone()).await else {
+        let Some(mut running) = start_long_query(target, ROOT, sql.clone()).await else {
             return;
         };
         let m = measure_text_lengths(probe, running.connection_id).await;
         kill_query(probe, running.connection_id).await;
-        let _ = running.handle.await;
+        running.join().await;
         out.push((
             format!("{label} max_sql_text_length={limit}"),
             format!(
@@ -198,7 +198,7 @@ async fn m1_2_explain_for_connection_covers_dml() {
 
     let mut rows = Vec::new();
     for (label, statements) in cases {
-        let Some(running) = start_long_statements(MYSQL84, ROOT, statements).await else {
+        let Some(mut running) = start_long_statements(MYSQL84, ROOT, statements).await else {
             return;
         };
         let id = running.connection_id;
@@ -251,7 +251,7 @@ async fn m1_2_explain_for_connection_covers_dml() {
         ));
 
         kill_query(&mut probe, id).await;
-        let _ = running.handle.await;
+        running.join().await;
     }
     report("M1-2 / M1-3 EXPLAIN FOR CONNECTION", &rows);
 }
@@ -302,7 +302,7 @@ async fn m1_2b_explain_failure_error_codes() {
     ));
 
     // ③ EXPLAIN 불가 문장 실행 중 → ER_EXPLAIN_NOT_SUPPORTED (3012 기대)
-    let Some(running) = start_long_query(MYSQL84, ROOT, "DO SLEEP(4)").await else {
+    let Some(mut running) = start_long_query(MYSQL84, ROOT, "DO SLEEP(4)").await else {
         return;
     };
     let r = probe
@@ -323,7 +323,7 @@ async fn m1_2b_explain_failure_error_codes() {
         },
     ));
     kill_query(&mut probe, running.connection_id).await;
-    let _ = running.handle.await;
+    running.join().await;
     let _ = idle.disconnect().await;
 
     report("M1-2b EXPLAIN 실패 에러 코드", &rows);
@@ -357,7 +357,7 @@ async fn m1_2b_explain_failure_error_codes() {
 #[tokio::test]
 async fn m1_4_for_connection_is_denied_to_least_privilege_accounts() {
     let mut root = conn_or_skip!(MYSQL84, ROOT);
-    let Some(running) = start_long_query(
+    let Some(mut running) = start_long_query(
         MYSQL84,
         ROOT,
         "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id \
@@ -426,7 +426,7 @@ async fn m1_4_for_connection_is_denied_to_least_privilege_accounts() {
     }
 
     kill_query(&mut root, id).await;
-    let _ = running.handle.await;
+    running.join().await;
     rows.push((
         "→ 결론".into(),
         "정적 전역 권한 전체가 필요하다. RDS 에서는 불가 → for_connection 경로를 쓸 수 없다".into(),
@@ -656,9 +656,9 @@ async fn m1_17_innodb_lock_waits_columns_and_truncation() {
 
     report("M1-17 sys.innodb_lock_waits", &rows);
 
-    for r in [blocker, waiter].into_iter().flatten() {
+    for mut r in [blocker, waiter].into_iter().flatten() {
         kill_query(&mut probe, r.connection_id).await;
-        let _ = r.handle.await;
+        r.join().await;
     }
 
     assert!(

@@ -294,3 +294,37 @@ async fn lexical_divergence_downgrades_plan_exactness() {
         );
     }
 }
+
+/// **축출은 `TickStats` 로 관측 가능해야 한다.**
+///
+/// 카운터가 `InFlightTracker` 안에만 있으면 아무도 읽지 않는다 — 문서가 "관측 가능해야
+/// 한다" 고 적어도 그건 주장일 뿐이다. 읽히지 않는 카운터는 관측성이 아니다.
+#[tokio::test]
+async fn eviction_is_visible_in_tick_stats() {
+    let db = FakeTargetDb::new();
+    let store = std::sync::Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store,
+        clock.clone(),
+        params(),
+    );
+    c.set_max_tracked_entries(2);
+
+    // 상한 2. 매 tick 새 스레드 3개가 나타나고 이전 것은 사라진다(잘린 목록).
+    let mut saw_evicted = 0usize;
+    for tick in 0..6i64 {
+        let ids: Vec<(u64, i64)> = (0..3).map(|i| ((tick * 3 + i) as u64, 3)).collect();
+        c.db_mut().with_threads_mut(&ids);
+        c.db_mut().set_truncated(true);
+        let st = c.detect_tick().await.expect("tick");
+        saw_evicted += st.evicted;
+        clock.advance(1_000);
+    }
+    assert!(
+        saw_evicted > 0,
+        "축출이 TickStats.evicted 로 올라오지 않았다"
+    );
+}

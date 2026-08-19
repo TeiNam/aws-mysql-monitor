@@ -608,12 +608,17 @@ impl FakeTargetDb {
             .collect();
     }
 
-    /// `warm` 이 몇 번 호출됐는가. **표시만 하고 아무도 부르지 않는 실수**를 잡는다.
+    /// `probe.truncated` 를 설정한다.
+    pub fn set_truncated(&self, v: bool) {
+        self.truncated.store(v, Ordering::SeqCst);
+    }
+
     /// 대상의 전역 `sql_mode` 를 설정한다.
     pub fn set_sql_mode(&self, mode: &str) {
         *self.sql_mode.lock().unwrap() = mode.to_string();
     }
 
+    /// `warm` 이 몇 번 호출됐는가. **표시만 하고 아무도 부르지 않는 실수**를 잡는다.
     pub fn warm_calls(&self) -> usize {
         self.warm_calls.load(Ordering::SeqCst)
     }

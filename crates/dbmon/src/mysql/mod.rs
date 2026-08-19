@@ -171,22 +171,6 @@ impl TargetMysql {
         })
     }
 
-    /// **hot 풀을 미리 채운다. tick 밖에서 부른다.**
-    ///
-    /// 기동 시 한 번, 그리고 detect 가 연결 문제로 실패한 뒤에 부른다.
-    /// `connect` 예산(기본 5초)을 온전히 쓰므로 TLS 핸드셰이크와 IAM 토큰 인증이
-    /// 중간에 취소되지 않는다 — `detect_total`(tick 예산) 안에서는 그게 불가능하다.
-    ///
-    /// 성공하면 이후 tick 은 warm 커넥션만 집으므로 획득이 즉시 끝난다.
-    pub async fn warm(&self) -> Result<()> {
-        // 커넥션을 얻어 간단한 쿼리를 돌린다. `init`(세션 설정)도 이때 적용된다.
-        let conn = self.hot_conn().await?;
-        let _: Vec<u8> = self
-            .run(conn, sql::PING.to_string(), Vec::new(), self.timeouts.query)
-            .await?;
-        Ok(())
-    }
-
     async fn hot_conn(&self) -> Result<Conn> {
         self.acquire(&self.hot).await
     }
@@ -580,6 +564,27 @@ impl TargetDb for TargetMysql {
     /// **포트의 기본 구현(빈 문자열)에 의존하면 통제가 무력화된다** — 빈 문자열은
     /// "위험 없음" 으로 해석되므로, 이 메서드가 없으면 `ANSI_QUOTES` 대상의 플랜이
     /// 계속 "정확" 으로 저장된다. 실제로 3차에서 그 상태였다(편집이 doc 주석에 들어갔다).
+    /// **hot 풀을 미리 채운다. tick 밖에서 부른다.**
+    ///
+    /// ⚠ **트레이트 메서드여야 한다.** 고유 메서드로 두면 `InstanceCollector<D: TargetDb>`
+    /// 의 `self.db.warm()` 이 **트레이트 기본 구현(`ping`)** 으로 해소되고 이 코드는
+    /// 죽는다 — 제네릭 경계는 고유 메서드를 보지 못한다. 실제로 그 상태였다
+    /// (미배선 수정의 네 번째 재발).
+    ///
+    /// 기동 시 한 번, 그리고 detect 가 연결 문제로 실패한 뒤에 부른다.
+    /// `connect` 예산(기본 5초)을 온전히 쓰므로 TLS 핸드셰이크와 IAM 토큰 인증이
+    /// 중간에 취소되지 않는다 — `detect_total`(tick 예산) 안에서는 그게 불가능하다.
+    ///
+    /// 성공하면 이후 tick 은 warm 커넥션만 집으므로 획득이 즉시 끝난다.
+    async fn warm(&self) -> Result<()> {
+        // 커넥션을 얻어 간단한 쿼리를 돌린다. `init`(세션 설정)도 이때 적용된다.
+        let conn = self.hot_conn().await?;
+        let _: Vec<u8> = self
+            .run(conn, sql::PING.to_string(), Vec::new(), self.timeouts.query)
+            .await?;
+        Ok(())
+    }
+
     async fn target_sql_mode(&self) -> Result<String> {
         let rows: Vec<String> = self
             .query_hot(sql::GLOBAL_SQL_MODE.to_string(), Vec::new())

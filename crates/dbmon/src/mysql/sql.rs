@@ -176,17 +176,15 @@ pub const PING: &str = "/* dbmon:ping */ SELECT 1";
 /// ([05 §10](../../../../docs/05-collector.md)).
 pub const STATEMENT_DIGEST: &str = "/* dbmon:selfdigest */ SELECT STATEMENT_DIGEST(?)";
 
-/// 세션 초기화. 커넥션 수립 직후 1회.
-///
-/// `max_execution_time` 은 **SELECT 에만** 적용된다. `SHOW`·`EXPLAIN FOR CONNECTION` 에는
-/// 걸리지 않으므로 클라이언트 타임아웃이 최후 방어선이다([05 §5](../../../../docs/05-collector.md)).
-///
 /// 대상 인스턴스의 **전역** `sql_mode`. 앱 세션이 상속하는 값이다.
 ///
 /// 세션 값(`@@session.sql_mode`)이 아니라 전역 값을 본다 — 우리 세션은 `''` 로
 /// 고정했으므로 세션 값은 항상 비어 있다.
 pub const GLOBAL_SQL_MODE: &str = "/* dbmon:sqlmode */ SELECT @@global.sql_mode";
 
+/// 세션 초기화. **커넥션 수립 직후와 풀 반납 후 재사용 시** 실행된다(`setup`).
+///
+/// `max_execution_time` 은 `EXPLAIN` 에도 적용된다(8.4.11 실측: 50ms 상한에서 ERROR 3024).
 /// `transaction_isolation='READ-COMMITTED'` 는 우리 조회가 다른 세션의 잠금·스냅샷에
 /// 영향을 주지 않게 한다. `SET SESSION` 이므로 대상 DB 전역 설정을 바꾸지 않는다.
 pub fn session_init(query_timeout_ms: u64) -> String {
