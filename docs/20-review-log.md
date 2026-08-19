@@ -543,11 +543,31 @@ crates/dbmon/src/collector/mod.rs:323:    pub async fn warm_if_needed(&mut self)
 `serve` 는 HTTP 서버(`/healthz`·`/readyz`)와 그레이스풀 셧다운만 돌린다. 즉 지금까지
 리뷰한 코드는 **단위·통합 테스트에서만 실행된다.** 실제로 돌려면 세 가지가 필요하다:
 
-| # | 필요한 것 | 로드맵 | 왜 막혀 있나 |
+| # | 필요한 것 | 로드맵 | 상태 |
 |---|---|---|---|
-| 1 | `SlowQueryStore` 구현 (DynamoDB) | M2-4 | 페이크만 있다. 로컬 DynamoDB 는 이미 떠 있다 |
+| 1 | ~~`SlowQueryStore` 구현 (DynamoDB)~~ | M2-4 | **완료 (2026-08-19).** `DynamoSlowQueryStore` + DynamoDB Local 통합 테스트 9건. AWS 자격증명 불필요 |
 | 2 | 샤드 리스 + 수집 리더 게이트 (F1) | M4-21 | `LeaseStore` 구현 없음. `ShardsOwned 합계 = 64 또는 0` 불변식을 코드가 강제하지 않는다 |
 | 3 | RDS 인스턴스 탐색 | M2-5 | `InstanceRegistry` 페이크만 있다 |
+
+### M2-4 가 리뷰로는 알 수 없던 것을 두 개 잡았다
+
+배선이 리뷰보다 값이 크다고 판단한 근거가 바로 이것이다. 저장소를 실제로 붙이자마자
+**리뷰 다섯 라운드가 볼 수 없던** 두 가지가 나왔다:
+
+1. **`record_id` 로는 `SK` 를 복원할 수 없다.** `record_id` 는 `started_at_ms` 를 초 단위로
+   절단해 담고(멱등 키가 ±1초 흔들림을 흡수하도록 의도된 설계다) `SK` 는 밀리초를 담는다.
+   그래서 `GetItem` 이 불가능하고 `begins_with(SK, <초 접두>)` + `thread_id` 필터를 써야 한다.
+   순수 로직 리뷰에서는 이 간극이 보이지 않는다 — 두 값이 다른 파일에 있다.
+
+2. **테스트가 이전 실행 상태에 의존했다.** DynamoDB Local 은 `-dbPath` 로 영속이라
+   이전 실행의 `finalized` 레코드가 남는다. 거기에 `in_flight` 를 병합하니
+   `merge_state` 가 종료 상태 되돌리기를 (정확하게) 거부해 인덱스에 나타나지 않았다.
+   **코드가 아니라 테스트가 틀렸다** — MySQL 쪽 `reset_targets` 와 같은 교훈이고, 이번에는
+   `reset_table_for_local()` 로 매 실행 초기화한다.
+
+또한 문서에만 있던 **GSI1 상태 전이**(진행 중 `SQS#in_flight` ↔ 확정 `DG#<digest>`)가
+실제로 동작하는지 처음 확인했다. 그 키를 잘못 쓰면 AP-18 이 영구히 0건이고 고아가
+TTL 35일까지 "실행 중" 으로 남는다 — 에러가 아니라 빈 결과라 운영에서만 드러난다.
 
 **리뷰의 한계**: 배선되지 않은 코드에 대한 리뷰는 "이 로직이 맞는가" 까지만 답한다.
 "이 로직이 실제로 불리는가", "루프가 예산 안에 도는가", "리스가 실제로 split-brain 을

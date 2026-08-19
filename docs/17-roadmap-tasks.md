@@ -106,7 +106,7 @@ CI 워크플로 작성 완료. 남은 것은 **M0-11a**(GitHub OIDC Role), **M0-
 | M2-1 | `dbmon::aws`: 리전별 클라이언트 캐시 + 자격증명 공급자 체인 | 로컬 SSO / ECS Task Role 양쪽 동작 |
 | M2-2 | Terraform: `dynamodb` 모듈 (테이블 2개, GSI, TTL, PITR, CMK) | `apply` 후 테이블 존재. TTL·PITR 활성 확인 |
 | M2-3 | Terraform: `iam` 모듈 (정책 6개 분리, Instance Profile) | `dbmon-rds-modify`는 기본 미첨부 |
-| M2-4 | `InstanceRegistry` DynamoDB 구현 | 단위(페이크) + 통합(DynamoDB Local) |
+| ~~M2-4~~ | ~~`InstanceRegistry` DynamoDB 구현~~ → **완료** | DynamoDB Local 에 실제로 쓰고 읽는 통합 테스트 9건 (`it_store.rs`). AWS 자격증명 불필요 |
 | M2-5 | RDS 탐색: `DescribeDBInstances`/`DescribeDBClusters` 리전 병렬 | 리전 1개 실패 시 나머지는 성공 |
 | M2-6 | 엔진·상태·버전 하한 필터 (FR-DSC-11) | 8.0.31 인스턴스가 `unsupported_version` |
 | M2-7 | 태그 → 환경 분류 + 매핑 설정 (FR-DSC-03) | 매핑표 기반. 태그 없으면 `unknown` |

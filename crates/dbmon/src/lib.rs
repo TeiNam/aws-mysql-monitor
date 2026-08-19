@@ -11,6 +11,7 @@ pub mod config;
 pub mod health;
 pub mod mysql;
 pub mod shutdown;
+pub mod store;
 pub mod telemetry;
 
 pub use config::{Config, Role};

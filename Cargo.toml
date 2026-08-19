@@ -43,6 +43,16 @@ regex = "1"
 futures = "0.3"
 rand = "0.9"
 
+# AWS SDK — DynamoDB 어댑터 (M2-4)
+#
+# `behavior-version-latest` 를 켜지 않으면 클라이언트 생성 시 패닉한다.
+# `serde_dynamo` 는 `SlowQuery` 의 serde 구현을 그대로 재사용한다 — AttributeValue 매핑을
+# 손으로 쓰면 필드가 추가될 때마다 두 곳을 고쳐야 하고, 그게 이 프로젝트에서 이미 네 번
+# 재발한 "미배선/불일치" 클래스다.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -84,6 +84,10 @@ jobs:
         options: >-
           --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pdbmon-local-root"
           --health-interval=5s --health-timeout=5s --health-retries=20
+      # 저장소 통합 테스트용. AWS 자격증명이 필요 없다.
+      dynamodb:
+        image: public.ecr.aws/aws-dynamodb-local/aws-dynamodb-local:latest
+        ports: ["18000:8000"]
       mysql80:
         image: public.ecr.aws/docker/library/mysql:8.0
         env:

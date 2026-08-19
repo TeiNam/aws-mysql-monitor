@@ -84,6 +84,10 @@ spike:
 test-collector:
     cargo test -p dbmon --test it_collector -- --nocapture
 
+# 저장소 통합 테스트 — DynamoDB Local 에 실제로 쓰고 읽는다 (AWS 불필요)
+test-store:
+    cargo test -p dbmon --test it_store -- --nocapture
+
 # ── 품질 게이트 ──────────────────────────────────────────────────────────────
 
 # 커밋 전에 돌리는 것 전부
