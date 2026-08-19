@@ -110,6 +110,12 @@ pub enum FinalizeReason {
     ThreadReused,
     /// 최대 추적 시간을 넘겼다.
     TooLong,
+    /// **엔트리 수 상한**에 걸려 강제 확정했다.
+    ///
+    /// `TooLong` 과 구분하는 이유: 이 값이 레코드에 남으면 "동시 슬로우 쿼리가 상한을
+    /// 넘었다" 는 사실이 사후에도 보인다. `TooLong` 으로 합치면 1시간 실행 쿼리와
+    /// 구분할 수 없고 `long_running` 이 잘못 붙는다.
+    Evicted,
     /// 그레이스풀 셧다운·리더 상실로 강제 확정했다.
     ///
     /// `TooLong` 과 구분하는 이유: 저장된 레코드의 `abandoned_reason` 이 사후 분석의
@@ -124,6 +130,7 @@ impl FinalizeReason {
             Self::Disappeared => "disappeared",
             Self::ThreadReused => "thread_reused",
             Self::TooLong => "too_long",
+            Self::Evicted => "evicted",
             Self::Shutdown => "shutdown",
         }
     }
@@ -157,12 +164,37 @@ pub struct InFlightTracker {
     entries: BTreeMap<u64, Tracked>,
     max_tracking_ms: i64,
     max_plan_attempts: u8,
+    max_entries: usize,
+    /// 상한 때문에 강제 확정된 누적 건수. **관측 가능해야 한다** — 조용히 버리면
+    /// 왜 레코드가 사라지는지 알 수 없다.
+    pub evicted_total: u64,
 }
 
 /// 기본 최대 추적 시간. 이걸 넘기면 강제 확정한다.
 pub const DEFAULT_MAX_TRACKING_MS: i64 = 3_600_000;
 /// 플랜 수집 재시도 상한.
 pub const DEFAULT_MAX_PLAN_ATTEMPTS: u8 = 3;
+
+/// 추적 엔트리 수 상한.
+///
+/// # `max_tracking_ms` 는 **크기** 상한이 아니다
+///
+/// 잘린 tick(`list_truncated`)에서는 사라짐 판정을 건너뛰므로, 절단이 지속되면
+/// 엔트리가 `max_tracking_ms`(1시간) 동안 **한 건도 제거되지 않는다.** 기본값
+/// (1초 tick, 500행/tick, 스레드 절반 회전)으로 계산하면:
+///
+/// ```text
+/// tick   600 (10분): 약 150,000 엔트리
+/// tick  3600 (60분): 약 900,000 엔트리 → 인스턴스당 약 225MB
+/// ```
+///
+/// 그리고 1시간 뒤에 250건/tick 씩 `TooLong` 으로 쏟아져 tick 안에서 순차 쓰기가 되고,
+/// 전부 `long_running=true` 오탐이 된다. 절단은 정의상 "장애 중" 이므로 이 경로가
+/// 가장 나쁠 때 터진다.
+///
+/// `detect_limit` 최대(10,000)의 몇 배로 잡는다 — 정상 운영에서는 절대 닿지 않고,
+/// 병리적 상황에서만 메모리를 묶는다.
+pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 
 impl Default for InFlightTracker {
     fn default() -> Self {
@@ -171,11 +203,19 @@ impl Default for InFlightTracker {
 }
 
 impl InFlightTracker {
+    /// 엔트리 수 상한을 바꾼다 (테스트용).
+    pub fn with_max_entries(mut self, n: usize) -> Self {
+        self.max_entries = n;
+        self
+    }
+
     pub fn new(max_tracking_ms: i64, max_plan_attempts: u8) -> Self {
         Self {
             entries: BTreeMap::new(),
             max_tracking_ms,
             max_plan_attempts,
+            max_entries: DEFAULT_MAX_ENTRIES,
+            evicted_total: 0,
         }
     }
 
@@ -291,6 +331,21 @@ impl InFlightTracker {
             }
         }
 
+        // **크기 상한.** 시간 상한만으로는 잘린 tick 이 지속될 때 캐시를 묶지 못한다.
+        // 가장 오래 추적한 것부터 확정한다 — 새 관측보다 오래된 것이 끝났을 확률이 높다.
+        while self.entries.len() > self.max_entries {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, t)| t.first_observed_at_ms)
+                .map(|(id, _)| *id);
+            let Some(id) = oldest else { break };
+            if let Some(t) = self.entries.remove(&id) {
+                self.evicted_total += 1;
+                result.finalized.push((t, FinalizeReason::Evicted));
+            }
+        }
+
         result
     }
 
@@ -353,6 +408,68 @@ fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Trac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **잘린 tick 이 지속되면 시간 상한만으로는 캐시를 묶지 못한다.**
+    ///
+    /// 절단은 정의상 "동시 슬로우 쿼리가 상한을 넘었다 = 장애 중" 이다. 그때
+    /// 사라짐 판정을 건너뛰므로 1시간 동안 한 건도 제거되지 않고 메모리가 수백 MB 로 자란다.
+    #[test]
+    fn entry_cap_bounds_the_cache_when_truncation_persists() {
+        let mut t = InFlightTracker::default().with_max_entries(10);
+        let mut evicted = 0usize;
+
+        // 매 tick 새 스레드 5개가 나타나고 아무도 사라지지 않는다(목록이 잘렸다).
+        for tick in 0..20i64 {
+            let obs: Vec<Observation> = (0..5)
+                .map(|i| obs((tick * 5 + i) as u64, 3, Some("d")))
+                .collect();
+            let r = t.tick(&obs, tick * 1_000, &no_offset(), true);
+            evicted += r
+                .finalized
+                .iter()
+                .filter(|(_, reason)| *reason == FinalizeReason::Evicted)
+                .count();
+            assert!(
+                t.len() <= 10,
+                "tick {tick}: 엔트리가 상한을 넘었다 ({}건)",
+                t.len()
+            );
+        }
+        assert!(evicted > 0, "축출이 한 번도 일어나지 않았다");
+        assert_eq!(
+            t.evicted_total as usize, evicted,
+            "축출 수가 관측되지 않는다"
+        );
+    }
+
+    /// 축출은 **가장 오래 추적한 것부터**여야 한다. 새로 관측된 것을 버리면
+    /// 방금 시작한 쿼리가 즉시 확정된다.
+    #[test]
+    fn eviction_removes_the_oldest_entry_first() {
+        let mut t = InFlightTracker::default().with_max_entries(2);
+        t.tick(&[obs(1, 3, Some("a"))], 1_000, &no_offset(), true);
+        t.tick(&[obs(2, 3, Some("b"))], 2_000, &no_offset(), true);
+        let r = t.tick(&[obs(3, 3, Some("c"))], 3_000, &no_offset(), true);
+
+        let evicted: Vec<u64> = r
+            .finalized
+            .iter()
+            .filter(|(_, reason)| *reason == FinalizeReason::Evicted)
+            .map(|(tr, _)| tr.thread_id)
+            .collect();
+        assert_eq!(evicted, vec![1], "가장 먼저 관측된 1번이 축출돼야 한다");
+        assert!(t.get(3).is_some(), "방금 관측된 것을 버리면 안 된다");
+    }
+
+    /// `Evicted` 는 `TooLong` 과 구분돼야 한다 — `long_running` 오탐을 막는다.
+    #[test]
+    fn evicted_is_not_reported_as_too_long() {
+        assert_ne!(
+            FinalizeReason::Evicted.as_str(),
+            FinalizeReason::TooLong.as_str()
+        );
+        assert!(!FinalizeReason::Evicted.observed_end());
+    }
 
     /// detect 목록이 `LIMIT` 에 잘렸으면 실행 중인 쿼리를 "정상 종료"로 확정하면 안 된다.
     #[test]

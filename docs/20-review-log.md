@@ -208,6 +208,111 @@ GSI1 사영에 `owner_epoch`·`thread_id`·`abandoned_reason` 도 추가했다(�
 
 ---
 
+---
+
+## 2차 (2026-08-19) — 리뷰어 2명
+
+`rust-reviewer`, `security-reviewer`. 대상은 **1차가 바꾼 코드**다 — 새 코드에 새 결함이 있다.
+
+**1차 수정 중 4건이 새 결함을 만들었다.** 그게 2차의 성과다.
+
+### 2.1 CRITICAL — 실제로 실행되는 SQL 주입 (✅)
+
+| # | 결함 | 확인 방법 |
+|---|---|---|
+| C-1 | **`sql_mode` 를 고정하지 않아 검증기와 실행기가 문자열 경계를 다르게 본다** | 실측 |
+
+`session_init` 이 `sql_mode` 를 건드리지 않아 **대상 인스턴스의 global 설정을 상속**한다.
+거기에 `NO_BACKSLASH_ESCAPES` 가 있으면 서버는 `\` 를 이스케이프로 보지 않는데
+우리 렉서는 항상 이스케이프로 처리한다. 8.4.11 실측:
+
+```sql
+-- PROCESSLIST.INFO 에서 온 신뢰 불가 텍스트
+SELECT * FROM orders WHERE memo = '\'; SELECT 31337 AS pwned; SELECT 1 -- '
+```
+
+| 세션 `sql_mode` | `Com_select` 델타 | 결과 |
+|---|---|---|
+| `''` | **1** | 페이로드가 문자열 리터럴 안에 머문다 (`attached_condition` 에서 확인) |
+| `NO_BACKSLASH_ESCAPES` | **3** | `SELECT 31337 AS pwned` 가 **실행된다** |
+
+우리 렉서는 두 경우 모두 `;` 토큰을 0개로 본다 → 멀티문장 게이트 통과.
+`mysql_async` 는 `CLIENT_MULTI_STATEMENTS` 를 무조건 켜고 끌 방법이 없으므로
+`plan_query` 가 유일한 차단점이었고, 그게 뚫렸다.
+
+**`docs/05-collector.md:756` 이 이미 `sql_mode=''` 를 요구하고 있었다** — 코드가 하지
+않았을 뿐이다. 1차의 P2(문서에만 있는 통제)와 같은 부류다.
+
+`LOAD DATA LOCAL INFILE` 파일 탈취는 **이중 차단으로 불가**하다: `mysql_async` 는
+핸들러가 없으면 `NoHandler` 를 반환하고 서버 `local_infile` 도 기본 OFF 다.
+
+회귀 테스트는 `crates/dbmon/tests/it_injection.rs` 다. **통제를 끈 대조 테스트를 함께
+둔다** — 그게 없으면 "고정이 효과가 있어서" 통과하는지 "애초에 뚫리지 않아서" 통과하는지
+구분할 수 없다.
+
+### 2.2 1차 수정이 만든 결함 (전부 ✅)
+
+| # | 무엇이 나빠졌나 | 처리 |
+|---|---|---|
+| H1 | **1차 수정이 수정 전보다 나빴다.** "실패를 삼키지 않는다" 를 `return Ok(stats)` 로 구현했는데, `tracker.tick()` 은 이미 캐시에서 엔트리를 제거해 `tick.finalized` 로 넘긴 상태였다 → 조기 반환이 그 Vec 을 버려 **확정이 영구히 사라졌다.** 확정 경로는 그 조회를 쓰지도 않는다 | `prefetch_save` 를 별도 메서드로 분리. 실패는 선행 저장에만 국한된다. `it_probe_failure.rs` 가 결함을 재주입해 잡히는지 확인 |
+| H4→H4' | `duration`(최대) + `ended_at`(최소) 를 따로 골라 **모순을 다른 필드로 옮겼다** (duration 62,000ms 인데 구간 4,000ms) | `merge_duration` 이 둘을 함께 반환한다 |
+| H3 | `merge_digest` doc 이 "`pick_str` 과 같은 규칙(사전순)" 이라고 적었지만 `pick_str` 은 **`a` 우선**이다 → 교환법칙 미성립. `app_digest` 는 GSI1PK 이므로 도착 순서가 집계 파티션을 바꾼다 | 실제 사전순(`min`)으로 |
+| H6 | `pick_sql_text` 가 PS 텍스트를 고를 수 있게 됐는데 절단 플래그는 IS 상한(65,535)만 봤다. PS 는 1,024 다 → **잘린 SQL 이 "잘리지 않았다" 로 저장된다.** 1차 C1c 와 같은 실패를 소스 추가로 재도입했다 | `PickedSql { text, maybe_truncated, lossy }`. IS 가 없으면 판정 근거가 없으므로 **보수적으로 true** |
+| M1' | `literal_policy` 동률에서 `min()` 을 썼는데 **선언 순서가 `Full` 먼저**라 `min` = 가장 느슨한 값이었다 — 내 fail-open 수정이 방향을 반대로 했다 | `restrictiveness()` 를 명시하고 `more_restrictive()` 로. **선언 순서에 보안 결정을 맡기지 않는다** |
+
+### 2.3 나머지 (전부 ✅)
+
+| # | 결함 | 처리 |
+|---|---|---|
+| H2 | 잘린 tick 이 지속되면 사라짐 판정을 건너뛰므로 엔트리가 1시간 동안 한 건도 제거되지 않는다 — 인스턴스당 약 **225MB**, 이후 250건/tick 이 `TooLong` 으로 쏟아진다. 절단은 정의상 "장애 중" 이라 가장 나쁠 때 터진다 | `DEFAULT_MAX_ENTRIES = 50_000` + `FinalizeReason::Evicted`(=`long_running` 오탐 방지) + `evicted_total` 카운터 |
+| H5 | `scrub` 이 **`Can't` 의 어포스트로피를 여는 인용부호로 봐서** 메시지가 `Can'?'` 로 붕괴했다. MySQL 에러 절반이 축약형으로 시작한다 → 운영자가 "연결 거부" 와 "접근 거부" 를 구분할 수 없다 | `'` 양옆이 모두 ASCII 알파벳이면 축약형으로 판정해 건너뛴다 |
+| M-2 | 같은 맥락: `mask_digit_runs` 가 3자리 이상을 지워 **에러 코드까지 `?`** 였다 | 코드를 `[mysql 1045]` 로 **마스킹 밖에** 붙인다 |
+| H-1 | `used_columns`·`used_key_parts` 가 `SAFE_KEYS` 였는데, **함수형 인덱스가 걸리면 표현식**이 들어온다. 실측: `concat(\`email\`,_utf8mb4'@internal-payroll.example.com')` | `EXPR_KEYS` 로 이동. `query`·`heading`·`lookup_condition`·`sort_fields` 도 명시 추가 |
+| H-2 | **JSON 숫자는 마스킹 대상이 아니었다.** v2 는 `LIMIT`/`OFFSET` 을 숫자로 낸다(실측 `"limit_offset": 4242`) | 숫자도 마스킹. `is_estimate_key` allowlist(비용·행수·순번)만 보존 — **새 숫자 키는 기본 마스킹**(fail-closed) |
+| M6 | `operation` 마스킹은 옳았지만 SQL 정규화기를 산문 라벨에 적용해 `Limit: 10 row(s)` → `LIMIT : ? ROW ( s )` 로 망가졌다 | `mask_label()` — 인용 구간과 **독립** 숫자만 지운다. `t1` 의 `1` 은 식별자라 남는다 |
+| M5 | 절단 가드가 폴백을 `digest_text` 로 돌렸는데 거기엔 `?`·`(...)` 자리표가 남아 **항상 1064** 다 → 실패가 보장된 EXPLAIN 을 최대 3회 보낸다 | `plan_query` 가 `Tok::Param`·`Tok::Ellipsis` 를 거부. 렉서가 이미 "입력의 `?`" 와 "마스킹한 리터럴" 을 구분하고 있었다 |
+| M8 | `unknown-<tid>` 자리표가 뒤늦게 도착한 진짜 다이제스트를 이겼다 | `UNKNOWN_DIGEST_PREFIX` 를 "없음" 으로 취급 |
+| M9 | 4바이트 문자 손실이 레코드에 남지 않았다 | `sql_text_lossy` 필드 추가 |
+| M3 | `detect_total` 이 하드코딩 1,000ms 라 `detect_timeout_ms` 설정을 조용히 덮었다 | `Timeouts::derive` 로 파생 |
+| M4 | **`detect_total` 초과 시 진행 중인 연결 수립이 취소된다** (`GetConn::drop` → `cancel_connection`). "다음 tick 은 warm" 은 사실이 아니었고, 콜드 상태에서 매 tick 취소를 반복해 `probe` 가 영구 실패할 수 있었다 | `detect_total > connect` 를 `derive` 가 보장 |
+| M2 | `connect_with_limit` 의 **호출부가 하나도 없었다** → M27 수정이 무효 | `from_config` 를 유일한 프로덕션 경로로 만들고 테스트로 고정 |
+| M7 | v2 는 `estimated_total_cost` 를 쓰는데 코드가 `cost_info.query_cost` 만 봤다 → MySQL 9.x 에서 비용이 **항상 `None`** | 두 키 모두 읽는다 |
+| M-5 | CI 에 `permissions` 가 없어 `GITHUB_TOKEN` 이 리포 기본 권한을 받는다 | `permissions: contents: read` |
+| M-6 | `allowed_client_cidrs` 가 `0.0.0.0/0` **리터럴만** 막았다. `["0.0.0.0/1","128.0.0.0/1"]` 는 통과 = IPv4 전체 | 접두 길이 `>= 24` 로 fail-closed |
+
+### 2.4 2차가 확인한 "1차가 맞았다" (건드리지 말 것)
+
+- `Shutdown::wait()` 의 확인-등록-확인은 lost wakeup 이 없다 (tokio 의 `notified()` 가 생성 시점 카운터를 캡처한다). `AtomicBool` 조합이 완전하다.
+- `scrub()` 은 UTF-8 안전하다 (인용부호가 ASCII 라 경계가 보장된다). 40만 케이스 퍼징 패닉 0.
+- `merge_stats`(필드별 최대 / 불리언 OR) 는 교환·결합법칙을 만족한다.
+- `list_truncated` 로 사라짐 판정을 건너뛰는 것 자체는 맞다 (H2 는 축출 부재의 문제).
+- `ranges`/`operation`/`condition` 를 `EXPR_KEYS` 로 옮긴 판단은 옳다 (M6 은 마스킹 *방식*의 문제).
+- `WITH` → `classify` 게이트, `checked_add`, T-37 `!= Env::Prd`, 루프 주기 검증 — 전부 정확.
+- 조회 도중 취소는 풀을 오염시키지 않는다 (recycler `cleanup_for_pool`).
+- T-37 게이트는 종단 검증 통과: `Env` 는 인식 못 하는 문자열을 `Unknown` 으로 떨어뜨리지 않고 **역직렬화 실패**로 기동을 거부한다. `join(",", [])` 의 빈 문자열도 빈 배열이 된다.
+
+### 2.5 대칭성은 전수 검사로 바꿨다
+
+손으로 고른 한 쌍으로는 대칭성을 확인할 수 없다 — **1차·2차가 모두 "고쳤다" 고 한 뒤에도
+비대칭이 남아 있었다.** 이제 `duration × source × state × ended_at × digest` 를 조합한
+**29,646 쌍 전부**에 대해 `merge(a,b) == merge(b,a)` 를 확인한다
+(`merge_is_commutative_across_all_axes`). 동률 tie-break 를 제거하면 실제로 실패한다.
+
+### 2.6 내가 만든 테스트 결함 3건
+
+기록해 두는 이유: 같은 함정을 다시 밟는다.
+
+1. **`exclusive_target` 은 프로세스를 넘지 않는다.** 새 테스트 바이너리에서 그걸 부르니
+   `reset_targets` 가 `it_collector` 의 장기 실행 쿼리를 죽여 그쪽이 플래키해졌다.
+   → 세션 범위 카운터만 쓰면 독점이 필요 없다.
+2. **`performance_schema.session_status` 에는 `Com_*` 가 없다** (8.4 실측: 336행 중 부재).
+   `SHOW SESSION STATUS` 만이 세션 단위 명령 카운터를 준다.
+3. **`LIKE` 자기 매칭** — 검색 패턴이 쿼리 자신의 텍스트에 있으면 자신을 찾는다.
+   그리고 `explain_rerun` 은 `/* dbmon:planrerun */ EXPLAIN …` 이라 `LIKE 'EXPLAIN%'` 로는
+   우리 EXPLAIN 을 제외하지 못한다.
+
+---
+
 ## 잔여 항목 (다음 라운드)
 
 > **1차 마무리 (2026-08-19)**: 아래 중 취소선이 그어진 10건은 1차에서 처리했다.

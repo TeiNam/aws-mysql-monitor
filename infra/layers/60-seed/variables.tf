@@ -89,9 +89,21 @@ variable "allowed_client_cidrs" {
   type        = list(string)
   default     = []
 
+  # **리터럴 denylist 는 fail-open 이다.** `0.0.0.0/0` 만 막으면 의미가 같은 값들이
+  # 통과한다 (HCL 만으로 격리 검증한 결과):
+  #
+  #   ["0.0.0.0/0"]                      → BLOCKED
+  #   ["0.0.0.0/1", "128.0.0.0/1"]       → ACCEPTED  (IPv4 전체)
+  #   ["0.0.0.0/4"], ["0.0.0.0/8"]       → ACCEPTED
+  #
+  # `publicly_accessible` 기본값이 `true` 이므로 이 값들은 **인터넷에 열린 MySQL** 이다.
+  # 접두 길이 하한이 fail-closed 형태다.
   validation {
-    condition     = !contains(var.allowed_client_cidrs, "0.0.0.0/0")
-    error_message = "0.0.0.0/0 을 허용할 수 없다. 개발자 IP 를 /32 로 넣는다."
+    condition = alltrue([
+      for c in var.allowed_client_cidrs :
+      can(regex("^[0-9.]+/[0-9]+$", c)) && tonumber(split("/", c)[1]) >= 24
+    ])
+    error_message = "각 CIDR 의 접두 길이는 /24 이상이어야 한다. /0~/23 은 너무 넓다 — 개발자 IP 를 /32 로 넣는다."
   }
 
   # 빈 목록이면 인바운드 규칙이 0개다. "안전한 기본값" 은 맞지만 그 결과가

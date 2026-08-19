@@ -67,6 +67,20 @@ pub fn plan_query(sql: &str) -> Option<PlanQuery> {
         return None;
     }
     let (toks, spans, unterminated) = Lexer::new(sql).tokenize_with_spans();
+    // **바인딩 자리표가 남은 텍스트를 거부한다.**
+    //
+    // 전문 SQL 이 없으면 호출자가 `DIGEST_TEXT` 를 넘긴다. 거기에는 리터럴이 `?` 로,
+    // 축약된 그룹이 `(...)` 로 치환돼 있다. 그걸 `EXPLAIN` 뒤에 붙이면 prepared statement
+    // 밖이라 **항상 `ERROR 1064`** 다 — 즉 실패가 보장된 쿼리를 대상 DB 로 보낸다.
+    // `max_plan_attempts` 만큼 반복되므로 "대상 DB 에 부하를 주지 않는다" 는 전제와 어긋난다.
+    //
+    // 리터럴 **안**의 `?` 는 무해하다(`WHERE memo = 'why?'`). 그래서 문자열이 아니라
+    // **토큰**을 본다 — 그게 자리표와 실제 물음표를 가르는 기준이다.
+    // 렉서는 이미 둘을 구분한다: `Tok::Param` 은 **입력에 있던** `?`,
+    // `Tok::Placeholder` 는 우리가 리터럴을 마스킹한 결과다. 전자만 거부한다.
+    if toks.iter().any(|t| matches!(t, Tok::Param | Tok::Ellipsis)) {
+        return None;
+    }
     if unterminated {
         // 인용부호가 닫히지 않았다 → 잘린 SQL 이다. 실행하면 구문 오류이거나,
         // 더 나쁘게는 **의도와 다른 문장**이 된다. 시도하지 않는다.

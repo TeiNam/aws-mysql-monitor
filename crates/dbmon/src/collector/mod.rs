@@ -228,87 +228,23 @@ where
         stats.deep_probed = targets.len();
 
         if !targets.is_empty() {
-            // **`unwrap_or_default()` 로 삼키면 안 된다.** 조회가 권한 오류(1142)나
-            // 타임아웃으로 실패하면 빈 Vec 이 되고, 그대로 진행하면 `sql_text=None`,
-            // `app_digest="unknown-<tid>"`, 지표 전부 None 인 레코드가 저장된다.
-            // tick 은 `Ok` 를 반환하므로 헬스·서킷도 정상으로 본다 — 운영자가 원인을
-            // 알 방법이 없다. 실패를 세고 로그로 남긴 뒤 **선행 저장을 건너뛴다.**
-            let full = match self.db.full_sql(&targets).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    stats.deep_probe_failed += targets.len();
-                    tracing::warn!(
-                        instance = %self.instance.id,
-                        targets = targets.len(),
-                        error = %e,
-                        "전문 SQL 조회 실패 — 이 tick 은 선행 저장을 건너뛴다"
-                    );
-                    return Ok(stats);
-                }
-            };
-            let stmts = match self.db.stmt_current(&targets).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    stats.deep_probe_failed += targets.len();
-                    tracing::warn!(
-                        instance = %self.instance.id,
-                        targets = targets.len(),
-                        error = %e,
-                        "정확 지표 조회 실패 — 이 tick 은 선행 저장을 건너뛴다"
-                    );
-                    return Ok(stats);
-                }
-            };
-
-            for id in &targets {
-                let f = full.iter().find(|r| r.id == *id);
-                let s = stmts.iter().find(|r| r.processlist_id == *id);
-                self.tracker.record_deep_probe(
-                    *id,
-                    s.and_then(|s| s.digest.clone()),
-                    s.and_then(|s| s.timer_wait_ps),
-                    now_ms,
-                    &self.offset,
+            // **실패해도 아래 확정 루프는 반드시 돈다.**
+            //
+            // `tracker.tick()` 은 이미 캐시에서 엔트리를 제거해 `tick.finalized` 로
+            // 넘겼다. 여기서 조기 반환하면 그 Vec 이 버려지고 엔트리는 캐시에도 없으므로
+            // **다시는 확정되지 않는다** — `duration_ms`·`ended_at_ms`·`Finalized` 가
+            // 영구 유실되고 레코드가 `in_flight` 고아로 남는다.
+            //
+            // 확정 경로는 `full_sql: None, stmt: None` 이라 이 두 조회를 쓰지도 않는다.
+            // 즉 실패의 영향은 **선행 저장에만** 국한돼야 한다.
+            if let Err(e) = self.prefetch_save(&targets, now_ms, &mut stats).await {
+                stats.deep_probe_failed += targets.len();
+                tracing::warn!(
+                    instance = %self.instance.id,
+                    targets = targets.len(),
+                    error = %e,
+                    "심층 조회 실패 — 선행 저장만 건너뛴다 (확정은 계속한다)"
                 );
-
-                let plan = self.collect_plan(*id, f, s, &mut stats).await;
-                self.tracker.record_plan_attempt(*id, plan.json.is_some());
-
-                // **선행 저장** — 정규화·마스킹을 거친 형태로 (F2).
-                if let Some(tracked) = self.tracker.get(*id) {
-                    let out = build(CaptureInput {
-                        instance: &self.instance,
-                        tracked,
-                        full_sql: f.and_then(|r| r.info.as_deref()),
-                        stmt: s,
-                        plan_json: plan.json.as_deref(),
-                        plan_source: plan.source,
-                        plan_error: plan.error.clone(),
-                        plan_tree: None,
-                        policy: self.params.literal_policy,
-                        policy_at_ms: now_ms,
-                        state: SlowQueryState::InFlight,
-                        finalize_reason: None,
-                        now_ms,
-                        offset: &self.offset,
-                        owner_worker: &self.params.worker_id,
-                        owner_epoch: self.epoch,
-                    });
-                    stats.masking_degraded += usize::from(out.masking_degraded);
-                    stats.plan_redactions += out.plan_redactions;
-                    match self.store.upsert_merged(&out.query).await {
-                        Ok(_) => stats.prefetch_saved += 1,
-                        Err(e) => {
-                            stats.store_errors += 1;
-                            tracing::warn!(
-                                instance = %self.instance.id,
-                                thread_id = id,
-                                error = %e,
-                                "선행 저장 실패"
-                            );
-                        }
-                    }
-                }
             }
         }
 
@@ -354,6 +290,82 @@ where
         }
 
         Ok(stats)
+    }
+
+    /// 대상 DB 어댑터. **페이크에 실패를 주입하는 테스트가 쓴다.**
+    ///
+    /// 실패 경로(권한 오류·타임아웃)는 실제 MySQL 로 원하는 순간에 만들 수 없는데,
+    /// 이 코드베이스에서 가장 위험한 결함들이 전부 그 경로에 있었다.
+    pub fn db_mut(&mut self) -> &mut D {
+        &mut self.db
+    }
+
+    /// 심층 조회 + 선행 저장. **확정과 분리되어 있다** — 여기서 실패해도 호출자는
+    /// 확정 루프를 계속 돌려야 한다 (그러지 않으면 확정이 영구 유실된다).
+    async fn prefetch_save(
+        &mut self,
+        targets: &[u64],
+        now_ms: dbmon_core::time::EpochMs,
+        stats: &mut TickStats,
+    ) -> Result<()> {
+        // **`unwrap_or_default()` 로 삼키면 안 된다.** 권한 오류(1142)·타임아웃으로
+        // 빈 Vec 이 되면 `sql_text=None`, `app_digest="unknown-<tid>"`, 지표 전부 None 인
+        // 레코드가 저장되고 tick 은 `Ok` 를 반환해 헬스·서킷도 정상으로 본다.
+        let full = self.db.full_sql(targets).await?;
+        let stmts = self.db.stmt_current(targets).await?;
+
+        for id in targets {
+            let f = full.iter().find(|r| r.id == *id);
+            let s = stmts.iter().find(|r| r.processlist_id == *id);
+            self.tracker.record_deep_probe(
+                *id,
+                s.and_then(|s| s.digest.clone()),
+                s.and_then(|s| s.timer_wait_ps),
+                now_ms,
+                &self.offset,
+            );
+
+            let plan = self.collect_plan(*id, f, s, stats).await;
+            self.tracker.record_plan_attempt(*id, plan.json.is_some());
+
+            // **선행 저장** — 정규화·마스킹을 거친 형태로 (F2).
+            if let Some(tracked) = self.tracker.get(*id) {
+                let out = build(CaptureInput {
+                    instance: &self.instance,
+                    tracked,
+                    full_sql: f.and_then(|r| r.info.as_deref()),
+                    stmt: s,
+                    plan_json: plan.json.as_deref(),
+                    plan_source: plan.source,
+                    plan_error: plan.error.clone(),
+                    plan_tree: None,
+                    policy: self.params.literal_policy,
+                    policy_at_ms: now_ms,
+                    state: SlowQueryState::InFlight,
+                    finalize_reason: None,
+                    now_ms,
+                    offset: &self.offset,
+                    owner_worker: &self.params.worker_id,
+                    owner_epoch: self.epoch,
+                });
+                stats.masking_degraded += usize::from(out.masking_degraded);
+                stats.plan_redactions += out.plan_redactions;
+                match self.store.upsert_merged(&out.query).await {
+                    Ok(_) => stats.prefetch_saved += 1,
+                    Err(e) => {
+                        stats.store_errors += 1;
+                        tracing::warn!(
+                            instance = %self.instance.id,
+                            thread_id = id,
+                            error = %e,
+                            "선행 저장 실패"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 플랜을 얻는다. 세 경로를 순서대로 시도한다.

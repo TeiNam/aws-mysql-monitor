@@ -24,7 +24,7 @@ use dbmon_core::instance::Instance;
 use dbmon_core::ports::target_db::StmtCurrentRow;
 use dbmon_core::slow_query::{
     CaptureSource, DurationSource, ExecStats, LiteralPolicy, PlanBundle, PlanSource, SlowQuery,
-    SlowQueryState,
+    SlowQueryState, UNKNOWN_DIGEST_PREFIX,
 };
 use dbmon_core::time::EpochMs;
 use dbmon_normalize::{DIGEST_ALGO_VERSION, StatementType, normalize};
@@ -93,11 +93,15 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
     // 둘 다 없으면 다이제스트를 계산할 수 없다.
     let digest_text = stmt.and_then(|s| s.digest_text.as_deref());
     let ps_sql = stmt.and_then(|s| s.sql_text.as_deref());
-    let full_sql = pick_sql_text(full_sql, ps_sql);
+    let picked = pick_sql_text(full_sql, ps_sql);
+    let full_sql = picked.map(|p| p.text);
     let source_text = full_sql.or(digest_text);
     let normalized = source_text.map(normalize);
 
-    let sql_text_truncated = full_sql.is_some_and(|s| s.len() >= IS_PROCESSLIST_INFO_MAX_BYTES);
+    // **플래그는 채택한 소스의 속성이다.** 두 소스의 상한이 다르므로(IS 65,535 /
+    // PS 기본 1,024) 한쪽 기준으로만 판정하면 잘린 SQL 이 "잘리지 않았다" 로 저장된다.
+    let sql_text_truncated = picked.is_some_and(|p| p.maybe_truncated);
+    let sql_text_lossy = picked.is_some_and(|p| p.lossy);
 
     // 마스킹 후조건은 **`masked` 정책에서만** 강제한다. `full` 은 원문을 저장하는 것이
     // 의도이므로 리터럴이 남아 있는 것이 정상이다.
@@ -185,7 +189,7 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
         .map(|n| n.app_digest.clone())
         // 텍스트가 전혀 없으면 다이제스트를 만들 수 없다. 빈 문자열로 두면 집계가
         // 오염되므로 스레드 기반의 명시적 자리표를 쓴다.
-        .unwrap_or_else(|| format!("unknown-{}", tracked.thread_id));
+        .unwrap_or_else(|| format!("{UNKNOWN_DIGEST_PREFIX}{}", tracked.thread_id));
 
     let statement_type = normalized
         .as_ref()
@@ -216,6 +220,7 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
             duration_source,
             sql_text,
             sql_text_truncated,
+            sql_text_lossy,
             literal_policy: effective_policy,
             literal_policy_at_ms: policy_at_ms,
             app_digest,
@@ -273,13 +278,56 @@ fn exec_stats(s: &StmtCurrentRow) -> ExecStats {
 /// `performance_schema_max_sql_text_length` 를 읽어 비교하면 인스턴스마다 값을 캐시해야
 /// 하고 설정 변경을 놓친다. 대신 **문자 수**를 비교한다 — `?` 치환은 1문자를 1문자로
 /// 바꾸므로 두 소스의 문자 수는 절단이 없을 때만 같다.
-fn pick_sql_text<'a>(is_text: Option<&'a str>, ps_text: Option<&'a str>) -> Option<&'a str> {
+fn pick_sql_text<'a>(is_text: Option<&'a str>, ps_text: Option<&'a str>) -> Option<PickedSql<'a>> {
+    // PS 상한은 설정(`performance_schema_max_sql_text_length`)으로 바뀌므로 값을
+    // 하드코딩하지 않는다. 대신 **IS 와 비교**해 절단 여부를 추론한다.
     match (is_text, ps_text) {
-        // PS 가 IS 보다 짧지 않으면 PS 는 절단되지 않았다 → 무손실 쪽을 쓴다.
-        (Some(is), Some(ps)) if ps.chars().count() >= is.chars().count() => Some(ps),
-        (Some(is), _) => Some(is),
-        (None, ps) => ps,
+        (Some(is), Some(ps)) => {
+            let (is_chars, ps_chars) = (is.chars().count(), ps.chars().count());
+            if ps_chars >= is_chars {
+                // PS 가 짧지 않다 → 절단되지 않았다 → 무손실 쪽을 쓴다.
+                Some(PickedSql {
+                    text: ps,
+                    maybe_truncated: is.len() >= IS_PROCESSLIST_INFO_MAX_BYTES,
+                    lossy: false,
+                })
+            } else {
+                // PS 가 잘렸다 → IS 를 쓴다. IS 는 `utf8mb3` 라 4바이트 문자를 잃었을 수 있다.
+                Some(PickedSql {
+                    text: is,
+                    maybe_truncated: is.len() >= IS_PROCESSLIST_INFO_MAX_BYTES,
+                    // 문자 수가 같으면 손실이 없다(`?` 치환은 1문자를 1문자로 바꾼다).
+                    // 다르면 PS 가 잘려서 비교 자체가 불가능하므로 "알 수 없음" 이다.
+                    lossy: true,
+                })
+            }
+        }
+        (Some(is), None) => Some(PickedSql {
+            text: is,
+            maybe_truncated: is.len() >= IS_PROCESSLIST_INFO_MAX_BYTES,
+            // 비교 대상이 없으니 손실 여부를 알 수 없다. 보수적으로 표시한다.
+            lossy: true,
+        }),
+        (None, Some(ps)) => Some(PickedSql {
+            text: ps,
+            // **IS 가 없으면 PS 의 절단을 판정할 근거가 없다.** IS 행이 사라지는 것은
+            // 정상 경로다(두 조회 사이에 스레드가 끝난다). 근거 없이 `false` 를 박으면
+            // 잘린 SQL 을 전문으로 오독하게 되므로 보수적으로 표시한다.
+            maybe_truncated: true,
+            lossy: false,
+        }),
+        (None, None) => None,
     }
+}
+
+/// [`pick_sql_text`] 의 결과. 텍스트와 **그 텍스트의 품질**을 함께 나른다.
+#[derive(Debug, Clone, Copy)]
+struct PickedSql<'a> {
+    text: &'a str,
+    /// 절단됐을 수 있다. 판정 근거가 없을 때도 `true` 다 (보수적).
+    maybe_truncated: bool,
+    /// 4바이트 문자가 `?` 로 손실됐을 수 있다 (`utf8mb3` 소스).
+    lossy: bool,
 }
 
 /// 파싱 실패 사유를 짧게. **원문을 포함하지 않는다.**
@@ -543,7 +591,7 @@ mod tests {
         let out = build(input(&i, &t, &o, LiteralPolicy::Full, None));
         assert_eq!(out.query.sql_text, None);
         assert!(
-            out.query.app_digest.starts_with("unknown-"),
+            out.query.app_digest.starts_with(UNKNOWN_DIGEST_PREFIX),
             "{}",
             out.query.app_digest
         );

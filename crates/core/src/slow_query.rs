@@ -22,6 +22,29 @@ pub enum LiteralPolicy {
 }
 
 impl LiteralPolicy {
+    /// 제한 강도. 큰 값이 더 제한적이다.
+    ///
+    /// **선언 순서에 의존하지 않는다.** derive 한 `Ord` 는 선언 순서를 따르는데
+    /// 이 enum 은 `Full` 이 먼저라 `min()` 이 **가장 느슨한** 값을 준다. 보안 결정을
+    /// 선언 순서에 맡기면 누가 variant 를 재배치하는 순간 fail-open 이 된다.
+    pub fn restrictiveness(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::FullRestricted => 1,
+            Self::Masked => 2,
+            Self::Off => 3,
+        }
+    }
+
+    /// 둘 중 **더 제한적인** 쪽. 정책이 갈렸을 때의 안전한 방향이다.
+    pub fn more_restrictive(self, other: Self) -> Self {
+        if other.restrictiveness() > self.restrictiveness() {
+            other
+        } else {
+            self
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -229,6 +252,16 @@ pub struct SlowQuery {
     /// 정책이 적용된 SQL 텍스트. `Off` 정책이면 `None`.
     pub sql_text: Option<String>,
     pub sql_text_truncated: bool,
+    /// 4바이트 문자가 `?` 로 **손실됐을 수 있다.**
+    ///
+    /// `information_schema.PROCESSLIST.INFO` 는 `utf8mb3` 라 이모지·확장 CJK 를
+    /// `?` 한 바이트로 치환한다([19 §A-2](../../../docs/19-m1-findings.md) 실측).
+    /// 무손실 소스(`events_statements_current.SQL_TEXT`)는 1,024바이트에서 잘리므로,
+    /// 긴 SQL 에서는 **손실본을 쓸 수밖에 없다.**
+    ///
+    /// 이 플래그가 없으면 운영자가 저장된 SQL 을 복사해 재현할 때 **다른 쿼리**가 되고
+    /// 왜 다른지 알 수 없다. UI 는 이 값이 참이면 경고를 붙인다.
+    pub sql_text_lossy: bool,
     /// **선행 저장 시점의 정책을 고정한다** (F2 / A3-2). 확정 시에도 이 정책을 쓴다.
     pub literal_policy: LiteralPolicy,
     pub literal_policy_at_ms: EpochMs,
@@ -264,6 +297,15 @@ impl SlowQuery {
     }
 }
 
+/// 다이제스트를 계산할 수 없을 때 쓰는 **자리표** 접두어.
+///
+/// 심층 조회가 상한(`deep_probe_limit`)에 걸리거나 실패하면 SQL 텍스트가 없어
+/// `app_digest` 를 계산할 수 없다. 그때 `unknown-<thread_id>` 를 넣는다.
+///
+/// **병합에서 이 값은 "없음" 과 같이 취급해야 한다.** 값으로 취급하면 나중에 도착한
+/// 슬로우로그의 진짜 다이제스트를 이겨 그 실행이 영구히 어느 그룹에도 속하지 않는다.
+pub const UNKNOWN_DIGEST_PREFIX: &str = "unknown-";
+
 /// `duration_source` 별 정확도 순위. 병합 시 큰 쪽이 이긴다.
 pub fn duration_rank(s: DurationSource) -> u8 {
     match s {
@@ -276,6 +318,35 @@ pub fn duration_rank(s: DurationSource) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **선언 순서에 의존하지 않는다는 것**을 고정한다.
+    #[test]
+    fn restrictiveness_order_is_explicit_not_declaration_order() {
+        use LiteralPolicy::*;
+        assert!(Off.restrictiveness() > Masked.restrictiveness());
+        assert!(Masked.restrictiveness() > FullRestricted.restrictiveness());
+        assert!(FullRestricted.restrictiveness() > Full.restrictiveness());
+
+        // derive 한 Ord 는 **반대 방향**이다. 이 단정이 그 함정을 기록한다.
+        assert!(Full < Masked, "선언 순서상 Full 이 작다");
+        assert_eq!(
+            Full.min(Masked),
+            Full,
+            "min() 은 가장 느슨한 값을 준다 — 보안 결정에 쓰면 안 된다"
+        );
+
+        // 교환법칙.
+        for (a, b) in [
+            (Full, Masked),
+            (Masked, Full),
+            (Off, Full),
+            (FullRestricted, Masked),
+        ] {
+            assert_eq!(a.more_restrictive(b), b.more_restrictive(a));
+        }
+        assert_eq!(Full.more_restrictive(Masked), Masked);
+        assert_eq!(Off.more_restrictive(Full), Off);
+    }
 
     #[test]
     fn literal_policy_semantics() {

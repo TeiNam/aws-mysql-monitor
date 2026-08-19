@@ -62,11 +62,11 @@ pub fn parse_failure_fingerprint(input: &str, byte_offset: usize) -> String {
 /// 백틱까지 지우는 이유: MySQL 에러의 `` `db`.`table` `` 은 스키마 정보이고,
 /// 스키마 이름이 사업 정보를 담는 경우가 있다.
 pub fn scrub(input: &str) -> String {
-    const QUOTES: [char; 3] = ['\'', '"', '`'];
-    let is_quote = |c: char| QUOTES.contains(&c);
-
     // 인용부호가 하나라도 있으면 첫 것부터 마지막 것까지 전부 버린다.
-    let (head, tail) = match (input.find(is_quote), input.rfind(is_quote)) {
+    // 단 **영문 축약형의 어포스트로피는 인용부호가 아니다** (아래 참조).
+    let find_q = |from: usize| next_quote(input, from, false);
+    let rfind_q = || next_quote(input, input.len(), true);
+    let (head, tail) = match (find_q(0), rfind_q()) {
         // 여는 부호와 닫는 부호가 따로 있다 → 그 사이를 버리고 양쪽을 남긴다.
         (Some(first), Some(last)) if last > first => (&input[..first], &input[last + 1..]),
         // 인용부호가 **하나뿐**이다 → 닫히지 않았으므로 뒤를 전부 버린다.
@@ -82,6 +82,46 @@ pub fn scrub(input: &str) -> String {
     }
     out.push_str(&mask_digit_runs(tail));
     out
+}
+
+/// 인용부호를 찾는다. **영문 축약형(`Can't`, `doesn't`, `isn't`)의 어포스트로피는 건너뛴다.**
+///
+/// MySQL 에러의 절반 이상이 축약형으로 시작한다:
+///
+/// ```text
+/// Can't connect to MySQL server on 'db.internal' (111 "Connection refused")
+/// Table 'shop.t' doesn't exist
+/// ```
+///
+/// 축약형의 `'` 를 여는 인용부호로 보면 그 뒤 마지막 인용부호까지 전부 버려져
+/// **메시지가 `Can'?'` 하나로 붕괴한다.** 운영자가 "연결 거부"와 "접근 거부"를
+/// 구분할 수 없게 되는데, 그건 이 도구의 자가진단 전체를 무력화한다.
+///
+/// 판정 규칙: `'` 의 **양옆이 모두 ASCII 알파벳**이면 축약형이다. 인용부호는
+/// 값을 감싸므로 최소 한쪽이 공백·괄호·문장 끝이다. `'s`·`'t`·`'re`·`'ll` 를
+/// 열거하지 않는 이유는 새 형태가 나올 때 다시 벌어지기 때문이다.
+fn next_quote(input: &str, from: usize, backward: bool) -> Option<usize> {
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+    let bytes = input.as_bytes();
+    let is_alpha = |i: usize| bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic());
+    let is_contraction =
+        |i: usize| bytes[i] == b'\'' && i > 0 && is_alpha(i - 1) && is_alpha(i + 1);
+
+    let indices: Box<dyn Iterator<Item = usize>> = if backward {
+        Box::new((0..from).rev())
+    } else {
+        Box::new(from..input.len())
+    };
+    for i in indices {
+        if !input.is_char_boundary(i) {
+            continue;
+        }
+        let c = input[i..].chars().next()?;
+        if QUOTES.contains(&c) && !is_contraction(i) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// 3자리 이상 연속 숫자를 `?` 로. 에러 코드(`1064`)는 4자리라 지워지지만, 그건
@@ -148,6 +188,54 @@ pub fn init(json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **영문 축약형의 어포스트로피를 인용부호로 보면 메시지가 붕괴한다.**
+    ///
+    /// MySQL 에러의 절반 이상이 `Can't`·`doesn't` 로 시작한다. 축약형을 여는 인용부호로
+    /// 보면 그 뒤 전부가 버려져 `Can'?'` 하나만 남고, 운영자가 "연결 거부" 와
+    /// "접근 거부" 를 구분할 수 없게 된다 — 자가진단이 무력화된다.
+    #[test]
+    fn contractions_do_not_swallow_the_diagnostic() {
+        let cases = [
+            (
+                "Can't connect to MySQL server on 'db.internal' (111 \"refused\")",
+                "Can't connect to MySQL server on",
+                "db.internal",
+            ),
+            (
+                "Table 'shop.nosuchtable' doesn't exist",
+                "doesn't exist",
+                "nosuchtable",
+            ),
+            (
+                "Can't find FULLTEXT index matching the column list",
+                "FULLTEXT index matching",
+                "\u{0}", // 유출 후보 없음 — 원문이 그대로 남아야 한다
+            ),
+        ];
+        for (input, must_keep, must_drop) in cases {
+            let out = scrub(input);
+            assert!(
+                out.contains(must_keep),
+                "진단이 사라졌다\n  입력: {input}\n  출력: {out}"
+            );
+            if must_drop != "\u{0}" {
+                assert!(
+                    !out.contains(must_drop),
+                    "값이 유출됐다: {must_drop}\n  출력: {out}"
+                );
+            }
+        }
+    }
+
+    /// 축약형 예외가 **실제 인용 구간을 열어주지는 않아야** 한다.
+    #[test]
+    fn contraction_exception_does_not_open_a_leak() {
+        // `'kim` 은 앞이 공백이므로 축약형이 아니다 → 인용부호로 본다.
+        let out = scrub("user isn't allowed: 'kim@example.com' rejected");
+        assert!(!out.contains("kim@example.com"), "유출: {out}");
+        assert!(out.contains("isn't allowed"), "진단 손실: {out}");
+    }
 
     /// **인용부호 짝맞추기로는 안 된다.** MySQL 에러는 `near '<조각>'` 형태이고
     /// 그 조각 안에 또 인용부호가 있으므로 짝이 한 칸씩 밀려 내용이 새어 나왔다.

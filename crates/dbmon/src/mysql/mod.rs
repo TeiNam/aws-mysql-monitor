@@ -50,7 +50,16 @@ pub struct Timeouts {
     /// `detect` 만 제한하면 총 소요가 `connect + detect` 까지 늘어난다(5,000 + 800ms).
     /// 그러면 1초 케이던스가 무너지고 tick 이 겹쳐 쌓인다. 콜드 경로에 5초가 실제로
     /// 필요하므로 `connect` 를 줄이는 대신 **경로 전체**를 한 interval 안으로 묶는다 —
-    /// 초과하면 그 tick 을 버리고, 그 사이 풀은 커넥션을 확보하므로 다음 tick 은 warm 이다.
+    /// # ⚠ 취소는 진행 중인 연결 수립을 **버린다**
+    ///
+    /// `mysql_async` 의 `GetConn::drop` 은 `Connecting` 상태면 `pool.cancel_connection()`
+    /// 을 호출한다 — TLS 핸드셰이크 + IAM 토큰 인증이 폐기되고 풀에 남지 않는다.
+    /// 따라서 "초과해도 다음 tick 은 warm" 은 **사실이 아니다.** 콜드 상태에서 이 값이
+    /// `connect` 보다 작으면 "연결 시작 → 컷 → 취소" 를 매 tick 반복해 `probe` 가
+    /// 한 번도 성공하지 못할 수 있다.
+    ///
+    /// 그래서 이 값은 **`connect` 보다 커야 한다.** `Timeouts::derive` 가 강제한다.
+    /// 조회 도중 취소는 안전하다(recycler 가 `cleanup_for_pool` 로 정리한다).
     pub detect_total: Duration,
     /// 심층 조회·플랜. tick 밖의 병렬 태스크에서 돈다.
     pub query: Duration,
@@ -66,12 +75,26 @@ pub const DEFAULT_DETECT_LIMIT: u64 = 500;
 
 impl Default for Timeouts {
     fn default() -> Self {
+        Self::derive(5_000, 800, 3_000, 30_000)
+    }
+}
+
+impl Timeouts {
+    /// 설정값에서 만든다. **`detect_total` 은 파생값이다** — 상수로 두면
+    /// `detect_timeout_ms` 설정이 조용히 무시된다(M27 과 같은 부류).
+    ///
+    /// `connect` 보다 크게 잡는 이유는 `detect_total` 문서에 있다: 작으면 콜드 경로에서
+    /// 연결 수립이 매번 취소되어 `probe` 가 영구히 실패할 수 있다.
+    pub fn derive(connect_ms: u64, detect_ms: u64, query_ms: u64, bulk_query_ms: u64) -> Self {
+        let connect = Duration::from_millis(connect_ms);
+        let detect = Duration::from_millis(detect_ms);
         Self {
-            connect: Duration::from_secs(5),
-            detect: Duration::from_millis(800),
-            detect_total: Duration::from_millis(1_000),
-            query: Duration::from_secs(3),
-            bulk_query: Duration::from_secs(30),
+            connect,
+            detect,
+            // 연결 수립(콜드)과 조회를 모두 담을 수 있어야 한다. 여유 20%.
+            detect_total: connect + detect + (connect + detect) / 5,
+            query: Duration::from_millis(query_ms),
+            bulk_query: Duration::from_millis(bulk_query_ms),
         }
     }
 }
@@ -90,6 +113,25 @@ impl TargetMysql {
     /// 풀을 만든다. **연결은 지연 생성**이므로 이 호출은 네트워크를 타지 않는다.
     pub fn connect(base: Opts, timeouts: Timeouts, label: impl Into<String>) -> Result<Self> {
         Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label)
+    }
+
+    /// **설정에서 만든다. 프로덕션 조립은 이것만 쓴다.**
+    ///
+    /// `connect` / `connect_with_limit` 을 직접 부르면 `collector.detect_limit` 과
+    /// 타임아웃 설정이 조용히 무시된다 — 실제로 그런 상태였다(M27 을 고쳤는데 호출부가
+    /// 없어서 무효였다). 설정에서 파생시키는 경로를 하나로 만들어 그 실수를 막는다.
+    pub fn from_config(
+        base: Opts,
+        cfg: &crate::config::CollectorConfig,
+        label: impl Into<String>,
+    ) -> Result<Self> {
+        let timeouts = Timeouts::derive(
+            cfg.connect_timeout_ms,
+            cfg.detect_timeout_ms,
+            cfg.query_timeout_ms,
+            cfg.bulk_query_timeout_ms,
+        );
+        Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label)
     }
 
     pub fn connect_with_limit(
@@ -133,7 +175,14 @@ impl TargetMysql {
     /// **메시지를 마스킹한다** — 서버 오류 메시지에는 실패한 문장의 조각과 리터럴이
     /// 들어 있다(`Duplicate entry 'kim@example.com' for key …`).
     fn map_err(&self, e: mysql_async::Error) -> DomainError {
-        let reason = format!("{}: {}", self.label, Scrubbed(&e));
+        // **에러 코드를 마스킹 밖에 둔다.** `scrub` 은 3자리 이상 숫자를 `?` 로 지우므로
+        // 메시지 안의 `1045`·`1146` 도 사라진다. 그런데 그 코드가 운영자에게 가장 필요한
+        // 정보다 — "연결 거부(2003)"·"접근 거부(1045)"·"테이블 없음(1146)" 을 구분하는
+        // 유일한 단서다. `Scrubbed` 는 자기 내용만 마스킹하므로 밖에 붙인 코드는 남는다.
+        let reason = match server_error_code(&e) {
+            Some(code) => format!("{}: [mysql {code}] {}", self.label, Scrubbed(&e)),
+            None => format!("{}: {}", self.label, Scrubbed(&e)),
+        };
         match server_error_code(&e) {
             // 권한 문제는 재시도가 무의미하다. 자가진단으로 승격해 GRANT 를 고치게 한다.
             Some(1044 | 1045 | 1142 | 1227) => DomainError::Forbidden { action: reason },
@@ -508,6 +557,25 @@ pub fn is_info_truncated(info: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **설정이 실제로 반영되는지** 확인한다. `from_config` 없이 `connect()` 를 쓰면
+    /// `detect_limit` 과 타임아웃이 상수에 밀려 조용히 무시된다.
+    #[test]
+    fn from_config_propagates_settings() {
+        // 설정값을 그대로 파생시킨다.
+        let t = Timeouts::derive(4_000, 600, 3_000, 30_000);
+        assert_eq!(t.detect, Duration::from_millis(600));
+        assert_eq!(t.connect, Duration::from_millis(4_000));
+        // **`detect_total` 은 `connect` 보다 커야 한다** — 작으면 콜드 경로에서
+        // 연결 수립이 매 tick 취소되어 probe 가 영구히 실패한다.
+        assert!(
+            t.detect_total > t.connect,
+            "detect_total({:?}) 이 connect({:?}) 보다 커야 한다",
+            t.detect_total,
+            t.connect
+        );
+        assert!(t.detect_total >= t.connect + t.detect);
+    }
     use super::*;
 
     #[test]

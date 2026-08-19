@@ -306,11 +306,13 @@ fn find_query_cost(v: &serde_json::Value) -> Option<f64> {
     fn scan(v: &serde_json::Value, best: &mut Option<f64>) {
         match v {
             serde_json::Value::Object(m) => {
-                if let Some(c) = m
+                let candidate = m
                     .get("cost_info")
                     .and_then(|c| c.get("query_cost"))
                     .and_then(as_f64)
-                {
+                    // v2 노드는 `estimated_total_cost` 를 쓴다.
+                    .or_else(|| m.get("estimated_total_cost").and_then(as_f64));
+                if let Some(c) = candidate {
                     *best = Some(best.map_or(c, |b: f64| b.max(c)));
                 }
                 for child in m.values() {
@@ -321,12 +323,25 @@ fn find_query_cost(v: &serde_json::Value) -> Option<f64> {
             _ => {}
         }
     }
-    // ① 최상위 우선. `query_block.cost_info.query_cost`(v1) 를 직접 본다.
+    // ① v1 최상위: `query_block.cost_info.query_cost`.
     if let Some(top) = v
         .get("query_block")
         .or(Some(v))
         .and_then(|b| b.get("cost_info"))
         .and_then(|c| c.get("query_cost"))
+        .and_then(as_f64)
+    {
+        return Some(top);
+    }
+    // ② **v2 최상위: `query_plan.estimated_total_cost`.**
+    //
+    // v2 는 `cost_info.query_cost` 를 쓰지 않는다 — 키 이름이 완전히 다르다.
+    // 이걸 읽지 않으면 MySQL 9.x(v2 가 기본값)에서 `query_cost` 가 **항상 `None`** 이고
+    // "가장 비싼 쿼리" 리포트가 빈다. 8.4.11 실측으로 확인했다.
+    if let Some(top) = v
+        .get("query_plan")
+        .or(Some(v))
+        .and_then(|b| b.get("estimated_total_cost"))
         .and_then(as_f64)
     {
         return Some(top);

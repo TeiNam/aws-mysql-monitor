@@ -43,8 +43,6 @@ const SAFE_KEYS: &[&str] = &[
     "sort_cost",
     "table_name",
     "table_type",
-    "used_columns",
-    "used_key_parts",
     "using_MRR",
     "using_filesort",
     "using_index",
@@ -72,12 +70,28 @@ const EXPR_KEYS: &[&str] = &[
     // SAFE_KEYS 에 있으면 `mask_str` 이 **먼저** 반환해 마스킹을 아예 시도하지 않고,
     // `redactions` 도 0 이라 후조건이 걸리지 않는다 — 무성 유출이다.
     "ranges",
-    // v2 의 **주 조건식 캐리어**다. v1 에는 이 키가 없다. 실측:
-    // `"operation": "Filter: ((orders.memo = 'kim@example.com') and (orders.id between 100 and 200))"`
-    "operation",
     // v2 가 `attached_condition` 대신 쓰는 이름. 휴리스틱이 잡긴 하지만
     // 명시해 두는 편이 낫다 — 인용부호 없는 리터럴에는 휴리스틱이 약하다.
     "condition",
+    // **함수형 인덱스가 걸리면 컬럼명이 아니라 표현식이 들어온다.** 8.4.11 실측:
+    //
+    // ```sql
+    // CREATE TABLE fx (email VARCHAR(200),
+    //   INDEX idx ((CONCAT(email,'@internal-payroll.example.com'))));
+    // -- "used_columns": [..., "concat(`email`,_utf8mb4'@internal-payroll.example.com')"]
+    // -- "used_key_parts": ["concat(`email`,_utf8mb4'@internal-payroll.example.com')"]
+    // ```
+    //
+    // `SAFE_KEYS` 에 있으면 마스킹을 시도조차 하지 않고 `redactions` 도 0 이다 —
+    // `ranges`·`operation` 과 **글자 그대로 같은 무성 유출**이었다.
+    "used_columns",
+    "used_key_parts",
+    // v2 는 재작성된 문장 전문을 담고, const-table 최적화 시 **실제 행 데이터**까지 넣는다.
+    // 지금은 휴리스틱이 잡지만 가장 리터럴을 많이 담는 키이므로 명시한다.
+    "query",
+    "heading",
+    "lookup_condition",
+    "sort_fields",
     "index_condition",
     "pushed_condition",
     "having",
@@ -89,8 +103,71 @@ const EXPR_KEYS: &[&str] = &[
     "materialized_from_subquery_condition",
 ];
 
+/// **산문형 라벨** 키. 리터럴만 지우고 나머지는 원문 그대로 둔다.
+///
+/// v2 의 `operation` 은 사람이 읽는 트리 노드 라벨이다. SQL 정규화기를 적용하면
+/// 리터럴은 사라지지만 라벨도 함께 망가진다 (실측):
+///
+/// ```text
+/// IN : Limit: 10 row(s)
+/// OUT: LIMIT : ? ROW ( s )          ← 정규화기를 쓰면
+/// OUT: Limit: ? row(s)              ← 라벨 규칙을 쓰면
+///
+/// IN : Single-row index lookup on o using PRIMARY (id=5)
+/// OUT: single - ROW INDEX lookup ON o USING PRIMARY ( id = ? )
+/// OUT: Single-row index lookup on o using PRIMARY (id=?)
+/// ```
+///
+/// 라벨의 가치는 가독성이다. 대소문자·공백을 뒤섞으면 화면에서 쓸 수 없다.
+const LABEL_KEYS: &[&str] = &["operation", "heading"];
+
 /// 마스킹 실패 시 값을 대체하는 문자열. 원문을 남기는 것보다 정보를 버리는 쪽을 택한다.
 pub const REDACTED: &str = "<redacted>";
+
+/// 산문형 라벨에서 **리터럴만** 지운다. 나머지는 바이트 단위로 보존한다.
+///
+/// 지우는 것:
+/// - 인용부호로 감싼 구간 → `?`
+/// - **독립** 숫자 → `?` (식별자에 붙은 숫자는 남긴다: `t1`, `idx_2`)
+///
+/// 판정: 숫자 앞이 식별자 문자(`[A-Za-z_]` 또는 숫자)면 식별자의 일부다.
+/// `cost=1.25` 는 앞이 `=` 이므로 리터럴, `t1` 은 앞이 `t` 이므로 식별자다.
+fn mask_label(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            // 닫는 같은 부호까지(없으면 끝까지) 버린다.
+            out.push('?');
+            i += 1;
+            while i < b.len() && b[i] != c {
+                i += 1;
+            }
+            i += 1; // 닫는 부호
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let prev_is_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            if prev_is_ident {
+                out.push_str(&s[start..i]);
+            } else {
+                out.push('?');
+            }
+            continue;
+        }
+        // 멀티바이트 문자를 쪼개지 않는다.
+        let ch = s[i..].chars().next().expect("경계 확인됨");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
 
 /// 플랜 JSON 전체에서 리터럴을 제거한다.
 ///
@@ -117,14 +194,54 @@ fn walk(v: &Value, key: Option<&str>, redactions: &mut usize) -> Value {
             Value::Array(items.iter().map(|c| walk(c, key, redactions)).collect())
         }
         Value::String(s) => Value::String(mask_str(key, s, redactions)),
+        // **숫자도 리터럴일 수 있다.** `explain_json_format_version=2` 는 `LIMIT`/`OFFSET`
+        // 을 JSON 숫자로 내보낸다 (8.4.11 실측: `"limit_offset": 4242`).
+        // 문자열만 마스킹하면 후조건이 걸리지 않고 `redactions` 도 0 이다 — 지금 새는 값이
+        // PII 가 아니라 해도, MySQL 이 앞으로 어떤 조건 상수를 숫자로 내보내도
+        // **아무도 알아채지 못하는** 구조가 된다.
+        Value::Number(_) if !key.is_some_and(is_estimate_key) => {
+            *redactions += 1;
+            Value::String("?".to_string())
+        }
         other => other.clone(),
     }
+}
+
+/// 값이 **추정치·구조 정보**여서 보존해야 하는 숫자 키인가.
+///
+/// 플랜의 유용성은 이 숫자들에서 온다(비용·행수·순번). 반대로 `limit`·`offset` 처럼
+/// 쿼리에서 온 상수는 리터럴이다. allowlist 로 두는 이유: 새 MySQL 버전이 추가하는
+/// 숫자 키는 **기본적으로 마스킹**돼야 한다 (fail-closed).
+fn is_estimate_key(key: &str) -> bool {
+    const ESTIMATE_KEYS: &[&str] = &[
+        "select_id",
+        "rows_examined_per_scan",
+        "rows_produced_per_join",
+        "rows_for_plan",
+        "estimated_rows",
+        "estimated_total_cost",
+        "estimated_first_row_cost",
+        "filtered",
+        "key_length",
+        "used_key_parts_count",
+        "depth",
+        "index_dives_for_eq_ranges",
+        "chosen",
+    ];
+    ESTIMATE_KEYS.contains(&key)
+        // `*_cost`·`*_per_join` 같은 접미로 끝나는 비용 계열은 전부 추정치다.
+        || key.ends_with("_cost")
+        || key.ends_with("_per_join")
+        || key.ends_with("_per_scan")
 }
 
 fn mask_str(key: Option<&str>, s: &str, redactions: &mut usize) -> String {
     let k = key.unwrap_or("");
     if SAFE_KEYS.contains(&k) {
         return s.to_string();
+    }
+    if LABEL_KEYS.contains(&k) {
+        return mask_label(s);
     }
     if EXPR_KEYS.contains(&k) || may_contain_literal(s) {
         let (masked, ok) = mask_expression(s);
@@ -158,6 +275,136 @@ fn may_contain_literal(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **라벨은 읽을 수 있어야 한다.** SQL 정규화기를 적용하면 리터럴은 사라지지만
+    /// 대소문자·공백이 뒤섞여 화면에서 쓸 수 없게 된다.
+    #[test]
+    fn labels_stay_readable_while_literals_are_removed() {
+        let cases = [
+            ("Limit: 10 row(s)", "Limit: ? row(s)"),
+            (
+                "Single-row index lookup on o using PRIMARY (id=5)",
+                "Single-row index lookup on o using PRIMARY (id=?)",
+            ),
+            (
+                "Index range scan on orders using PRIMARY over (100 <= id <= 200)",
+                "Index range scan on orders using PRIMARY over (? <= id <= ?)",
+            ),
+            // `t1` 의 `1` 은 식별자의 일부다. `cost=1.25` 는 리터럴이다.
+            (
+                "Table scan on t1  (cost=1.25 rows=5)",
+                "Table scan on t1  (cost=? rows=?)",
+            ),
+            (
+                "Filter: (orders.memo = 'kim@example.com')",
+                "Filter: (orders.memo = ?)",
+            ),
+        ];
+        for (input, expected) in cases {
+            let plan = serde_json::json!({ "query_plan": { "operation": input } });
+            let (masked, _) = mask_plan(&plan);
+            let got = masked
+                .get("query_plan")
+                .and_then(|q| q.get("operation"))
+                .and_then(|o| o.as_str())
+                .expect("operation");
+            assert_eq!(got, expected, "\n  입력: {input}");
+        }
+    }
+
+    /// 라벨 규칙이 유출 경로가 되지 않아야 한다.
+    #[test]
+    fn label_rule_does_not_leak_quoted_values() {
+        for input in [
+            "Filter: (t.ssn = '900101-1234567')",
+            r#"Filter: (t.email = "kim@example.com")"#,
+            "Filter: (t.memo = '닫히지 않은 인용부호",
+        ] {
+            let plan = serde_json::json!({ "query_plan": { "operation": input } });
+            let (masked, _) = mask_plan(&plan);
+            let text = serde_json::to_string(&masked).expect("직렬화");
+            assert!(!text.contains("900101"), "{input} → {text}");
+            assert!(!text.contains("kim@example"), "{input} → {text}");
+            assert!(!text.contains("인용부호"), "{input} → {text}");
+        }
+    }
+
+    /// **함수형 인덱스는 `used_columns`·`used_key_parts` 에 표현식을 넣는다.**
+    /// 8.4.11 실측 출력이다.
+    #[test]
+    fn functional_index_expressions_are_masked() {
+        let plan = serde_json::json!({
+            "query_block": {
+                "table": {
+                    "table_name": "fx2",
+                    "key": "idx_lit",
+                    "used_columns": [
+                        "id", "email",
+                        "concat(`email`,_utf8mb4'@internal-payroll.example.com')"
+                    ],
+                    "used_key_parts": [
+                        "concat(`email`,_utf8mb4'@internal-payroll.example.com')"
+                    ]
+                }
+            }
+        });
+        let (masked, _) = mask_plan(&plan);
+        let text = serde_json::to_string(&masked).expect("직렬화");
+        assert!(
+            !text.contains("internal-payroll"),
+            "함수형 인덱스 표현식의 리터럴이 남았다: {text}"
+        );
+        // 컬럼명·인덱스명은 보존해야 플랜이 쓸모 있다.
+        assert!(text.contains("email"), "컬럼명이 사라졌다: {text}");
+        assert!(text.contains("idx_lit"), "인덱스명이 사라졌다: {text}");
+    }
+
+    /// **v2 는 `LIMIT`/`OFFSET` 을 JSON 숫자로 내보낸다.** 문자열만 마스킹하면
+    /// 후조건이 걸리지 않고 `redactions` 도 0 이다.
+    #[test]
+    fn numeric_query_literals_are_masked_but_estimates_survive() {
+        let plan = serde_json::json!({
+            "query_plan": {
+                "operation": "Limit table",
+                "limit": 5241,
+                "limit_offset": 4242,
+                // 추정치는 보존해야 한다 — 플랜의 유용성이 여기서 온다.
+                "estimated_rows": 60023.0,
+                "estimated_total_cost": 6053.25,
+                "select_id": 1,
+                "filtered": 100.0
+            }
+        });
+        let (masked, redactions) = mask_plan(&plan);
+        let text = serde_json::to_string(&masked).expect("직렬화");
+
+        assert!(!text.contains("4242"), "OFFSET 리터럴이 남았다: {text}");
+        assert!(!text.contains("5241"), "LIMIT 리터럴이 남았다: {text}");
+        assert!(
+            redactions >= 2,
+            "마스킹 흔적이 없다 (redactions={redactions})"
+        );
+
+        assert!(text.contains("60023"), "추정 행수가 사라졌다: {text}");
+        assert!(text.contains("6053.25"), "추정 비용이 사라졌다: {text}");
+        assert!(
+            text.contains("\"select_id\":1"),
+            "select_id 가 사라졌다: {text}"
+        );
+    }
+
+    /// 새 숫자 키는 **기본적으로 마스킹**돼야 한다 (fail-closed).
+    #[test]
+    fn unknown_numeric_keys_are_masked_by_default() {
+        let plan = serde_json::json!({ "query_block": { "future_mysql_constant": 900101 } });
+        let (masked, redactions) = mask_plan(&plan);
+        let text = serde_json::to_string(&masked).expect("직렬화");
+        assert!(
+            !text.contains("900101"),
+            "미지의 숫자 키가 통과했다: {text}"
+        );
+        assert_eq!(redactions, 1);
+    }
 
     /// T-16 — `explain_json_format_version=2` 의 실측 출력에 리터럴이 남으면 안 된다.
     ///

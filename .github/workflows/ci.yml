@@ -13,6 +13,13 @@ on:
     branches: [main]
   pull_request:
 
+# **최소 권한.** 명시하지 않으면 `GITHUB_TOKEN` 이 리포지토리 기본 권한을 받는다.
+# 기본값이 read-write 인 리포/조직에서는 `contents: write` 를 가진 토큰이
+# PR 브랜치에서 온 임의 코드(`scripts/check-docs.py`, Docker 빌드)와 같은 러너에 놓인다.
+# 포크 PR 은 GitHub 이 강제로 내리지만 같은 리포 브랜치 PR 과 `push: main` 은 아니다.
+permissions:
+  contents: read
+
 # 같은 브랜치에 새 푸시가 오면 진행 중인 실행을 취소한다.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

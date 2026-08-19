@@ -13,6 +13,10 @@ use crate::error::{DomainError, Result};
 use crate::ids::{InstanceId, RecordId};
 use crate::instance::{Instance, MISSING_THRESHOLD};
 use crate::merge::merge;
+use crate::ports::target_db::{
+    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
+    ProcessRow, StmtCurrentRow, TargetDb,
+};
 use crate::ports::{
     DigestStore, DigestTextEntry, InstanceRegistry, LEASE_TTL_MS, Lease, LeaseStore, SlowQueryStore,
 };
@@ -21,7 +25,7 @@ use crate::slow_query::SlowQuery;
 use crate::time::{Clock, EpochMs, TimeRange};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 주입 가능한 시계. `advance()` 로 시간을 밀어 상태 머신을 테이블 주도로 검증한다 (R5).
@@ -528,5 +532,168 @@ mod tests {
             "남은 항목을 반환해 재시도할 수 있어야 한다"
         );
         assert_eq!(store.rollup_count(), 2);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TargetDb
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 대상 DB 페이크. **실패 주입이 요점이다.**
+///
+/// 실패 경로는 Docker 로 재현하기 어렵다(권한 오류·타임아웃을 원하는 순간에 만들 수 없다).
+/// 그런데 이 코드베이스에서 가장 위험한 결함들이 전부 그 경로에 있었다 — 조회 실패가
+/// 확정을 영구히 잃거나, 빈 레코드를 저장하거나, 실패를 성공으로 세는 것들이다.
+#[derive(Default)]
+pub struct FakeTargetDb {
+    /// `probe` 가 돌려줄 행.
+    pub rows: Mutex<Vec<ProcessRow>>,
+    /// `probe.truncated`.
+    pub truncated: AtomicBool,
+    /// `full_sql` 이 돌려줄 행.
+    pub full: Mutex<Vec<FullSqlRow>>,
+    /// `stmt_current` 가 돌려줄 행.
+    pub stmts: Mutex<Vec<StmtCurrentRow>>,
+    /// `full_sql` 을 앞으로 n 번 실패시킨다.
+    fail_full_sql: AtomicUsize,
+    /// `stmt_current` 를 앞으로 n 번 실패시킨다.
+    fail_stmt_current: AtomicUsize,
+    /// `explain_*` 결과.
+    pub explain: Mutex<Option<ExplainOutcome>>,
+    /// 호출 횟수 (경로가 실제로 돌았는지 확인용).
+    pub full_sql_calls: AtomicUsize,
+    pub explain_calls: AtomicUsize,
+}
+
+impl FakeTargetDb {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `probe` 가 이 스레드들을 돌려준다.
+    pub fn with_threads(self, ids: &[(u64, i64)]) -> Self {
+        *self.rows.lock().unwrap() = ids
+            .iter()
+            .map(|(id, time_secs)| ProcessRow {
+                id: *id,
+                user: Some("app".into()),
+                host: Some("10.0.3.44:5000".into()),
+                db: Some("shop".into()),
+                command: Some("Query".into()),
+                time_secs: *time_secs,
+                state: Some("executing".into()),
+            })
+            .collect();
+        self
+    }
+
+    /// `probe` 결과를 바꾼다 (스레드가 나타나고 사라지는 상황).
+    pub fn with_threads_mut(&self, ids: &[(u64, i64)]) {
+        *self.rows.lock().unwrap() = ids
+            .iter()
+            .map(|(id, time_secs)| ProcessRow {
+                id: *id,
+                user: Some("app".into()),
+                host: Some("10.0.3.44:5000".into()),
+                db: Some("shop".into()),
+                command: Some("Query".into()),
+                time_secs: *time_secs,
+                state: Some("executing".into()),
+            })
+            .collect();
+    }
+
+    pub fn fail_full_sql(&self, n: usize) {
+        self.fail_full_sql.store(n, Ordering::SeqCst);
+    }
+
+    pub fn fail_stmt_current(&self, n: usize) {
+        self.fail_stmt_current.store(n, Ordering::SeqCst);
+    }
+
+    fn should_fail(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_sub(1).or(Some(0))
+            })
+            .is_ok_and(|prev| prev > 0)
+    }
+}
+
+#[async_trait]
+impl TargetDb for FakeTargetDb {
+    async fn probe(&self, _threshold_secs: u32, _excludes: &Excludes) -> Result<ProbeResult> {
+        Ok(ProbeResult {
+            rows: self.rows.lock().unwrap().clone(),
+            truncated: self.truncated.load(Ordering::SeqCst),
+            db_now_ms: None,
+        })
+    }
+
+    async fn full_sql(&self, _ids: &[u64]) -> Result<Vec<FullSqlRow>> {
+        self.full_sql_calls.fetch_add(1, Ordering::SeqCst);
+        if Self::should_fail(&self.fail_full_sql) {
+            return Err(DomainError::Forbidden {
+                action: "full_sql: injected 1142".into(),
+            });
+        }
+        Ok(self.full.lock().unwrap().clone())
+    }
+
+    async fn stmt_current(&self, _ids: &[u64]) -> Result<Vec<StmtCurrentRow>> {
+        if Self::should_fail(&self.fail_stmt_current) {
+            return Err(DomainError::Unavailable {
+                dependency: "target-mysql",
+                reason: "stmt_current: injected timeout".into(),
+            });
+        }
+        Ok(self.stmts.lock().unwrap().clone())
+    }
+
+    async fn explain_for_connection(&self, _connection_id: u64) -> Result<ExplainOutcome> {
+        // RDS 의 정상 동작을 재현한다.
+        Ok(ExplainOutcome::Failed(PlanFailure::Denied))
+    }
+
+    async fn explain_rerun(&self, _sql: &str) -> Result<ExplainOutcome> {
+        self.explain_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .explain
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(ExplainOutcome::Failed(PlanFailure::NotExplainable)))
+    }
+
+    async fn explain_tree(&self, _sql: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn digest_snapshot(&self, _last_seen_gte_ms: Option<EpochMs>) -> Result<DigestSnapshot> {
+        Ok(DigestSnapshot {
+            rows: Vec::new(),
+            db_now_ms: 0,
+            overflow_detected: false,
+        })
+    }
+
+    async fn digest_texts(&self, _digests: &[String]) -> Result<Vec<DigestTextRow>> {
+        Ok(Vec::new())
+    }
+
+    async fn global_status(&self) -> Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn statement_digest(&self, _sql: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn db_now_ms(&self) -> Result<EpochMs> {
+        Ok(0)
+    }
+
+    async fn ping(&self) -> Result<()> {
+        Ok(())
     }
 }

@@ -184,8 +184,30 @@ pub const STATEMENT_DIGEST: &str = "/* dbmon:selfdigest */ SELECT STATEMENT_DIGE
 /// `transaction_isolation='READ-COMMITTED'` 는 우리 조회가 다른 세션의 잠금·스냅샷에
 /// 영향을 주지 않게 한다. `SET SESSION` 이므로 대상 DB 전역 설정을 바꾸지 않는다.
 pub fn session_init(query_timeout_ms: u64) -> String {
+    // **`sql_mode` 를 고정한다. 이것은 보안 통제다.**
+    //
+    // 고정하지 않으면 대상 인스턴스의 global `sql_mode` 를 그대로 상속한다. 거기에
+    // `NO_BACKSLASH_ESCAPES` 가 있으면 서버는 `\` 를 이스케이프로 보지 않는데
+    // 우리 렉서는 항상 이스케이프로 처리한다 — **검증기와 실행기가 문자열 경계를 다르게
+    // 본다.** 그 틈으로 주입된 문장이 실제로 실행된다. 8.4.11 실측:
+    //
+    // ```text
+    // 입력 (PROCESSLIST.INFO 에서 온 신뢰 불가 텍스트):
+    //   SELECT * FROM orders WHERE memo = '\'; SELECT 31337 AS pwned; SELECT 1 -- '
+    //
+    // 우리 렉서: '\'…' 를 문자열 하나로 삼킨다 → `;` 토큰 0개 → 멀티문장 검사 통과
+    //
+    // sql_mode=''                    → Com_select +1  (EXPLAIN 만)
+    // sql_mode=NO_BACKSLASH_ESCAPES  → SELECT 31337 AS pwned 가 **실행된다**
+    // ```
+    //
+    // `mysql_async` 는 `CLIENT_MULTI_STATEMENTS` 를 무조건 켜고 끌 방법이 없으므로
+    // 이 고정이 유일한 차단점이다. `ANSI_QUOTES` 도 같은 부류라 함께 닫힌다.
+    //
+    // 빈 문자열로 두는 이유: 특정 모드를 열거하면 새 MySQL 버전이 기본값에 모드를
+    // 추가할 때 다시 벌어진다. **아무 모드도 없는 상태**가 렉서의 전제와 일치한다.
     format!(
-        "SET SESSION max_execution_time = {query_timeout_ms}, \
+        "SET SESSION sql_mode = '', max_execution_time = {query_timeout_ms}, \
          transaction_isolation = 'READ-COMMITTED', autocommit = 1"
     )
 }
@@ -357,6 +379,12 @@ mod tests {
         let q = session_init(3000);
         assert!(q.starts_with("SET SESSION"));
         assert!(q.contains("max_execution_time = 3000"));
+        // **보안 통제**: 고정하지 않으면 NO_BACKSLASH_ESCAPES 를 상속해
+        // 렉서와 서버가 문자열 경계를 다르게 보고 주입 문장이 실행된다.
+        assert!(
+            q.contains("sql_mode = ''"),
+            "sql_mode 를 빈 문자열로 고정해야 한다: {q}"
+        );
         assert!(
             !q.to_uppercase().contains("GLOBAL"),
             "전역 설정을 바꾸면 안 된다"
