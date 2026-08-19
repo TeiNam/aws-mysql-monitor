@@ -12,17 +12,25 @@ use crate::keywords::is_reserved;
 pub enum Tok {
     /// 예약어. 대문자로 정규화한다.
     Kw(String),
-    /// 식별자. 백틱을 벗기고 원본 대소문자를 유지한다.
+    /// 식별자. 백틱을 벗기고 소문자로 접는다.
     Ident(String),
     /// 리터럴에서 유래한 `?`. 마스킹 후조건 검증이 이 종류를 센다.
     Placeholder,
     /// 입력에 이미 있던 `?` (프리페어드 파라미터 또는 `DIGEST_TEXT`).
     Param,
+    /// 캐릭터셋 introducer 가 붙은 문자열 리터럴 (`_utf8mb4'한글'`).
+    ///
+    /// MySQL 은 이걸 `( _charset ) ?` 로 정규화한다. 우리도 같은 형태로 렌더링해야
+    /// 수렴한다 — M1-6 실측에서 발견했다.
+    IntroducedLiteral,
     /// `DIGEST_TEXT` 의 축약 표기 `...`
     Ellipsis,
-    /// 옵티마이저 힌트 `/*+ ... */` — 실행계획에 영향을 주므로 보존한다.
+    /// 옵티마이저 힌트의 **내부 텍스트** (`/*+` 와 `*/` 제외).
+    ///
+    /// MySQL 은 힌트 내부도 토큰화한다(`MAX_EXECUTION_TIME(1000)` → `MAX_EXECUTION_TIME (?)`).
+    /// 그래서 여기서는 원문을 보관하고 [`crate::canonical`] 이 재귀적으로 정규화한다.
     Hint(String),
-    /// 연산자 (`=`, `<=`, `<>`, `:=` 등)
+    /// 연산자 (`=`, `<=`, `!=`, `:=` 등)
     Op(String),
     /// 구두점 (`(`, `)`, `,`, `.`, `;`)
     Punct(char),
@@ -30,11 +38,16 @@ pub enum Tok {
 
 impl Tok {
     /// 정규 텍스트로 렌더링한다. 토큰 사이는 canonical 에서 공백 1칸으로 잇는다.
+    ///
+    /// [`Tok::Hint`] 는 내부를 재귀 정규화해야 하므로 여기서 처리하지 않는다
+    /// ([`crate::canonical::render`] 가 담당한다).
     pub fn render(&self) -> &str {
         match self {
-            Tok::Kw(s) | Tok::Ident(s) | Tok::Hint(s) | Tok::Op(s) => s,
+            Tok::Kw(s) | Tok::Ident(s) | Tok::Op(s) => s,
             Tok::Placeholder | Tok::Param => "?",
+            Tok::IntroducedLiteral => "( _charset ) ?",
             Tok::Ellipsis => "...",
+            Tok::Hint(_) => "", // canonical::render 가 대신 처리한다
             Tok::Punct(c) => match c {
                 '(' => "(",
                 ')' => ")",
@@ -42,9 +55,18 @@ impl Tok {
                 '.' => ".",
                 ';' => ";",
                 '*' => "*",
-                _ => "?", // 도달 불가 — push_punct 가 위 집합만 만든다
+                _ => "?", // 도달 불가 — 렉서가 위 집합만 만든다
             },
         }
+    }
+
+    /// 리터럴 자리(괄호 축약 대상)인가.
+    ///
+    /// **`IntroducedLiteral` 은 포함하지 않는다.** 그건 `( _charset ) ?` 로 렌더링되어
+    /// 괄호를 품고 있으므로, `DIGEST_TEXT` 를 재렉싱하면 축약 대상이 아닌 형태가 된다.
+    /// 우리 쪽만 축약하면 양쪽이 갈라진다.
+    pub fn is_literal_slot(&self) -> bool {
+        matches!(self, Tok::Placeholder | Tok::Param | Tok::Ellipsis)
     }
 }
 
@@ -150,33 +172,28 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 블록 주석을 읽는다. 옵티마이저 힌트(`/*+ ... */`)면 원문을 반환한다.
+    /// 블록 주석을 읽는다. 옵티마이저 힌트(`/*+ ... */`)면 **내부 텍스트**를 반환한다.
     ///
     /// ponytail: `/*! ... */` 버전 주석은 제거한다. MySQL 은 그 안을 SQL 로 실행하므로
     /// 엄밀히는 코드지만, 애플리케이션 SQL 에서 거의 쓰이지 않는다. 골든 코퍼스에
     /// 케이스를 넣어 두었고, 실패하면 그때 내용을 토큰화하는 쪽으로 바꾼다.
     fn read_block_comment(&mut self) -> Option<String> {
-        let start = self.pos;
         self.pos += 2; // "/*"
         let is_hint = self.peek(0) == Some(b'+');
+        if is_hint {
+            self.pos += 1; // "+"
+        }
+        let inner_start = self.pos;
         while self.pos < self.src.len() {
             if self.peek(0) == Some(b'*') && self.peek(1) == Some(b'/') {
+                let inner = &self.src[inner_start..self.pos];
                 self.pos += 2;
-                if is_hint {
-                    // 힌트 내부 공백을 1칸으로 축약해 원문 차이를 흡수한다.
-                    let raw = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("/*+ */");
-                    return Some(collapse_ws(raw));
-                }
-                return None;
+                return is_hint.then(|| String::from_utf8_lossy(inner).into_owned());
             }
             self.pos += 1;
         }
         // 닫히지 않은 주석: 나머지를 전부 주석으로 본다 (MySQL 도 그렇게 처리한다).
-        if is_hint {
-            let raw = std::str::from_utf8(&self.src[start..]).unwrap_or("/*+ */");
-            return Some(collapse_ws(raw));
-        }
-        None
+        is_hint.then(|| String::from_utf8_lossy(&self.src[inner_start..]).into_owned())
     }
 
     /// 문자열 리터럴을 소비한다. 백슬래시 이스케이프와 인용부호 중복(`''`) 모두 처리한다.
@@ -278,6 +295,19 @@ impl<'a> Lexer<'a> {
                 self.pos = save;
             }
         }
+        // 크기 접미(`16M`, `256K`) — `SET_VAR(sort_buffer_size = 16M)` 힌트에 쓰인다.
+        // MySQL 은 이걸 하나의 리터럴로 보고 `?` 로 치환한다. 접미를 흡수하지 않으면
+        // `? m` 이 되어 갈라진다 (M1-6 실측).
+        //
+        // 일반 SQL 에는 `<숫자><문자>` 형태가 없다(`0x`·`0b`·`1e5` 는 위에서 처리했다).
+        // 그래서 무조건 흡수해도 안전하다.
+        if matches!(
+            self.peek(0),
+            Some(b'K' | b'M' | b'G' | b'T' | b'k' | b'm' | b'g' | b't')
+        ) && !matches!(self.peek(1), Some(c) if is_ident_part(c))
+        {
+            self.pos += 1;
+        }
         Tok::Placeholder
     }
 
@@ -290,38 +320,55 @@ impl<'a> Lexer<'a> {
         let word = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
 
         // introducer 리터럴: 단어 바로 뒤에 인용부호가 붙어 있다.
-        if self.peek(0) == Some(b'\'') && is_literal_introducer(&word) {
-            self.read_quoted(b'\'');
-            return Tok::Placeholder;
+        if self.peek(0) == Some(b'\'') {
+            // 캐릭터셋 introducer(`_utf8mb4'..'`)만 MySQL 이 `( _charset ) ?` 로 바꾼다.
+            if word.starts_with('_') {
+                self.read_quoted(b'\'');
+                return Tok::IntroducedLiteral;
+            }
+            // `N'..'`, `X'..'`, `b'..'` 는 그냥 `?` 다.
+            if matches!(word.to_ascii_uppercase().as_str(), "N" | "X" | "B") {
+                self.read_quoted(b'\'');
+                return Tok::Placeholder;
+            }
         }
 
-        if is_reserved(&word) {
-            Tok::Kw(word.to_ascii_uppercase())
+        // 파이프라인: 소문자로 접기 → 동의어 치환 → 예약어 판정.
+        //
+        // **동의어 치환이 예약어 판정보다 앞에 온다.** MySQL 이 예약어를 비예약어로
+        // 바꾸는 경우가 있기 때문이다(`CURRENT_TIMESTAMP` → `NOW`). 순서를 바꾸면
+        // `Kw("NOW")` 와 `Ident("now")` 로 갈라진다.
+        let folded = synonym(&fold_ident(&word));
+        if is_reserved(&folded) {
+            Tok::Kw(folded.to_ascii_uppercase())
         } else {
-            Tok::Ident(fold_ident(&word))
+            Tok::Ident(folded)
         }
     }
 
     fn read_operator(&mut self) -> Tok {
-        const THREE: [&[u8]; 1] = [b"<=>"];
-        const TWO: [&[u8]; 11] = [
-            b"<=", b">=", b"<>", b"!=", b":=", b"||", b"&&", b"<<", b">>", b"->", b"=>",
-        ];
-        for pat in THREE {
-            if self.src[self.pos..].starts_with(pat) {
-                self.pos += 3;
-                return Tok::Op("<=>".into());
-            }
+        if self.src[self.pos..].starts_with(b"<=>") {
+            self.pos += 3;
+            return Tok::Op("<=>".into());
         }
         // `->>` (JSON unquote) 는 2문자 `->` 보다 먼저 본다.
         if self.src[self.pos..].starts_with(b"->>") {
             self.pos += 3;
             return Tok::Op("->>".into());
         }
+        const TWO: [&[u8]; 10] = [
+            b"<=", b">=", b"<>", b"!=", b":=", b"||", b"&&", b"<<", b">>", b"->",
+        ];
         for pat in TWO {
             if self.src[self.pos..].starts_with(pat) {
                 self.pos += 2;
-                return Tok::Op(String::from_utf8_lossy(pat).into_owned());
+                // MySQL 은 `<>` 를 `!=` 로 정규화한다 (M1-6 실측).
+                let op = if pat == b"<>" {
+                    "!="
+                } else {
+                    &String::from_utf8_lossy(pat) as &str
+                };
+                return Tok::Op(op.to_string());
             }
         }
         let c = self.src[self.pos];
@@ -367,29 +414,47 @@ fn is_ident_part(c: u8) -> bool {
     is_ident_start(c) || c.is_ascii_digit()
 }
 
-/// `_latin1'x'`, `N'x'`, `X'41'`, `b'101'` 형태의 introducer.
-fn is_literal_introducer(word: &str) -> bool {
-    if word.starts_with('_') {
-        return true; // 캐릭터셋 introducer
+/// MySQL 이 `DIGEST_TEXT` 에서 하나로 합치는 **동의어**를 통일한다.
+///
+/// M1-6 스파이크(2026-08-20, MySQL 8.4.11 실측)에서 **직접 확인한 것만** 넣는다.
+/// 추측으로 넣으면 서로 다른 문법 요소를 같은 토큰으로 만들어 조용히 잘못 묶는다.
+///
+/// | 입력 | MySQL `DIGEST_TEXT` |
+/// |---|---|
+/// | `DISTINCT` | `DISTINCTROW` |
+/// | `CHAR` (CAST) | `CHARACTER` |
+/// | `INT` (CAST) | `INTEGER` |
+/// | `REGEXP` | `RLIKE` |
+/// | `SUBSTR` · `MID` | `SUBSTRING` |
+/// | `DATABASE` | `SCHEMA` |
+/// | `CURRENT_TIMESTAMP` · `LOCALTIME` · `LOCALTIMESTAMP` | `NOW` |
+/// | `CURRENT_DATE` | `CURDATE` |
+/// | `CURRENT_TIME` | `CURTIME` |
+/// | `INTERVAL ? DAY` | `INTERVAL ? SQL_TSI_DAY` |
+///
+/// 어느 방향으로 통일해도 수렴한다(같은 함수를 양쪽에 적용하므로).
+///
+/// `sql_tsi_` 접두는 **벗기는** 쪽을 택했다. `INTERVAL ? DAY` 의 `DAY` 는 `sql_tsi_day` 가
+/// 되지만 `DAY(date)` 함수는 그냥 `day` 다 — **문맥 의존**이라 렉서로는 구분할 수 없다.
+/// 접두를 벗기면 문맥을 몰라도 수렴하고, 대가는 "`sql_tsi_day` 라는 컬럼명이 `day` 와
+/// 묶인다"뿐이다.
+fn synonym(lower: &str) -> String {
+    if let Some(stripped) = lower.strip_prefix("sql_tsi_") {
+        return stripped.to_string();
     }
-    matches!(word.to_ascii_uppercase().as_str(), "N" | "X" | "B")
-}
-
-fn collapse_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-            }
-            prev_space = true;
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
+    match lower {
+        "distinctrow" => "distinct",
+        "character" => "char",
+        "int" => "integer",
+        "regexp" => "rlike",
+        "substr" | "mid" => "substring",
+        "database" => "schema",
+        "current_timestamp" | "localtime" | "localtimestamp" => "now",
+        "current_date" => "curdate",
+        "current_time" => "curtime",
+        other => other,
     }
-    out.trim().to_string()
+    .to_string()
 }
 
 /// 백틱 식별자를 바이트 단위로 모았으므로 멀티바이트를 복원한다.
@@ -411,8 +476,38 @@ mod tests {
 
     #[test]
     fn strings_and_numbers_become_placeholders() {
-        let t = toks("SELECT 1, 'a', 0x1F, 1.5e-3, b'101', X'41', _utf8mb4'z'");
-        assert_eq!(t.iter().filter(|t| **t == Tok::Placeholder).count(), 7);
+        let t = toks("SELECT 1, 'a', 0x1F, 1.5e-3, b'101', X'41'");
+        assert_eq!(t.iter().filter(|t| **t == Tok::Placeholder).count(), 6);
+        // 캐릭터셋 introducer 는 별도 토큰이다 — MySQL 이 `( _charset ) ?` 로 정규화한다.
+        assert_eq!(toks("SELECT _utf8mb4'z'")[1], Tok::IntroducedLiteral);
+    }
+
+    #[test]
+    fn size_suffix_absorbed_into_literal() {
+        // `SET_VAR(sort_buffer_size = 16M)` 힌트. 흡수하지 않으면 `? m` 이 되어 갈라진다.
+        assert_eq!(
+            toks("SET x = 16M"),
+            vec![
+                Tok::Kw("SET".into()),
+                Tok::Ident("x".into()),
+                Tok::Op("=".into()),
+                Tok::Placeholder
+            ]
+        );
+        // 식별자 경계가 이어지면 흡수하지 않는다.
+        assert_eq!(toks("SELECT 16Mb")[1], Tok::Placeholder);
+        assert_eq!(toks("SELECT 16Mb")[2], Tok::Ident("mb".into()));
+    }
+
+    #[test]
+    fn keyword_and_ident_synonyms_unified() {
+        assert_eq!(toks("SELECT DISTINCTROW a")[1], Tok::Kw("DISTINCT".into()));
+        assert_eq!(toks("SELECT DISTINCT a")[1], Tok::Kw("DISTINCT".into()));
+        assert_eq!(toks("CAST(a AS CHARACTER)")[4], Tok::Kw("CHAR".into()));
+        assert_eq!(toks("INTERVAL 7 SQL_TSI_DAY")[2], Tok::Ident("day".into()));
+        assert_eq!(toks("INTERVAL 7 DAY")[2], Tok::Ident("day".into()));
+        assert_eq!(toks("a <> b")[1], Tok::Op("!=".into()));
+        assert_eq!(toks("a != b")[1], Tok::Op("!=".into()));
     }
 
     #[test]
@@ -426,7 +521,10 @@ mod tests {
     #[test]
     fn hints_preserved_comments_removed() {
         let t = toks("SELECT /*+ MAX_EXECUTION_TIME(1000) */ a /* junk */ FROM t -- tail\n");
-        assert!(matches!(&t[1], Tok::Hint(h) if h.starts_with("/*+")));
+        // Hint 는 **내부 텍스트만** 담는다. canonical 이 재귀 정규화한다.
+        assert!(
+            matches!(&t[1], Tok::Hint(h) if h.contains("MAX_EXECUTION_TIME") && !h.contains("/*"))
+        );
         assert!(
             !t.iter()
                 .any(|x| matches!(x, Tok::Hint(h) if h.contains("junk")))

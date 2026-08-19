@@ -29,6 +29,9 @@ async-trait.workspace = true
 zeroize.workspace = true
 futures.workspace = true
 rand.workspace = true
+mysql_async.workspace = true
+chrono.workspace = true
+hex.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -113,12 +113,46 @@ pub fn mask_expression(expr: &str) -> (String, bool) {
 
 /// MySQL 이 `DIGEST_TEXT` 를 절단했는지 판정한다.
 ///
-/// `performance_schema_max_digest_length`(기본 1024바이트) 초과 시 `...` 로 끝난다.
-/// 절단본은 `app_digest` 신뢰도가 낮으므로 `mysql_digest` 매핑으로 보정한다
-/// ([05 §3.3](../../../docs/05-collector.md)).
-pub fn looks_truncated_by_server(digest_text: &str) -> bool {
-    digest_text.trim_end().ends_with("...")
+/// # `...` 접미로는 판정할 수 없다 (M1-13 실측, MySQL 8.4.11)
+///
+/// 초기 설계는 "잘렸을 때 `...` 로 끝난다"를 전제했다. **실제로는 토큰 중간에서 그냥 끝난다.**
+///
+/// ```text
+/// max_digest_length=1024 → DIGEST_TEXT 992바이트, 끝: "... `id` AS `a_00047` ,"
+/// max_digest_length=4096 → DIGEST_TEXT 3917바이트, 끝: "... AS `a_00193` , `id`"
+/// ```
+///
+/// 그래서 세 신호를 함께 본다. **오탐(절단이 아닌데 절단이라 판정)은 무해**하다
+/// — `mysql_digest` 매핑 경로를 타는 것뿐이다. 반대로 누락은 조용한 오분류다.
+///
+/// `max_digest_length` 는 자가진단이 읽어 둔 값이다. **`performance_schema_max_digest_length`
+/// 가 아니다** — 두 변수는 다르고, 해시를 바꾸는 것은 전자다.
+pub fn looks_truncated_by_server(digest_text: &str, max_digest_length: Option<u32>) -> bool {
+    let t = digest_text.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    // ① 일부 버전·경로는 `...` 를 붙인다.
+    if t.ends_with("...") {
+        return true;
+    }
+    // ② 백틱 개수가 홀수 → 식별자 중간에서 끊겼다.
+    if t.bytes().filter(|b| *b == b'`').count() % 2 == 1 {
+        return true;
+    }
+    // ③ 문장이 끝날 수 없는 토큰으로 끝난다.
+    const INCOMPLETE_TAIL: &[char] = &[
+        ',', '(', '.', '+', '-', '*', '/', '%', '=', '<', '>', '&', '|', '!', '~', '^',
+    ];
+    if t.ends_with(INCOMPLETE_TAIL) {
+        return true;
+    }
+    // ④ 길이가 상한에 근접했다. MySQL 은 상한보다 조금 앞에서 자른다(토큰 경계).
+    matches!(max_digest_length, Some(lim) if t.len() as u32 + TRUNCATION_MARGIN_BYTES >= lim)
 }
+
+/// 절단 판정의 길이 여유. 실측에서 상한 대비 32~179바이트 앞에서 잘렸다.
+const TRUNCATION_MARGIN_BYTES: u32 = 256;
 
 #[cfg(test)]
 mod tests {
@@ -250,10 +284,39 @@ mod tests {
 
     #[test]
     fn server_truncation_detected() {
+        // ① `...` 접미 (구버전·일부 경로)
         assert!(looks_truncated_by_server(
-            "SELECT `a` FROM `t` WHERE `id` IN (?, ?, ..."
+            "SELECT `a` FROM `t` WHERE `id` IN (?, ?, ...",
+            None
         ));
-        assert!(!looks_truncated_by_server("SELECT `a` FROM `t`"));
+        // ② 홀수 백틱 — 식별자 중간에서 끊김 (8.4.11 실측 형태)
+        assert!(looks_truncated_by_server(
+            "SELECT `id` AS `a_00193` , `id",
+            None
+        ));
+        // ③ 완결될 수 없는 토큰으로 끝남 (8.4.11 실측 형태)
+        assert!(looks_truncated_by_server(
+            "SELECT `id` AS `a_00047` ,",
+            None
+        ));
+        assert!(looks_truncated_by_server("SELECT `a` + ", None));
+        // ④ 길이가 상한에 근접
+        let near_limit = format!("SELECT {} FROM `t`", "`c` AS `d` ".repeat(90));
+        assert!(near_limit.len() > 900);
+        assert!(looks_truncated_by_server(&near_limit, Some(1024)));
+
+        // 정상 종료 형태를 절단으로 오판하면 안 된다.
+        for ok in [
+            "SELECT `a` FROM `t`",
+            "SELECT * FROM `orders` WHERE `id` = ?",
+            "INSERT INTO `t` VALUES (...)",
+            "",
+        ] {
+            assert!(
+                !looks_truncated_by_server(ok, Some(1024)),
+                "{ok:?} 를 절단으로 오판했다"
+            );
+        }
     }
 
     #[test]

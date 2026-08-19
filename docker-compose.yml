@@ -1,0 +1,113 @@
+# 로컬 개발 환경 (M0-9).
+#
+# AWS SSO 세션과 무관하게 개발을 이어갈 수 있어야 한다는 요구를 이 파일이 담당한다.
+# 대상 MySQL 3종 + DynamoDB Local 이면 수집기·저장소 경로를 전부 로컬에서 돌릴 수 있다.
+#
+#   mysql84        기본 파라미터. 주 개발 대상 (ADR-019 하한)
+#   mysql84-wide   max_digest_length=4096 / max_sql_text_length=8192
+#                  → M1-13: "DIGEST_TEXT 절단이 DIGEST 해시도 바꾸는가" 비교군
+#   mysql80        Aurora MySQL 3.x 의 커뮤니티 기반(8.0). 버전 분기 검증용
+#   dynamodb       DynamoDB Local. 10-foundation 을 apply 하지 않고도 저장 경로를 돈다
+#
+# 포트는 13306~ 을 쓴다. 로컬에 이미 MySQL 이 있어도 충돌하지 않는다.
+#
+# 이미지는 **public.ecr.aws 미러**를 쓴다. Docker Hub 가 인증된 풀만 허용하도록
+# 바뀌어(`Enforced sign-in`) `docker login` 없이는 `mysql:8.4` 를 받을 수 없다.
+# ECR Public 의 `docker/library` 미러는 같은 공식 이미지를 인증 없이 제공한다
+# → 새 개발자가 계정 준비 없이 `just dev` 로 시작할 수 있다.
+
+name: dbmon-dev
+
+x-mysql-common: &mysql-common
+  restart: unless-stopped
+  environment:
+    MYSQL_ROOT_PASSWORD: dbmon-local-root
+    MYSQL_DATABASE: shop
+    MYSQL_USER: app
+    MYSQL_PASSWORD: dbmon-local-app
+  healthcheck:
+    test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pdbmon-local-root"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+    start_period: 30s
+
+x-mysql-args: &mysql-args
+  # performance_schema 와 consumer 를 명시적으로 켠다. 자가진단이 검사하는 항목들이다.
+  - --performance-schema=ON
+  - --performance-schema-consumer-statements-digest=ON
+  - --performance-schema-consumer-events-statements-current=ON
+  - --performance-schema-consumer-events-statements-history=ON
+  # 슬로우로그 — 3소스 병합(F5) 검증에 필요하다. RDS 와 같은 FILE 출력을 쓴다.
+  - --slow-query-log=ON
+  - --long-query-time=1
+  - --log-output=FILE
+  - --slow-query-log-file=/var/lib/mysql-logs/slow.log
+  - --log-slow-admin-statements=ON
+  # 락 경합·데드락 시나리오를 짧게 재현하기 위해
+  - --innodb-lock-wait-timeout=10
+  - --max-connections=200
+
+services:
+  mysql84:
+    <<: *mysql-common
+    image: public.ecr.aws/docker/library/mysql:8.4
+    ports: ["13306:3306"]
+    command:
+      *mysql-args
+    volumes:
+      - ./local/seed:/docker-entrypoint-initdb.d:ro
+      - mysql84-logs:/var/lib/mysql-logs
+
+  # M1-13 비교군: 다이제스트·SQL 텍스트 상한만 다르다.
+  mysql84-wide:
+    <<: *mysql-common
+    image: public.ecr.aws/docker/library/mysql:8.4
+    ports: ["13307:3306"]
+    command:
+      - --performance-schema=ON
+      - --performance-schema-consumer-statements-digest=ON
+      - --performance-schema-consumer-events-statements-current=ON
+      # ⚠ 두 변수는 **다르다** (M1-13 실측으로 확인).
+      #   max_digest_length                    : 다이제스트 **계산** 버퍼 → DIGEST 해시를 바꾼다
+      #   performance_schema_max_digest_length : 다이제스트 텍스트 **저장** 길이
+      # 후자만 올리면 DIGEST 해시가 그대로여서 비교군이 성립하지 않는다.
+      - --max-digest-length=4096
+      - --performance-schema-max-digest-length=4096
+      - --performance-schema-max-sql-text-length=8192
+      - --slow-query-log=ON
+      - --long-query-time=1
+      - --log-output=FILE
+      - --slow-query-log-file=/var/lib/mysql-logs/slow.log
+      - --max-connections=200
+    volumes:
+      - ./local/seed:/docker-entrypoint-initdb.d:ro
+      - mysql84wide-logs:/var/lib/mysql-logs
+
+  # Aurora MySQL 3.x 는 커뮤니티 8.0 기반이다. `SHOW MASTER STATUS` 분기 검증용.
+  mysql80:
+    <<: *mysql-common
+    image: public.ecr.aws/docker/library/mysql:8.0
+    ports: ["13308:3306"]
+    command:
+      *mysql-args
+    volumes:
+      - ./local/seed:/docker-entrypoint-initdb.d:ro
+      - mysql80-logs:/var/lib/mysql-logs
+
+  dynamodb:
+    image: public.ecr.aws/aws-dynamodb-local/aws-dynamodb-local:latest
+    restart: unless-stopped
+    ports: ["18000:8000"]
+    # inMemory 를 쓰지 않는다 — 재시작해도 데이터가 남아야 조회 화면을 개발할 수 있다.
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/data"]
+    working_dir: /home/dynamodblocal
+    user: root
+    volumes:
+      - dynamodb-data:/data
+
+volumes:
+  mysql84-logs:
+  mysql84wide-logs:
+  mysql80-logs:
+  dynamodb-data:

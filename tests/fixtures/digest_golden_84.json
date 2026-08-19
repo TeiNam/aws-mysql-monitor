@@ -1,0 +1,919 @@
+[
+  {
+    "app_digest": "66cbb3a40d4bbd150b75825ad291a654",
+    "digest_text": "SELECT ?",
+    "mysql_digest": "d1b44b0c19af710b5a679907e284acd2ddc285201794bc69a2389d77baedddae",
+    "sql": "SELECT 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT * FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "select * from orders where id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT   *   FROM   orders   WHERE   id  =  1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3be4edd2582f5eab92d4987a57cf916a",
+    "digest_text": "SELECT `id` , STATUS , `amount` FROM `orders` WHERE STATUS = ? ORDER BY `created_at` DESC LIMIT ?",
+    "mysql_digest": "3a01f640bb27a224c00805f2fe4599f68c3c29ff921bf71941824e1904e5c15b",
+    "sql": "SELECT id, status, amount FROM orders WHERE status = 'PENDING' ORDER BY created_at DESC LIMIT 10",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e61085cc5a04ec9d71b949fd13dec258",
+    "digest_text": "SELECT COUNT ( * ) FROM `orders`",
+    "mysql_digest": "911a46dc72426f700dd2cd5d9595c3c49bbbb254d3c74fdfbec457b76b0213f1",
+    "sql": "SELECT COUNT(*) FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "af3f277dcdef210c939d6e115a2befa3",
+    "digest_text": "SELECT COUNT ( * ) AS `c` , STATUS FROM `orders` GROUP BY STATUS HAVING COUNT ( * ) > ?",
+    "mysql_digest": "8b0085af588ccaff09cf3701301509302cfa9e9650e45a4b6fb6a5d80cec4fbe",
+    "sql": "SELECT COUNT(*) AS c, status FROM orders GROUP BY status HAVING COUNT(*) > 100",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "6d1f19e3f23545ad6a3e7bddba6e3281",
+    "digest_text": "SELECT `o` . `id` , `c` . `email` FROM `orders` `o` JOIN `customers` `c` ON `o` . `customer_id` = `c` . `id` WHERE `o` . `amount` > ?",
+    "mysql_digest": "657f0e94bbe4fc1fdd88f48000cd25089dd047ca8dd1eea815e425944481b705",
+    "sql": "SELECT o.id, c.email FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.amount > 5000",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "5d683ac6c38367781b6a330a4df69edf",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` LEFT JOIN `order_items` `i` ON `i` . `order_id` = `o` . `id` WHERE `i` . `sku` IS NULL",
+    "mysql_digest": "2384eb316bf5e5bc897efd5eb9437e049d5803e6b09588bd6aefc8dd36e7e5c8",
+    "sql": "SELECT o.id FROM orders o LEFT JOIN order_items i ON i.order_id = o.id WHERE i.sku IS NULL",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "caafb86fca5cdce0b5562501146fd4f1",
+    "digest_text": "SELECT DISTINCTROW `region_code` FROM `customers`",
+    "mysql_digest": "f91d1d418f06e56700d2d0b18956936a7ce2d49da1e7892527317a38ea134bd5",
+    "sql": "SELECT DISTINCT region_code FROM customers",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3102d69839e6a579788eea1c5968a007",
+    "digest_text": "SELECT `id` , `status` FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "916f163415cc345fc5bcf4ae1d206f9c0f180bbab31d533a549c5a655d2baf99",
+    "sql": "SELECT `id`, `status` FROM `orders` WHERE `id` = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "98839cc1999f554141d3eadef3638698",
+    "digest_text": "SELECT `id` FROM `shop` . `orders` WHERE `id` = ?",
+    "mysql_digest": "7e5fc0564dfc5c12105ecf0ac2c45a59867c1e55ca5c0d9e7f57c22193f46cdf",
+    "sql": "SELECT id FROM shop.orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "98839cc1999f554141d3eadef3638698",
+    "digest_text": "SELECT `id` FROM `shop` . `orders` WHERE `id` = ?",
+    "mysql_digest": "7e5fc0564dfc5c12105ecf0ac2c45a59867c1e55ca5c0d9e7f57c22193f46cdf",
+    "sql": "SELECT id FROM `shop`.`orders` WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e7a6dd30ebb1955ded09b5e3da3a3c30",
+    "digest_text": "SELECT `ID` FROM `ORDERS` WHERE `ID` = ?",
+    "mysql_digest": "f046b5daa43ce24693c2797ab76d0dfc04ec5578296269db7cc664421c2ad5af",
+    "sql": "SELECT ID FROM ORDERS WHERE ID = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "5af8134ce4d6ca4f1a9f8306a8aee33f",
+    "digest_text": "SELECT `o` . `amount` FROM `shop` . `orders` AS `o` WHERE `o` . `id` = ?",
+    "mysql_digest": "ae84255d5f06cae4d5c3acb8e152a8b377040abd22c51d8657310428908865a0",
+    "sql": "SELECT o.`amount` FROM `shop`.`orders` AS `o` WHERE `o`.`id` = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "673c6b615fd1ebcbdfb2b020051b676d",
+    "digest_text": "SELECT * FROM `orders` WHERE `amount` = ?",
+    "mysql_digest": "26114303b4eaf473c64f69f726603bee161a0d61e98f326c8a7627a33cc468f5",
+    "sql": "SELECT * FROM orders WHERE amount = 1234.56",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "673c6b615fd1ebcbdfb2b020051b676d",
+    "digest_text": "SELECT * FROM `orders` WHERE `amount` = ?",
+    "mysql_digest": "26114303b4eaf473c64f69f726603bee161a0d61e98f326c8a7627a33cc468f5",
+    "sql": "SELECT * FROM orders WHERE amount = 1.5e3",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "673c6b615fd1ebcbdfb2b020051b676d",
+    "digest_text": "SELECT * FROM `orders` WHERE `amount` = ?",
+    "mysql_digest": "26114303b4eaf473c64f69f726603bee161a0d61e98f326c8a7627a33cc468f5",
+    "sql": "SELECT * FROM orders WHERE amount = .5",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT * FROM orders WHERE id = 0x1F",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT * FROM orders WHERE id = b'1010'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2468dbee7eb02a601f10efd1ceafafdc",
+    "digest_text": "SELECT * FROM `orders` WHERE `memo` = ?",
+    "mysql_digest": "6605db90bff090e00867e201655c73e895a57671e6388ea69d37fc0454909110",
+    "sql": "SELECT * FROM orders WHERE memo = X'414243'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9998e3d2a2b612149e75170a82f4d7e3",
+    "digest_text": "SELECT * FROM `orders` WHERE `memo` = (_charset) ?",
+    "mysql_digest": "602468cb446f9daf0206874012138a5aabbf863d4f90868ec5b17226aec163fe",
+    "sql": "SELECT * FROM orders WHERE memo = _utf8mb4'한글'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2468dbee7eb02a601f10efd1ceafafdc",
+    "digest_text": "SELECT * FROM `orders` WHERE `memo` = ?",
+    "mysql_digest": "6605db90bff090e00867e201655c73e895a57671e6388ea69d37fc0454909110",
+    "sql": "SELECT * FROM orders WHERE memo = N'unicode'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "52ed4a64b5c70afe9d136a436b32a5e2",
+    "digest_text": "SELECT * FROM `orders` WHERE `created_at` > DATE ?",
+    "mysql_digest": "c74fad37189f50eb5015a815241bb87bc737930197c4c028998d13a011c944f4",
+    "sql": "SELECT * FROM orders WHERE created_at > DATE '2026-01-01'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "043e68f8f0a3edb2ad904b009121dc34",
+    "digest_text": "SELECT * FROM `orders` WHERE `created_at` > TIMESTAMP ?",
+    "mysql_digest": "33c374d0bc4412ac30bdb4331defde31dd8e3324f84fc3754c5c1e83017adad3",
+    "sql": "SELECT * FROM orders WHERE created_at > TIMESTAMP '2026-01-01 00:00:00'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "a8f64c6db2541b0545fac47cdb7a04e1",
+    "digest_text": "SELECT * FROM `orders` WHERE `created_at` > NOW ( ) - INTERVAL ? SQL_TSI_DAY",
+    "mysql_digest": "f28ce7a222ba3c8ddf08ad6f86ba387b1a9da65820877389f9ba7f91bbe8bdfa",
+    "sql": "SELECT * FROM orders WHERE created_at > NOW() - INTERVAL 7 DAY",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d544f94bc2952b177a500e358722fdbe",
+    "digest_text": "SELECT * FROM `orders` WHERE STATUS = ?",
+    "mysql_digest": "768932cabcd79295c0821f5158bdc6c1eabc89a2f6c4b46c0dd2c4fb2269c9d3",
+    "sql": "SELECT * FROM orders WHERE status = 'it''s'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3ac782cf6279ab859a8b5dc269aae63d",
+    "digest_text": "SELECT * FROM `orders` WHERE `memo` IS NULL AND STATUS != ?",
+    "mysql_digest": "00a4fba20a75df858e7d73d22f6e339d047696621e844e75a4560715bb72362b",
+    "sql": "SELECT * FROM orders WHERE memo IS NULL AND status <> 'PAID'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "dca719f1cb92ec25b0ac0f4bd1a8a794",
+    "digest_text": "SELECT * FROM `orders` WHERE STATUS IN (...)",
+    "mysql_digest": "c10f62bdf0c50df18748596c233226bb9220b9a9bc084dda9e0b9854b873444f",
+    "sql": "SELECT * FROM orders WHERE status IN ('PENDING')",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "84dfd65c2abf4166c4b13a3dc5411f18",
+    "digest_text": "SELECT * FROM `customers` WHERE NAME = ?",
+    "mysql_digest": "b48f72fbf3fcecc929124d860f1a0bb4c6312bd3d407d5585078464ec5cd6c83",
+    "sql": "SELECT * FROM customers WHERE name = '고객-1'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9cc36bc586c00103ba27717709bcf874",
+    "digest_text": "SELECT * FROM `orders` WHERE `amount` BETWEEN ? AND ?",
+    "mysql_digest": "2e0db6347a84298d6cd2e251aa8376c31825899811b60cc8627f81f82db4ff3f",
+    "sql": "SELECT * FROM orders WHERE amount BETWEEN 100 AND 200",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7a7c22d63781e63708fc3393ed285319",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` IN (...)",
+    "mysql_digest": "36f32c5944e3ea716cf6ccf28116e0dba6079c519bc1d7b88140eb1158b0eb0e",
+    "sql": "SELECT * FROM orders WHERE id IN (1)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7a7c22d63781e63708fc3393ed285319",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` IN (...)",
+    "mysql_digest": "36f32c5944e3ea716cf6ccf28116e0dba6079c519bc1d7b88140eb1158b0eb0e",
+    "sql": "SELECT * FROM orders WHERE id IN (1,2,3)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7a7c22d63781e63708fc3393ed285319",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` IN (...)",
+    "mysql_digest": "36f32c5944e3ea716cf6ccf28116e0dba6079c519bc1d7b88140eb1158b0eb0e",
+    "sql": "SELECT * FROM orders WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "dca719f1cb92ec25b0ac0f4bd1a8a794",
+    "digest_text": "SELECT * FROM `orders` WHERE STATUS IN (...)",
+    "mysql_digest": "c10f62bdf0c50df18748596c233226bb9220b9a9bc084dda9e0b9854b873444f",
+    "sql": "SELECT * FROM orders WHERE status IN ('PENDING','PAID','SHIPPED')",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7760e16d055b2de83cc16cd75a519d30",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` IN ( SELECT `order_id` FROM `order_items` WHERE `qty` > ? )",
+    "mysql_digest": "4ff929d6959cb8e23f90863cf40e32875e4cb6cc41e0878298d20d058c17c48a",
+    "sql": "SELECT * FROM orders WHERE id IN (SELECT order_id FROM order_items WHERE qty > 3)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "60f9a276b679b71f04eff4d81222b91e",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` NOT IN (...)",
+    "mysql_digest": "1ceee4f90c9a5a7a01e7477ec413aa6d8044546031a109a0e179a91568e0dad8",
+    "sql": "SELECT * FROM orders WHERE id NOT IN (1,2,3)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "46a896a79f3db1f49221fee6e77b7178",
+    "digest_text": "INSERT INTO `lock_arena` ( `id` , `val` ) VALUES (...)",
+    "mysql_digest": "995e5f43e4e1ea1a8fa3245b9d48da7b28475fc07fbb36776120875bcb7ef010",
+    "sql": "INSERT INTO lock_arena (id, val) VALUES (99, 1)",
+    "statement_type": "INSERT"
+  },
+  {
+    "app_digest": "46a896a79f3db1f49221fee6e77b7178",
+    "digest_text": "INSERT INTO `lock_arena` ( `id` , `val` ) VALUES (...) /* , ... */",
+    "mysql_digest": "e592912d6d9cdf6456bd93cf317ade4c4a330ae20207ef632d4ecbadccbb4071",
+    "sql": "INSERT INTO lock_arena (id, val) VALUES (99,1),(98,2),(97,3)",
+    "statement_type": "INSERT"
+  },
+  {
+    "app_digest": "219479c922bc53029efe59913e49a07b",
+    "digest_text": "INSERT INTO `lock_arena` ( `id` , `val` ) VALUES (...) ON DUPLICATE KEY UPDATE `val` = `val` + ?",
+    "mysql_digest": "6737d7eaee99e4f721121ec0cc75b067ca92e65abad5f6394519e31cf81d668f",
+    "sql": "INSERT INTO lock_arena (id, val) VALUES (99, 1) ON DUPLICATE KEY UPDATE val = val + 1",
+    "statement_type": "INSERT"
+  },
+  {
+    "app_digest": "b8a377cce076302a2bdf749f2cdf6bcc",
+    "digest_text": "REPLACE INTO `lock_arena` ( `id` , `val` ) VALUES (...)",
+    "mysql_digest": "2c504a9ec9a198fbf191c8f5f6186c6dee808bb7fcbc8a682cf16196b95e605f",
+    "sql": "REPLACE INTO lock_arena (id, val) VALUES (99, 1)",
+    "statement_type": "REPLACE"
+  },
+  {
+    "app_digest": "125ed2c6f3003712bbc1180bfabc06fe",
+    "digest_text": "UPDATE `orders` SET STATUS = ? WHERE `id` = ?",
+    "mysql_digest": "75f897cef4f13fdfdd757faabaca1382c840aef935f9bf0572cd8bf1f60943b1",
+    "sql": "UPDATE orders SET status = 'PAID' WHERE id = 1",
+    "statement_type": "UPDATE"
+  },
+  {
+    "app_digest": "c340d55dc26fd8274b56311a19d24f25",
+    "digest_text": "UPDATE `orders` SET STATUS = ? , `memo` = ? WHERE `customer_id` = ? AND STATUS = ?",
+    "mysql_digest": "3311f7dc4f0fd1167da0aa1f0328ac17accf185eda8593bf76e6a8f8107d17d7",
+    "sql": "UPDATE orders SET status = 'PAID', memo = 'done' WHERE customer_id = 1 AND status = 'PENDING'",
+    "statement_type": "UPDATE"
+  },
+  {
+    "app_digest": "bf7378c12a51e5db2a0d341b95ba4cc9",
+    "digest_text": "DELETE FROM `order_items` WHERE `order_id` = ?",
+    "mysql_digest": "45f259b6cb087c7e3710d15888844212e079794e55ed663339b740654f114130",
+    "sql": "DELETE FROM order_items WHERE order_id = 1",
+    "statement_type": "DELETE"
+  },
+  {
+    "app_digest": "bbb90da4130acb960e815c6e2564a5a1",
+    "digest_text": "DELETE FROM `order_items` WHERE `order_id` IN (...) LIMIT ?",
+    "mysql_digest": "f9d22bbc806f6499f7ec4d68cae4392affcc9dd0d2b1c2ca471e0576dc3385cd",
+    "sql": "DELETE FROM order_items WHERE order_id IN (1,2,3) LIMIT 100",
+    "statement_type": "DELETE"
+  },
+  {
+    "app_digest": "e7321a6fac5a58edd10db5705929baf6",
+    "digest_text": "SELECT ( SELECT COUNT ( * ) FROM `order_items` `i` WHERE `i` . `order_id` = `o` . `id` ) AS `n` FROM `orders` `o` WHERE `o` . `id` = ?",
+    "mysql_digest": "a2db4633bfc6a12d5e94c8f8c14730eccc22d38a2e524ea02bcdcb28f8187185",
+    "sql": "SELECT (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS n FROM orders o WHERE o.id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "604b73e960e0f9ef40182e7141cc0d50",
+    "digest_text": "WITH `recent` AS ( SELECT * FROM `orders` WHERE `created_at` > NOW ( ) - INTERVAL ? SQL_TSI_DAY ) SELECT COUNT ( * ) FROM `recent`",
+    "mysql_digest": "6779f130206ae2ba0f67bc48e24d2ee7785186f23f956f2d25620f8dee6c554b",
+    "sql": "WITH recent AS (SELECT * FROM orders WHERE created_at > NOW() - INTERVAL 1 DAY) SELECT COUNT(*) FROM recent",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f0bc0d38ef794908e82a0d59ef6e6b4d",
+    "digest_text": "WITH RECURSIVE `seq` ( `n` ) AS ( SELECT ? UNION ALL SELECT `n` + ? FROM `seq` WHERE `n` < ? ) SELECT SUM ( `n` ) FROM `seq`",
+    "mysql_digest": "5d8a3b24efe21274c3f5336452240345a8efbb1a9904115e1f64df5aaa001426",
+    "sql": "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10) SELECT SUM(n) FROM seq",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "a1ceb54372e81b86c540a85df84c2bc9",
+    "digest_text": "SELECT `id` , `amount` , ROW_NUMBER ( ) OVER ( PARTITION BY STATUS ORDER BY `amount` DESC ) AS `rn` FROM `orders`",
+    "mysql_digest": "9ec546e03f8623cedf8a2daee565979f4b4fcbc7540bd1654e181562859cb5ae",
+    "sql": "SELECT id, amount, ROW_NUMBER() OVER (PARTITION BY status ORDER BY amount DESC) AS rn FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "81f5656fe99b60a3db0510098d7aa465",
+    "digest_text": "SELECT `id` , SUM ( `amount` ) OVER ( ORDER BY `created_at` ROWS BETWEEN ? PRECEDING AND CURRENT ROW ) FROM `orders`",
+    "mysql_digest": "521b453d2ad4706cc052a2cacef1480d0a3a44bf142f1f811c732ff561e8d3cd",
+    "sql": "SELECT id, SUM(amount) OVER (ORDER BY created_at ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e51eda557c4766e71b400a4c61fcd48f",
+    "digest_text": "SELECT * FROM `orders` WHERE EXISTS ( SELECT ? FROM `order_items` `i` WHERE `i` . `order_id` = `orders` . `id` )",
+    "mysql_digest": "16a229d33ce07e040602ea6b435013bd9a3b2f8cba65f62871c4c53cdf9e4849",
+    "sql": "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = orders.id)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b7288aef55417298f3467a47f9aff85b",
+    "digest_text": "SELECT * FROM ( SELECT `id` , `amount` FROM `orders` WHERE `amount` > ? ) AS `d` WHERE `d` . `id` < ?",
+    "mysql_digest": "17ab4077b1331f50d7a8f181d7faeb407f517afac9013ff68c7c991566fe3783",
+    "sql": "SELECT * FROM (SELECT id, amount FROM orders WHERE amount > 100) AS d WHERE d.id < 1000",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "6994f5dfc459a1df6f130c67d3278b02",
+    "digest_text": "SELECT `id` FROM `orders` UNION SELECT `id` FROM `order_items`",
+    "mysql_digest": "80ea1d54fd11923276cf95f3d8938dc80e8d36de0388b5bb1747625381d3c1d5",
+    "sql": "SELECT id FROM orders UNION SELECT id FROM order_items",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3f19a4c699a33f414caf76a400a63a93",
+    "digest_text": "SELECT `id` FROM `orders` UNION ALL SELECT `id` FROM `order_items`",
+    "mysql_digest": "8acb96005fc61f31a874483667d17bdb09f5981a82520d8f95875fac635c4559",
+    "sql": "SELECT id FROM orders UNION ALL SELECT id FROM order_items",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "efb20c271a06a5923fcfb3d6a3244f71",
+    "digest_text": "SELECT /*+ MAX_EXECUTION_TIME (?) */ * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "d4e7575624a26849ff27af151092fc9848e9a71b12fa480a6df169196a322a7f",
+    "sql": "SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "a96d902451c23c52b0075e64b66d6c3a",
+    "digest_text": "SELECT /*+ NO_ICP ( `orders` ) */ * FROM `orders` WHERE STATUS = ?",
+    "mysql_digest": "cf8035d67d7ec3d8ad35474ebda4e894b3540ef20c8741e0cbc245eda4a585c4",
+    "sql": "SELECT /*+ NO_ICP(orders) */ * FROM orders WHERE status = 'PAID'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "c800524c100367c716a2d3c28f87374e",
+    "digest_text": "SELECT /*+ JOIN_ORDER ( `o` , `c` ) */ `o` . `id` FROM `orders` `o` JOIN `customers` `c` ON `o` . `customer_id` = `c` . `id`",
+    "mysql_digest": "4cd592cd46c91b68e055e70786339141147eb0644e0990ec5fbcf8fa48ff8f3a",
+    "sql": "SELECT /*+ JOIN_ORDER(o, c) */ o.id FROM orders o JOIN customers c ON o.customer_id = c.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "4b7f7502420fd7fed16106b56fc09120",
+    "digest_text": "SELECT /*+ SET_VAR ( `sort_buffer_size` = ? ) */ * FROM `orders` ORDER BY `amount`",
+    "mysql_digest": "2e17cfb99992dcc9eaa048c865bb4f10189095e0c3d4db3f43fffb7ef4f5fa2b",
+    "sql": "SELECT /*+ SET_VAR(sort_buffer_size = 16M) */ * FROM orders ORDER BY amount",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "/* leading block */ SELECT * FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT /* inline */ * FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT * FROM orders WHERE id = 1 -- trailing line",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d38d7a7c8744c802ab1c75fc8ff324ab",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "cbc540a780559b66bb51cba4ea074f47f37122292720d013baeff3ed0bf077e7",
+    "sql": "SELECT * FROM orders WHERE id = 1 # hash comment",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "eabac07970f79f3e0fce84e11b64637c",
+    "digest_text": "SELECT `UPPER` ( STATUS ) , `LENGTH` ( `memo` ) , COALESCE ( `memo` , ? ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "36c783f440ef8a3846ae0e5ebc5a4ee99cf36414043b44036aa7a58273a45f7c",
+    "sql": "SELECT UPPER(status), LENGTH(memo), COALESCE(memo, 'none') FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b54028a73db7fda3a945a56eadbaaf0f",
+    "digest_text": "SELECT CASE WHEN `amount` > ? THEN ? ELSE ? END FROM `orders`",
+    "mysql_digest": "0e3a76ec23af8369282841f310cd72c3c781010a13d34e7f1ee5c77bf7493346",
+    "sql": "SELECT CASE WHEN amount > 1000 THEN 'big' ELSE 'small' END FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e82d61eaa38d71ba8c3d0e821a0fc5cc",
+    "digest_text": "SELECT `DATE_FORMAT` ( `created_at` , ? ) AS `m` , SUM ( `amount` ) FROM `orders` GROUP BY `m`",
+    "mysql_digest": "b040a17b1d03dfbd6789ff44eb37e448c8771d7198979b251efba482d6ee6914",
+    "sql": "SELECT DATE_FORMAT(created_at, '%Y-%m') AS m, SUM(amount) FROM orders GROUP BY m",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "ffd29547b06e059aef06d1f9768831b2",
+    "digest_text": "SELECT `JSON_EXTRACT` (...)",
+    "mysql_digest": "bdf5e8c00a297d4a601ee307a16ecb86138201b96c7ae711da32b935c89bcf78",
+    "sql": "SELECT JSON_EXTRACT('{\"a\":1}', '$.a')",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "03a1dcd0433b55ae8915a455e41604dd",
+    "digest_text": "SELECT CAST ( `amount` AS CHARACTER ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "45747e37220cb36ba2168b4f9c7a77e6a0b2b6c005f6bff08ebb66171a7bb1a2",
+    "sql": "SELECT CAST(amount AS CHAR) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7e77fa5ff5eb13b55dd613fef1ac34b1",
+    "digest_text": "SELECT `amount` / ? , `amount` * ? , `amount` + ? , `amount` - ? , `amount` % ? FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "298289b5630911542802c7c4efa3e3134aa2ac809372b0bb78f642ec73038e42",
+    "sql": "SELECT amount / 3, amount * 2, amount + 1, amount - 1, amount % 7 FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b54c75f172c464dce42e1cf3143c6d36",
+    "digest_text": "SELECT `SLEEP` (?)",
+    "mysql_digest": "3b74a4bb71311c8dffd4b64a1dabe02d0ac8fcd7ae03087dd69378a554bb28bc",
+    "sql": "SELECT SLEEP(0)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "271d08ac1212ea4e4a1a86790718b1be",
+    "digest_text": "SELECT * FROM `customers` WHERE NAME LIKE ? AND `region_code` = ?",
+    "mysql_digest": "2b06892cbbfc6d8106b37aa6cecb1da40a4380ae72da8a4dfd7142f0e91b6a76",
+    "sql": "SELECT * FROM customers WHERE name LIKE '%고객%' AND region_code = 'KR'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f6a6995f24309ffe187a204093863e3f",
+    "digest_text": "SELECT ? AS `t`",
+    "mysql_digest": "8512396ab08a7420b65b7cc7831d5b9de0558344c41f6e26f0ed15b02790a6c8",
+    "sql": "SELECT '이모지 🙂 포함' AS t",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "c37331d090b58fd74584c80e65ca967a",
+    "digest_text": "SELECT TRUE , FALSE",
+    "mysql_digest": "e5462bada0a988f378c1e99b0528c356bf31afa8d120c3d70b3032a00e68767b",
+    "sql": "SELECT TRUE, FALSE",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "584f79dea9c4258d196946976ad01193",
+    "digest_text": "SELECT ? IS TRUE",
+    "mysql_digest": "63f68546de9d7e93f9a7716152468a1760a8fd754dc8fcd82346a7b96b2ced77",
+    "sql": "SELECT 1 IS TRUE",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7e27b4f96f86214cd42a26ee888b6a70",
+    "digest_text": "SELECT NOT ( ? = ? )",
+    "mysql_digest": "042a355737ad3331fa34153429755dfa7ad170870cea488c9e21710f00581b29",
+    "sql": "SELECT NOT (1 = 1)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "0fde4f4a23d7d30596dd018e707d5521",
+    "digest_text": "SELECT ! ( ? = ? )",
+    "mysql_digest": "3e622cf7a4f845c8f2cdbb19a4376f1c006ecb2dbbc93bfd83bf4490f4bfcd6e",
+    "sql": "SELECT !(1 = 1)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9bda520e668aa44f5948db1eecacd2f4",
+    "digest_text": "SELECT ? AND ?",
+    "mysql_digest": "97a7e50ec76bd0cefc7d719063c5dbb24a7377f5458753ca67481d49ab7059ed",
+    "sql": "SELECT 1 AND 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d21b739d8c0201d4c41747d707c3d836",
+    "digest_text": "SELECT ? && ?",
+    "mysql_digest": "032aa97eb9f5603d88b9588aaa2dec40e04372c69ee530874ee483931b2c027e",
+    "sql": "SELECT 1 && 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b00997dafd7f2cb3aa93ac1a9dc4625a",
+    "digest_text": "SELECT ? OR ?",
+    "mysql_digest": "3a58407d2346ca6ac29c9e208866f8036d889251f7090509fae0a14dfb785536",
+    "sql": "SELECT 1 OR 0",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "5555be7866817fd0679070a15adc6ccc",
+    "digest_text": "SELECT ? XOR ?",
+    "mysql_digest": "cc40cfb5ba454a456e35c3253c273002487c561248a7746122526e323cec99c7",
+    "sql": "SELECT 1 XOR 0",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "87c272bda65cbcd84fb051ba6b471ea0",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` LEFT OUTER JOIN `order_items` `i` ON `i` . `order_id` = `o` . `id`",
+    "mysql_digest": "e282ab1e3fdb107dfd6bf9c55c7f30d6f638524a236d6f54eaeff12749bb6716",
+    "sql": "SELECT o.id FROM orders o LEFT OUTER JOIN order_items i ON i.order_id = o.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b6bc31ae3753d8ccd8efdfbd4a9837e5",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` LEFT JOIN `order_items` `i` ON `i` . `order_id` = `o` . `id`",
+    "mysql_digest": "9bb87f62df3e13d7bef7503b0486a99eaaa846e6a945acc6c6ca85ccc5edc672",
+    "sql": "SELECT o.id FROM orders o LEFT JOIN order_items i ON i.order_id = o.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "88b55928450c17f6c213cf5f862af099",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` RIGHT OUTER JOIN `order_items` `i` ON `i` . `order_id` = `o` . `id`",
+    "mysql_digest": "5705a738404e5121629f6f3274f3b002050ca5ac7ec40a044620ed1a5f80b1b7",
+    "sql": "SELECT o.id FROM orders o RIGHT OUTER JOIN order_items i ON i.order_id = o.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "02853e3a2eb0ec7b55c5e7b0bd6660dd",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` INNER JOIN `order_items` `i` ON `i` . `order_id` = `o` . `id`",
+    "mysql_digest": "7d6e815289a4da248abf12a200a05cd7e65692dc480c43a3848f14e344dfb72d",
+    "sql": "SELECT o.id FROM orders o INNER JOIN order_items i ON i.order_id = o.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "09d04da1c4eb66d7bfbe2daeba87fa21",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` , `customers` `c` WHERE `o` . `customer_id` = `c` . `id`",
+    "mysql_digest": "4ec23345d2018ce972d4bc9dd7192993b5354fbe8c4d249056fe56c8d038da14",
+    "sql": "SELECT o.id FROM orders o, customers c WHERE o.customer_id = c.id",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b627a941e931189701320cbb8b251664",
+    "digest_text": "SELECT `o` . `id` FROM `orders` `o` CROSS JOIN `customers` `c`",
+    "mysql_digest": "522f0e94edf55c7e1ff57bf85d1adda71c7cdb73f4a4a9ba3cc47abe3f778e7f",
+    "sql": "SELECT o.id FROM orders o CROSS JOIN customers c",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2e38838f719c50465c522e198834fc57",
+    "digest_text": "SELECT SUBSTRING ( `memo` , ?, ... ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "62f4efb65ec08fac5694b0ba89939980d1a29dcb6d4e59f7981f0a936da4aa3c",
+    "sql": "SELECT SUBSTRING(memo, 1, 3) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2e38838f719c50465c522e198834fc57",
+    "digest_text": "SELECT SUBSTRING ( `memo` , ?, ... ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "62f4efb65ec08fac5694b0ba89939980d1a29dcb6d4e59f7981f0a936da4aa3c",
+    "sql": "SELECT SUBSTR(memo, 1, 3) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2e38838f719c50465c522e198834fc57",
+    "digest_text": "SELECT SUBSTRING ( `memo` , ?, ... ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "62f4efb65ec08fac5694b0ba89939980d1a29dcb6d4e59f7981f0a936da4aa3c",
+    "sql": "SELECT MID(memo, 1, 3) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9e199324aed5b13633ed1bb95a0a3958",
+    "digest_text": "SELECT * FROM `customers` WHERE NAME RLIKE ?",
+    "mysql_digest": "c24a3744fe6023666d31a37ac4d466f8e16dba6169773516bd9777f7354485a8",
+    "sql": "SELECT * FROM customers WHERE name RLIKE '고객'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9e199324aed5b13633ed1bb95a0a3958",
+    "digest_text": "SELECT * FROM `customers` WHERE NAME RLIKE ?",
+    "mysql_digest": "c24a3744fe6023666d31a37ac4d466f8e16dba6169773516bd9777f7354485a8",
+    "sql": "SELECT * FROM customers WHERE name REGEXP '고객'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2d7493b60f94f301c646d74b00f5de82",
+    "digest_text": "SELECT CAST ( ? AS DECIMAL (...) )",
+    "mysql_digest": "d9d52db68ea025a3205903777e2a85824953442676702dbf733f56a6f5c5f402",
+    "sql": "SELECT CAST(1 AS DECIMAL(10,2))",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f9e7953435bc0120c51c304c616af8e8",
+    "digest_text": "SELECT CAST ( ? AS SIGNED INTEGER )",
+    "mysql_digest": "8c040d61439ca162e1a9eb7d843c9c46eb473d76ad72cbec6226eb17b9c8b1fc",
+    "sql": "SELECT CAST(1 AS SIGNED INTEGER)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f9e7953435bc0120c51c304c616af8e8",
+    "digest_text": "SELECT CAST ( ? AS SIGNED INTEGER )",
+    "mysql_digest": "8c040d61439ca162e1a9eb7d843c9c46eb473d76ad72cbec6226eb17b9c8b1fc",
+    "sql": "SELECT CAST(1 AS SIGNED INT)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "70d19c3034e34935bab18b3dfc4e5a4e",
+    "digest_text": "SELECT CAST ( ? AS UNSIGNED )",
+    "mysql_digest": "269ed95032088db06dab04d95127e8555e408f1f56d6be5682d17f9751f43112",
+    "sql": "SELECT CAST(1 AS UNSIGNED)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "92e0696dd4a22f419bee662adfccf4b9",
+    "digest_text": "SELECT CAST ( ? AS BINARY )",
+    "mysql_digest": "455dd83f05d8358e0cebb7b1385739c41d2c279dfa16927ef2d2b06e304fd72e",
+    "sql": "SELECT CAST('a' AS BINARY)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b3b1ca795276137de58190a210ab7fa2",
+    "digest_text": "SELECT BINARY ?",
+    "mysql_digest": "5b862c90448d8d925f1a32cd235b8fddbf18c89381a51af3c97ade8aaba2cd86",
+    "sql": "SELECT BINARY 'a'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "8062642f4363ebce969920e93cf5ebcd",
+    "digest_text": "SELECT NOW ( ) + INTERVAL ? SQL_TSI_HOUR",
+    "mysql_digest": "a3921ce601cbc5f7a24a41c28afba0d01203c4ccb0b47bb45b9067af4828a51f",
+    "sql": "SELECT NOW() + INTERVAL 1 HOUR",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b28486b2d0a74114ea09434ac4893244",
+    "digest_text": "SELECT NOW ( ) + INTERVAL ? SQL_TSI_MONTH",
+    "mysql_digest": "27b0295886cb955c374d10b748ab8bcd5143905979c75138a02302bcf91d2aca",
+    "sql": "SELECT NOW() + INTERVAL 1 MONTH",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3d3b83a41b14e8d6e8de8b28c63d7122",
+    "digest_text": "SELECT NOW ( ) + INTERVAL ? YEAR",
+    "mysql_digest": "1d79f04e0332e292b61e8240e3456b5a9344d9f71959f574965749c744d69a65",
+    "sql": "SELECT NOW() + INTERVAL 1 YEAR",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "84d752a13867df07302b5721b3bad231",
+    "digest_text": "SELECT NOW ( ) + INTERVAL ? MINUTE_SECOND",
+    "mysql_digest": "ee1fc34aacc3dbd4404d40aa2c92aab768287f3e60cff8a5dd641b9bc84323a1",
+    "sql": "SELECT NOW() + INTERVAL '1:1' MINUTE_SECOND",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e542d78bc34868a7fec62ff9fb9e1d2d",
+    "digest_text": "SELECT COUNT ( DISTINCTROW STATUS ) FROM `orders`",
+    "mysql_digest": "2649b16af73869059cbdafaaa57a1308a9916fb9373680d36f0771d85149cc17",
+    "sql": "SELECT COUNT(DISTINCT status) FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3f2536a082c8e3c03cacbf4d2e5f026c",
+    "digest_text": "SELECT GROUP_CONCAT ( STATUS SEPARATOR ? ) FROM `orders`",
+    "mysql_digest": "498e2b2fe708fec9595461557f75960885288b98421248f45fe48b774672f10c",
+    "sql": "SELECT GROUP_CONCAT(status SEPARATOR ',') FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7e984fad5adbea8c81d728352d635f4b",
+    "digest_text": "SELECT GROUP_CONCAT ( DISTINCTROW STATUS ORDER BY STATUS ASC ) FROM `orders`",
+    "mysql_digest": "72749e965df364f2dd901daa899b0576b822df16fd1012172089645ea660ff4e",
+    "sql": "SELECT GROUP_CONCAT(DISTINCT status ORDER BY status ASC) FROM orders",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e4a0508a590cb69410416325aaf2a3da",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ? FOR UPDATE",
+    "mysql_digest": "d11ed4a55919126065a3265dc2219f58c0fe09f56fa5a7df4f030158f2ce274b",
+    "sql": "SELECT * FROM orders WHERE id = 1 FOR UPDATE",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "cd5b00061ad6101b1f3984e4761b35d6",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ? FOR SHARE",
+    "mysql_digest": "8fc74f33b28934240e5f14d98368ce439c3191d5bb3effdbbd06c7cc686c2a4b",
+    "sql": "SELECT * FROM orders WHERE id = 1 FOR SHARE",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "082b9055304d7e5825f443a48194fa3c",
+    "digest_text": "SELECT * FROM `orders` WHERE `id` = ? LOCK IN SHARE MODE",
+    "mysql_digest": "30739a3d56f628f44d29245f7fcddbd0ebe979b9d5e24ed20e19519e47c70b40",
+    "sql": "SELECT * FROM orders WHERE id = 1 LOCK IN SHARE MODE",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "2f159ef29a60a3a153c749f7ba87f978",
+    "digest_text": "SELECT `id` FROM `orders` ORDER BY `id` ASC LIMIT ?",
+    "mysql_digest": "83a8407bd1bcc9da1b6a7977ca5e890f91bc36bee5ea7b93ffe74f55f6b94be0",
+    "sql": "SELECT id FROM orders ORDER BY id ASC LIMIT 10",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "0dd6d69fb0ca3f61312c3c7e46ac0be2",
+    "digest_text": "SELECT `id` FROM `orders` ORDER BY `id` DESC LIMIT ? OFFSET ?",
+    "mysql_digest": "5a4ad03f404d9834d497ec43d39e6f2f836005e8b686a4410c7b412b23fbc78b",
+    "sql": "SELECT id FROM orders ORDER BY id DESC LIMIT 10 OFFSET 5",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "9ebdfa6cf9b0b1934b2ecc6ced1f820e",
+    "digest_text": "SELECT `id` FROM `orders` LIMIT ?, ...",
+    "mysql_digest": "5274287403c3caaa5d1ce333c25ff3a801374b759abe6ff6fe6a0ef8c57995ba",
+    "sql": "SELECT id FROM orders LIMIT 5, 10",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f7ddb607737ce60cbcdabe81906a79ae",
+    "digest_text": "SELECT * FROM `orders` USE INDEX ( `idx_orders_customer` ) WHERE `customer_id` = ?",
+    "mysql_digest": "9f325a181aa21c5a7e9286dc964a3bbeaf949b9a76e00f16644dce6f4e0b63a4",
+    "sql": "SELECT * FROM orders USE INDEX (idx_orders_customer) WHERE customer_id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "b8f70e68e18242b269f94a294762f34b",
+    "digest_text": "SELECT * FROM `orders` IGNORE INDEX ( `idx_orders_customer` ) WHERE `customer_id` = ?",
+    "mysql_digest": "889b1dc08362b2d470f2fdc3ada0389033632f2dfd349ff120254cf2e2884f08",
+    "sql": "SELECT * FROM orders IGNORE INDEX (idx_orders_customer) WHERE customer_id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "6296a74153cc5bf2e27c80e767dd1a96",
+    "digest_text": "SELECT * FROM `orders` FORCE INDEX ( `idx_orders_customer` ) WHERE `customer_id` = ?",
+    "mysql_digest": "d7dd25241951b2f419604f64ac97291305fe8644007a0b6f1ffcd4734c8ceb0d",
+    "sql": "SELECT * FROM orders FORCE INDEX (idx_orders_customer) WHERE customer_id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "042fe4abade2bd567e9940ecbbfd92e4",
+    "digest_text": "SELECT @@`version`",
+    "mysql_digest": "d210015a0c276d85b92323714234cff1ce4a2a740ac094a87abf8f25e21f1e3d",
+    "sql": "SELECT @@version",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "a85adb59ed6a7e403a4231dc4317bfd2",
+    "digest_text": "SELECT @@SESSION . `sql_mode`",
+    "mysql_digest": "e150be6761e6ac2a779221373cbd94529f93c7208964fb12b7503ae236e911f7",
+    "sql": "SELECT @@session.sql_mode",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "74e4f22af384faa3b78e1c0a9f5c7249",
+    "digest_text": "SELECT NOW",
+    "mysql_digest": "71ad6eefa308f2c6eb744d936aa25a5d9a48f63a763bf59678629f68095accc0",
+    "sql": "SELECT CURRENT_TIMESTAMP",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "3dfb380aea9cb135eaa086e04bc69d90",
+    "digest_text": "SELECT NOW ( )",
+    "mysql_digest": "2fad55a506c3342fe82629447a3412f5dfb1aaaa20b13be45f1b9c42175da923",
+    "sql": "SELECT CURRENT_TIMESTAMP()",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "74e4f22af384faa3b78e1c0a9f5c7249",
+    "digest_text": "SELECT NOW",
+    "mysql_digest": "71ad6eefa308f2c6eb744d936aa25a5d9a48f63a763bf59678629f68095accc0",
+    "sql": "SELECT LOCALTIMESTAMP",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "99bd525900684009dbb715c9893302eb",
+    "digest_text": "SELECT SCHEMA ( )",
+    "mysql_digest": "ce04eda080d3f5605113e1d0d47c2f20e23b091e2487ba586f07b32cda423942",
+    "sql": "SELECT DATABASE()",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "99bd525900684009dbb715c9893302eb",
+    "digest_text": "SELECT SCHEMA ( )",
+    "mysql_digest": "ce04eda080d3f5605113e1d0d47c2f20e23b091e2487ba586f07b32cda423942",
+    "sql": "SELECT SCHEMA()",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d409cb4eec02cf2e37702332ed0989a3",
+    "digest_text": "SELECT * FROM `orders` WHERE `memo` LIKE ? ESCAPE ?",
+    "mysql_digest": "12ec7fc07e77c4ba051a0ca7b3be95c414c1d71fb5c3f58ed53d3ba851079c5c",
+    "sql": "SELECT * FROM orders WHERE memo LIKE '%a%' ESCAPE '!'",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e14145d1113dd0fbb1b42d7d4339ad27",
+    "digest_text": "SELECT ? UNION DISTINCTROW SELECT ?",
+    "mysql_digest": "c0e7dada6b88423cc5d626c8f899761af6dc996da73e045ee43d2c0bbeb57104",
+    "sql": "SELECT 1 UNION DISTINCT SELECT 2",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d06952eda2bbe92d3fdd96b641935cff",
+    "digest_text": "INSERT IGNORE INTO `lock_arena` ( `id` , `val` ) VALUES (...)",
+    "mysql_digest": "57b595d08bdc0580eb56bead038371ece37f4026ea4b235609c68a049faf6d6d",
+    "sql": "INSERT IGNORE INTO lock_arena (id, val) VALUES (1, 1)",
+    "statement_type": "INSERT"
+  },
+  {
+    "app_digest": "712ee6d9635cbd9d6a6779e03ad22c09",
+    "digest_text": "UPDATE LOW_PRIORITY `orders` SET STATUS = ? WHERE `id` = ?",
+    "mysql_digest": "4fecaa7775311d2be5140cd10c7bcccbc816efd1a31dfcbf329a249429a2d940",
+    "sql": "UPDATE LOW_PRIORITY orders SET status = 'X' WHERE id = 1",
+    "statement_type": "UPDATE"
+  },
+  {
+    "app_digest": "da59212e5243a78c43d5dd75eb0c841a",
+    "digest_text": "SELECT CONVERT ( ? USING `utf8mb4` )",
+    "mysql_digest": "1bfeffc3b777d259a8d3ef6a9457fab24e0046e4f6f02774a12c0b343fce2f81",
+    "sql": "SELECT CONVERT('a' USING utf8mb4)",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d5cb2b8dbf7de7467eecc9cce6e1082b",
+    "digest_text": "SELECT ? COLLATE `utf8mb4_bin`",
+    "mysql_digest": "fa7d76ae4ea446515fbaaa5acaf2333646d17ae156072913680a33f5ba8bb735",
+    "sql": "SELECT 'a' COLLATE utf8mb4_bin",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "d4c4a7394f712d853665aefa47d826cc",
+    "digest_text": "SELECT POSITION ( ? IN `memo` ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "d84be54853dfca52204003576dc77a06399d13b673d43951ae3613979293f919",
+    "sql": "SELECT POSITION('a' IN memo) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "7764c34fdf741154d7b21a13d6297fad",
+    "digest_text": "SELECT TRIM ( BOTH ? FROM `memo` ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "548560178c98de0684281707fa29ee9c02583e112fda43ce8db6dcccd02643a7",
+    "sql": "SELECT TRIM(BOTH ' ' FROM memo) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "1169cf061ab4c9637ae947394ea7622d",
+    "digest_text": "SELECT EXTRACT ( YEAR FROM `created_at` ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "73320f098e361d7bad911bfe208923076e957accf7cfd4a907fcf096a9a6cb68",
+    "sql": "SELECT EXTRACT(YEAR FROM created_at) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "f20f8ead0fee5e38327de6eecdb9fb96",
+    "digest_text": "SELECT IF ( `amount` > ?, ... ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "62b0b95eb92273f27891d5072dab2d62bc3fabc06e85cf57f45880ccb9540d10",
+    "sql": "SELECT IF(amount > 100, 'big', 'small') FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "924929eac6e5e16ef24a43c0b7942249",
+    "digest_text": "SELECT `IFNULL` ( `memo` , ? ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "86d6219a0c2253593b19857ae8693df6e97d95d72419efff1ae2e83e64888c65",
+    "sql": "SELECT IFNULL(memo, 'none') FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  },
+  {
+    "app_digest": "e5508fbb03a4a9b290071ef5dca5a6b9",
+    "digest_text": "SELECT `NULLIF` ( `amount` , ? ) FROM `orders` WHERE `id` = ?",
+    "mysql_digest": "b2ac2205273aa66dcedc6f1b0d8124208179f529273e9fabbb5a0b2be1e61d59",
+    "sql": "SELECT NULLIF(amount, 0) FROM orders WHERE id = 1",
+    "statement_type": "SELECT"
+  }
+]
