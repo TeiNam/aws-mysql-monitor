@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dbmon — 슬로우 쿼리</title>
+<!--
+  임베드된 최소 화면.
+
+  ⚠ 이것은 docs/09-frontend.md 가 규정한 SPA 가 **아니다.**
+  그 스택(React 19 + Vite + TanStack + uPlot)은 M0-12 의 작업이고, 노드 툴체인을
+  런타임 이미지에 넣지 않기 위해 별도 빌드 산출물로 서빙할 계획이다.
+
+  이 파일이 존재하는 이유: **API 가 브라우저에서 실제로 동작하는지 확인**하고,
+  컨테이너 하나만 띄워도 수집 결과를 눈으로 볼 수 있게 하는 것. 같은 API 를
+  나중의 SPA 가 그대로 쓴다.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", "Noto Sans KR", sans-serif;
+    margin: 0; padding: 24px; max-width: 1400px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { opacity: .65; font-size: 13px; margin-bottom: 20px; }
+  .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  button, select { font: inherit; padding: 5px 10px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); vertical-align: top; }
+  th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+  td.num { text-align: right; }
+  code { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+         border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+  .muted { opacity: .55; font-style: italic; }
+  .warn { color: #b45309; }
+  .empty { padding: 40px; text-align: center; opacity: .6; }
+  .err { padding: 12px; border: 1px solid #b91c1c; border-radius: 6px; color: #b91c1c; }
+</style>
+</head>
+<body>
+<h1>dbmon — 슬로우 쿼리</h1>
+<div class="sub" id="mode">…</div>
+
+<div class="bar">
+  <label>환경
+    <select id="env">
+      <option value="">전체</option>
+      <option value="prd">prd</option><option value="stg">stg</option>
+      <option value="dev">dev</option><option value="unknown">unknown</option>
+    </select>
+  </label>
+  <label>구간
+    <select id="range">
+      <option value="3600000">1시간</option>
+      <option value="21600000">6시간</option>
+      <option value="86400000" selected>24시간</option>
+      <option value="604800000">7일</option>
+    </select>
+  </label>
+  <button id="reload">새로고침</button>
+  <span id="count" class="sub" style="margin:0"></span>
+</div>
+
+<div id="out"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// 컨테이너에서는 루프백 바인드가 불가능해 인증 우회가 안 된다. 서버가 기동 시
+// 발급한 토큰을 `?token=` 으로 받아 세션에 보관하고 Bearer 로 보낸다.
+//
+// **URL 에서 즉시 지운다** — 주소창·브라우저 히스토리·`Referer` 헤더에 남기지
+// 않는다. sessionStorage 라 탭을 닫으면 사라진다.
+const token = (() => {
+  const q = new URLSearchParams(location.search).get("token");
+  if (q) {
+    sessionStorage.setItem("dbmon.token", q);
+    history.replaceState(null, "", location.pathname);
+    return q;
+  }
+  return sessionStorage.getItem("dbmon.token");
+})();
+
+async function api(path) {
+  const headers = { accept: "application/json" };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const r = await fetch(path, { headers });
+  if (!r.ok) {
+    let code = r.status;
+    try { code = (await r.json()).error ?? code; } catch {}
+    throw new Error(`${r.status} ${code}`);
+  }
+  return r.json();
+}
+
+function ms(v) {
+  if (v == null) return "";
+  return v >= 1000 ? (v / 1000).toFixed(2) + "s" : v + "ms";
+}
+
+// SQL 은 서버가 정책·권한에 따라 가려서 보낸다. 화면은 그 사유를 그대로 표시한다 —
+// "없음" 과 "볼 권한이 없음" 은 사용자에게 전혀 다른 정보다.
+function sqlCell(q) {
+  if (q.sql_text) {
+    const trunc = q.sql_text_truncated ? ' <span class="tag warn">절단됨</span>' : "";
+    return `<code>${esc(q.sql_text)}</code>${trunc}`;
+  }
+  const why = {
+    not_stored: "정책상 저장되지 않음",
+    insufficient_role: "열람 권한 없음",
+  }[q.sql_redacted_reason] ?? "없음";
+  return `<span class="muted">${esc(why)}</span>`;
+}
+
+function render(items) {
+  if (!items.length) {
+    $("out").innerHTML = `<div class="empty">이 구간에 슬로우 쿼리가 없다.<br>
+      <code>just local-slow</code> 로 하나 만들어 볼 수 있다.</div>`;
+    return;
+  }
+  const rows = items.map(q => `<tr>
+    <td>${esc(new Date(q.started_at_ms).toLocaleString())}</td>
+    <td class="num"><strong>${esc(ms(q.duration_ms))}</strong></td>
+    <td>${esc(q.instance_id.split("/").pop())}</td>
+    <td><span class="tag">${esc(q.env)}</span></td>
+    <td><span class="tag">${esc(q.state)}</span>${
+      q.abandoned_reason ? ` <span class="muted">${esc(q.abandoned_reason)}</span>` : ""}</td>
+    <td class="num">${q.rows_examined ?? '<span class="muted">—</span>'}</td>
+    <td>${esc(q.duration_source)} / ${esc(q.capture_source)}</td>
+    <td>${sqlCell(q)}</td>
+  </tr>`).join("");
+
+  $("out").innerHTML = `<table><thead><tr>
+    <th>시작</th><th style="text-align:right">소요</th><th>인스턴스</th><th>env</th>
+    <th>상태</th><th style="text-align:right">검사 행</th><th>출처</th><th>SQL</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function load() {
+  $("out").innerHTML = '<div class="empty">불러오는 중…</div>';
+  const to = Date.now();
+  const from = to - Number($("range").value);
+  const env = $("env").value;
+  const qs = new URLSearchParams({ from_ms: from, to_ms: to, limit: "200" });
+  if (env) qs.set("env", env);
+  try {
+    const data = await api("/api/slow-queries?" + qs);
+    render(data.items);
+    $("count").textContent = `${data.items.length}건${data.has_more ? " (더 있음)" : ""}`;
+  } catch (e) {
+    $("out").innerHTML = `<div class="err">조회 실패: ${esc(e.message)}</div>`;
+    $("count").textContent = "";
+  }
+}
+
+(async () => {
+  try {
+    const cfg = await api("/api/auth/config");
+    const desc = {
+      "local-dev": `로컬 개발 모드 — 인증 우회 (deployment_env=${cfg.deployment_env}, 루프백 바인드)`,
+      "local-token": token
+        ? "로컬 개발 모드 — 발급 토큰으로 인증됨 (컨테이너)"
+        : "로컬 토큰이 필요하다. 서버 로그(`docker logs`)의 `?token=…` URL 로 접속한다.",
+    };
+    $("mode").textContent = desc[cfg.mode]
+      ?? `인증 모드: ${cfg.mode}${cfg.cognito_configured ? "" : " (아직 구성되지 않음)"}`;
+  } catch (e) {
+    $("mode").textContent = "인증 설정을 읽을 수 없다: " + e.message;
+  }
+  $("reload").onclick = load;
+  $("env").onchange = load;
+  $("range").onchange = load;
+  load();
+})();
+</script>
+</body>
+</html>

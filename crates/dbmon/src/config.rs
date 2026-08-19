@@ -346,6 +346,41 @@ fn is_loopback_url(url: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// ECS 태스크 안에서 돌고 있는가.
+///
+/// ECS 에이전트가 태스크마다 `ECS_CONTAINER_METADATA_URI_V4` 를 주입한다.
+/// **부재를 조건으로 쓴다** — 위험한 방향은 "프로덕션에서 로컬 예외가 켜지는"
+/// 것이므로, 프로덕션에서 항상 존재하는 값의 부재로 판정해야 안전하다.
+pub fn on_ecs() -> bool {
+    std::env::var_os("ECS_CONTAINER_METADATA_URI_V4").is_some()
+}
+
+/// 로컬 컨테이너 샌드박스인가 — **ECS 가 아닌 컨테이너 안.**
+///
+/// ECS 태스크도 `/.dockerenv` 를 가지므로 그것만으로는 판정할 수 없다.
+/// 두 사실의 곱이어야 한다.
+pub fn is_local_container_sandbox() -> bool {
+    std::path::Path::new("/.dockerenv").exists() && !on_ecs()
+}
+
+/// 엔드포인트 재지정이 허용되는가. **순수 함수** — 프로세스 환경을 읽지 않는다.
+///
+/// # 왜 컨테이너에 예외가 필요한가
+///
+/// 컨테이너 안에서 `127.0.0.1` 은 **컨테이너 자신**이다. 호스트에 띄운 DynamoDB
+/// Local 에 닿으려면 컴포즈 네트워크의 서비스 이름(`http://dynamodb:8000`)을 써야
+/// 하는데 그건 루프백이 아니다. 즉 루프백만 허용하면 **컨테이너로 로컬 개발을 할
+/// 수 없다** — 그리고 그게 이 프로젝트의 전제(SSO 만료와 무관하게 개발)를 깬다.
+///
+/// # 그래도 프로덕션이 안전한 이유
+///
+/// `deployment_env == dev` 가 여전히 필수다. prd·stg·unknown 은 URL 이 무엇이든,
+/// 컨테이너 안이든 밖이든 거부된다. 그리고 [`is_local_container_sandbox`] 가 ECS 를
+/// 배제하므로 dev ECS 태스크도 이 예외를 얻지 못한다.
+pub fn endpoint_override_allowed(env: Env, url: &str, in_local_container: bool) -> bool {
+    env == Env::Dev && (is_loopback_url(url) || in_local_container)
+}
+
 fn err(field: &str, reason: impl Into<String>) -> ConfigError {
     ConfigError {
         field: field.to_string(),
@@ -650,11 +685,13 @@ impl Config {
                 ));
             }
             // **루프백만 허용한다.** 없으면 비프로덕션 배포가 임의의 외부 주소로
-            // 인스턴스 메타데이터를 보낼 수 있다.
-            if !is_loopback_url(url) {
+            // 인스턴스 메타데이터를 보낼 수 있다. 로컬 컨테이너는 예외 —
+            // 아래 판정 함수의 문서에 이유를 적었다.
+            if !endpoint_override_allowed(self.deployment_env, url, is_local_container_sandbox()) {
                 return Err(err(
                     "storage.endpoint_url",
-                    "루프백 주소만 허용한다 (127.0.0.1 / localhost / [::1])",
+                    "루프백 주소만 허용한다 (127.0.0.1 / localhost / [::1]). \
+                     컨테이너 안에서는 컴포즈 서비스 이름도 허용한다",
                 ));
             }
         }
@@ -1098,6 +1135,12 @@ config_table = "dbmon-config"
     /// 없으면 dev 배포가 임의의 외부 주소로 인스턴스 메타데이터를 보낼 수 있다.
     #[test]
     fn non_loopback_endpoints_are_rejected() {
+        // `validate()` 는 프로세스 환경을 읽으므로 컨테이너 안에서는 판정이 다르다.
+        // 그 축은 아래 `endpoint_override_allowed` 순수 함수 테스트가 담당한다 —
+        // 여기서 조용히 통과시키면 "컨테이너에서 테스트가 이유 없이 초록" 이 된다.
+        if is_local_container_sandbox() {
+            return;
+        }
         for url in [
             "https://attacker.example",
             "http://10.0.0.5:8000",
@@ -1111,6 +1154,36 @@ config_table = "dbmon-config"
             c.storage.endpoint_url = Some(url.into());
             let e = c.validate().expect_err(&format!("{url} 이 통과했다"));
             assert_eq!(e.field, "storage.endpoint_url", "{url}");
+        }
+    }
+
+    /// **엔드포인트 재지정 판정을 전수로 확인한다.**
+    ///
+    /// 프로세스 환경을 읽지 않는 순수 함수이므로 컨테이너 안·밖 어디서 돌려도
+    /// 같은 결과가 나온다 — 그게 이 판정을 함수로 뺀 이유다.
+    #[test]
+    fn endpoint_override_is_dev_only_regardless_of_container() {
+        const REMOTE: &str = "http://dynamodb.ap-northeast-2.amazonaws.com";
+        const COMPOSE: &str = "http://dynamodb:8000";
+        const LOOPBACK: &str = "http://127.0.0.1:18000";
+
+        // dev: 루프백은 항상, 비루프백은 컨테이너 안에서만.
+        assert!(endpoint_override_allowed(Env::Dev, LOOPBACK, false));
+        assert!(endpoint_override_allowed(Env::Dev, LOOPBACK, true));
+        assert!(!endpoint_override_allowed(Env::Dev, COMPOSE, false));
+        assert!(endpoint_override_allowed(Env::Dev, COMPOSE, true));
+
+        // **비-dev 는 무엇이든 거부한다** — 컨테이너 여부가 이 판정을 뒤집지 못한다.
+        // 이게 깨지면 prd 태스크가 더미 자격증명으로 뜨고 저장이 조용히 실패한다.
+        for env in [Env::Prd, Env::Stg, Env::Unknown] {
+            for url in [LOOPBACK, COMPOSE, REMOTE] {
+                for in_container in [false, true] {
+                    assert!(
+                        !endpoint_override_allowed(env, url, in_container),
+                        "{env} / {url} / container={in_container} 가 통과했다"
+                    );
+                }
+            }
         }
     }
 

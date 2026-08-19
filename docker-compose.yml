@@ -57,7 +57,10 @@ services:
       *mysql-args
     volumes:
       - ./local/seed:/docker-entrypoint-initdb.d:ro
-      - mysql84-logs:/var/lib/mysql-logs
+      # **바인드 마운트다.** 호스트가 슬로우로그를 직접 읽어야 백필 경로를 로컬에서
+      # 돌릴 수 있다 — 이름 있는 볼륨이면 `docker exec cat` 으로 퍼내야 하고,
+      # 그러면 "한 명령으로 로컬 구동" 이 성립하지 않는다.
+      - ./local/logs/mysql84:/var/lib/mysql-logs
 
   # M1-13 비교군: 다이제스트·SQL 텍스트 상한만 다르다.
   mysql84-wide:
@@ -105,6 +108,50 @@ services:
     user: root
     volumes:
       - dynamodb-data:/data
+
+  # 모니터 자신을 컨테이너로 띄운다 (`just docker-up`).
+  #
+  # **기본으로 뜨지 않는다** (`profiles`). MySQL·DynamoDB 만 컨테이너로 쓰고
+  # dbmon 은 `cargo run` 으로 돌리는 게 개발 루프가 빠르다. 이 서비스는
+  # "운영과 같은 이미지로 화면이 뜨는지" 를 확인할 때 쓴다.
+  #
+  # 화면에 들어가려면 **기동 로그의 토큰 URL** 이 필요하다:
+  #
+  #   docker compose logs dbmon | grep token=
+  #
+  # 컨테이너는 루프백에 바인드할 수 없어(포트 퍼블리시가 안 된다) 인증 우회가
+  # 적용되지 않는다. 대신 기동 시 발급한 토큰으로 인증한다 — 우회가 아니라
+  # 자격증명이므로 `0.0.0.0` 바인드에도 구멍이 없다.
+  dbmon:
+    profiles: ["monitor"]
+    build: .
+    image: dbmon:dev
+    restart: unless-stopped
+    ports: ["18080:8080"]
+    depends_on:
+      dynamodb: { condition: service_started }
+    environment:
+      # DynamoDB Local 은 값을 보지 않지만 **SDK 는 서명하려면 자격증명이 필요하다.**
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      # 컨테이너 안의 `127.0.0.1` 은 컨테이너 자신이다 — 컴포즈 서비스 이름을 쓴다.
+      # `deployment_env=dev` + 비ECS 컨테이너에서만 허용된다(설정 검증).
+      DBMON__STORAGE__ENDPOINT_URL: http://dynamodb:8000
+      DBMON__HTTP__BIND: 0.0.0.0
+      # **조회만 한다.** 등록부의 인스턴스 엔드포인트는 호스트 기준(`127.0.0.1`)이라
+      # 컨테이너 안에서는 닿지 않는다 — 수집까지 켜면 절반만 동작하고 로그가
+      # 오해를 만든다. 수집은 호스트의 `cargo run` 이 맡고, 이 컨테이너는 그 결과를
+      # 같은 DynamoDB 에서 읽어 화면에 띄운다.
+      DBMON__ROLE: api
+      # `DBMON__ROLE=all` 로 바꿔 수집까지 시험할 때 필요하다. 없으면 IAM DB Auth
+      # 폴백을 타고 로컬 MySQL 접속이 실패한다.
+      DBMON_TARGET_PASSWORD: dbmon-local-monitor
+    volumes:
+      # 워킹 디렉터리가 `/` 이므로 설정의 상대 경로(`local/logs/…`)가 여기 맞는다.
+      # `DBMON__ROLE=all` 로 바꿔 수집까지 시험할 때 쓴다.
+      - ./local/dbmon.toml:/etc/dbmon.toml:ro
+      - ./local/logs/mysql84:/local/logs/mysql84:ro
+    command: ["--config", "/etc/dbmon.toml", "serve"]
 
 volumes:
   mysql84-logs:

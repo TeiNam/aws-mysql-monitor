@@ -18,6 +18,7 @@
 //! `endpoint_url` 을 주면 DynamoDB Local 에 붙는다. AWS 자격증명이 만료돼도 저장 경로를
 //! 개발·검증할 수 있다 — 이 프로젝트의 로컬 우선 원칙이다.
 
+pub mod broadcast;
 pub mod checkpoint;
 pub mod keys;
 pub mod lease;
@@ -546,6 +547,12 @@ impl SlowQueryStore for DynamoSlowQueryStore {
 /// 이 상수는 그 사실을 테스트가 확인하는 데 쓴다.
 #[allow(dead_code)]
 const _NO_SCAN: () = ();
+
+/// 앱이 실제로 쓰는 슬로우 쿼리 저장소 타입.
+///
+/// **DynamoDB 저장소를 그대로 쓰지 않는다** — 방송 래퍼를 거쳐야 실시간 화면에
+/// 나타나기 때문이다. 이 별칭을 쓰면 감싸는 것을 잊을 수 없다.
+pub type AppSlowQueryStore = broadcast::BroadcastingStore<DynamoSlowQueryStore>;
 
 #[cfg(test)]
 pub(crate) mod tests {

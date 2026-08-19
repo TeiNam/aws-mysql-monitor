@@ -209,10 +209,48 @@ pub fn target_opts(
         // **평문 구간에서는 cleartext 플러그인을 켜지 않는다.** 켜면 dev 비밀번호가
         // 암호화 없이 전송된다. 로컬 MySQL 은 `caching_sha2_password` 를 쓰므로
         // 필요도 없다.
-        TlsMode::PlaintextLoopback => builder.ssl_opts(None),
+        TlsMode::PlaintextLoopback => {
+            // ⚠ **여기서 길이를 막지 않으면 드라이버가 패닉한다.**
+            //
+            // `caching_sha2_password` 전체 인증은 비밀을 서버 공개키로 RSA
+            // 암호화한다. IAM DB Auth 토큰은 약 1000바이트라 RSA 블록에 들어가지
+            // 않고, `mysql_common` 이 `assert!` 로 **패닉**한다
+            // (`crypto/rsa.rs`: "message too long"). tokio 워커 스레드가 죽는다.
+            //
+            // 실제로 이걸 만들었다: `DBMON_TARGET_PASSWORD` 를 안 주면 dev 도
+            // IAM 폴백을 타고, 로컬 MySQL 에 붙는 순간 프로세스가 패닉했다.
+            // 오류로 바꿔야 원인을 읽을 수 있다.
+            if !plaintext_secret_is_sendable(secret.len()) {
+                return Err(DomainError::InvalidInput {
+                    field: "target_secret".into(),
+                    reason: format!(
+                        "평문 접속에 {}바이트 비밀을 보낼 수 없다 (RSA 한도 {MAX_PLAINTEXT_SECRET_LEN}). \
+                         IAM 토큰을 로컬 MySQL 에 쓰려 한 것으로 보인다 — \
+                         로컬 개발은 {} 환경변수로 비밀번호를 준다",
+                        secret.len(),
+                        crate::aws::auth_token::TARGET_PASSWORD_ENV
+                    ),
+                });
+            }
+            builder.ssl_opts(None)
+        }
     };
 
     Ok(Opts::from(builder))
+}
+
+/// `caching_sha2_password` 전체 인증이 RSA 로 암호화할 수 있는 최대 비밀 길이.
+///
+/// RSA-2048 블록 256바이트 − PKCS#1 v1.5 패딩 11바이트 = 245.
+/// MySQL 은 비밀 뒤에 NUL 을 붙여 암호화하므로 실제로는 1바이트 더 줄지만,
+/// 판정 목적(IAM 토큰 ~1000바이트 vs 비밀번호 수십 바이트)에는 차이가 없다.
+const MAX_PLAINTEXT_SECRET_LEN: usize = 245;
+
+/// 평문(TLS 없음) 접속에 이 길이의 비밀을 보낼 수 있는가.
+///
+/// **순수 함수로 둔다** — 드라이버 패닉을 재현하지 않고 판정을 검증할 수 있어야 한다.
+pub fn plaintext_secret_is_sendable(len: usize) -> bool {
+    len <= MAX_PLAINTEXT_SECRET_LEN
 }
 
 /// RDS 엔드포인트 도메인 접미.
@@ -508,6 +546,50 @@ mod tests {
             !opts.enable_cleartext_plugin(),
             "평문 구간에서 cleartext 를 켰다 — 비밀번호가 암호화 없이 전송된다"
         );
+    }
+
+    /// **IAM 토큰을 평문 접속에 쓰면 오류다 — 패닉이 아니라.**
+    ///
+    /// `caching_sha2_password` 전체 인증은 비밀을 RSA 로 암호화하는데 IAM 토큰
+    /// (~1000바이트)은 블록에 안 들어가고 `mysql_common` 이 `assert!` 로 패닉한다.
+    /// 실제로 이 상태를 만들어 tokio 워커가 죽는 것을 봤다 — 그때 로그에는
+    /// "message too long" 만 남아서 원인을 읽을 수 없었다.
+    #[test]
+    fn an_iam_token_on_a_plaintext_target_is_an_error_not_a_panic() {
+        let i = instance(Some("127.0.0.1"));
+        // 실제 IAM DB Auth 토큰 길이대 (서명 쿼리 문자열이 붙어 매우 길다).
+        let token = "x".repeat(1_000);
+        let err = target_opts(&i, "dbmon", &token, Env::Dev).expect_err("통과했다");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(crate::aws::auth_token::TARGET_PASSWORD_ENV),
+            "오류가 해결 방법을 알려 주지 않는다: {msg}"
+        );
+    }
+
+    /// 정상 길이 비밀번호는 계속 통과해야 한다 — 가드가 로컬 개발을 막으면 안 된다.
+    #[test]
+    fn ordinary_passwords_still_pass_on_plaintext_targets() {
+        let i = instance(Some("127.0.0.1"));
+        for pw in ["p", "dbmon-local-monitor", &"a".repeat(245)] {
+            assert!(
+                target_opts(&i, "dbmon", pw, Env::Dev).is_ok(),
+                "{}바이트 비밀번호가 막혔다",
+                pw.len()
+            );
+        }
+        assert!(!plaintext_secret_is_sendable(246));
+        assert!(plaintext_secret_is_sendable(245));
+    }
+
+    /// **TLS 경로에는 길이 제한이 없다** — 토큰이 암호화된 채널로 평문 전송된다.
+    ///
+    /// 여기까지 제한하면 프로덕션 IAM 인증이 전부 막힌다.
+    #[test]
+    fn tls_targets_accept_long_iam_tokens() {
+        let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
+        let token = "x".repeat(1_000);
+        assert!(target_opts(&i, "dbmon", &token, Env::Prd).is_ok());
     }
 
     /// **`mysql_old_password` 다운그레이드를 열지 않는다.**

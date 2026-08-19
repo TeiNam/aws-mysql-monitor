@@ -1,6 +1,11 @@
 # 로컬 개발 설정. **AWS 없이 기동된다.**
 #
-#   cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+#   DBMON_TARGET_PASSWORD=dbmon-local-monitor \
+#     cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+#
+# ⚠ `DBMON_TARGET_PASSWORD` 는 **필수**다. 없으면 dev 도 IAM DB Auth 로 폴백하고,
+#   로컬 MySQL 의 `caching_sha2_password` 가 그 긴 토큰을 RSA 로 암호화하려다
+#   실패한다. 값은 `local/seed/03-monitor-users.sql` 의 `dbmon` 계정 비밀번호다.
 #
 # 실제 AWS 리소스에 붙이려면 `10-foundation` 을 apply 하고 그 출력을 환경변수로 덮어쓴다:
 #
@@ -36,6 +41,13 @@ endpoint_url = "http://127.0.0.1:18000"
 # 로컬 컨테이너는 빠르므로 임계값을 낮춰 시나리오를 빨리 관측한다.
 slow_threshold_secs = 2
 monitor_db_user = "dbmon"
+# 로컬에서는 데모를 빨리 보기 위해 주기를 줄인다 (프로덕션 기본값은 300/60초).
+orphan_sweep_secs = 30
+backfill_secs = 10
+# **슬로우로그 백필의 로컬 소스.** `dev` 에서만 허용된다(설정 검증).
+# 실행별 정확 지표(`rows_examined`)는 이 경로로만 들어온다 — 실시간 캡처는
+# 실행 중 문장의 행 카운터를 얻을 수 없다([19 §G2](../docs/19-m1-findings.md)).
+slowlog_file = "local/logs/mysql84/slow.log"
 
 [discovery]
 # 로컬에는 VPC 가 없지만 dev 게이트를 통과하려면 값이 있어야 한다.

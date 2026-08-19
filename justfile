@@ -127,7 +127,66 @@ tf-check:
 
 # 로컬 설정으로 서버를 띄운다
 run *ARGS:
-    cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve {{ARGS}}
+    # **`DBMON_TARGET_PASSWORD` 가 없으면 dev 도 IAM DB Auth 폴백을 탄다.**
+    # 그러면 로컬 MySQL 접속에서 `caching_sha2_password` 가 ~1000바이트 토큰을
+    # RSA 로 암호화하려다 드라이버가 패닉한다. 값은 local/seed/03-monitor-users.sql
+    # 의 `dbmon` 계정 비밀번호다.
+    DBMON_TARGET_PASSWORD=dbmon-local-monitor \
+      cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve {{ARGS}}
+
+# 로컬 저장소를 준비한다 — DynamoDB Local 테이블 + 로컬 MySQL 을 감시 대상으로 등록
+#
+# **왜 등록이 필요한가**: RDS 탐색은 AWS 를 호출하므로 로컬에서는 아무것도 찾지 못한다.
+# 등록부가 비면 수집 태스크가 0개이므로, 로컬 MySQL 을 직접 등록해 그 뒤 경로
+# (수집 → 정규화 → 저장 → 백필 병합)를 전부 돌린다.
+local-init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-2
+    ddb() { aws dynamodb --endpoint-url http://127.0.0.1:18000 "$@"; }
+
+    if ! ddb describe-table --table-name dbmon-data-local >/dev/null 2>&1; then
+      # 스키마는 JSON 파일로 둔다. CLI 단축 문법은 중첩 JSON 을 받지 않고,
+      # `just` 는 `{{` 를 보간으로 해석하므로 인라인으로 쓰면 양쪽에서 깨진다.
+      ddb create-table --cli-input-json file://local/table.json >/dev/null
+      echo "테이블 생성: dbmon-data-local"
+    else
+      echo "테이블 있음: dbmon-data-local"
+    fi
+
+    # 로컬 MySQL 을 감시 대상으로 등록한다. `endpoint` 가 루프백이므로 평문 접속
+    # 경로를 탄다(`dev` + 루프백일 때만 허용된다 — `mysql::connect` 참고).
+    ddb put-item --table-name dbmon-data-local --item file://local/instance.json >/dev/null
+    echo "인스턴스 등록: mysql84-local (127.0.0.1:13306)"
+    ddb delete-item --table-name dbmon-data-local       --key '{"PK":{"S":"LEASE#LEADER#collect"},"SK":{"S":"L"}}' >/dev/null 2>&1 || true
+
+# 로컬 상태를 지운다 (테이블 삭제)
+local-reset:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-2
+    aws dynamodb --endpoint-url http://127.0.0.1:18000       delete-table --table-name dbmon-data-local >/dev/null 2>&1 || true
+    echo "테이블 삭제: dbmon-data-local"
+
+# 저장된 슬로우 쿼리를 본다
+local-show:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-2
+    aws dynamodb --endpoint-url http://127.0.0.1:18000 scan       --table-name dbmon-data-local       --filter-expression 'begins_with(PK, :p)'       --expression-attribute-values '{":p":{"S":"SQ#"}}'       --query 'Items[].{dur_ms:duration_ms.N,src:duration_source.S,cap:capture_source.S,rows:stats.M.rows_examined.N,state:state.S,sql:sql_text.S}'       --output table
+
+# 느린 쿼리를 하나 만든다 (관측 대상)
+local-slow SECS="5":
+    docker exec dbmon-dev-mysql84-1 mysql -uloadgen -pdbmon-local-loadgen -D shop       -e "SELECT /* demo */ COUNT(*) FROM orders o JOIN order_items i ON i.order_id=o.id WHERE SLEEP({{SECS}})=0;"
+
+# 전체 데모: 컨테이너 → 준비 → 기동. 다른 터미널에서 `just local-slow` 를 쏜다.
+demo: dev wait local-init
+    @echo ""
+    @echo "  준비됐다. 이 창은 서버가 점유한다."
+    @echo "  다른 터미널에서:  just local-slow   → 느린 쿼리 발생"
+    @echo "                    just local-show   → 저장된 레코드 확인"
+    @echo ""
+    just run
 
 # 설정만 검증한다
 config-check:
@@ -158,6 +217,32 @@ image-test: image
     start=$(date +%s); docker stop -t 60 dbmon-smoke >/dev/null
     echo "SIGTERM 정지: $(( $(date +%s) - start ))초 (PID 1 이 dbmon 이면 즉시)"
     docker rm -f dbmon-smoke >/dev/null
+
+# 모니터를 컨테이너로 띄우고 화면 접속 URL 을 찍는다
+#
+# 컨테이너는 루프백에 바인드할 수 없으므로 인증 우회가 적용되지 않는다.
+# 기동 시 발급된 토큰이 있어야 들어간다 — URL 을 그대로 브라우저에 붙인다.
+docker-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker compose --profile monitor up -d --build dbmon
+    echo "토큰 URL 을 기다린다…"
+    for i in $(seq 1 30); do
+      url=$(docker compose logs dbmon 2>/dev/null | grep -oE 'http://127\.0\.0\.1:8080/\?token=[a-f0-9]+' | tail -1 || true)
+      if [ -n "$url" ]; then
+        echo ""
+        echo "  화면:  ${url/:8080/:18080}"
+        echo ""
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "토큰이 나오지 않았다. docker compose logs dbmon 을 확인한다." >&2
+    exit 1
+
+# 모니터 컨테이너를 내린다
+docker-down:
+    docker compose --profile monitor rm -sf dbmon
 
 # ── AWS 가 필요한 것 (SSO 세션 필요) ─────────────────────────────────────────
 

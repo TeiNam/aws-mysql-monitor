@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
 use dbmon::config::{Config, Role};
@@ -114,7 +115,7 @@ fn worker_id(config: &Config) -> String {
 /// DynamoDB 클라이언트를 만들고 저장소 두 개를 조립한다.
 ///
 /// `endpoint_url` 이 설정에 있으면 그걸 쓴다 — DynamoDB Local 로 개발할 때다.
-async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
+async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Result<Stores> {
     use aws_config::BehaviorVersion;
 
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
@@ -144,11 +145,19 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
     let sdk = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&sdk);
 
-    Ok(Stores {
-        slow_query: Arc::new(dbmon::store::DynamoSlowQueryStore::new(
+    // **여기서 한 번 감싼다.** 수집기·백필·고아 정리가 모두 이 저장소를 쓰므로
+    // 저장 경로 어디서든 방송이 빠질 수 없다. 호출부마다 `publish` 를 넣으면
+    // 빠뜨릴 기회가 경로 수만큼 생긴다.
+    let slow_query = Arc::new(dbmon::store::broadcast::BroadcastingStore::new(
+        Arc::new(dbmon::store::DynamoSlowQueryStore::new(
             client.clone(),
             config.storage.data_table.clone(),
         )),
+        hub.clone(),
+    ));
+
+    Ok(Stores {
+        slow_query,
         lease: Arc::new(dbmon::store::lease::DynamoLeaseStore::new(
             client.clone(),
             config.storage.data_table.clone(),
@@ -166,7 +175,7 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
 
 /// 조립된 저장소들. 인자 5개를 넘기는 대신 묶는다.
 struct Stores {
-    slow_query: Arc<dbmon::store::DynamoSlowQueryStore>,
+    slow_query: Arc<dbmon::store::AppSlowQueryStore>,
     lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
     registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
     /// 백필 재개 지점. **없으면 중단 구간이 영구히 빈다.**
@@ -269,7 +278,7 @@ async fn build_slowlog_fetcher(config: &Config) -> Arc<dyn dbmon::slowlog::SlowL
 /// 한 인스턴스의 로그 그룹이 없다고 전체가 멈추면 안 된다.
 async fn backfill_round(
     fetcher: &Arc<dyn dbmon::slowlog::SlowLogFetcher>,
-    store: &Arc<dbmon::store::DynamoSlowQueryStore>,
+    store: &Arc<dbmon::store::AppSlowQueryStore>,
     checkpoints: &Arc<dbmon::store::checkpoint::DynamoCheckpointStore>,
     instances: &[dbmon_core::instance::Instance],
     config: &Config,
@@ -726,7 +735,10 @@ impl CollectTasks {
 /// 수집 태스크가 필요한 의존성.
 #[derive(Clone)]
 struct CollectDeps {
-    store: Arc<dbmon::store::DynamoSlowQueryStore>,
+    store: Arc<dbmon::store::AppSlowQueryStore>,
+    /// 실시간 지표 방송. 슬로우 쿼리는 저장소 래퍼가 방송하지만 지표는
+    /// 저장하지 않으므로(휘발성) 여기서 직접 넣는다.
+    hub: dbmon::api::hub::Hub,
     auth: TargetAuth,
     config: Arc<Config>,
     worker_id: String,
@@ -859,6 +871,9 @@ fn spawn_instance_collector(
         collector.restore(None, deps.epoch);
 
         let mut last_refresh_attempt_ms: i64 = 0;
+        // **실시간 지표 샘플러는 인스턴스마다 하나다** — 공유하면 다른 인스턴스의
+        // 카운터를 뺀다. 여기가 `global_status()` 의 유일한 호출부다.
+        let mut sampler = dbmon::metrics::MetricsSampler::new();
 
         loop {
             // **셧다운이면 협조적으로 정리하고 나간다.**
@@ -920,6 +935,21 @@ fn spawn_instance_collector(
             // 연결 수립은 tick **밖**이다. 안에서 하면 콜드 핸드셰이크(최대 5초)가
             // 1초 케이던스를 깨뜨린다.
             collector.warm_if_needed().await;
+
+            // ── 실시간 지표 (5초 주기) ──────────────────────────────────────
+            //
+            // **탐지보다 먼저 실패해도 탐지를 막지 않는다.** 지표는 부가 기능이고
+            // 탐지가 본업이다. 그래서 오류를 삼키지 않고 로그만 남기고 넘어간다.
+            if sampler.is_due(now_ms) {
+                match sampler.sample(collector.db(), now_ms).await {
+                    Ok(metrics) => deps.hub.publish_status(instance.id.as_str(), metrics),
+                    Err(e) => tracing::debug!(
+                        instance = %label,
+                        error = %telemetry::Scrubbed(&e),
+                        "실시간 지표 조회 실패 — 이 샘플만 버린다"
+                    ),
+                }
+            }
 
             match collector.detect_tick().await {
                 Ok(stats) => {
@@ -989,6 +1019,7 @@ fn spawn_leader_loop(
     auth: TargetAuth,
     readiness: Arc<Readiness>,
     shutdown: Arc<Shutdown>,
+    hub: dbmon::api::hub::Hub,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use dbmon::worker::{LeaderGate, tick_interval};
     use dbmon_core::time::{Clock, SystemClock};
@@ -1013,6 +1044,7 @@ fn spawn_leader_loop(
     let config = Arc::new(config.clone());
     let collect_deps = CollectDeps {
         store: Arc::clone(&stores.slow_query),
+        hub,
         auth,
         config: Arc::clone(&config),
         worker_id: worker_id.clone(),
@@ -1292,6 +1324,73 @@ fn spawn_leader_loop(
     }))
 }
 
+/// 커서 서명 키를 만든다.
+///
+/// **`Math.random` 같은 약한 소스를 쓰지 않는다.** 위조 가능한 커서는 다른 환경의
+/// 데이터를 가리킬 수 있다. OS 엔트로피를 쓴다.
+///
+/// 다중 워커가 커서를 공유하려면 공용 비밀이 필요하다(M6 의 남은 작업). 지금은
+/// 프로세스마다 다르므로 다른 워커의 커서는 `invalid_cursor` 로 거부된다 —
+/// 조용히 잘못된 페이지를 주는 것보다 낫다.
+fn random_cursor_key() -> Vec<u8> {
+    let mut key = vec![0u8; 32];
+    match read_entropy(&mut key) {
+        Ok(()) => key,
+        Err(e) => {
+            // 엔트로피를 못 읽으면 커서를 안전하게 만들 수 없다. 약한 키로
+            // 계속하면 위조가 가능해지므로, 커서 기능을 쓸 수 없게 만든다.
+            tracing::error!(error = %e, "엔트로피를 읽을 수 없다 — 커서 서명 키를 만들 수 없다");
+            Vec::new()
+        }
+    }
+}
+
+fn read_entropy(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf))
+}
+
+/// 컨테이너에서 화면을 쓰기 위한 로컬 토큰을 발급하고 접속 URL 을 찍는다.
+///
+/// **우회가 아니라 자격증명이다.** 발급 조건은 [`dbmon::api::auth::mint_dev_token`]
+/// 이 판정한다 — dev + 비루프백 + 비ECS 일 때만.
+fn dev_access_token(config: &dbmon::config::Config, bind_is_loopback: bool) -> Option<Arc<str>> {
+    // ECS 판정은 `config::on_ecs` 한 곳에만 둔다 — 두 곳에서 각자 환경변수를
+    // 읽으면 판정이 갈릴 수 있고, 갈리면 어느 쪽이 맞는지 알 수 없다.
+    let token = dbmon::api::auth::mint_dev_token(
+        config.deployment_env,
+        bind_is_loopback,
+        dbmon::config::on_ecs(),
+        || {
+            let mut b = [0u8; 16];
+            read_entropy(&mut b).ok().map(|()| b)
+        },
+    )?;
+
+    // **토큰을 로그에 찍는다** — 이게 유일한 전달 경로다(`docker logs`).
+    // dev + 비ECS 에서만 발급되므로 CloudWatch 로 새지 않는다.
+    tracing::warn!(
+        url = %format!("http://127.0.0.1:{}/?token={token}", config.http.port),
+        "로컬 개발 접속 토큰을 발급했다 — 이 URL 로 화면에 들어간다 (dev 전용)"
+    );
+    Some(token)
+}
+
+/// 임베드된 최소 화면.
+///
+/// ⚠ `docs/09-frontend.md` 가 규정한 SPA(React 19 + Vite + TanStack + uPlot)가 **아니다.**
+/// 그건 M0-12 의 작업이고, 노드 툴체인을 런타임 이미지에 넣지 않기 위해 별도 빌드
+/// 산출물로 서빙할 계획이다. 이 페이지는 **API 가 브라우저에서 실제로 동작하는지**
+/// 확인하고 컨테이너 하나로 결과를 볼 수 있게 하는 최소 수단이다.
+async fn index_page() -> axum::response::Response {
+    use axum::http::header;
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../assets/index.html"),
+    )
+        .into_response()
+}
+
 /// `/healthz` 에 최소 HTTP/1.1 요청을 보낸다.
 ///
 /// **HTTP 클라이언트 의존성을 추가하지 않는다.** 컨테이너 이미지에 `curl` 을 넣거나
@@ -1402,36 +1501,18 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // ── HTTP 서버 ────────────────────────────────────────────────────────────
     // `/healthz` 와 `/readyz` 는 **역할과 무관하게** 항상 띄운다.
     // collector 전용 워커도 컨테이너 헬스체크를 받아야 한다.
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .with_state(readiness.clone());
-
-    let addr = format!("{}:{}", config.http.bind, config.http.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("{addr} 에 바인드할 수 없다"))?;
-    tracing::info!(%addr, "HTTP 리스닝");
-
-    let http_shutdown = shutdown.clone();
-    let server = tokio::spawn(async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move { http_shutdown.wait().await })
-            .await;
-        if let Err(e) = result {
-            tracing::error!(error = %telemetry::Scrubbed(e), "HTTP 서버 종료 오류");
-        }
-    });
-
     // ── 저장소와 리더 게이트 ─────────────────────────────────────────────────
     //
     // **저장소에 붙지 못해도 기동은 된다.** `/readyz` 가 `storage_unavailable` 을
     // 정확히 보고하는 것이 맞다 — 기동 실패로 재시작 루프를 만들면 원인을 볼 수 없다.
-    let leader_task = match build_stores(&config).await {
+    let mut api_state: Option<dbmon::api::ApiState> = None;
+    // 방송 허브를 먼저 만든다 — 저장소가 이걸 물고 조립된다.
+    let hub = dbmon::api::hub::Hub::new();
+    let leader_task = match build_stores(&config, &hub).await {
         Ok(stores) => {
             // **실제로 닿는지 확인한다.** 클라이언트 조립 성공만으로 준비 완료를
             // 보고하면 자격증명·테이블 이름이 틀려도 `/readyz` 가 초록이다.
-            match stores.slow_query.probe().await {
+            match stores.slow_query.inner().probe().await {
                 Ok(()) => {
                     readiness.set_storage_ok(true);
                     tracing::info!(table = %config.storage.data_table, "저장소 확인됨");
@@ -1448,6 +1529,24 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             }
             let worker_id = worker_id(&config);
             tracing::info!(%worker_id, "워커 식별자");
+
+            // 조회 API 상태. **역할과 무관하게 만든다** — `role=collector` 도 저장소를
+            // 갖고 있고, 로컬 개발에서는 한 프로세스가 둘을 겸한다.
+            let bind_is_loopback = dbmon::api::auth::is_loopback_bind(&config.http.bind);
+            api_state = Some(dbmon::api::ApiState {
+                store: Arc::clone(&stores.slow_query),
+                registry: Arc::clone(&stores.registry),
+                policy: dbmon::api::auth::AuthPolicy {
+                    deployment_env: config.deployment_env,
+                    bind_is_loopback,
+                    dev_token: dev_access_token(&config, bind_is_loopback),
+                },
+                // 프로세스마다 다른 키. 재시작하면 기존 커서가 무효해지고, 그게
+                // 조용한 오동작이 아니라 명시적 `invalid_cursor` 로 나타난다.
+                cursor_key: Arc::new(random_cursor_key()),
+                hub: hub.clone(),
+            });
+
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
             let auth = build_auth(&config).await;
             spawn_leader_loop(
@@ -1457,6 +1556,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 auth,
                 readiness.clone(),
                 shutdown.clone(),
+                hub.clone(),
             )
         }
         Err(e) => {
@@ -1465,6 +1565,49 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             None
         }
     };
+
+    // `/healthz`·`/readyz` 만 인증 예외다 (T-01). 나머지는 API 라우터가 인증한다.
+    let mut app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(readiness.clone());
+
+    // 조회 API 와 화면은 **저장소가 조립된 뒤에만** 붙는다 — 저장소 없이 라우트를
+    // 열면 500 을 돌려주는 엔드포인트가 생기고, 그건 "데이터가 없다" 로 오해된다.
+    if let Some(api_state) = api_state {
+        // **임베드 화면은 로컬 개발에서만 서빙한다.**
+        //
+        // 정적 HTML 이라 데이터가 새지는 않지만, 서빙하면 T-01 의 인증 예외가
+        // `/healthz`·`/readyz`·`/api/auth/config` 에서 하나 더 늘어난다. 게다가
+        // prd 에서는 인증을 통과할 수 없으니 **깨진 화면**이다 — 표를 못 채운다.
+        // 실제 SPA(M0-12)가 오면 그때 인증을 태워 붙인다.
+        let serve_ui = api_state.policy.serves_local_ui();
+        app = app.merge(dbmon::api::router(api_state));
+        if serve_ui {
+            app = app.route("/", get(index_page));
+        }
+        tracing::info!(
+            bind_is_loopback = %dbmon::api::auth::is_loopback_bind(&config.http.bind),
+            serve_ui,
+            "조회 API 를 서비스한다"
+        );
+    }
+
+    let addr = format!("{}:{}", config.http.bind, config.http.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("{addr} 에 바인드할 수 없다"))?;
+    tracing::info!(%addr, "HTTP 리스닝");
+
+    let http_shutdown = shutdown.clone();
+    let server = tokio::spawn(async move {
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { http_shutdown.wait().await })
+            .await;
+        if let Err(e) = result {
+            tracing::error!(error = %telemetry::Scrubbed(e), "HTTP 서버 종료 오류");
+        }
+    });
 
     let signal = wait_for_signal().await;
     tracing::info!(

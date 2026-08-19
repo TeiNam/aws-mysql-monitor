@@ -587,6 +587,10 @@ pub struct FakeTargetDb {
     pub explain: Mutex<Option<ExplainOutcome>>,
     /// 대상의 전역 `sql_mode`. 어휘 발산 테스트가 여기에 값을 넣는다.
     pub sql_mode: Mutex<String>,
+    /// `global_status` 가 돌려줄 변수들.
+    pub status_vars: Mutex<BTreeMap<String, String>>,
+    /// `global_status` 를 앞으로 n 번 실패시킨다.
+    fail_global_status: AtomicUsize,
     /// 호출 횟수 (경로가 실제로 돌았는지 확인용).
     pub full_sql_calls: AtomicUsize,
     pub explain_calls: AtomicUsize,
@@ -596,6 +600,19 @@ pub struct FakeTargetDb {
 impl FakeTargetDb {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `global_status` 가 이 변수들을 돌려준다.
+    pub fn set_status(&self, pairs: &[(&str, &str)]) {
+        *self.status_vars.lock().unwrap() = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+    }
+
+    /// `global_status` 를 앞으로 n 번 실패시킨다.
+    pub fn fail_global_status(&self, n: usize) {
+        self.fail_global_status.store(n, Ordering::SeqCst);
     }
 
     /// `probe` 가 이 스레드들을 돌려준다.
@@ -736,7 +753,13 @@ impl TargetDb for FakeTargetDb {
     }
 
     async fn global_status(&self) -> Result<BTreeMap<String, String>> {
-        Ok(BTreeMap::new())
+        if Self::should_fail(&self.fail_global_status) {
+            return Err(DomainError::Unavailable {
+                dependency: "target-mysql",
+                reason: "global_status: 연결 획득 타임아웃".into(),
+            });
+        }
+        Ok(self.status_vars.lock().unwrap().clone())
     }
 
     async fn statement_digest(&self, _sql: &str) -> Result<Option<String>> {

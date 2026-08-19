@@ -24,3 +24,8 @@ web/.vite
 /local/*.local.toml
 build.log
 *.log
+local/logs/
+
+# Playwright MCP 산출물 (스냅샷·스크린샷) — 검증 흔적이지 소스가 아니다
+.playwright-mcp/
+dbmon-ui.png
