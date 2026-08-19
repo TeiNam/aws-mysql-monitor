@@ -166,3 +166,35 @@ async fn repeated_probe_failure_keeps_the_loop_alive() {
     let t = c.detect_tick().await.expect("복구 tick");
     assert_eq!(t.deep_probe_failed, 0);
 }
+
+/// **연결 수립은 tick 밖에서 일어나야 한다.**
+///
+/// 예산 충돌의 해법이 `warm()` 이므로, 실패 후 그게 실제로 표시되고 실행되는지 확인한다.
+/// 표시만 하고 아무도 부르지 않으면 이 수정은 무효다 (M2 와 같은 부류의 실수).
+#[tokio::test]
+async fn probe_failure_marks_the_pool_for_rewarming() {
+    let db = FakeTargetDb::new().with_threads(&[(1, 3)]);
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store,
+        clock.clone(),
+        params(),
+    );
+
+    // 기동 직후에는 warm 이 필요하다.
+    c.warm_if_needed().await;
+
+    c.db_mut().fail_full_sql(1);
+    c.detect_tick().await.expect("tick");
+
+    // 실패가 warm 필요를 표시했는지 — `warm_if_needed` 가 실제로 어댑터를 부르는지로 본다.
+    let before = c.db().warm_calls();
+    c.warm_if_needed().await;
+    assert!(
+        c.db().warm_calls() > before,
+        "실패 후 warm 이 호출되지 않았다 — 표시만 하고 아무도 안 부르면 무효다"
+    );
+}

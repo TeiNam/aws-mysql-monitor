@@ -109,6 +109,8 @@ pub struct InstanceCollector<D, S, C> {
     excludes: Excludes,
     params: CollectParams,
     epoch: Option<u64>,
+    /// 다음 기회에 연결 풀을 다시 채워야 한다. 기동 직후에도 참이다.
+    needs_warm: bool,
     /// `FOR CONNECTION` 이 권한 부족으로 실패했다. 이후 시도하지 않는다.
     for_connection_denied: bool,
     /// `probe` 가 0행이라 DB 시각을 못 받은 연속 횟수.
@@ -139,6 +141,7 @@ where
             excludes,
             params,
             epoch: None,
+            needs_warm: true,
             for_connection_denied: false,
             ticks_without_db_time: AtomicU64::new(0),
         }
@@ -245,6 +248,9 @@ where
                     error = %e,
                     "심층 조회 실패 — 선행 저장만 건너뛴다 (확정은 계속한다)"
                 );
+                // 연결 문제였다면 다음 tick 도 실패한다. **tick 예산 밖에서** 풀을 다시
+                // 채워야 하므로 여기서 표시만 하고 실제 warm 은 루프가 처리한다.
+                self.needs_warm = true;
             }
         }
 
@@ -290,6 +296,30 @@ where
         }
 
         Ok(stats)
+    }
+
+    /// 필요하면 연결 풀을 채운다. **`detect_tick` 밖에서 호출한다** — 여기서
+    /// `connect` 예산(기본 5초)을 온전히 쓰기 때문이다.
+    ///
+    /// 실패는 로그만 남긴다. 다음 tick 이 어차피 실패하면서 다시 표시한다.
+    pub async fn warm_if_needed(&mut self) {
+        if !self.needs_warm {
+            return;
+        }
+        match self.db.warm().await {
+            Ok(()) => {
+                self.needs_warm = false;
+                tracing::debug!(instance = %self.instance.id, "연결 풀 준비됨");
+            }
+            Err(e) => {
+                tracing::warn!(instance = %self.instance.id, error = %e, "연결 풀 준비 실패");
+            }
+        }
+    }
+
+    /// 대상 DB 어댑터 (읽기).
+    pub fn db(&self) -> &D {
+        &self.db
     }
 
     /// 대상 DB 어댑터. **페이크에 실패를 주입하는 테스트가 쓴다.**

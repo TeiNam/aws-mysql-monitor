@@ -563,6 +563,7 @@ pub struct FakeTargetDb {
     /// 호출 횟수 (경로가 실제로 돌았는지 확인용).
     pub full_sql_calls: AtomicUsize,
     pub explain_calls: AtomicUsize,
+    warm_calls: AtomicUsize,
 }
 
 impl FakeTargetDb {
@@ -601,6 +602,11 @@ impl FakeTargetDb {
                 state: Some("executing".into()),
             })
             .collect();
+    }
+
+    /// `warm` 이 몇 번 호출됐는가. **표시만 하고 아무도 부르지 않는 실수**를 잡는다.
+    pub fn warm_calls(&self) -> usize {
+        self.warm_calls.load(Ordering::SeqCst)
     }
 
     pub fn fail_full_sql(&self, n: usize) {
@@ -694,6 +700,11 @@ impl TargetDb for FakeTargetDb {
     }
 
     async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn warm(&self) -> Result<()> {
+        self.warm_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

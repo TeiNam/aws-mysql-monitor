@@ -50,15 +50,24 @@ pub struct Timeouts {
     /// `detect` 만 제한하면 총 소요가 `connect + detect` 까지 늘어난다(5,000 + 800ms).
     /// 그러면 1초 케이던스가 무너지고 tick 이 겹쳐 쌓인다. 콜드 경로에 5초가 실제로
     /// 필요하므로 `connect` 를 줄이는 대신 **경로 전체**를 한 interval 안으로 묶는다 —
-    /// # ⚠ 취소는 진행 중인 연결 수립을 **버린다**
+    /// # 두 요구가 충돌하고, 해법은 연결 수립을 tick 밖으로 빼는 것이다
     ///
-    /// `mysql_async` 의 `GetConn::drop` 은 `Connecting` 상태면 `pool.cancel_connection()`
-    /// 을 호출한다 — TLS 핸드셰이크 + IAM 토큰 인증이 폐기되고 풀에 남지 않는다.
-    /// 따라서 "초과해도 다음 tick 은 warm" 은 **사실이 아니다.** 콜드 상태에서 이 값이
-    /// `connect` 보다 작으면 "연결 시작 → 컷 → 취소" 를 매 tick 반복해 `probe` 가
-    /// 한 번도 성공하지 못할 수 있다.
+    /// | 요구 | 값 |
+    /// |---|---|
+    /// | tick 케이던스를 지켜야 한다 | 예산 800ms (1초 주기의 80%) |
+    /// | 콜드 연결 수립(TLS + IAM 토큰)에 필요한 시간 | 최대 5초 |
     ///
-    /// 그래서 이 값은 **`connect` 보다 커야 한다.** `Timeouts::derive` 가 강제한다.
+    /// 연결 수립이 tick **안에서** 일어나면 이 둘은 화해할 수 없다:
+    ///
+    /// - 상한을 5.8초로 두면 tick 이 주기의 6배가 되어 케이던스가 무너진다.
+    /// - 상한을 1초로 두면 `GetConn::drop` 이 `pool.cancel_connection()` 을 호출해
+    ///   진행 중인 핸드셰이크가 **폐기**되고, 콜드 상태에서 매 tick "시작 → 컷 → 취소" 를
+    ///   반복해 `probe` 가 한 번도 성공하지 못한다.
+    ///
+    /// 그래서 **연결 수립을 tick 밖으로 뺀다** ([`TargetMysql::warm`]). 기동 시와 실패 후에
+    /// `connect` 예산을 온전히 써서 풀을 채워 두면, tick 은 항상 warm 커넥션만 집는다.
+    /// 이 값은 그때 **tick 예산**이면 된다.
+    ///
     /// 조회 도중 취소는 안전하다(recycler 가 `cleanup_for_pool` 로 정리한다).
     pub detect_total: Duration,
     /// 심층 조회·플랜. tick 밖의 병렬 태스크에서 돈다.
@@ -75,7 +84,7 @@ pub const DEFAULT_DETECT_LIMIT: u64 = 500;
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self::derive(5_000, 800, 3_000, 30_000)
+        Self::derive(5_000, 800, 3_000, 30_000, 1_000)
     }
 }
 
@@ -85,14 +94,18 @@ impl Timeouts {
     ///
     /// `connect` 보다 크게 잡는 이유는 `detect_total` 문서에 있다: 작으면 콜드 경로에서
     /// 연결 수립이 매번 취소되어 `probe` 가 영구히 실패할 수 있다.
-    pub fn derive(connect_ms: u64, detect_ms: u64, query_ms: u64, bulk_query_ms: u64) -> Self {
-        let connect = Duration::from_millis(connect_ms);
-        let detect = Duration::from_millis(detect_ms);
+    pub fn derive(
+        connect_ms: u64,
+        detect_ms: u64,
+        query_ms: u64,
+        bulk_query_ms: u64,
+        detect_interval_ms: u64,
+    ) -> Self {
         Self {
-            connect,
-            detect,
-            // 연결 수립(콜드)과 조회를 모두 담을 수 있어야 한다. 여유 20%.
-            detect_total: connect + detect + (connect + detect) / 5,
+            connect: Duration::from_millis(connect_ms),
+            detect: Duration::from_millis(detect_ms),
+            // **tick 예산이다.** 연결 수립은 `warm()` 이 tick 밖에서 처리한다.
+            detect_total: Duration::from_millis(detect_interval_ms * 80 / 100),
             query: Duration::from_millis(query_ms),
             bulk_query: Duration::from_millis(bulk_query_ms),
         }
@@ -130,6 +143,7 @@ impl TargetMysql {
             cfg.detect_timeout_ms,
             cfg.query_timeout_ms,
             cfg.bulk_query_timeout_ms,
+            cfg.detect_interval_ms,
         );
         Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label)
     }
@@ -149,6 +163,22 @@ impl TargetMysql {
             detect_limit,
             label: label.into(),
         })
+    }
+
+    /// **hot 풀을 미리 채운다. tick 밖에서 부른다.**
+    ///
+    /// 기동 시 한 번, 그리고 detect 가 연결 문제로 실패한 뒤에 부른다.
+    /// `connect` 예산(기본 5초)을 온전히 쓰므로 TLS 핸드셰이크와 IAM 토큰 인증이
+    /// 중간에 취소되지 않는다 — `detect_total`(tick 예산) 안에서는 그게 불가능하다.
+    ///
+    /// 성공하면 이후 tick 은 warm 커넥션만 집으므로 획득이 즉시 끝난다.
+    pub async fn warm(&self) -> Result<()> {
+        // 커넥션을 얻어 간단한 쿼리를 돌린다. `init`(세션 설정)도 이때 적용된다.
+        let conn = self.hot_conn().await?;
+        let _: Vec<u8> = self
+            .run(conn, sql::PING.to_string(), Vec::new(), self.timeouts.query)
+            .await?;
+        Ok(())
     }
 
     async fn hot_conn(&self) -> Result<Conn> {
@@ -563,18 +593,21 @@ mod tests {
     #[test]
     fn from_config_propagates_settings() {
         // 설정값을 그대로 파생시킨다.
-        let t = Timeouts::derive(4_000, 600, 3_000, 30_000);
+        let t = Timeouts::derive(4_000, 600, 3_000, 30_000, 1_000);
         assert_eq!(t.detect, Duration::from_millis(600));
         assert_eq!(t.connect, Duration::from_millis(4_000));
-        // **`detect_total` 은 `connect` 보다 커야 한다** — 작으면 콜드 경로에서
-        // 연결 수립이 매 tick 취소되어 probe 가 영구히 실패한다.
-        assert!(
-            t.detect_total > t.connect,
-            "detect_total({:?}) 이 connect({:?}) 보다 커야 한다",
+        // **`detect_total` 은 tick 예산이다.** 연결 수립은 `warm()` 이 tick 밖에서 한다.
+        // 예전 판은 `connect + detect + 20%` = 6,960ms 였는데, 1초 주기의 **8.7배**라
+        // 아무것도 묶지 못했다 — M17(케이던스)과 M4(취소) 사이를 한 바퀴 돈 결과였다.
+        assert_eq!(
             t.detect_total,
-            t.connect
+            Duration::from_millis(800),
+            "1초 주기의 80% 여야 한다"
         );
-        assert!(t.detect_total >= t.connect + t.detect);
+        assert!(
+            t.detect_total < t.connect,
+            "tick 예산이 연결 예산보다 작은 것이 정상이다 — 그래서 warm() 이 필요하다"
+        );
     }
     use super::*;
 

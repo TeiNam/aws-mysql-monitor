@@ -277,6 +277,18 @@ pub trait TargetDb: Send + Sync {
     async fn db_now_ms(&self) -> Result<EpochMs>;
 
     async fn ping(&self) -> Result<()>;
+
+    /// **연결 풀을 미리 채운다. tick 밖에서 호출한다.**
+    ///
+    /// 콜드 연결 수립(TLS 핸드셰이크 + IAM 토큰 인증)은 최대 5초가 걸리는데 detect tick
+    /// 예산은 800ms 다. tick 안에서 수립을 시도하면 예산 초과로 **취소**되고,
+    /// `mysql_async` 는 진행 중이던 핸드셰이크를 폐기하므로 콜드 상태에서 영구히
+    /// 실패할 수 있다. 그래서 수립을 tick 밖으로 뺀다.
+    ///
+    /// 기본 구현은 `ping` 이다 — 대부분의 어댑터에는 풀이 없다.
+    async fn warm(&self) -> Result<()> {
+        self.ping().await
+    }
 }
 
 #[cfg(test)]
