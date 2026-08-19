@@ -336,8 +336,12 @@ SELECT * FROM orders WHERE memo = '\'; SELECT 31337 AS pwned; SELECT 1 -- '
 `TargetDb::warm()`(기본 구현 = `ping`)을 기동 시와 실패 후에 부른다. 그러면 tick 은
 항상 warm 커넥션만 집으므로 `detect_total` 은 tick 예산이면 된다.
 
-배선까지 테스트로 고정했다 — `needs_warm` 표시를 지우면 실패한다.
+`needs_warm` 표시를 지우면 테스트가 실패한다 — 표시와 처리의 **관계**는 고정됐다.
 2차의 M2("`connect_with_limit` 호출부가 없어서 수정이 무효였다")와 같은 실수를 막는다.
+
+⚠ **다만 `warm_if_needed` 도 `detect_tick` 도 프로덕션 호출부가 없다.** 수집 루프 자체가
+`main.rs` 에 배선되지 않았다(M4-21 미구현). 즉 이 수정들은 **배선되는 시점에** 유효해진다.
+아래 "가장 큰 남은 격차" 를 참조한다.
 
 ---
 
@@ -523,6 +527,32 @@ SQL 은 `PROCESSLIST.INFO` 에서 오므로 대상 DB 에 쿼리를 날릴 수 �
 숫자 마스킹의 `is_estimate_key` allowlist 는 8.4 가 내는 모든 숫자 키에 대해 정확하다.
 `mask_label`·`scrub`·`next_quote` 는 패닉 없고 UTF-8 안전하다(합계 80만+ 퍼징).
 `LOAD DATA LOCAL INFILE` 파일 탈취는 이중 차단으로 불가.
+
+---
+
+## 가장 큰 남은 격차 — **수집 루프가 배선되지 않았다**
+
+359개 테스트가 통과하고 4라운드 리뷰를 거쳤지만, **`main.rs` 는 수집을 시작하지 않는다.**
+
+```
+$ grep -rn "detect_tick\|warm_if_needed" crates/ | grep -v tests/
+crates/dbmon/src/collector/mod.rs:323:    pub async fn warm_if_needed(&mut self) {
+   → 정의만 있고 호출부가 없다
+```
+
+`serve` 는 HTTP 서버(`/healthz`·`/readyz`)와 그레이스풀 셧다운만 돌린다. 즉 지금까지
+리뷰한 코드는 **단위·통합 테스트에서만 실행된다.** 실제로 돌려면 세 가지가 필요하다:
+
+| # | 필요한 것 | 로드맵 | 왜 막혀 있나 |
+|---|---|---|---|
+| 1 | `SlowQueryStore` 구현 (DynamoDB) | M2-4 | 페이크만 있다. 로컬 DynamoDB 는 이미 떠 있다 |
+| 2 | 샤드 리스 + 수집 리더 게이트 (F1) | M4-21 | `LeaseStore` 구현 없음. `ShardsOwned 합계 = 64 또는 0` 불변식을 코드가 강제하지 않는다 |
+| 3 | RDS 인스턴스 탐색 | M2-5 | `InstanceRegistry` 페이크만 있다 |
+
+**리뷰의 한계**: 배선되지 않은 코드에 대한 리뷰는 "이 로직이 맞는가" 까지만 답한다.
+"이 로직이 실제로 불리는가", "루프가 예산 안에 도는가", "리스가 실제로 split-brain 을
+막는가" 는 배선 후에만 검증된다. 3차의 C3-5(`warm()` 이 자기 시나리오에서 발동하지 않음)와
+2차의 M2(호출부 없음)가 그 부류였고, **둘 다 배선이 없어서 리뷰로만 잡힌 것**이다.
 
 ---
 
