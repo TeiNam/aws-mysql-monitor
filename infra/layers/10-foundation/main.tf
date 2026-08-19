@@ -147,8 +147,19 @@ resource "aws_dynamodb_table" "data" {
 
   # 다이제스트 축 + 활성 알림 + 진행 중 레코드.
   #
-  # **희소 인덱스**로 쓴다: 확정 시 `GSI1PK` 를 제거하면 항목이 인덱스에서 자동 탈락한다.
-  # 그게 고아 `in_flight` 정리(F4)와 활성 알림 목록(AP-9)의 구현 방식이다.
+  # **희소 인덱스**다: `GSI1PK` 속성이 없는 항목은 인덱스에 들어가지 않는다.
+  #
+  # 엔티티마다 쓰는 방식이 다르다:
+  #
+  # | 엔티티 | in_flight / firing | 확정 / 해소 |
+  # |---|---|---|
+  # | `SlowQuery` | `SQS#in_flight` (AP-18 고아 정리, F4) | **`DG#<app_digest>` 로 교체** (AP-3) |
+  # | `Alert` | `ALS#firing` (AP-9) | 속성 **제거** → 인덱스에서 탈락 |
+  #
+  # `SlowQuery` 는 제거가 아니라 **교체**다. 확정된 레코드는 AP-3(다이제스트 → 최근 실행
+  # 샘플)에서 여전히 보여야 한다. 제거하면 그 접근 패턴이 조용히 0건을 반환한다.
+  # 한 항목은 `GSI1PK` 를 하나만 가질 수 있으므로 상태 전이로 두 패턴을 나눈다
+  # ([04 §2.3](../../../docs/04-data-model.md)).
   global_secondary_index {
     name = "GSI1"
     # provider 6.x 에서 GSI 의 `hash_key`/`range_key` 는 deprecated 다.
@@ -167,6 +178,8 @@ resource "aws_dynamodb_table" "data" {
       "record_id", "instance_id", "env", "started_at_ms", "duration_ms",
       "app_digest", "statement_type", "state", "last_seen_at_ms", "owner_worker",
       "exec_count", "total_time_ms", "severity", "rule_id",
+      # F4 고아 스윕이 소유권을 확인하고 정리 대상을 판정하는 데 필요하다.
+      "owner_epoch", "thread_id", "abandoned_reason",
     ]
   }
 

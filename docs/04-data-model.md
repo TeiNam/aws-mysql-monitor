@@ -132,7 +132,7 @@ v    (N)  스키마 버전
 |---|---|---|---|
 | AP-1 | 특정 인스턴스의 기간별 슬로우 쿼리(최신순) | 기본 | `PK = SQ#<instance_id>#<date>`, SK 범위 |
 | AP-2 | 슬로우 쿼리 단건 상세 | 기본 | `record_id`에서 PK/SK 유도 → `GetItem` |
-| AP-3 | 특정 다이제스트의 최근 실행 샘플(크로스 인스턴스) | GSI1 | `GSI1PK = DG#<app_digest>`, `begins_with(GSI1SK,'Q#')`, 역순 |
+| AP-3 | 특정 다이제스트의 최근 실행 샘플(크로스 인스턴스) | GSI1 | `GSI1PK = DG#<app_digest>`, `begins_with(GSI1SK,'Q#')`, 역순. **완결된 레코드만 보인다** (진행 중은 GSI1 의 다른 파티션에 있다) |
 | AP-4 | 환경별 슬로우 쿼리 목록(최신순, 실행시간 구간 필터) | GSI2 | `GSI2PK = ENV#<env>#<dur_bucket>#<hour_bucket>` |
 | AP-5 | 인스턴스-시간별 다이제스트 롤업 | 기본 | `PK = DR#<instance_id>#<yyyy-mm>`, SK 범위 |
 | AP-6 | 특정 다이제스트의 시간별 추이(크로스 인스턴스) | GSI1 | `GSI1PK = DG#<app_digest>`, `begins_with(GSI1SK,'R#')` |
@@ -147,7 +147,7 @@ v    (N)  스키마 버전
 | AP-15 | 인스턴스 자체 지표 시간 롤업 | 기본 | `PK = MR#<instance_id>#<yyyy-mm>`, `SK = <hour_bucket>` |
 | AP-16 | 계정별 워크로드 시간 롤업 ([ADR-021](03-decisions.md)) | 기본 | `PK = UR#<instance_id>#<yyyy-mm>`, `SK = <hour_bucket>#<db_user>` |
 | AP-17 | 환경 전체 Top 다이제스트 (사전 집계, [ADR-003](03-decisions.md)) | 기본 | `PK = TOP#<env>#<yyyy-mm-dd>`, `SK = <hour_bucket>#<rank>` |
-| AP-18 | 진행 중(`in_flight`) 레코드 조회 (고아 정리, F4) | GSI1 | `GSI1PK = SQS#in_flight` (희소) |
+| AP-18 | 진행 중(`in_flight`) 레코드 조회 (고아 정리, F4) | GSI1 | `GSI1PK = SQS#in_flight` (희소), `GSI1SK < <임계>`. **확정 시 `DG#<app_digest>` 로 바뀐다** — §2.3 참조 |
 | AP-19 | 히스토그램 롤업 (관찰 등록 다이제스트, [12 §3.2.1](12-reporting.md)) | 기본 | `PK = HG#<instance_id>#<yyyy-mm>`, `SK = <hour_bucket>#<app_digest>` |
 | AP-20 | 발송 의도 큐 ([10 §2.0](10-alerting.md)) | 기본 | `PK = NOTIFY`, `SK = <epoch_ms>#<fingerprint>` |
 | AP-21 | AI 토큰 사용량 누적 (F30) | 기본 | `PK = USAGE#<env>`, `SK = <yyyy-mm>` |
@@ -159,13 +159,31 @@ v    (N)  스키마 버전
 ```
 PK        SQ#<instance_id>#<date_part>
 SK        <started_at_ms>#<thread_id>
-GSI1PK    DG#<app_digest>
-GSI1SK    Q#<started_at_ms>#<instance_id>
+GSI1PK    state == in_flight ? SQS#in_flight : DG#<app_digest>     ← 상태에 따라 바뀐다
+GSI1SK    state == in_flight ? <last_seen_at_ms>  : Q#<started_at_ms>#<instance_id>
 GSI2PK    ENV#<env>#<dur_bucket>#<hour_bucket>
 GSI2SK    <started_at_ms>#<thread_id>
 ttl       started_at_ms/1000 + 35일
 v         1
 ```
+
+**`GSI1PK` 가 상태에 따라 바뀌는 이유** — 한 항목은 `GSI1PK` 를 **하나만** 가질 수 있는데
+이 엔티티에는 GSI1 을 쓰는 접근 패턴이 둘이다:
+
+| 패턴 | 필요한 `GSI1PK` | 관심 있는 상태 |
+|---|---|---|
+| AP-3 (다이제스트 → 최근 실행 샘플) | `DG#<app_digest>` | **완결된** 것만 |
+| AP-18 (진행 중 레코드 → 고아 정리, F4) | `SQS#in_flight` (희소) | **진행 중**인 것만 |
+
+두 패턴이 관심 있는 상태가 겹치지 않으므로 **상태 전이와 함께 키를 바꾸면** 둘 다 만족한다.
+선행 저장은 `SQS#in_flight` 로 쓰고, 확정 시 `DG#<app_digest>` 로 바꾼다.
+
+⚠ **이걸 놓치면 F4 가 조용히 죽는다.** `GSI1PK = DG#<app_digest>` 를 항상 쓰면 AP-18 쿼리가
+**항상 0건**을 반환하고, 고아 레코드는 영원히 `in_flight` 로 남아 TTL(35일)까지 화면에
+"실행 중" 으로 표시된다. 실패가 에러로 나타나지 않으므로 알아채기 어렵다.
+
+`in_flight` 상태의 `GSI1SK` 를 `last_seen_at_ms` 로 두면 고아 스윕이
+`GSI1SK < now - 임계` 로 **오래된 것부터** 스캔할 수 있다 — 전체를 읽지 않아도 된다.
 
 | 속성 | 타입 | 설명 |
 |---|---|---|
