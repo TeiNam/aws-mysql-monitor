@@ -154,6 +154,10 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
             config.storage.data_table.clone(),
         )),
         registry: Arc::new(dbmon::store::registry::DynamoInstanceRegistry::new(
+            client.clone(),
+            config.storage.data_table.clone(),
+        )),
+        checkpoint: Arc::new(dbmon::store::checkpoint::DynamoCheckpointStore::new(
             client,
             config.storage.data_table.clone(),
         )),
@@ -165,6 +169,8 @@ struct Stores {
     slow_query: Arc<dbmon::store::DynamoSlowQueryStore>,
     lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
     registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
+    /// 백필 재개 지점. **없으면 중단 구간이 영구히 빈다.**
+    checkpoint: Arc<dbmon::store::checkpoint::DynamoCheckpointStore>,
 }
 
 /// 리전별 RDS 탐색기.
@@ -189,6 +195,18 @@ async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> 
     }
     out
 }
+
+/// 첫 실행이 거슬러 올라갈 구간 (5분).
+///
+/// 짧으면 기동 직후 구간을 잃는다 — 창보다 오래 걸린 쿼리는 첫 라운드에서 빠지고,
+/// 체크포인트가 그 지점을 지나가면 **영구히 백필되지 않는다.**
+const BACKFILL_INITIAL_LOOKBACK_MS: i64 = 5 * 60_000;
+
+/// 백필이 한 번에 거슬러 올라갈 최대 구간 (1시간).
+///
+/// 며칠 멈춘 워커가 며칠치를 한 번에 읽으면 API 조절과 메모리 폭주가 함께 온다.
+/// 잘린 구간은 로그로 알린다 — 그만큼 정확 지표가 영구히 없다.
+const BACKFILL_MAX_LOOKBACK_MS: i64 = 60 * 60_000;
 
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
 const ORPHAN_SWEEP_LIMIT: usize = 500;
@@ -221,19 +239,48 @@ async fn build_slowlog_fetcher(config: &Config) -> Arc<dyn dbmon::slowlog::SlowL
 async fn backfill_round(
     fetcher: &Arc<dyn dbmon::slowlog::SlowLogFetcher>,
     store: &Arc<dbmon::store::DynamoSlowQueryStore>,
+    checkpoints: &Arc<dbmon::store::checkpoint::DynamoCheckpointStore>,
     instances: &[dbmon_core::instance::Instance],
     config: &Config,
     now_ms: i64,
 ) -> dbmon::slowlog::source::BackfillStats {
     use dbmon::slowlog::source::{BackfillStats, backfill};
+    use dbmon::store::checkpoint::{resume_from, slowlog_job};
 
     let min_ms = (config.collector.slow_threshold_secs as i64) * 1000;
+    // 첫 실행이 볼 구간. **백필 주기의 2배로는 부족하다** — 주기가 60초면 120초이고,
+    // 그보다 오래 걸린 쿼리는 첫 라운드에서 창 밖이라 건너뛴 뒤 체크포인트가 그
+    // 지점을 지나가 **영구히 백필되지 않는다.** 실측에서 26초 쿼리 3건 중 2건이
+    // 그렇게 빠지는 것을 봤다(주기 10초, 창 20초).
+    //
+    // 첫 실행은 한 번뿐이고 `max_lookback` 으로 상한이 있으므로 넉넉하게 둔다.
+    let initial_lookback_ms =
+        BACKFILL_INITIAL_LOOKBACK_MS.max((config.collector.backfill_secs as i64) * 2_000);
+    let max_lookback_ms = BACKFILL_MAX_LOOKBACK_MS;
     let mut total = BackfillStats::default();
 
     for instance in instances.iter().filter(|i| i.is_collectible()) {
-        // 체크포인트 없이 도는 첫 구현이다 — 병합이 멱등이므로 안전하고,
-        // 구간은 백필 주기의 2배로 제한해 같은 데이터를 무한히 다시 읽지 않는다.
-        let since_ms = now_ms - (config.collector.backfill_secs as i64) * 2_000;
+        let job = slowlog_job(&instance.id);
+        // **체크포인트에서 재개한다.** 고정 창만 쓰면 그 창보다 긴 중단이
+        // 생겼을 때 그 구간의 정확 지표가 영구히 없다.
+        let checkpoint = checkpoints.get(&job).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                instance = %instance.id.as_str(),
+                error = %telemetry::Scrubbed(&e),
+                "체크포인트를 읽을 수 없다 — 기본 창으로 진행한다"
+            );
+            None
+        });
+        let (since_ms, skipped_ms) =
+            resume_from(checkpoint, now_ms, initial_lookback_ms, max_lookback_ms);
+        if let Some(gap_ms) = skipped_ms {
+            // **조용히 건너뛰지 않는다.** 그 구간은 정확 지표가 영구히 없다.
+            tracing::warn!(
+                instance = %instance.id.as_str(),
+                gap_ms,
+                "백필 재개 지점이 너무 오래됐다 — 구간을 건너뛴다 (그만큼 정확 지표가 없다)"
+            );
+        }
         let chunk = match fetcher.fetch(&instance.id, since_ms).await {
             Ok(c) => c,
             Err(e) => {
@@ -245,7 +292,22 @@ async fn backfill_round(
                 continue;
             }
         };
-        let parsed = dbmon::slowlog::parse(&chunk.text, min_ms);
+        let mut parsed = dbmon::slowlog::parse(&chunk.text, min_ms);
+        // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
+        //
+        // 파일 소스는 파일 전체를 준다. 그대로 병합하면 매 라운드 같은 수천 건을
+        // 다시 쓴다 — 실제로 10초마다 1,588건을 재병합하는 것을 관측했다.
+        // CloudWatch 는 `start_time` 을 적용하지만 경계가 이벤트 단위라 겹칠 수 있다.
+        let before = parsed.entries.len();
+        parsed.entries.retain(|e| e.ended_at_ms >= since_ms);
+        let filtered_out = before - parsed.entries.len();
+        if filtered_out > 0 {
+            tracing::debug!(
+                instance = %instance.id.as_str(),
+                filtered_out,
+                "재개 지점보다 오래된 엔트리를 건너뛴다"
+            );
+        }
         if !parsed.skipped.is_empty() {
             tracing::debug!(
                 instance = %instance.id.as_str(),
@@ -268,6 +330,30 @@ async fn backfill_round(
                 total.merged += s.merged;
                 total.unnormalizable += s.unnormalizable;
                 total.errors += s.errors;
+
+                // **체크포인트를 옮긴다.** 처리한 마지막 엔트리 시각 + 1ms 다.
+                //
+                // 실패한 엔트리가 있으면 옮기지 않는다 — 옮기면 그 엔트리는 영구히
+                // 다시 시도되지 않는다. 병합이 멱등이므로 다시 읽는 비용이 유실보다 싸다.
+                if s.errors == 0 {
+                    let position = chunk.next_since_ms.or_else(|| {
+                        parsed
+                            .entries
+                            .iter()
+                            .map(|e| e.ended_at_ms)
+                            .max()
+                            .map(|t| t + 1)
+                    });
+                    if let Some(pos) = position
+                        && let Err(e) = checkpoints.put(&job, pos).await
+                    {
+                        tracing::warn!(
+                            instance = %instance.id.as_str(),
+                            error = %telemetry::Scrubbed(&e),
+                            "체크포인트 저장 실패 — 다음 라운드가 같은 구간을 다시 읽는다"
+                        );
+                    }
+                }
             }
             Err(e) => tracing::warn!(
                 instance = %instance.id.as_str(),
@@ -1111,8 +1197,15 @@ fn spawn_leader_loop(
                     if let (Some(f), Ok(instances)) =
                         (fetcher.as_ref(), stores.registry.list().await)
                     {
-                        let s = backfill_round(f, &stores.slow_query, &instances, &config, now_ms)
-                            .await;
+                        let s = backfill_round(
+                            f,
+                            &stores.slow_query,
+                            &stores.checkpoint,
+                            &instances,
+                            &config,
+                            now_ms,
+                        )
+                        .await;
                         if s.merged > 0 || s.errors > 0 {
                             tracing::info!(
                                 merged = s.merged,
