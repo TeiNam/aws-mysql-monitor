@@ -270,3 +270,50 @@ pub fn report(title: &str, rows: &[(String, String)]) {
     }
     println!("└─");
 }
+
+/// 실행 중인 쿼리를 죽이고 태스크가 끝나기를 기다린다.
+pub async fn kill_and_wait(r: RunningQuery) {
+    if let Some(mut probe) = connect(MYSQL84, ROOT).await {
+        kill_query(&mut probe, r.connection_id).await;
+        let _ = probe.disconnect().await;
+    }
+    let _ = r.handle.await;
+    // 서버가 스레드를 정리할 시간을 준다 — 바로 tick 하면 아직 processlist 에 있다.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+}
+
+/// 대상 DB 에 남아 있는 장기 실행 쿼리를 전부 죽인다.
+///
+/// 테스트가 순차로 돌더라도 `SLEEP(6)` 이 다음 테스트까지 살아남으면 후보가 섞인다.
+/// 각 테스트 시작 시 호출해 **격리를 보장한다.**
+pub async fn reset_targets(target: Target) {
+    let Some(mut root) = connect(target, ROOT).await else {
+        return;
+    };
+    let ids: Vec<u64> = root
+        .query(
+            "SELECT ID FROM information_schema.PROCESSLIST              WHERE COMMAND <> 'Sleep' AND USER <> 'root' AND INFO IS NOT NULL",
+        )
+        .await
+        .unwrap_or_default();
+    for id in ids {
+        kill_query(&mut root, id).await;
+    }
+    let _ = root.disconnect().await;
+    // 서버가 스레드를 정리할 시간을 준다.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+/// 대상 DB 를 쓰는 테스트를 **직렬화**한다.
+///
+/// `reset_targets` 가 다른 테스트의 장기 실행 쿼리까지 죽이므로 병렬 실행은 불안정하다.
+/// `--test-threads=1` 을 잊어도 안전하게 만든다 — 실행 방법에 의존하는 테스트는
+/// 언젠가 CI 에서 깨진다.
+pub static TARGET_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 락을 잡고 대상 DB 를 초기화한다. 가드가 살아 있는 동안 다른 테스트가 끼어들지 않는다.
+pub async fn exclusive_target(target: Target) -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TARGET_DB_LOCK.lock().await;
+    reset_targets(target).await;
+    guard
+}

@@ -21,6 +21,8 @@
 //! | [`slow_query`] | 슬로우 쿼리 레코드, 리터럴 정책 |
 //! | [`merge`] | 3소스 대칭 병합 (F5) |
 //! | [`digest`] | 다이제스트 델타, 리셋 감지 |
+//! | [`inflight`] | in-flight 상태 머신, 스레드 재사용 방어 (R5) |
+//! | [`clock_offset`] | 시계 오프셋 추정 (F14) |
 //! | [`rollup`] | 상위 N + `_other` 총량 보존 (F6, R9) |
 //! | [`rbac`] | 토큰 ∩ 서버 레코드 인가 (T-20) |
 //! | [`secret`] | 로깅할 수 없는 값 |
@@ -28,11 +30,13 @@
 //! | [`ports`] | trait 정의 |
 //! | [`fakes`] | 테스트용 인메모리 구현 = **두 번째 구현** |
 
+pub mod clock_offset;
 pub mod digest;
 pub mod env;
 pub mod error;
 pub mod fakes;
 pub mod ids;
+pub mod inflight;
 pub mod instance;
 pub mod merge;
 pub mod ports;
@@ -42,8 +46,10 @@ pub mod secret;
 pub mod slow_query;
 pub mod time;
 
+pub use clock_offset::{ClockOffset, OffsetSeverity};
 pub use error::{DomainError, Result};
 pub use ids::{ClusterId, DurBucket, InstanceId, RecordId};
+pub use inflight::{InFlightTracker, Observation, Tracked};
 pub use secret::{Secret, SecretString};
 pub use time::{Clock, DatePart, EpochMs, HourBucket, SystemClock, TimeRange};
 
