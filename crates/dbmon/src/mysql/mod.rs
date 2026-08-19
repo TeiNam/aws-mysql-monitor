@@ -16,6 +16,7 @@
 //! | `hot` | `detect` **전용 예약** + 심층 조회 + 플랜 | 2~4 |
 //! | `bulk` | `digest`·`status`·`health`·`daily` | 1~2 |
 
+pub mod connect;
 pub mod sql;
 
 use std::time::Duration;

@@ -15,6 +15,7 @@ use dbmon::config::{Config, Role};
 use dbmon::health::{Readiness, healthz, readyz};
 use dbmon::shutdown::{Shutdown, run_stages, stage, wait_for_signal};
 use dbmon::telemetry;
+use dbmon_core::ports::{AuthTokenProvider, InstanceRegistry};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,6 +145,7 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
     let client = aws_sdk_dynamodb::Client::new(&sdk);
 
     Ok(Stores {
+        sdk: sdk.clone(),
         slow_query: Arc::new(dbmon::store::DynamoSlowQueryStore::new(
             client.clone(),
             config.storage.data_table.clone(),
@@ -161,6 +163,9 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
 
 /// 조립된 저장소들. 인자 5개를 넘기는 대신 묶는다.
 struct Stores {
+    /// 인증 공급자 조립에 쓴다. **DynamoDB 로컬 경로의 더미 자격증명이 아니라**
+    /// 대상 리전 자격증명이 필요하므로 `build_auth` 가 리전을 다시 지정한다.
+    sdk: aws_config::SdkConfig,
     slow_query: Arc<dbmon::store::DynamoSlowQueryStore>,
     lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
     registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
@@ -298,6 +303,236 @@ async fn discover(
     outcome
 }
 
+/// 대상 접속 비밀을 발급하는 주체. 배포 환경에 따라 갈린다.
+///
+/// **`dev` + 환경변수가 있을 때만 고정 비밀번호를 쓴다.** 두 조건이 모두 필요하다 —
+/// 환경변수만 보면 prd 태스크에 그 변수가 새어 들어갔을 때 IAM 대신 비밀번호로
+/// 붙으려 하고, 실패 원인이 "인증 실패" 로만 보인다.
+fn build_auth(
+    config: &Config,
+    region: &str,
+    sdk: &aws_config::SdkConfig,
+) -> Arc<dyn AuthTokenProvider> {
+    use dbmon::aws::auth_token::{IamAuthTokenProvider, StaticPasswordProvider};
+
+    if config.deployment_env == dbmon_core::env::Env::Dev {
+        if let Some(p) = StaticPasswordProvider::from_env() {
+            tracing::info!("대상 인증: 고정 비밀번호 (dev 폴백)");
+            return Arc::new(p);
+        }
+    }
+    tracing::info!(%region, "대상 인증: IAM DB Auth");
+    // **대상 인스턴스의 리전으로 서명한다.** 앱 배포 리전으로 서명하면 거부된다.
+    Arc::new(IamAuthTokenProvider::new(
+        sdk.credentials_provider()
+            .expect("SDK 자격증명 공급자")
+            .clone(),
+        region,
+    ))
+}
+
+/// 인스턴스별 수집 태스크 집합.
+struct CollectTasks {
+    handles: std::collections::BTreeMap<String, tokio::task::JoinHandle<()>>,
+}
+
+impl CollectTasks {
+    fn new() -> Self {
+        Self {
+            handles: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn running(&self) -> std::collections::BTreeSet<String> {
+        self.handles.keys().cloned().collect()
+    }
+
+    /// 목표 집합에 맞춰 태스크를 띄우고 죽인다.
+    ///
+    /// **교집합은 건드리지 않는다.** 죽이고 다시 띄우면 진행 중 캐시가 사라져
+    /// 그 순간 실행 중이던 쿼리가 `in_flight` 고아가 된다.
+    async fn reconcile(
+        &mut self,
+        instances: &[dbmon_core::instance::Instance],
+        deps: &CollectDeps,
+    ) {
+        use dbmon::collect_loop::{desired_ids, index_by_id, task_delta};
+
+        let desired = desired_ids(instances);
+        let delta = task_delta(&self.running(), &desired);
+        let by_id = index_by_id(instances);
+
+        for id in &delta.to_stop {
+            if let Some(h) = self.handles.remove(id) {
+                // `abort()` 는 다음 await 지점에서 태스크를 끊는다. 수집 tick 은
+                // 읽기뿐이고 저장은 멱등(`upsert_merged`)이라 중간에 끊겨도 안전하다.
+                h.abort();
+                tracing::info!(instance = %id, "수집 태스크 중지");
+            }
+        }
+        for id in &delta.to_start {
+            let Some(instance) = by_id.get(id) else {
+                continue;
+            };
+            let handle = spawn_instance_collector((*instance).clone(), deps.clone());
+            self.handles.insert(id.clone(), handle);
+            tracing::info!(instance = %id, "수집 태스크 시작");
+        }
+    }
+
+    /// 전부 중지한다 (셧다운).
+    fn abort_all(&mut self) {
+        for (id, h) in std::mem::take(&mut self.handles) {
+            h.abort();
+            tracing::debug!(instance = %id, "수집 태스크 중지 (종료)");
+        }
+    }
+}
+
+/// 수집 태스크가 필요한 의존성.
+#[derive(Clone)]
+struct CollectDeps {
+    store: Arc<dbmon::store::DynamoSlowQueryStore>,
+    auth: Arc<dyn AuthTokenProvider>,
+    config: Arc<Config>,
+    worker_id: String,
+}
+
+/// 인스턴스 하나의 수집 루프를 띄운다.
+///
+/// # 토큰 갱신 때문에 풀을 다시 만든다
+///
+/// IAM 토큰은 15분 만료고 **연결 수립 시점**에만 쓰인다. 기존 연결은 살아 있지만
+/// 그 뒤 새로 만들어지는 연결은 인증에 실패한다. 그래서 만료 5분 전에 풀을 갈아
+/// 끼운다 — [`InstanceCollector::replace_db`] 가 진행 중 캐시를 유지한 채 연결만
+/// 교체한다. 수집기를 새로 만들면 15분마다 고아가 생긴다.
+fn spawn_instance_collector(
+    instance: dbmon_core::instance::Instance,
+    deps: CollectDeps,
+) -> tokio::task::JoinHandle<()> {
+    use dbmon::collector::{CollectParams, InstanceCollector};
+    use dbmon::mysql::TargetMysql;
+    use dbmon::mysql::connect::target_opts;
+    use dbmon_core::time::{Clock, SystemClock};
+
+    let tick = Duration::from_millis(deps.config.collector.detect_interval_ms);
+    // 토큰 만료 여유. 이보다 적게 남으면 풀을 갈아 끼운다.
+    const REFRESH_MARGIN_MS: i64 = 5 * 60_000;
+
+    tokio::spawn(async move {
+        let db_user = deps.config.collector.monitor_db_user.clone();
+        let label = instance.id.as_str().to_string();
+
+        // 첫 연결. 실패하면 잠시 뒤 재시도한다 — 태스크를 끝내면 이 인스턴스는
+        // 다음 탐색(5분)까지 수집되지 않는다.
+        let mut secret = match deps
+            .auth
+            .token(
+                instance.endpoint.as_deref().unwrap_or_default(),
+                instance.port,
+                &db_user,
+            )
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(instance = %label, error = %telemetry::Scrubbed(&e), "대상 인증 실패");
+                return;
+            }
+        };
+        let make_db = |secret: &dbmon_core::secret::ExpiringSecret| -> anyhow::Result<TargetMysql> {
+            let opts = target_opts(
+                &instance,
+                &db_user,
+                secret.expose(),
+                deps.config.deployment_env,
+            )?;
+            Ok(TargetMysql::from_config(
+                opts,
+                &deps.config.collector,
+                label.clone(),
+            )?)
+        };
+        let db = match make_db(&secret) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(instance = %label, error = %telemetry::Scrubbed(&*e), "연결 옵션 구성 실패");
+                return;
+            }
+        };
+
+        let params = CollectParams {
+            slow_threshold_secs: deps.config.collector.slow_threshold_secs,
+            deep_probe_limit: deps.config.collector.deep_probe_limit as usize,
+            try_for_connection: true,
+            literal_policy: dbmon_core::slow_query::LiteralPolicy::Masked,
+            monitor_db_user: db_user.clone(),
+            worker_id: deps.worker_id.clone(),
+        };
+        let mut collector = InstanceCollector::new(
+            instance.clone(),
+            db,
+            deps.store.clone(),
+            SystemClock,
+            params,
+        );
+
+        loop {
+            // 토큰이 만료에 가까우면 연결만 갈아 끼운다.
+            let now_ms = SystemClock.now_ms();
+            if secret.needs_refresh(now_ms, REFRESH_MARGIN_MS) {
+                match deps
+                    .auth
+                    .token(
+                        instance.endpoint.as_deref().unwrap_or_default(),
+                        instance.port,
+                        &db_user,
+                    )
+                    .await
+                {
+                    Ok(fresh) => match make_db(&fresh) {
+                        Ok(db) => {
+                            collector.replace_db(db);
+                            secret = fresh;
+                            tracing::debug!(instance = %label, "대상 인증 토큰 갱신");
+                        }
+                        Err(e) => tracing::warn!(
+                            instance = %label,
+                            error = %telemetry::Scrubbed(&*e),
+                            "토큰 갱신 후 연결 구성 실패 — 기존 풀을 유지한다"
+                        ),
+                    },
+                    // 갱신 실패로 기존 풀을 버리지 않는다 — 살아 있는 연결은 계속 쓴다.
+                    Err(e) => tracing::warn!(
+                        instance = %label,
+                        error = %telemetry::Scrubbed(&e),
+                        "토큰 갱신 실패 — 기존 연결을 유지한다"
+                    ),
+                }
+            }
+
+            // 연결 수립은 tick **밖**이다. 안에서 하면 콜드 핸드셰이크(최대 5초)가
+            // 1초 케이던스를 깨뜨린다.
+            collector.warm_if_needed().await;
+
+            match collector.detect_tick().await {
+                Ok(stats) => tracing::trace!(
+                    instance = %label,
+                    candidates = stats.candidates,
+                    finalized = stats.finalized,
+                    "수집 tick"
+                ),
+                Err(e) => tracing::warn!(
+                    instance = %label,
+                    error = %telemetry::Scrubbed(&e),
+                    "수집 tick 실패"
+                ),
+            }
+            tokio::time::sleep(tick).await;
+        }
+    })
+}
+
 /// 리더 게이트 루프를 띄운다. **수집 역할이 아니면 `None` 을 반환한다.**
 ///
 /// # 이 루프가 F1 을 강제하는 유일한 지점이다
@@ -340,11 +575,17 @@ fn spawn_leader_loop(
 
     let interval = tick_interval(config.collector.detect_interval_ms);
     let discovery_interval = Duration::from_secs(config.discovery.interval_secs);
+    let deployment_region = config.aws.region.clone();
     // **`Arc` 로 든다.** `select!` 팔에 참조를 넘기면 `implementation of Send is not
     // general enough` 로 컴파일이 깨진다 — 참조 인자에 대해 `for<'a>` Send 를
     // 증명해야 하기 때문이다.
     let config = Arc::new(config.clone());
-    let _slow_query = stores.slow_query;
+    let collect_deps = CollectDeps {
+        store: Arc::clone(&stores.slow_query),
+        auth: build_auth(&config, &deployment_region, &stores.sdk),
+        config: Arc::clone(&config),
+        worker_id: worker_id.clone(),
+    };
 
     Some(tokio::spawn(async move {
         let mut gate = LeaderGate::new(stores.lease, SystemClock, worker_id);
@@ -354,10 +595,15 @@ fn spawn_leader_loop(
         // **마지막 탐색 시각.** 0 이면 리더가 된 직후 한 번 돈다 — 5분을 기다리면
         // 배포 직후 목록이 비어 있고, 그건 장애로 보인다.
         let mut last_discovery_ms: i64 = 0;
+        // 인스턴스별 수집 태스크. **리더만 갖는다.**
+        let mut tasks = CollectTasks::new();
 
         loop {
-            // 셧다운 신호가 오면 리스를 반납하고 나간다.
+            // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
             if shutdown.is_triggered() {
+                // **태스크를 먼저 멈춘다.** 리스를 반납한 뒤에도 돌고 있으면
+                // 다음 리더와 중복 수집이 된다.
+                tasks.abort_all();
                 gate.release().await;
                 readiness.set_collect_leader(false);
                 return;
@@ -366,7 +612,23 @@ fn spawn_leader_loop(
             gate.refresh().await;
             readiness.set_collect_leader(gate.is_leader());
 
-            if gate.is_leader() {
+            // **리더가 아니면 수집 태스크를 즉시 멈춘다.**
+            //
+            // `LeaderGate` 는 갱신에 실패하면 `held` 를 비우지만, **이미 띄운 태스크는
+            // 그것과 무관하게 계속 돈다.** 멈추지 않으면 새 리더와 같은 인스턴스를
+            // 중복 수집하고 다이제스트 누산기가 last-writer-wins 로 조용히 손상된다 —
+            // 리스 기구가 존재하는 이유 그 자체가 무너진다.
+            //
+            // 리스를 잃는 것은 정상 경로다(재배포, 일시적 장애). 그래서 매 tick 확인한다.
+            if !gate.is_leader() {
+                if !tasks.running().is_empty() {
+                    tracing::warn!(
+                        stopped = tasks.running().len(),
+                        "리더가 아니다 — 수집 태스크를 전부 멈춘다 (중복 수집 방지)"
+                    );
+                    tasks.abort_all();
+                }
+            } else {
                 let now_ms = SystemClock.now_ms();
                 if now_ms - last_discovery_ms >= discovery_interval.as_millis() as i64 {
                     // **실행 전에 시각을 찍는다.** 실패해도 다음 주기까지 기다린다 —
@@ -437,20 +699,35 @@ fn spawn_leader_loop(
                             ),
                         }
                     }
-                }
 
-                // TODO(M2-6): 등록부의 수집 대상마다 `detect_tick()` 을 돈다.
-                // 대상 접속에는 `AuthTokenProvider`(IAM DB Auth) 가 먼저 필요하다.
-                tracing::trace!(
-                    shards = gate.shards_owned(),
-                    epoch = ?gate.epoch(),
-                    "수집 tick (대상 인증 대기 중)"
-                );
+                    // ③ 수집 태스크 집합을 등록부에 맞춘다.
+                    //
+                    // 재조정 **뒤에** 한다 — 방금 `Excluded` 로 바뀐 인스턴스의
+                    // 태스크를 같은 라운드에서 내려야 한다. 앞에 두면 필터에서
+                    // 빠진 인스턴스를 5분 더 수집한다.
+                    match stores.registry.list().await {
+                        Ok(instances) => {
+                            tasks.reconcile(&instances, &collect_deps).await;
+                            let collecting = tasks.running().len();
+                            readiness.record_collect_ok(SystemClock.now_ms());
+                            tracing::info!(
+                                collecting,
+                                registered = instances.len(),
+                                "수집 태스크 집합 갱신"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %telemetry::Scrubbed(&e),
+                            "등록부를 읽을 수 없다 — 태스크 집합을 유지한다"
+                        ),
+                    }
+                }
             }
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = shutdown.wait() => {
+                    tasks.abort_all();
                     gate.release().await;
                     readiness.set_collect_leader(false);
                     return;

@@ -59,6 +59,15 @@ jobs:
       # (`--lib` 는 `tests/` 를 돌리지 않는다.)
       - run: cargo test -p dbmon --test it_infra_consistency --locked
 
+      # 임베드된 RDS CA 번들과 만료일 상수의 일치 (07 §3.3).
+      # 번들만 갱신하고 상수를 잊으면 만료 감시가 틀린 날짜를 본다.
+      - run: ./scripts/check-ca-bundle.sh
+
+      # IAM DB Auth 토큰 서명을 AWS CLI 와 교차 검증한다.
+      # 단위 테스트는 "문서대로 생겼는가" 만 답한다 — 서명이 AWS 와 같은 값인지는
+      # 독립 구현과 대조해야 알 수 있다. 토큰 생성은 네트워크를 타지 않는다.
+      - run: ./scripts/verify-iam-token.sh
+
   # ── 통합 테스트: 실제 MySQL 이 필요하다 ───────────────────────────────────
   #
   # 이 잡이 M1 실측 수치의 회귀를 잡는다. 파라미터가 없으면 `max_digest_length` 가

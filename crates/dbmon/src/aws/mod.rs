@@ -4,6 +4,7 @@
 //! (SSO 만료 시 아예 못 돈다) 판정은 전수 검증할 수 있다 — 그리고 prd 인스턴스를
 //! 하나라도 통과시키면 그걸로 끝이므로 위험은 호출이 아니라 판정에 있다.
 
+pub mod auth_token;
 pub mod discovery;
 pub mod filter;
 pub mod rds;
