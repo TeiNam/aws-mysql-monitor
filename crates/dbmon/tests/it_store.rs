@@ -47,6 +47,19 @@ async fn store(name: &str) -> Option<Arc<DynamoSlowQueryStore>> {
     match s.reset_table_for_local().await {
         Ok(()) => Some(s),
         Err(e) => {
+            // **CI 에서는 건너뛰지 않고 실패한다.**
+            //
+            // 이 파일이 `mark_missing`·`stamp_deleted`·`list()` 페이지네이션을 덮는
+            // 유일한 테스트다. 서비스명·포트·이미지가 깨지면 23건이 조용히 무력화되고
+            // 스위트는 초록으로 남는다 — `ignored` 도 아니라 `ok` 로 보고된다
+            // (2차 리뷰가 지적). CI 는 `DBMON_REQUIRE_DYNAMO=1` 을 준다.
+            if std::env::var("DBMON_REQUIRE_DYNAMO").as_deref() == Ok("1") {
+                panic!(
+                    "DynamoDB Local 에 붙을 수 없다: {e}\n\
+                     DBMON_REQUIRE_DYNAMO=1 이므로 건너뛰지 않는다 — \
+                     이 테스트가 등록부·리스 어댑터를 덮는 유일한 경로다"
+                );
+            }
             eprintln!(
                 "건너뜀: DynamoDB Local 에 붙을 수 없다 ({e}). docker compose up -d dynamodb"
             );
@@ -761,5 +774,75 @@ async fn rediscovery_preserves_the_user_override_through_the_store() {
         got.state,
         InstanceState::Collecting,
         "재탐색이 수집 중 인스턴스를 Pending 으로 되돌렸다 — 수집이 5분마다 멈춘다"
+    );
+}
+
+/// **삭제 도장을 찍을 때 `ttl` 이 함께 들어가야 한다** (FR-DSC-07 의 30일 보존).
+///
+/// 정리 잡을 따로 두면 그 잡이 죽었을 때 등록부가 조용히 자란다. DynamoDB TTL 이
+/// 대신 지운다. 단, **살아 있는 인스턴스에는 TTL 이 없어야** 한다 — 있으면 30일 뒤
+/// 정상 인스턴스가 등록부에서 사라진다.
+#[tokio::test]
+async fn retention_ttl_is_set_only_when_deleted() {
+    let Some(r) = registry("reg-ttl").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    let raw = |suffix: &str| {
+        let table = format!("dbmon-test-reg-ttl{suffix}");
+        async move {
+            client()
+                .get_item()
+                .table_name(table)
+                .key(
+                    "PK",
+                    aws_sdk_dynamodb::types::AttributeValue::S("INST".into()),
+                )
+                .key(
+                    "SK",
+                    aws_sdk_dynamodb::types::AttributeValue::S(
+                        "ap-northeast-2#123456789012/ap-northeast-2/orders-01".into(),
+                    ),
+                )
+                .send()
+                .await
+                .expect("원시 조회")
+                .item
+                .expect("항목")
+        }
+    };
+
+    // 살아 있는 동안에는 TTL 이 없어야 한다.
+    assert!(
+        !raw("").await.contains_key("ttl"),
+        "살아 있는 인스턴스에 TTL 이 걸렸다 — 30일 뒤 등록부에서 사라진다"
+    );
+
+    // 2회 미발견 → 삭제 도장 + TTL.
+    r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    assert!(
+        !raw("").await.contains_key("ttl"),
+        "1회 미발견으로 TTL 이 걸렸다"
+    );
+    r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
+
+    let item = raw("").await;
+    let ttl: i64 = item
+        .get("ttl")
+        .expect("삭제 도장에 TTL 이 없다 — 등록부가 무한히 자란다")
+        .as_n()
+        .expect("N 타입")
+        .parse()
+        .expect("숫자");
+    let expected = (T0 + 2_000) / 1000 + 30 * 86_400;
+    assert_eq!(ttl, expected, "보존 기간이 30일이 아니다");
+
+    // **되살아나면 TTL 이 지워져야 한다.** 남아 있으면 30일 뒤 조용히 사라진다.
+    r.mark_seen(&i.id, T0 + 3_000).await.expect("재발견");
+    assert!(
+        !raw("").await.contains_key("ttl"),
+        "되살아난 인스턴스에 TTL 이 남았다 — 30일 뒤 등록부에서 사라진다"
     );
 }

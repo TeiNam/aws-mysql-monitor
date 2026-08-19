@@ -143,6 +143,12 @@ pub enum InstanceState {
     Unsupported,
     /// 사용자가 수집을 끔.
     Disabled,
+    /// **탐색 필터가 제외했다** (T-37). 사용자가 끈 것도, 사라진 것도 아니다.
+    ///
+    /// 이 상태가 따로 있어야 하는 이유: 필터가 거부한 인스턴스를 "사라졌다" 로
+    /// 처리하면 태그 일괄 변경 한 번에 등록부가 비고, `Disabled` 로 처리하면
+    /// 사용자가 끈 것과 구분되지 않아 "내가 끄지 않았는데" 가 된다.
+    Excluded,
     /// RDS 에서 사라졌다.
     Deleted,
 }
@@ -156,6 +162,7 @@ impl InstanceState {
             Self::Degraded => "degraded",
             Self::Unsupported => "unsupported",
             Self::Disabled => "disabled",
+            Self::Excluded => "excluded",
             Self::Deleted => "deleted",
         }
     }
@@ -217,6 +224,16 @@ impl Instance {
 
 /// 탐색에서 사라진 것으로 판정하기 위한 연속 미발견 횟수 (FR-DSC-07).
 pub const MISSING_THRESHOLD: u32 = 2;
+
+/// 카운터를 올린 **뒤** 삭제로 판정할 것인가 (FR-DSC-07).
+///
+/// **이 판정의 유일한 정의다.** 저장 어댑터와 페이크가 모두 이 함수를 부른다 —
+/// 처음에는 상수만 공유하고 비교식은 각자 적었는데, 그러면 **값의 드리프트만 막고
+/// 규칙의 드리프트는 막지 못한다.** 술어를 `>` 로 바꿔도 페이크 기반 테스트는 전부
+/// 통과했다(2차 리뷰가 지적).
+pub fn should_mark_deleted(missing_count_after: u32) -> bool {
+    missing_count_after >= MISSING_THRESHOLD
+}
 
 #[cfg(test)]
 mod tests {

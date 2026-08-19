@@ -88,6 +88,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { role } => {
             if let Some(r) = role {
                 config.role = parse_role(&r)?;
+                // **오버라이드 후 다시 검증한다.** `Config::load` 안의 검증은 이미
+                // 끝났으므로, 역할에 의존하는 규칙이 생기면 `--role` 로 우회된다
+                // (2차 리뷰가 지적). 지금은 무해하지만 게이트를 먼저 닫는다.
+                config.validate()?;
             }
             serve(config).await
         }
@@ -125,7 +129,13 @@ async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
         //
         // 이 경로는 `endpoint_url` 이 설정된 경우에만 탄다. `deployment_env == prd`
         // 에서는 설정 검증이 `endpoint_url` 자체를 금지한다.
-        tracing::info!(%url, "DynamoDB 엔드포인트 재지정 (로컬 개발 — 더미 자격증명)");
+        // **URL 원문을 찍지 않는다.** `http://user:pass@host` 형태면 자격증명이
+        // 로그에 남는다. 설정 검증이 루프백만 허용하므로 실질 위험은 낮지만,
+        // 로그에 비밀이 들어갈 여지를 남기지 않는다(2차 리뷰가 지적).
+        tracing::info!(
+            endpoint_host = %url.rsplit('@').next().unwrap_or("?"),
+            "DynamoDB 엔드포인트 재지정 (로컬 개발 — 더미 자격증명)"
+        );
         loader = loader.endpoint_url(url).credentials_provider(
             aws_sdk_dynamodb::config::Credentials::new("local", "local", None, None, "dbmon-local"),
         );
@@ -179,44 +189,69 @@ async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> 
     out
 }
 
-/// 한 번의 탐색: 리전별 `DescribeDBInstances` → T-37 필터 → 도메인 매핑 → 재조정.
+/// 탐색 **조회** 단계 — `DescribeDBInstances` → T-37 필터 → 도메인 매핑.
+///
+/// # 이 단계만 취소해도 안전하다
+///
+/// 읽기와 순수 판정뿐이라 중간에 잘려도 남는 상태가 없다. 반대로 재조정
+/// ([`dbmon::discovery::reconcile`])은 **취소하면 안 된다** — `mark_missing` 이
+/// 비멱등이라 적용된 증가분이 남은 채 라운드가 실패로 보고되고, 그러면
+/// "2회 **연속**" 이라는 FR-DSC-07 의 성질이 깨진다.
+///
+/// 그래서 예산·셧다운 취소는 이 함수에만 건다.
 ///
 /// # 필터를 통과하지 못한 것은 등록부에 넣지 않는다
 ///
 /// prd 인스턴스를 등록부에 넣고 나중에 걸러도 되지만, 그러면 **한 곳이라도 필터를
 /// 잊으면 prd 를 수집한다.** 애초에 들이지 않는 것이 방어선을 하나로 만든다.
-async fn discovery_round(
-    sources: &[dbmon::aws::rds::RdsDiscovery],
-    registry: &Arc<dbmon::store::registry::DynamoInstanceRegistry>,
-    config: &Config,
+/// 단, "봤지만 제외" 와 "사라졌다" 는 구분해서 넘긴다 — 섞으면 필터 사고 하나로
+/// 등록부가 비워진다.
+async fn discover(
+    sources: Arc<Vec<dbmon::aws::rds::RdsDiscovery>>,
+    config: Arc<Config>,
     now_ms: i64,
-) -> anyhow::Result<dbmon::discovery::DiscoveryStats> {
-    use dbmon::aws::discovery::to_instance;
+) -> dbmon::discovery::RoundOutcome {
+    use dbmon::aws::discovery::{Unmappable, to_instance};
     use dbmon::aws::filter::Filter;
+    use dbmon::discovery::RoundOutcome;
     use dbmon_core::env::EnvMapping;
+    use dbmon_core::ids::InstanceId;
 
-    let filter = Filter {
-        allowed_vpc_ids: config.discovery.allowed_vpc_ids.clone(),
-        required_tags: config.discovery.required_tags.clone(),
-        denied_name_substrings: config.discovery.denied_name_substrings.clone(),
-    };
+    let filter = Filter::from_config(&config.discovery);
     let mapping = EnvMapping::default();
+    let mut outcome = RoundOutcome::default();
 
-    let mut discovered = Vec::new();
-    // **한 리전이라도 부분 결과면 전체를 부분 결과로 본다.** 리전별로 나눠 판정하면
-    // 실패한 리전의 인스턴스가 "사라졌다" 로 판정된다.
-    let mut truncated = false;
+    // **탐색기가 없으면 부분 결과로 본다.** 빈 결과를 온전한 결과로 취급하면
+    // 등록부의 전 인스턴스가 "사라졌다" 로 판정된다.
+    if sources.is_empty() {
+        tracing::error!("탐색 대상 리전이 없다 — 부분 결과로 처리한다");
+        outcome.truncated = true;
+        return outcome;
+    }
 
-    for source in sources {
+    // 제외된 인스턴스의 id 를 만든다. 만들 수 없으면(식별자 규칙 위반) 등록부에도
+    // 있을 수 없으므로 `None` 이어도 안전하다.
+    //
+    // 클로저가 아니라 함수로 둔다 — `&mut outcome` 을 잡는 클로저를 `.await` 를 넘어
+    // 쓰면 future 가 `Send` 가 아니게 되고, `tokio::spawn` 이 거부한다.
+    fn excluded_id(account: &str, region: &str, identifier: &str) -> Option<String> {
+        InstanceId::new(account, region, identifier)
+            .ok()
+            .map(|id| id.as_str().to_string())
+    }
+
+    for source in sources.iter() {
         let page = match source.describe().await {
             Ok(p) => p,
             Err(e) => {
+                // **한 리전이라도 실패하면 전체를 부분 결과로 본다.** 리전별로 나눠
+                // 판정하면 실패한 리전의 인스턴스가 "사라졌다" 로 판정된다.
                 tracing::warn!(error = %telemetry::Scrubbed(&e), "리전 탐색 실패");
-                truncated = true;
+                outcome.truncated = true;
                 continue;
             }
         };
-        truncated |= page.truncated;
+        outcome.truncated |= page.truncated;
 
         for raw in &page.instances {
             let verdict = filter.judge(&raw.candidate());
@@ -227,54 +262,95 @@ async fn discovery_round(
                     reason = %verdict.reason(),
                     "탐색 필터가 거부했다"
                 );
+                outcome.filtered += 1;
+                if let Some(id) = excluded_id(&config.aws.account_id, &raw.region, &raw.identifier)
+                {
+                    outcome.excluded_ids.insert(id);
+                }
                 continue;
             }
             match to_instance(raw, &config.aws.account_id, &mapping, now_ms) {
-                Ok(i) => discovered.push(i),
-                // MySQL 이 아닌 엔진은 정상적으로 흔하다. `debug` 로만 남긴다.
-                Err(dbmon::aws::discovery::Unmappable::NotMysql { engine }) => {
+                Ok(i) => outcome.discovered.push(i),
+                // MySQL 이 아닌 엔진은 정상적으로 흔하다 — 등록부에 있을 수 없으므로
+                // 제외 목록에 넣지 않는다(넣어도 무해하지만 통계를 흐린다).
+                Err(Unmappable::NotMysql { engine }) => {
                     tracing::debug!(instance = %raw.identifier, %engine, "MySQL 계열이 아니다");
                 }
                 Err(e) => {
-                    tracing::warn!(instance = %raw.identifier, reason = ?e, "인스턴스 매핑 실패");
+                    // **버리지 않고 제외로 기록한다.** AWS 가 새 버전 문자열을 내면
+                    // 전건 매핑 실패가 되는데, 그걸 미발견으로 처리하면 Aurora 인스턴스
+                    // 전부가 2라운드 뒤 삭제 판정된다.
+                    tracing::warn!(
+                        instance = %raw.identifier,
+                        reason = %telemetry::Scrubbed(&e),
+                        "인스턴스 매핑 실패 — 제외로 기록한다(삭제하지 않는다)"
+                    );
+                    outcome.unmappable += 1;
+                    if let Some(id) =
+                        excluded_id(&config.aws.account_id, &raw.region, &raw.identifier)
+                    {
+                        outcome.excluded_ids.insert(id);
+                    }
                 }
             }
         }
     }
-
-    Ok(dbmon::discovery::reconcile(registry, &discovered, truncated, now_ms).await?)
+    outcome
 }
 
-/// 리더 게이트 루프를 띄운다.
+/// 리더 게이트 루프를 띄운다. **수집 역할이 아니면 `None` 을 반환한다.**
 ///
 /// # 이 루프가 F1 을 강제하는 유일한 지점이다
 ///
 /// `target_shard_count` 가 불변식을 계산하지만 **부르는 곳이 없으면 무효다** —
-/// 이 프로젝트에서 "고쳤는데 호출부가 없다" 가 네 번 재발했다.
+/// 이 프로젝트에서 "고쳤는데 호출부가 없다" 가 다섯 번 재발했다.
 ///
 /// 리더가 아닌 동안에는 수집하지 않는다. `desiredCount=2` 로 띄운 두 워커가 모두
 /// 수집하면 같은 인스턴스를 중복 수집하고 다이제스트 누산기가 손상된다.
+///
+/// # ⚠ 수집 역할이 아닌 워커는 리스를 **잡아서도 안 된다**
+///
+/// 처음에는 역할과 무관하게 루프를 띄우고 `runs_collector` 를 `gate.refresh()`
+/// **다음에** 검사했다. 그러면 `role=api` 워커가 수집 리더 리스를 따서 영구히
+/// 갱신하고, `role=collector` 워커는 영원히 standby 가 된다 — **수집이 한 번도
+/// 돌지 않는다.** 게다가 api 워커가 `set_collect_leader(true)` 를 불러 `/readyz` 는
+/// "수집 리더 정상" 을 보고한다. 완전히 조용한 실패다(2차 리뷰가 지적한 CRITICAL).
+///
+/// F1 의 산술("합계가 64 또는 0")은 그 상태에서도 **성립한다** — `shards_owned()` 이
+/// `is_leader()` 하나에서 파생되기 때문이다. 불변식을 코드로 강제해도 이 실패는
+/// 잡히지 않는다. 그래서 역할 검사를 리스 획득보다 **앞에** 둔다.
 fn spawn_leader_loop(
     config: &Config,
     worker_id: String,
     stores: Stores,
     readiness: Arc<Readiness>,
     shutdown: Arc<Shutdown>,
-) -> tokio::task::JoinHandle<()> {
+) -> Option<tokio::task::JoinHandle<()>> {
     use dbmon::worker::{LeaderGate, tick_interval};
     use dbmon_core::time::{Clock, SystemClock};
 
+    // **역할 검사가 리스 획득보다 먼저다.** 아래 doc 주석 참고.
+    if !config.role.runs_collector() {
+        tracing::info!(
+            role = ?config.role,
+            "수집 역할이 아니다 — 수집 리더 리스를 잡지 않는다"
+        );
+        return None;
+    }
+
     let interval = tick_interval(config.collector.detect_interval_ms);
     let discovery_interval = Duration::from_secs(config.discovery.interval_secs);
-    let runs_collector = config.role.runs_collector();
-    let config = config.clone();
+    // **`Arc` 로 든다.** `select!` 팔에 참조를 넘기면 `implementation of Send is not
+    // general enough` 로 컴파일이 깨진다 — 참조 인자에 대해 `for<'a>` Send 를
+    // 증명해야 하기 때문이다.
+    let config = Arc::new(config.clone());
     let _slow_query = stores.slow_query;
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut gate = LeaderGate::new(stores.lease, SystemClock, worker_id);
         // 탐색기는 리더가 될 때까지 만들지 않는다 — standby 워커가 AWS 자격증명을
         // 요구하면 로컬 개발(SSO 만료)에서 기동만으로 에러가 난다.
-        let mut sources: Option<Vec<dbmon::aws::rds::RdsDiscovery>> = None;
+        let mut sources: Option<Arc<Vec<dbmon::aws::rds::RdsDiscovery>>> = None;
         // **마지막 탐색 시각.** 0 이면 리더가 된 직후 한 번 돈다 — 5분을 기다리면
         // 배포 직후 목록이 비어 있고, 그건 장애로 보인다.
         let mut last_discovery_ms: i64 = 0;
@@ -290,30 +366,76 @@ fn spawn_leader_loop(
             gate.refresh().await;
             readiness.set_collect_leader(gate.is_leader());
 
-            if runs_collector && gate.is_leader() {
+            if gate.is_leader() {
                 let now_ms = SystemClock.now_ms();
                 if now_ms - last_discovery_ms >= discovery_interval.as_millis() as i64 {
+                    // **실행 전에 시각을 찍는다.** 실패해도 다음 주기까지 기다린다 —
+                    // 실패 시 즉시 재시도하면 AWS 장애 중에 핫 루프가 된다.
                     last_discovery_ms = now_ms;
                     if sources.is_none() {
-                        sources = Some(build_discovery(&config).await);
+                        sources = Some(Arc::new(build_discovery(&config).await));
                     }
-                    let srcs = sources.as_deref().unwrap_or_default();
-                    match discovery_round(srcs, &stores.registry, &config, now_ms).await {
-                        Ok(s) => tracing::info!(
-                            inserted = s.inserted,
-                            updated = s.updated,
-                            missing = s.missing,
-                            deleted = s.deleted,
-                            skipped = s.skipped_missing_check,
-                            errors = s.errors,
-                            "탐색 완료"
-                        ),
-                        // **탐색 실패로 루프를 죽이지 않는다.** 다음 주기에 다시 시도한다 —
-                        // 여기서 죽으면 리스도 반납되지 않아 최대 60초 수집 공백이 된다.
-                        Err(e) => tracing::warn!(
-                            error = %telemetry::Scrubbed(&e),
-                            "탐색 실패 — 다음 주기에 재시도한다"
-                        ),
+                    // `sources` 는 바로 위에서 채워졌다. 빈 벡터여도 `discover` 가
+                    // 부분 결과로 처리하므로 등록부가 비워지지 않는다.
+                    let srcs = sources.clone().unwrap_or_default();
+
+                    // ① 조회 — 취소 가능하다(읽기와 순수 판정뿐).
+                    //
+                    // `select!` 를 별도 async 함수로 빼면 `implementation of Send is
+                    // not general enough` 로 컴파일이 깨진다(참조 인자에 대해
+                    // `for<'a>` Send 를 증명해야 한다). 수명이 구체적인 여기서 한다.
+                    let budget = dbmon::worker::work_budget();
+                    let outcome = tokio::select! {
+                        o = discover(srcs, Arc::clone(&config), now_ms) => Some(o),
+                        _ = tokio::time::sleep(budget) => {
+                            tracing::warn!(
+                                budget_ms = budget.as_millis() as u64,
+                                "탐색 조회가 예산을 초과했다 — 부분 결과로 처리한다"
+                            );
+                            // **라운드를 버리지 않는다.** 버리면 다음 라운드도 같은
+                            // 이유로 초과해 등록부가 영구히 갱신되지 않는다.
+                            Some(dbmon::discovery::RoundOutcome {
+                                truncated: true,
+                                ..Default::default()
+                            })
+                        }
+                        // 종료 중이다. 재조정을 시작하지 않는다 —
+                        // 쓰기를 벌여 놓고 죽는 것이 최악이다.
+                        _ = shutdown.wait() => None,
+                    };
+
+                    // ② 재조정 — **취소하지 않는다.** `mark_missing` 이 비멱등이다.
+                    // `None` 은 종료 중이라는 뜻이다 — 아래 셧다운 처리로 넘긴다.
+                    if let Some(outcome) = outcome {
+                        // 관측용 수치를 먼저 읽는다 — `outcome` 은 이동한다.
+                        let (filtered, unmappable) = (outcome.filtered, outcome.unmappable);
+                        match dbmon::discovery::reconcile(
+                            Arc::clone(&stores.registry),
+                            outcome,
+                            now_ms,
+                        )
+                        .await
+                        {
+                            Ok(s) => tracing::info!(
+                                inserted = s.inserted,
+                                updated = s.updated,
+                                missing = s.missing,
+                                deleted = s.deleted,
+                                excluded = s.excluded,
+                                filtered,
+                                unmappable,
+                                skipped = s.skipped_missing_check,
+                                errors = s.errors,
+                                "탐색 완료"
+                            ),
+                            // **탐색 실패로 루프를 죽이지 않는다.** 다음 주기에
+                            // 다시 시도한다 — 여기서 죽으면 리스도 반납되지 않아
+                            // 최대 60초 수집 공백이 된다.
+                            Err(e) => tracing::warn!(
+                                error = %telemetry::Scrubbed(&e),
+                                "재조정 실패 — 다음 주기에 재시도한다"
+                            ),
+                        }
                     }
                 }
 
@@ -335,7 +457,7 @@ fn spawn_leader_loop(
                 }
             }
         }
-    })
+    }))
 }
 
 /// `/healthz` 에 최소 HTTP/1.1 요청을 보낸다.
@@ -381,7 +503,7 @@ fn parse_role(s: &str) -> anyhow::Result<Role> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
-    let readiness = Readiness::new(config.role.runs_api());
+    let readiness = Readiness::new_for_role(config.role.runs_api(), config.role.runs_collector());
     readiness.set_config_loaded(true);
 
     let shutdown = Shutdown::new(Duration::from_secs(config.http.shutdown_grace_secs));
@@ -393,6 +515,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         account = %config.aws.account_id,
         target_regions = ?config.target_regions(),
         vpc_filter = ?config.discovery.allowed_vpc_ids,
+        // 유도 기본값이 실제로 적용됐는지 **기동 로그에서 보여야 한다.**
+        // 필터가 비어 있는데 조용히 뜨면 T-37 방어선이 없는 채로 돌아간다.
+        name_deny = ?config.discovery.denied_name_substrings,
+        discovery_interval_secs = config.discovery.interval_secs,
         "기동"
     );
 
@@ -426,16 +552,32 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // 정확히 보고하는 것이 맞다 — 기동 실패로 재시작 루프를 만들면 원인을 볼 수 없다.
     let leader_task = match build_stores(&config).await {
         Ok(stores) => {
-            readiness.set_storage_ok(true);
+            // **실제로 닿는지 확인한다.** 클라이언트 조립 성공만으로 준비 완료를
+            // 보고하면 자격증명·테이블 이름이 틀려도 `/readyz` 가 초록이다.
+            match stores.slow_query.probe().await {
+                Ok(()) => {
+                    readiness.set_storage_ok(true);
+                    tracing::info!(table = %config.storage.data_table, "저장소 확인됨");
+                }
+                Err(e) => {
+                    // 기동은 계속한다 — `/readyz` 가 사유를 보고하는 것이 맞다.
+                    // 다만 준비 완료라고 거짓말하지 않는다.
+                    tracing::error!(
+                        table = %config.storage.data_table,
+                        error = %telemetry::Scrubbed(&e),
+                        "저장소에 닿을 수 없다 — standby 로 기동한다"
+                    );
+                }
+            }
             let worker_id = worker_id(&config);
-            tracing::info!(%worker_id, "저장소 연결됨");
-            Some(spawn_leader_loop(
+            tracing::info!(%worker_id, "워커 식별자");
+            spawn_leader_loop(
                 &config,
                 worker_id,
                 stores,
                 readiness.clone(),
                 shutdown.clone(),
-            ))
+            )
         }
         Err(e) => {
             // 여기서 죽지 않는다. `/readyz` 가 사유를 보고하고 사람이 고친다.

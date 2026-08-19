@@ -25,12 +25,18 @@ use dbmon_core::instance::Instance;
 use dbmon_core::ports::InstanceRegistry;
 use dbmon_core::time::EpochMs;
 
-use crate::aws::discovery::should_mark_deleted;
+use dbmon_core::instance::should_mark_deleted;
 
 use super::map_sdk_err;
 
 /// 등록부의 단일 파티션 키.
 const PK: &str = "INST";
+
+/// 사라진 인스턴스를 보존하는 기간 (일). FR-DSC-07.
+///
+/// 과거 슬로우 쿼리가 인스턴스 메타를 참조하므로 즉시 지우지 않는다. 30일 뒤에는
+/// DynamoDB TTL 이 지운다 — 정리 잡을 따로 두면 그 잡이 죽었을 때 조용히 자란다.
+const DELETED_RETENTION_DAYS: i64 = 30;
 
 pub struct DynamoInstanceRegistry {
     client: Client,
@@ -82,8 +88,25 @@ impl DynamoInstanceRegistry {
             req = req.key(k, v);
         }
         let out = req
-            .update_expression("SET deleted_at_ms = :now, #s = :st")
+            // **`ttl` 은 삭제 도장을 찍을 때만 넣는다** (FR-DSC-07 의 30일 보존).
+            //
+            // 살아 있는 인스턴스에 TTL 을 걸면 30일 뒤 등록부에서 사라진다. 그래서
+            // `upsert` 는 `ttl` 을 쓰지 않고, 여기서만 쓴다 — 사라진 인스턴스는
+            // 30일 뒤 DynamoDB 가 스스로 지운다. 정리 잡을 따로 만들 필요가 없다.
+            .update_expression("SET deleted_at_ms = :now, #s = :st, #ttl = :ttl")
+            // **항목이 없으면 만들지 않는다.** `mark_missing` 과 이 호출 사이에 항목이
+            // 사라지면(콘솔 수동 삭제, TTL) PK/SK/deleted_at/state 만 있는 손상 항목이
+            // 생기고, 그 하나가 `list()` 역직렬화를 깨뜨려 **모든 탐색 라운드가 영구히
+            // 실패한다**(2차 리뷰가 지적한 CRITICAL).
+            .condition_expression("attribute_exists(PK)")
             .expression_attribute_names("#s", "state")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_values(
+                ":ttl",
+                AttributeValue::N(
+                    (now_ms.div_euclid(1000) + DELETED_RETENTION_DAYS * 86_400).to_string(),
+                ),
+            )
             .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
             // **`as_str()` 을 쓰지 않는다.** 지금은 우연히 serde 표현과 같지만
             // (`snake_case` → `"deleted"`), 한쪽만 바뀌면 역직렬화가 조용히 깨진다.
@@ -94,9 +117,16 @@ impl DynamoInstanceRegistry {
             )
             .return_values(ReturnValue::AllNew)
             .send()
-            .await
-            .map_err(map_sdk_err)?;
-        Self::from_item(out.attributes.unwrap_or_default())
+            .await;
+        match out {
+            Ok(o) => Self::from_item(o.attributes.unwrap_or_default()),
+            // 그 사이에 항목이 사라졌다. 손상 항목을 만들지 않은 것이 성공이다.
+            Err(e) if super::is_conditional_failure(&e) => Err(DomainError::NotFound {
+                kind: "instance",
+                id: id.as_str().to_string(),
+            }),
+            Err(e) => Err(map_sdk_err(e)),
+        }
     }
 }
 
@@ -121,7 +151,20 @@ impl InstanceRegistry for DynamoInstanceRegistry {
             }
             let res = req.send().await.map_err(map_sdk_err)?;
             for item in res.items.unwrap_or_default() {
-                out.push(Self::from_item(item)?);
+                // **항목 하나가 전체 목록을 죽이지 않는다.**
+                //
+                // `?` 로 두면 손상된 항목(스키마 변경 중 남은 것, 수동 편집) 하나가
+                // `list()` 를 영구히 `Err` 로 만들고, `reconcile` 이 첫 줄에서 실패해
+                // **탐색이 사람이 그 행을 지울 때까지 복구되지 않는다.**
+                match Self::from_item(item) {
+                    Ok(i) => out.push(i),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "등록부 항목을 읽을 수 없다 — 건너뛴다 (수동 확인 필요)"
+                        );
+                    }
+                }
             }
             match res.last_evaluated_key {
                 Some(k) if !k.is_empty() => last = Some(k),
@@ -214,9 +257,12 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         }
         // `REMOVE` 가 아니라 `NULL` 로 되돌린다. `serde_dynamo` 가 `None` 을 `NULL` 로
         // 쓰므로, 그렇게 해야 항목 모양이 `upsert` 가 쓴 것과 같아진다.
+        // **`ttl` 도 지운다.** 삭제 도장을 찍을 때 걸어 둔 30일 TTL 이 남아 있으면
+        // 되살아난 인스턴스가 30일 뒤 등록부에서 조용히 사라진다.
         req.update_expression(
-            "SET missing_count = :zero, last_seen_ms = :now, deleted_at_ms = :null",
+            "SET missing_count = :zero, last_seen_ms = :now, deleted_at_ms = :null REMOVE #ttl",
         )
+        .expression_attribute_names("#ttl", "ttl")
         .condition_expression("attribute_exists(PK)")
         .expression_attribute_values(":zero", AttributeValue::N("0".into()))
         .expression_attribute_values(":null", AttributeValue::Null(true))
@@ -271,10 +317,25 @@ fn pick_state(
 ) -> dbmon_core::instance::InstanceState {
     use dbmon_core::instance::InstanceState as S;
     match discovered {
-        S::Disabled | S::Unsupported => discovered,
-        // 기존이 `Disabled`/`Unsupported` 였는데 그 사유가 사라졌으면(태그 삭제,
-        // 버전 업그레이드) 다시 자가진단부터 시작해야 한다.
-        _ if matches!(prev, S::Disabled | S::Unsupported | S::Deleted) => discovered,
+        // 설정·버전·**RDS 상태**가 근거인 상태는 탐색이 이긴다.
+        //
+        // `Unreachable` 이 여기 있는 이유: RDS 가 `stopped` 라고 알려 주면 그건
+        // 런타임 추측이 아니라 사실이다. 이게 없으면 정지된 인스턴스가 `Collecting`
+        // 으로 남아 매초 접속을 시도한다.
+        S::Disabled | S::Unsupported | S::Unreachable => discovered,
+        // 기존이 `Disabled`/`Unsupported`/`Excluded` 였는데 그 사유가 사라졌으면
+        // (태그 삭제, 버전 업그레이드, 필터 설정 수정) 다시 자가진단부터 시작해야 한다.
+        //
+        // ⚠ `Excluded` 를 빼먹으면 **한 번 제외된 인스턴스가 영구히 수집되지 않는다.**
+        // 필터 설정을 고쳐도 돌아오지 않는다 — 새 상태를 넣으면서 이 목록을 갱신하지
+        // 않아 실제로 그렇게 됐고, 테스트가 잡았다.
+        _ if matches!(
+            prev,
+            S::Disabled | S::Unsupported | S::Excluded | S::Deleted
+        ) =>
+        {
+            discovered
+        }
         _ => prev,
     }
 }

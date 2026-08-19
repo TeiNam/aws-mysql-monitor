@@ -136,6 +136,26 @@ pub fn tick_interval(detect_interval_ms: u64) -> Duration {
     Duration::from_millis(detect_interval_ms.max(100))
 }
 
+/// 리더 루프 안에서 도는 작업 하나가 쓸 수 있는 시간 예산.
+///
+/// # 이것이 없으면 살아 있는 인스턴스가 삭제 처리될 수 있다
+///
+/// 탐색은 이 루프와 **같은 태스크에서** 돈다. 한 라운드가 오래 걸리면 그 동안
+/// [`LeaderGate::refresh`] 가 불리지 않아 **리스가 만료된다.** 그러면 다른 워커가
+/// 리더가 되어 자기 탐색을 돌리고, 두 리더가 같은 인스턴스에 `mark_missing` 을 부른다.
+///
+/// `mark_missing` 은 이 시스템에서 **유일한 비멱등 쓰기**(`ADD missing_count :one`)다.
+/// 두 번 불리면 `missing_count` 가 한 라운드에 0 → 2 로 올라가 FR-DSC-07 의
+/// "2회 연속" 규칙이 무너지고 살아 있는 인스턴스에 `deleted_at` 이 찍힌다.
+///
+/// 그래서 갱신 주기 안으로 묶는다 — 예산 안에서 끝나면 매 라운드 갱신이 보장된다.
+///
+/// ⚠ 이것은 **원인을 없애는 것이지 펜싱이 아니다.** GC 정지로 리스 만료를 눈치채지
+/// 못하는 경우는 2단계 펜싱 토큰이 필요하다 (ADR-018, M12-21).
+pub fn work_budget() -> Duration {
+    Duration::from_millis(LEASE_RENEW_INTERVAL_MS as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +273,35 @@ mod tests {
         assert!(
             b.is_leader(),
             "반납 후에도 TTL 을 기다려야 했다 — 수집 공백이 길어진다"
+        );
+    }
+
+    /// **리스가 만료되기 전에 갱신 기회가 오는가.**
+    ///
+    /// 처음 쓴 테스트는 `work_budget() <= LEASE_RENEW_INTERVAL_MS` 였는데,
+    /// `work_budget()` 이 그 상수로 정의돼 있으니 **`x <= x` 라 항진식이었다** —
+    /// 상수 값이 무엇이든, 아무도 `work_budget()` 을 부르지 않아도 통과한다
+    /// (2차 리뷰가 지적).
+    ///
+    /// 실제로 이중 리더를 막는 성질은 `refresh()` 두 번 사이의 **최악 간격**이다:
+    ///
+    /// ```text
+    /// 갱신 주기 + 작업 예산 + tick 주기  <  리스 TTL
+    /// ```
+    ///
+    /// `refresh()` 는 주기 미달이면 조기 반환하므로, 최악의 경우 갱신 직전에 한 tick 을
+    /// 흘려보내고 그 다음 tick 에서 예산만큼 작업한 뒤에야 갱신한다.
+    #[test]
+    fn a_renewal_chance_always_arrives_before_the_lease_expires() {
+        let worst_gap_ms = LEASE_RENEW_INTERVAL_MS
+            + work_budget().as_millis() as i64
+            + tick_interval(1_000).as_millis() as i64;
+
+        assert!(
+            worst_gap_ms < dbmon_core::ports::LEASE_TTL_MS,
+            "최악 간격 {worst_gap_ms}ms 가 TTL {}ms 를 넘는다 — 작업 중 리스가 만료돼 \
+             두 리더가 생기고, 비멱등 쓰기(`mark_missing`)가 두 번 불린다",
+            dbmon_core::ports::LEASE_TTL_MS
         );
     }
 

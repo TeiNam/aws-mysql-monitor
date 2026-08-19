@@ -11,7 +11,7 @@
 
 use crate::error::{DomainError, Result};
 use crate::ids::{InstanceId, RecordId};
-use crate::instance::{Instance, MISSING_THRESHOLD};
+use crate::instance::Instance;
 use crate::merge::merge;
 use crate::ports::target_db::{
     DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
@@ -332,7 +332,9 @@ impl InstanceRegistry for FakeInstanceRegistry {
             })?;
         inst.missing_count += 1;
         // 1회 API 실패로 삭제되지 않는다 (FR-DSC-07).
-        if inst.missing_count >= MISSING_THRESHOLD && inst.deleted_at_ms.is_none() {
+        // **술어를 여기서 다시 적지 않는다** — 상수만 공유하면 규칙의 드리프트를 못 막는다.
+        if crate::instance::should_mark_deleted(inst.missing_count) && inst.deleted_at_ms.is_none()
+        {
             inst.deleted_at_ms = Some(now_ms);
             inst.state = crate::instance::InstanceState::Deleted;
         }
@@ -344,6 +346,9 @@ impl InstanceRegistry for FakeInstanceRegistry {
         if let Some(inst) = m.get_mut(id.as_str()) {
             inst.missing_count = 0;
             inst.last_seen_ms = now_ms;
+            // **실제 어댑터와 계약을 맞춘다.** 페이크가 삭제 도장을 남기면, 페이크로
+            // 단위 테스트하는 코드는 실제 동작과 다른 상태를 본다(2차 리뷰가 지적).
+            inst.deleted_at_ms = None;
         }
         Ok(())
     }

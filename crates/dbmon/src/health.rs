@@ -38,8 +38,17 @@ pub struct Readiness {
     kms_denied: AtomicBool,
     /// 수집 리더를 보유했다. `false` 면 standby.
     collect_leader: AtomicBool,
-    /// 이 워커가 API 역할을 수행하는가. 아니면 리더 여부를 준비 판정에 넣지 않는다.
+    /// 이 워커가 API 역할을 수행하는가. 보고용이다.
     serves_api: bool,
+    /// **준비 판정에 리더 여부를 넣는가.**
+    ///
+    /// FR-OPS-08: 1단계는 active 1대 + standby 로 운영하고 standby 는 `/readyz` 503 으로
+    /// ALB 에서 빠진다. 그건 **한 워커가 API 와 수집을 겸할 때**만 성립한다.
+    ///
+    /// ⚠ 예전에는 `serves_api` 만 봤다. 그러면 `role=api` 워커(수집을 하지 않으므로
+    /// 리스를 잡지 않는다)가 **영원히 준비되지 않아 ALB 가 트래픽을 보내지 않는다** —
+    /// API 가 전면 중단된다. 역할 분리(2단계)를 켜는 순간 드러나는 결함이었다.
+    requires_leadership: bool,
     /// 종료 절차가 시작됐다. 이후 항상 503 (등록 해제를 먼저 유도한다).
     draining: AtomicBool,
     /// 마지막으로 수집 tick 이 성공한 시각.
@@ -47,13 +56,18 @@ pub struct Readiness {
 }
 
 impl Readiness {
-    pub fn new(serves_api: bool) -> Arc<Self> {
+    /// `serves_api` — API 트래픽을 받는가. `runs_collector` — 수집을 하는가.
+    ///
+    /// 두 값을 따로 받는 이유는 위 [`Self::requires_leadership`] 주석에 있다.
+    pub fn new_for_role(serves_api: bool, runs_collector: bool) -> Arc<Self> {
         Arc::new(Self {
             config_loaded: AtomicBool::new(false),
             storage_ok: AtomicBool::new(false),
             kms_denied: AtomicBool::new(false),
             collect_leader: AtomicBool::new(false),
             serves_api,
+            // API 와 수집을 **겸하는** 워커만 리더 여부로 ALB 등록을 가른다.
+            requires_leadership: serves_api && runs_collector,
             draining: AtomicBool::new(false),
             last_collect_ok_ms: AtomicI64::new(0),
         })
@@ -96,9 +110,10 @@ impl Readiness {
             && config_loaded
             && storage_ok
             && !kms_denied
-            // API 를 서비스하는 워커만 리더 여부를 따진다. collector 전용 워커는
-            // 리더가 아니어도 "준비됨" 이다 (애초에 트래픽을 받지 않는다).
-            && (!self.serves_api || collect_leader);
+            // **API 와 수집을 겸하는 워커만** 리더 여부를 따진다 (FR-OPS-08 의
+            // active/standby). collector 전용은 트래픽을 받지 않고, api 전용은
+            // 리스를 잡지 않으므로 리더 여부를 물으면 영원히 준비되지 않는다.
+            && (!self.requires_leadership || collect_leader);
 
         ReadyReport {
             ready,
@@ -117,7 +132,7 @@ impl Readiness {
                     config_loaded,
                     storage_ok,
                     kms_denied,
-                    self.serves_api,
+                    self.requires_leadership,
                     collect_leader,
                 ))
             },
@@ -184,8 +199,9 @@ pub async fn readyz(State(r): State<Arc<Readiness>>) -> (StatusCode, Json<ReadyR
 mod tests {
     use super::*;
 
+    /// `role=all` 상당 워커(API + 수집 겸임). `serves_api=false` 면 collector 전용.
     fn ready_worker(serves_api: bool) -> Arc<Readiness> {
-        let r = Readiness::new(serves_api);
+        let r = Readiness::new_for_role(serves_api, true);
         r.set_config_loaded(true);
         r.set_storage_ok(true);
         r
@@ -193,7 +209,7 @@ mod tests {
 
     #[test]
     fn starts_not_ready() {
-        let r = Readiness::new(true);
+        let r = Readiness::new_for_role(true, true);
         let s = r.snapshot();
         assert!(!s.ready);
         assert_eq!(s.reason, Some("config_not_loaded"));
@@ -209,6 +225,36 @@ mod tests {
         // collector 전용 워커는 리더가 아니어도 준비됨이다 — 트래픽을 받지 않는다.
         let collector = ready_worker(false);
         assert!(collector.snapshot().ready, "{:?}", collector.snapshot());
+    }
+
+    /// **`role=api` 워커는 리더가 아니어도 준비됨이어야 한다.**
+    ///
+    /// api 전용 워커는 수집을 하지 않으므로 수집 리더 리스를 잡지 않는다. 준비 판정에
+    /// 리더 여부를 넣으면 **영원히 준비되지 않아 ALB 가 트래픽을 보내지 않는다** —
+    /// API 전면 중단이다. 역할 분리를 켜는 순간 드러나는 결함이었다.
+    #[test]
+    fn an_api_only_worker_is_ready_without_the_collect_lease() {
+        let api_only = Readiness::new_for_role(true, false);
+        api_only.set_config_loaded(true);
+        api_only.set_storage_ok(true);
+        assert!(!api_only.is_collect_leader(), "리스를 잡지 않는다");
+        assert!(
+            api_only.snapshot().ready,
+            "api 전용 워커가 준비되지 않았다 — ALB 가 트래픽을 보내지 않는다: {:?}",
+            api_only.snapshot()
+        );
+    }
+
+    /// 겸임 워커(`role=all`)는 FR-OPS-08 대로 standby 가 ALB 에서 빠져야 한다.
+    #[test]
+    fn a_combined_worker_standby_stays_out_of_the_load_balancer() {
+        let combined = Readiness::new_for_role(true, true);
+        combined.set_config_loaded(true);
+        combined.set_storage_ok(true);
+        assert!(!combined.snapshot().ready, "standby 가 ALB 에 붙는다");
+        assert_eq!(combined.snapshot().reason, Some("standby"));
+        combined.set_collect_leader(true);
+        assert!(combined.snapshot().ready);
     }
 
     /// F25 — KMS 거부는 다른 어떤 사유보다 먼저 보고돼야 한다. 조치가 다르다.
@@ -256,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_returns_503_with_reason() {
-        let r = Readiness::new(true);
+        let r = Readiness::new_for_role(true, true);
         let (code, Json(body)) = readyz(State(r.clone())).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(!body.ready);

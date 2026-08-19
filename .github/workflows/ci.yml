@@ -123,7 +123,12 @@ jobs:
           # 대조군이 실제로 적용됐는지 확인한다. 아니면 절단 테스트가 조용히 통과한다.
           m 13307 -N -B -e "SELECT @@max_digest_length" | grep -qx 4096
 
+      # `DBMON_REQUIRE_DYNAMO=1` — DynamoDB Local 에 못 붙으면 **건너뛰지 말고 실패**한다.
+      # `it_store` 가 등록부·리스 어댑터를 덮는 유일한 테스트이므로, 서비스 컨테이너가
+      # 깨졌을 때 조용히 초록이 되면 안 된다.
       - run: cargo test --workspace --locked
+        env:
+          DBMON_REQUIRE_DYNAMO: "1"
 
   # ── Terraform: AWS 호출 없음 ──────────────────────────────────────────────
   terraform:

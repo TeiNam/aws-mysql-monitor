@@ -114,10 +114,11 @@ pub struct AwsConfig {
     pub target_regions: Vec<String>,
     /// **키에 들어가는 계정 ID** ([`dbmon_core::InstanceId`]). 필수다.
     pub account_id: String,
-    /// 로컬 개발용 엔드포인트 오버라이드 (DynamoDB Local 등).
-    #[serde(default)]
-    pub endpoint_url: Option<String>,
 }
+// ⚠ `aws.endpoint_url` 을 두지 않는다. 선언만 있고 읽는 곳이 없어 **조용히 무시되는
+// 설정**이었고(2차 리뷰가 지적), `deny_unknown_fields` 로 그런 부류와 싸우는 코드가
+// 정작 자기 필드로 그걸 만들고 있었다. 엔드포인트 재지정은 `storage.endpoint_url`
+// 하나뿐이고 거기에만 게이트가 걸린다.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,8 +208,14 @@ pub struct DiscoveryConfig {
     #[serde(default)]
     pub required_tags: Vec<String>,
     /// 이름에 이 문자열이 들어가면 제외한다. 화이트리스트가 통과시켜도 거부한다.
+    ///
+    /// 비프로덕션 배포에서는 기본값이 **합쳐진다**(대체되지 않는다) —
+    /// [`Config::apply_derived_defaults`] 참고.
     #[serde(default)]
     pub denied_name_substrings: Vec<String>,
+    /// 환경 태그가 prd 인 인스턴스를 거부한다. 비프로덕션 배포에서 기본 `true`.
+    #[serde(default)]
+    pub reject_production_tags: bool,
 }
 
 fn default_discovery_interval_secs() -> u64 {
@@ -222,6 +229,7 @@ impl Default for DiscoveryConfig {
             allowed_vpc_ids: Vec::new(),
             required_tags: Vec::new(),
             denied_name_substrings: Vec::new(),
+            reject_production_tags: false,
         }
     }
 }
@@ -251,6 +259,36 @@ impl std::error::Error for ConfigError {}
 
 /// 탐색 주기 하한 (초). AWS API 조절을 피하는 최소값.
 pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 30;
+
+/// 로컬 개발용 엔드포인트인가. **호스트가 루프백이어야 한다.**
+///
+/// URL 파서 의존성을 넣지 않는다 — 스킴과 호스트만 보면 충분하다.
+///
+/// ⚠ **접두 비교로 판정하지 않는다.** 처음에는 `host.starts_with("127.")` 을 썼는데
+/// `127.0.0.1.attacker.example` 이 통과했다(테스트가 잡았다). 주소를 실제로 파싱해
+/// `is_loopback()` 에 맡긴다 — 판정을 직접 적으면 이런 구멍이 계속 생긴다.
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    // `host:port/path` 에서 호스트만 뗀다. IPv6 은 `[::1]:8000` 형태다.
+    let host = if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(end) => &rest[1..end],
+            None => return false,
+        }
+    } else {
+        rest.split([':', '/']).next().unwrap_or("")
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
 
 fn err(field: &str, reason: impl Into<String>) -> ConfigError {
     ConfigError {
@@ -289,14 +327,51 @@ impl Config {
     }
 
     fn from_value(root: toml::Value) -> Result<Self, ConfigError> {
-        let cfg: Config = root.try_into().map_err(|e| {
+        let mut cfg: Config = root.try_into().map_err(|e| {
             err(
                 "deserialize",
                 format!("{e} — 값의 타입이 맞지 않거나 알 수 없는 키가 있다"),
             )
         })?;
+        cfg.apply_derived_defaults();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// 다른 값에서 유도되는 기본값을 채운다. **검증 전에** 부른다.
+    ///
+    /// # 왜 serde `default` 로 안 되는가
+    ///
+    /// `deployment_env` 를 봐야 정할 수 있는 값이라 필드 단위 기본값으로 표현할 수 없다.
+    fn apply_derived_defaults(&mut self) {
+        // **dev·stg 배포는 이름 거부 목록을 기본으로 켠다** (T-37 심층 방어).
+        //
+        // VPC 필터가 1차 방어선이지만, prd 인스턴스가 dev VPC 안에 잘못 배치되면
+        // VPC 조건을 통과한다. 이름 거부가 그걸 잡는다 — `filter.rs` 의
+        // `name_deny_overrides_vpc_allow` 가 그 동작을 고정한다.
+        //
+        // ⚠ 이 호출부가 없어서 **기본 거부 목록이 한 번도 적용되지 않았다.**
+        // 함수는 있었고 테스트도 있었지만 프로덕션 경로가 부르지 않았다 —
+        // 이 프로젝트에서 다섯 번째로 재발한 부류다.
+        if self.deployment_env != Env::Prd {
+            // **대체가 아니라 합친다.** 비어 있을 때만 채우면, 운영자가
+            // `denied_name_substrings = ["canary"]` 한 줄을 더하는 순간 `prd`/`prod`/
+            // `production` 이 조용히 사라진다 — 설정을 좁히려는 행위가 방어선을 넓힌다
+            // (2차 리뷰가 지적).
+            for d in DiscoveryConfig::default_denied_for_dev() {
+                if !self
+                    .discovery
+                    .denied_name_substrings
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(&d))
+                {
+                    self.discovery.denied_name_substrings.push(d);
+                }
+            }
+            // 태그 기반 prd 거부도 기본으로 켠다. 이름 거부만으로는
+            // `Environment=production` + 무해한 이름 조합을 잡지 못한다.
+            self.discovery.reject_production_tags = true;
+        }
     }
 
     /// 값 범위와 **교차 검증** ([14 §8.9](../../../docs/14-infrastructure.md)).
@@ -423,16 +498,36 @@ impl Config {
         //
         // `prd` 를 예외로 두는 이유: prd 배포는 계정 전체를 수집하는 것이 의도다.
         // 그 의도를 밝히려면 `deployment_env` 를 명시적으로 `prd` 로 적어야 한다.
-        // **프로덕션에서 엔드포인트 재지정을 금지한다.**
+        // **엔드포인트 재지정은 `dev` + 루프백에서만 허용한다.**
         //
         // `endpoint_url` 이 설정되면 조립부가 더미 자격증명을 넣는다(로컬 개발 경로).
-        // prd 에서 그게 켜지면 태스크 롤이 무시되고, 그 실패는 "저장이 안 된다" 로만
-        // 나타나 원인을 찾기 어렵다. 설정 단계에서 막는다.
-        if self.deployment_env == Env::Prd && self.storage.endpoint_url.is_some() {
-            return Err(err(
-                "storage.endpoint_url",
-                "prd 에서는 엔드포인트 재지정을 쓸 수 없다 (로컬 개발 전용)",
-            ));
+        // 그게 프로덕션에서 켜지면 태스크 롤이 무시되고, 실패는 "저장이 안 된다" 로만
+        // 나타나 원인을 찾기 어렵다.
+        //
+        // ⚠ 처음에는 `deployment_env == Prd` 만 막았다. 그런데 **기본값이 `unknown`**
+        // 이고 `Env::Unknown.treat_as_production()` 은 `true` 다 — 다른 모든 곳이
+        // 프로덕션으로 취급하는 값을 이 게이트만 통과시켰다. `DEPLOYMENT_ENV` 를
+        // 빠뜨린 배포가 조용히 더미 자격증명으로 뜬다(2차 리뷰가 지적).
+        // 그래서 **허용 목록 방식으로 뒤집는다.**
+        if let Some(url) = &self.storage.endpoint_url {
+            if self.deployment_env != Env::Dev {
+                return Err(err(
+                    "storage.endpoint_url",
+                    format!(
+                        "엔드포인트 재지정은 deployment_env=dev 에서만 쓴다 (현재: {}). \
+                         더미 자격증명이 태스크 롤을 가린다",
+                        self.deployment_env
+                    ),
+                ));
+            }
+            // **루프백만 허용한다.** 없으면 비프로덕션 배포가 임의의 외부 주소로
+            // 인스턴스 메타데이터를 보낼 수 있다.
+            if !is_loopback_url(url) {
+                return Err(err(
+                    "storage.endpoint_url",
+                    "루프백 주소만 허용한다 (127.0.0.1 / localhost / [::1])",
+                ));
+            }
         }
 
         // **탐색 주기 하한.** 0 이면 API 를 핫 루프로 때려 조절당하고, 조절은 부분
@@ -490,7 +585,6 @@ fn default_document() -> toml::Value {
             region: String::new(),
             target_regions: Vec::new(),
             account_id: String::new(),
-            endpoint_url: None,
         }),
     );
     t.insert(
@@ -848,16 +942,65 @@ config_table = "dbmon-config"
         Config::from_value(root).expect("기본 prd 설정")
     }
 
-    /// **prd 에서 엔드포인트 재지정을 막는다.**
+    /// **엔드포인트 재지정은 `dev` 에서만 허용한다.**
     ///
     /// 켜지면 조립부가 더미 자격증명을 넣어 태스크 롤이 무시된다. 그 실패는
     /// "저장이 안 된다" 로만 보여 원인 추적이 어렵다.
+    ///
+    /// ⚠ **`unknown` 도 막아야 한다.** 기본값이 `unknown` 이고
+    /// `Env::Unknown.treat_as_production()` 은 `true` 다 — 처음에는 `== Prd` 만 막아서
+    /// `DEPLOYMENT_ENV` 를 빠뜨린 배포가 조용히 더미 자격증명으로 떴다.
     #[test]
-    fn prd_rejects_the_local_endpoint_override() {
-        let mut c = prd_config();
-        c.storage.endpoint_url = Some("http://127.0.0.1:18000".into());
-        let e = c.validate().expect_err("prd 에서 통과했다");
-        assert_eq!(e.field, "storage.endpoint_url");
+    fn only_dev_may_override_the_endpoint() {
+        for env in [Env::Prd, Env::Stg, Env::Unknown] {
+            let mut c = prd_config();
+            c.deployment_env = env;
+            c.discovery.allowed_vpc_ids = vec!["vpc-a".into()];
+            c.storage.endpoint_url = Some("http://127.0.0.1:18000".into());
+            let e = c
+                .validate()
+                .expect_err(&format!("{env} 에서 엔드포인트 재지정이 통과했다"));
+            assert_eq!(e.field, "storage.endpoint_url", "{env}: {e}");
+        }
+    }
+
+    /// **루프백이 아닌 주소는 거부한다.**
+    ///
+    /// 없으면 dev 배포가 임의의 외부 주소로 인스턴스 메타데이터를 보낼 수 있다.
+    #[test]
+    fn non_loopback_endpoints_are_rejected() {
+        for url in [
+            "https://attacker.example",
+            "http://10.0.0.5:8000",
+            "http://dynamodb.ap-northeast-2.amazonaws.com",
+            "http://127.0.0.1.attacker.example",
+            "http://localhost.attacker.example:8000",
+        ] {
+            let mut c = prd_config();
+            c.deployment_env = Env::Dev;
+            c.discovery.allowed_vpc_ids = vec!["vpc-a".into()];
+            c.storage.endpoint_url = Some(url.into());
+            let e = c.validate().expect_err(&format!("{url} 이 통과했다"));
+            assert_eq!(e.field, "storage.endpoint_url", "{url}");
+        }
+    }
+
+    /// 루프백 형태는 모두 허용한다 — 로컬 개발이 막히면 안 된다.
+    #[test]
+    fn loopback_endpoints_are_allowed_in_dev() {
+        for url in [
+            "http://127.0.0.1:18000",
+            "http://localhost:18000",
+            "http://[::1]:18000",
+            "http://127.0.0.2:18000",
+        ] {
+            let mut c = prd_config();
+            c.deployment_env = Env::Dev;
+            c.discovery.allowed_vpc_ids = vec!["vpc-a".into()];
+            c.storage.endpoint_url = Some(url.into());
+            c.validate()
+                .unwrap_or_else(|e| panic!("{url} 이 막혔다 — 로컬 개발을 할 수 없다: {e}"));
+        }
     }
 
     /// dev 에서는 허용한다 — 그게 로컬 우선 개발의 전제다.
@@ -891,5 +1034,144 @@ config_table = "dbmon-config"
         let mut ok = prd_config();
         ok.discovery.interval_secs = MIN_DISCOVERY_INTERVAL_SECS;
         ok.validate().expect("하한값이 막혔다");
+    }
+}
+
+#[cfg(test)]
+mod derived_defaults_tests {
+    use super::*;
+
+    fn load(toml_text: &str) -> Config {
+        let mut root = default_document();
+        merge(&mut root, toml::from_str(toml_text).expect("테스트 TOML"));
+        Config::from_value(root).expect("설정")
+    }
+
+    const DEV_BASE: &str = r#"
+deployment_env = "dev"
+[aws]
+region = "ap-northeast-2"
+account_id = "123456789012"
+[storage]
+data_table = "d"
+config_table = "c"
+[discovery]
+allowed_vpc_ids = ["vpc-dev"]
+"#;
+
+    /// **dev 배포는 이름 거부 목록이 기본으로 켜져야 한다** (T-37 심층 방어).
+    ///
+    /// 이 테스트가 없었을 때 `default_denied_for_dev()` 는 **테스트에서만** 불렸고,
+    /// 프로덕션 경로에는 호출부가 없었다. 기능이 아니라 배선의 부재였다.
+    #[test]
+    fn dev_deployment_gets_the_default_deny_list() {
+        let c = load(DEV_BASE);
+        assert!(
+            !c.discovery.denied_name_substrings.is_empty(),
+            "dev 인데 이름 거부 목록이 비었다 — dev VPC 에 잘못 배치된 prd 를 잡지 못한다"
+        );
+        for want in ["prd", "prod", "production"] {
+            assert!(
+                c.discovery.denied_name_substrings.iter().any(|d| d == want),
+                "{want} 가 없다: {:?}",
+                c.discovery.denied_name_substrings
+            );
+        }
+    }
+
+    /// **명시한 값에 기본값을 합친다 — 대체하지 않는다.**
+    ///
+    /// 비어 있을 때만 채우면, 운영자가 거부 문자열 하나를 추가하는 순간
+    /// `prd`/`prod`/`production` 이 조용히 사라진다.
+    #[test]
+    fn an_explicit_deny_list_is_unioned_with_the_defaults() {
+        let c = load(&format!(
+            "{DEV_BASE}\ndenied_name_substrings = [\"canary\"]\n"
+        ));
+        let deny = &c.discovery.denied_name_substrings;
+        assert!(
+            deny.iter().any(|d| d == "canary"),
+            "명시값이 사라졌다: {deny:?}"
+        );
+        for want in ["prd", "prod", "production"] {
+            assert!(
+                deny.iter().any(|d| d == want),
+                "명시값을 넣자 기본 거부 {want} 가 사라졌다: {deny:?}"
+            );
+        }
+    }
+
+    /// 중복은 넣지 않는다.
+    #[test]
+    fn union_does_not_duplicate() {
+        let c = load(&format!("{DEV_BASE}\ndenied_name_substrings = [\"PRD\"]\n"));
+        let count = c
+            .discovery
+            .denied_name_substrings
+            .iter()
+            .filter(|d| d.eq_ignore_ascii_case("prd"))
+            .count();
+        assert_eq!(count, 1, "{:?}", c.discovery.denied_name_substrings);
+    }
+
+    /// **비프로덕션 배포는 태그 기반 prd 거부가 기본으로 켜져야 한다.**
+    #[test]
+    fn non_prd_deployment_rejects_production_tags_by_default() {
+        assert!(load(DEV_BASE).discovery.reject_production_tags);
+        // prd 배포에는 켜지 않는다 — 자기 인스턴스를 전부 거부하게 된다.
+        let prd = load(
+            r#"
+deployment_env = "prd"
+[aws]
+region = "ap-northeast-2"
+account_id = "123456789012"
+[storage]
+data_table = "d"
+config_table = "c"
+"#,
+        );
+        assert!(!prd.discovery.reject_production_tags);
+    }
+
+    /// prd 배포에는 넣지 않는다 — 자기 이름에 `prd` 가 들어간 인스턴스를 거부하게 된다.
+    #[test]
+    fn prd_deployment_gets_no_default_deny_list() {
+        let c = load(
+            r#"
+deployment_env = "prd"
+[aws]
+region = "ap-northeast-2"
+account_id = "123456789012"
+[storage]
+data_table = "d"
+config_table = "c"
+"#,
+        );
+        assert!(
+            c.discovery.denied_name_substrings.is_empty(),
+            "prd 배포가 이름에 prd 가 든 자기 인스턴스를 거부한다"
+        );
+    }
+
+    /// 유도 기본값이 **실제 필터에 도달해야** 한다 — 설정만 채우고 안 쓰면 무의미하다.
+    #[test]
+    fn the_derived_deny_list_actually_rejects_a_misplaced_prd_instance() {
+        use crate::aws::filter::{Candidate, Filter};
+
+        let c = load(DEV_BASE);
+        // **프로덕션과 같은 경로로 만든다.** 필드를 여기서 다시 옮기면 이 테스트는
+        // 배선이 아니라 자기 자신을 검증하게 된다.
+        let filter = Filter::from_config(&c.discovery);
+        // dev VPC 안에 있지만 이름이 prd 다 — 잘못 배치된 프로덕션 인스턴스.
+        let misplaced = Candidate {
+            identifier: "orders-prd-01".into(),
+            vpc_id: Some("vpc-dev".into()),
+            tags: Default::default(),
+            cluster_identifier: None,
+        };
+        assert!(
+            !filter.judge(&misplaced).is_accept(),
+            "dev 배포가 dev VPC 안의 prd 인스턴스를 통과시켰다"
+        );
     }
 }

@@ -52,6 +52,22 @@ impl DynamoSlowQueryStore {
         }
     }
 
+    /// 테이블에 실제로 닿는지 확인한다. **기동 시 준비 상태의 근거다.**
+    ///
+    /// `build_stores` 는 클라이언트만 조립하고 네트워크를 건드리지 않는다. 그것만으로
+    /// `storage_ok = true` 를 세우면 **자격증명이 틀렸거나 테이블 이름이 틀렸을 때도
+    /// `/readyz` 가 정상을 보고한다** — 모든 쓰기가 실패하는데 헬스체크는 초록이다
+    /// (2차 리뷰가 지적). `DescribeTable` 한 번으로 그 거짓 보고를 없앤다.
+    pub async fn probe(&self) -> Result<()> {
+        self.client
+            .describe_table()
+            .table_name(&self.table)
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        Ok(())
+    }
+
     /// **로컬·테스트용 테이블 생성.** 프로덕션 테이블은 Terraform 이 만든다
     /// (`10-foundation`) — 앱이 스키마를 만들면 두 곳이 갈린다.
     ///
@@ -265,12 +281,17 @@ impl DynamoSlowQueryStore {
     }
 }
 
+/// SDK 오류를 도메인 오류로.
+///
+/// **`scrub()` 을 여기서 적용한다.** `SdkError` 의 `Debug` 에는 응답 본문과 메타데이터가
+/// 전부 들어 있고, 호출부가 `Scrubbed` 로 감싸는 것을 한 곳만 잊어도 그게 CloudWatch 로
+/// 나간다(2차 리뷰가 지적). 근원에서 막으면 호출부의 실수와 무관해진다.
 pub(crate) fn map_sdk_err<E: std::fmt::Debug, R: std::fmt::Debug>(
     e: SdkError<E, R>,
 ) -> DomainError {
     DomainError::Unavailable {
         dependency: "dynamodb",
-        reason: format!("{e:?}"),
+        reason: crate::telemetry::scrub(&format!("{e:?}")),
     }
 }
 

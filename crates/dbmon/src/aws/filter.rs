@@ -22,6 +22,12 @@ pub struct Candidate {
     pub identifier: String,
     pub vpc_id: Option<String>,
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Aurora 클러스터 식별자.
+    ///
+    /// **이름 거부는 이것도 봐야 한다.** Aurora 멤버 인스턴스 이름은 자유롭게 정할 수
+    /// 있어서 `orders-prd-cluster` 의 멤버가 `orders-writer` 일 수 있다 — 인스턴스
+    /// 이름만 보면 prd 라는 증거를 놓친다(2차 리뷰가 지적).
+    pub cluster_identifier: Option<String>,
 }
 
 /// 필터 판정 결과. **왜 거부됐는지 남긴다** — 조용히 거부하면 "왜 안 보이나" 를
@@ -37,9 +43,15 @@ pub enum Verdict {
     MissingTag {
         want: String,
     },
-    /// 이름에 거부 문자열이 있다.
+    /// 이름에 거부 문자열이 있다. `field` 는 `identifier` 또는 `cluster`.
     NameDenied {
         matched: String,
+        field: &'static str,
+    },
+    /// **태그가 프로덕션이라고 말한다.** 비프로덕션 배포에서만 적용된다 (T-37).
+    ProductionTag {
+        key: String,
+        value: String,
     },
 }
 
@@ -53,7 +65,8 @@ impl Verdict {
             Self::Accept => "accept".into(),
             Self::VpcNotAllowed { got } => format!("vpc_not_allowed({got:?})"),
             Self::MissingTag { want } => format!("missing_tag({want})"),
-            Self::NameDenied { matched } => format!("name_denied({matched})"),
+            Self::NameDenied { matched, field } => format!("name_denied({field}:{matched})"),
+            Self::ProductionTag { key, value } => format!("production_tag({key}={value})"),
         }
     }
 }
@@ -65,9 +78,29 @@ pub struct Filter {
     /// `키=값` 형태.
     pub required_tags: Vec<String>,
     pub denied_name_substrings: Vec<String>,
+    /// **환경 태그가 prd 인 인스턴스를 거부한다.** 비프로덕션 배포에서 켠다.
+    ///
+    /// 이름 거부만으로는 부족하다 — `Environment=production` 태그가 붙었지만 이름에
+    /// prd 문자열이 없는 인스턴스가 허용 VPC 안에 있으면 통과한다(2차 리뷰가 지적).
+    /// `EnvMapping` 이 이미 그 판정을 하고 있는데 필터가 쓰지 않고 있었다.
+    pub reject_production_tags: bool,
 }
 
 impl Filter {
+    /// **설정에서 만드는 유일한 경로.**
+    ///
+    /// 호출부가 각자 필드를 옮기면 한 곳이 빠져도 컴파일된다 — 실제로
+    /// `denied_name_substrings` 기본값이 그렇게 한 번 죽었다(호출부 없음).
+    /// 여기 하나만 두면 테스트가 프로덕션과 같은 경로를 지난다.
+    pub fn from_config(cfg: &crate::config::DiscoveryConfig) -> Self {
+        Self {
+            allowed_vpc_ids: cfg.allowed_vpc_ids.clone(),
+            required_tags: cfg.required_tags.clone(),
+            denied_name_substrings: cfg.denied_name_substrings.clone(),
+            reject_production_tags: cfg.reject_production_tags,
+        }
+    }
+
     /// 후보를 판정한다.
     ///
     /// **순서가 의미를 갖는다.** 거부 규칙(`denied_name_substrings`)을 마지막에 두면
@@ -89,13 +122,18 @@ impl Filter {
         }
 
         // ② 필수 태그. **AND 조건**이다.
+        //
+        // 키 조회는 **대소문자를 무시한다.** `Environment` 와 `environment` 를 다르게
+        // 보면 `required_tags` 오타 하나로 전 인스턴스가 거부되고, 거부는 미발견으로
+        // 이어져 등록부 전체가 삭제 판정된다(2차 리뷰가 지적). 이 크레이트의 다른
+        // 태그 조회(`tag_disables_collection`, `EnvMapping::classify`)도 무시한다.
         for want in &self.required_tags {
             let (k, v) = match want.split_once('=') {
                 Some((k, v)) => (k.trim(), Some(v.trim())),
                 // 값 없이 키만 요구할 수도 있다.
                 None => (want.trim(), None),
             };
-            let matched = match (c.tags.get(k), v) {
+            let matched = match (lookup_tag(&c.tags, k), v) {
                 (Some(actual), Some(expected)) => actual == expected,
                 (Some(_), None) => true,
                 (None, _) => false,
@@ -105,19 +143,68 @@ impl Filter {
             }
         }
 
-        // ③ 이름 거부 — 마지막이다. 위를 통과했어도 거부한다.
-        let lower = c.identifier.to_ascii_lowercase();
-        for deny in &self.denied_name_substrings {
-            let d = deny.to_ascii_lowercase();
-            if !d.is_empty() && lower.contains(&d) {
-                return Verdict::NameDenied {
-                    matched: deny.clone(),
-                };
+        // ③ **태그가 프로덕션이라고 말하면 거부한다.**
+        //
+        // `Env::Prd` 만 본다. `Env::Unknown` 까지 거부하면 태그를 안 붙인 dev
+        // 인스턴스가 전부 사라진다 — 그건 T-37 이 막으려는 실패가 아니다.
+        if self.reject_production_tags {
+            let mapping = dbmon_core::env::EnvMapping::default();
+            if mapping.classify(&c.tags) == dbmon_core::env::Env::Prd {
+                let (key, value) = production_tag_evidence(&c.tags, &mapping);
+                return Verdict::ProductionTag { key, value };
+            }
+        }
+
+        // ④ 이름 거부 — 마지막이다. 위를 통과했어도 거부한다.
+        //
+        // **클러스터 이름도 본다.** Aurora 멤버 이름은 자유라 `orders-prd-cluster` 의
+        // 멤버가 `orders-writer` 일 수 있다.
+        for (field, name) in [
+            ("identifier", Some(&c.identifier)),
+            ("cluster", c.cluster_identifier.as_ref()),
+        ] {
+            let Some(name) = name else { continue };
+            let lower = name.to_ascii_lowercase();
+            for deny in &self.denied_name_substrings {
+                let d = deny.to_ascii_lowercase();
+                if !d.is_empty() && lower.contains(&d) {
+                    return Verdict::NameDenied {
+                        matched: deny.clone(),
+                        field,
+                    };
+                }
             }
         }
 
         Verdict::Accept
     }
+}
+
+/// 태그를 **대소문자 무시로** 찾는다.
+fn lookup_tag<'a>(
+    tags: &'a std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<&'a String> {
+    tags.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+}
+
+/// 어느 태그가 prd 판정을 냈는지 찾아 사유에 담는다.
+///
+/// 판정만 남기고 근거를 버리면 "왜 안 보이나" 를 추적할 수 없다.
+fn production_tag_evidence(
+    tags: &std::collections::BTreeMap<String, String>,
+    mapping: &dbmon_core::env::EnvMapping,
+) -> (String, String) {
+    for key in &mapping.keys {
+        if let Some(v) = lookup_tag(tags, key)
+            && mapping.values.get(&v.trim().to_lowercase()) == Some(&dbmon_core::env::Env::Prd)
+        {
+            return (key.clone(), v.clone());
+        }
+    }
+    ("?".into(), "?".into())
 }
 
 #[cfg(test)]
@@ -132,6 +219,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            cluster_identifier: None,
         }
     }
 
@@ -140,6 +228,7 @@ mod tests {
             allowed_vpc_ids: vec!["vpc-dev".into()],
             required_tags: vec![],
             denied_name_substrings: vec!["prd".into(), "prod".into()],
+            ..Default::default()
         }
     }
 
@@ -200,6 +289,7 @@ mod tests {
             allowed_vpc_ids: vec!["vpc-dev".into()],
             required_tags: vec!["Team=db".into(), "Monitored=true".into()],
             denied_name_substrings: vec![],
+            ..Default::default()
         };
         // 하나만 있으면 거부.
         let v = f.judge(&cand("x", Some("vpc-dev"), &[("Team", "db")]));
@@ -227,6 +317,7 @@ mod tests {
             allowed_vpc_ids: vec![],
             required_tags: vec!["Monitored".into()],
             denied_name_substrings: vec![],
+            ..Default::default()
         };
         assert_eq!(
             f.judge(&cand("x", None, &[("Monitored", "anything")])),
@@ -246,6 +337,140 @@ mod tests {
         assert_eq!(
             f.judge(&cand("anything", Some("vpc-whatever"), &[])),
             Verdict::Accept
+        );
+    }
+
+    /// **태그가 프로덕션이라고 말하면 거부한다** (2차 리뷰 F1).
+    ///
+    /// 이름에 prd 문자열이 없고 허용 VPC 안에 있어도, `Environment=production` 태그가
+    /// 붙었으면 프로덕션이다. `EnvMapping` 이 이미 그 판정을 하는데 필터가 쓰지
+    /// 않고 있었다 — 판정은 있는데 호출부가 없던 부류다.
+    #[test]
+    fn production_env_tag_is_rejected_even_with_an_innocuous_name() {
+        let f = Filter {
+            allowed_vpc_ids: vec!["vpc-dev".into()],
+            reject_production_tags: true,
+            ..Default::default()
+        };
+        // 이름은 무해하고 VPC 는 허용 목록에 있다.
+        for (k, v) in [
+            ("Environment", "production"),
+            ("env", "prd"),
+            ("ENV", " PROD "),
+            ("stage", "live"),
+            ("tier", "real"),
+        ] {
+            let c = cand("orders-01", Some("vpc-dev"), &[(k, v)]);
+            let verdict = f.judge(&c);
+            assert!(
+                matches!(verdict, Verdict::ProductionTag { .. }),
+                "{k}={v} 인 인스턴스를 통과시켰다: {verdict:?}"
+            );
+            // 사유에 근거 태그가 담겨야 한다.
+            assert!(
+                verdict.reason().contains(&v.trim().to_string()),
+                "{verdict:?}"
+            );
+        }
+    }
+
+    /// **태그가 없는 것은 거부하지 않는다.**
+    ///
+    /// `Env::Unknown` 까지 거부하면 태그를 안 붙인 dev 인스턴스가 전부 사라진다 —
+    /// 그건 T-37 이 막으려는 실패가 아니다. `Unknown` 의 보수적 취급은 리터럴 정책
+    /// 쪽에서 한다.
+    #[test]
+    fn untagged_instances_are_not_rejected_as_production() {
+        let f = Filter {
+            allowed_vpc_ids: vec!["vpc-dev".into()],
+            reject_production_tags: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            f.judge(&cand("orders-01", Some("vpc-dev"), &[])),
+            Verdict::Accept
+        );
+        assert_eq!(
+            f.judge(&cand("orders-01", Some("vpc-dev"), &[("env", "dev")])),
+            Verdict::Accept
+        );
+        // 알 수 없는 값도 통과 — 거부는 명시적 prd 에만.
+        assert_eq!(
+            f.judge(&cand("orders-01", Some("vpc-dev"), &[("env", "권한없음")])),
+            Verdict::Accept
+        );
+    }
+
+    /// prd 배포에서는 이 규칙을 켜지 않는다 — 자기 인스턴스를 전부 거부한다.
+    #[test]
+    fn production_deployment_does_not_reject_production_tags() {
+        let f = Filter {
+            reject_production_tags: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            f.judge(&cand("orders-prd", None, &[("env", "prd")])),
+            Verdict::Accept
+        );
+    }
+
+    /// **클러스터 이름도 이름 거부 대상이다** (2차 리뷰 F2).
+    ///
+    /// Aurora 멤버 인스턴스 이름은 자유라 `orders-prd-cluster` 의 멤버가
+    /// `orders-writer` 일 수 있다. 인스턴스 이름만 보면 prd 라는 증거를 놓친다.
+    #[test]
+    fn cluster_name_is_checked_for_denied_substrings() {
+        let f = dev_filter();
+        let mut c = cand("orders-writer", Some("vpc-dev"), &[]);
+        c.cluster_identifier = Some("orders-prd-cluster".into());
+
+        let verdict = f.judge(&c);
+        assert!(
+            matches!(
+                verdict,
+                Verdict::NameDenied {
+                    field: "cluster",
+                    ..
+                }
+            ),
+            "prd 클러스터의 멤버를 통과시켰다: {verdict:?}"
+        );
+        // 사유에 어느 필드였는지 남아야 한다.
+        assert!(verdict.reason().contains("cluster"), "{verdict:?}");
+    }
+
+    /// 클러스터가 없으면(RDS MySQL) 인스턴스 이름만 본다.
+    #[test]
+    fn standalone_instances_are_unaffected_by_the_cluster_check() {
+        let f = dev_filter();
+        assert_eq!(
+            f.judge(&cand("orders-dev-01", Some("vpc-dev"), &[])),
+            Verdict::Accept
+        );
+    }
+
+    /// **필수 태그 키 조회는 대소문자를 무시해야 한다** (2차 리뷰 F3).
+    ///
+    /// 구분하면 `required_tags = ["environment=dev"]` + 실제 태그 `Environment` 조합에서
+    /// **전 인스턴스가 거부되고**, 거부는 미발견으로 이어져 등록부 전체가 삭제 판정된다.
+    /// 오타 하나가 전면 삭제가 되는 실패 방향이다.
+    #[test]
+    fn required_tag_keys_are_matched_case_insensitively() {
+        let f = Filter {
+            required_tags: vec!["environment=dev".into()],
+            ..Default::default()
+        };
+        for key in ["Environment", "ENVIRONMENT", "environment"] {
+            assert_eq!(
+                f.judge(&cand("x", None, &[(key, "dev")])),
+                Verdict::Accept,
+                "태그 키 {key} 를 찾지 못했다 — 오타 하나가 전면 거부가 된다"
+            );
+        }
+        // 값은 정확 일치를 유지한다 — 값까지 느슨하면 prd 를 dev 로 볼 수 있다.
+        assert!(
+            !f.judge(&cand("x", None, &[("Environment", "DEV")]))
+                .is_accept()
         );
     }
 

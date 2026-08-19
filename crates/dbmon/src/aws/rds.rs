@@ -280,6 +280,7 @@ mod tests {
             allowed_vpc_ids: vec!["vpc-dev".into()],
             required_tags: vec![],
             denied_name_substrings: vec!["prd".into()],
+            ..Default::default()
         };
         assert!(f.judge(&raw.candidate()).is_accept(), "필터가 거부했다");
 

@@ -59,6 +59,9 @@ impl RawDbInstance {
             identifier: self.identifier.clone(),
             vpc_id: self.vpc_id.clone(),
             tags: self.tags.clone(),
+            // **클러스터 이름을 버리지 않는다.** Aurora 멤버 이름은 자유라
+            // `orders-prd-cluster` 의 멤버가 `orders-writer` 일 수 있다.
+            cluster_identifier: self.cluster_identifier.clone(),
         }
     }
 }
@@ -67,6 +70,9 @@ impl RawDbInstance {
 pub const ENABLED_TAG: &str = "dbmon:enabled";
 
 /// 인스턴스로 변환할 수 없는 이유.
+///
+/// `Display` 를 구현해 `Scrubbed` 로 감쌀 수 있게 한다 — 이 값은 AWS 가 준 문자열
+/// (버전 문자열·식별자)을 담으므로 로그에 원문으로 나가면 안 된다(2차 리뷰가 지적).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unmappable {
     /// MySQL 계열이 아니다 (postgres, sqlserver …). 정상적으로 흔하다.
@@ -75,6 +81,16 @@ pub enum Unmappable {
     UnparsableVersion { raw: String },
     /// 식별자·계정·리전이 키 규칙을 위반한다.
     InvalidId { reason: String },
+}
+
+impl std::fmt::Display for Unmappable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotMysql { engine } => write!(f, "not_mysql({engine})"),
+            Self::UnparsableVersion { raw } => write!(f, "unparsable_version({raw})"),
+            Self::InvalidId { reason } => write!(f, "invalid_id({reason})"),
+        }
+    }
 }
 
 /// 원시 응답을 도메인 인스턴스로. **탐색이 발견한 사실만 담는다** —
@@ -143,7 +159,40 @@ fn initial_state(raw: &RawDbInstance, engine: Engine, version: &EngineVersion) -
     if !version.is_supported(engine) {
         return InstanceState::Unsupported;
     }
+    // **RDS 상태가 "서비스 중이 아니다" 라고 하면 그걸 반영한다.**
+    //
+    // 이 검사가 없으면 정지된 인스턴스가 `Collecting` 으로 남는다 —
+    // `merge_discovered` 가 기존 상태를 유지하기 때문이다. 정지된 Aurora 는
+    // 엔드포인트를 그대로 유지하므로 매초 접속을 시도하고 매초 실패한다
+    // (2차 리뷰가 지적: `status` 를 옮겨만 놓고 아무도 읽지 않았다).
+    if !is_serving(&raw.status) {
+        return InstanceState::Unreachable;
+    }
     InstanceState::Pending
+}
+
+/// RDS 상태가 접속을 기대할 수 있는 상태인가.
+///
+/// **거부 목록으로 판정한다(fail-open).** RDS 상태값은 20가지가 넘고 그중
+/// `backing-up`·`modifying`·`maintenance`·`rebooting`·`upgrading` 등은 **접속이 된다.**
+/// 허용 목록으로 두면 그런 상태에서 수집이 멈추고, 그건 조용한 관측 손실이다.
+/// 반대로 거부 목록이 한 상태를 놓치면 접속을 시도하다 실패할 뿐이고,
+/// 서킷 브레이커가 그걸 처리한다 — 실패 방향이 덜 나쁘다.
+fn is_serving(status: &str) -> bool {
+    !matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "creating"
+            | "deleting"
+            | "failed"
+            | "inaccessible-encryption-credentials"
+            | "inaccessible-encryption-credentials-recoverable"
+            | "incompatible-network"
+            | "incompatible-restore"
+            | "restore-error"
+            | "starting"
+            | "stopped"
+            | "stopping"
+    )
 }
 
 /// `dbmon:enabled` 가 수집을 끄는가 (FR-DSC-05).
@@ -154,55 +203,6 @@ fn tag_disables_collection(tags: &BTreeMap<String, String>) -> bool {
     tags.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(ENABLED_TAG))
         .is_some_and(|(_, v)| matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"))
-}
-
-/// 탐색 결과를 기존 등록부와 맞춘다 (FR-DSC-07).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reconcile {
-    /// 처음 봤다 — 등록한다.
-    Insert,
-    /// 다시 보였다 — `last_seen_ms` 갱신, `missing_count` 초기화.
-    Seen,
-    /// 이번 탐색에 없었다. **연속 횟수만 올린다.**
-    Missing { consecutive: u32 },
-    /// 연속 미발견이 임계에 닿았다 — `deleted_at` 을 찍는다(즉시 삭제하지 않는다).
-    MarkDeleted,
-}
-
-/// 등록부 하나에 대한 판정.
-///
-/// # 왜 1회 미발견으로 삭제하지 않는가 (FR-DSC-07)
-///
-/// `DescribeDBInstances` 는 조절(throttling)·부분 실패·일시적 권한 오류로 **빈 목록에
-/// 가까운 응답**을 줄 수 있다. 그 한 번으로 500대를 `deleted` 로 찍으면 UI 가 비고
-/// 과거 데이터의 인스턴스 메타 참조가 끊긴다. 그래서 [`MISSING_THRESHOLD`] 회
-/// 연속일 때만 삭제로 판정한다.
-///
-/// [`MISSING_THRESHOLD`]: dbmon_core::instance::MISSING_THRESHOLD
-pub fn reconcile_one(known: Option<&Instance>, seen_now: bool) -> Reconcile {
-    match (known, seen_now) {
-        (None, true) => Reconcile::Insert,
-        // 등록부에 없고 이번에도 없다 — 판정할 것이 없다. 호출자가 부르지 않는 경로다.
-        (None, false) => Reconcile::Missing { consecutive: 0 },
-        (Some(_), true) => Reconcile::Seen,
-        (Some(prev), false) => {
-            let next = prev.missing_count + 1;
-            if should_mark_deleted(next) {
-                Reconcile::MarkDeleted
-            } else {
-                Reconcile::Missing { consecutive: next }
-            }
-        }
-    }
-}
-
-/// 카운터를 올린 **뒤** 삭제로 판정할 것인가.
-///
-/// **이 판정의 유일한 정의다.** 저장 어댑터([`crate::store::registry`])의
-/// `mark_missing` 도 이 함수를 부른다 — 임계값을 두 곳에 적으면 한쪽만 바뀐다.
-/// 이 프로젝트에서 "고쳤는데 다른 경로가 옛 규칙을 쓴다" 부류가 반복됐다.
-pub fn should_mark_deleted(missing_count_after: u32) -> bool {
-    missing_count_after >= dbmon_core::instance::MISSING_THRESHOLD
 }
 
 #[cfg(test)]
@@ -279,6 +279,61 @@ mod tests {
             !i.is_collectible(),
             "자가진단 전에 수집 대상이 됐다 — 전제조건을 확인하지 않고 쿼리를 보낸다"
         );
+    }
+
+    /// **정지·삭제 중 인스턴스는 수집 대상이 아니어야 한다** (2차 리뷰 F14).
+    ///
+    /// 정지된 Aurora 는 엔드포인트를 그대로 유지하므로, 상태를 안 보면 매초 접속을
+    /// 시도하고 매초 실패한다.
+    #[test]
+    fn non_serving_rds_statuses_are_not_collectible() {
+        for status in [
+            "stopped",
+            "stopping",
+            "starting",
+            "creating",
+            "deleting",
+            "failed",
+            "incompatible-network",
+            "restore-error",
+            "STOPPED",
+            " stopped ",
+        ] {
+            let mut r = raw("mysql", "8.4.6");
+            r.status = status.into();
+            let i = map(&r).expect("매핑");
+            assert_eq!(
+                i.state,
+                InstanceState::Unreachable,
+                "{status} 인 인스턴스를 정상으로 봤다"
+            );
+        }
+    }
+
+    /// **접속 가능한 상태를 막지 않는다.** 허용 목록으로 두면 `backing-up` 같은
+    /// 정상 상태에서 수집이 조용히 멈춘다.
+    #[test]
+    fn transient_but_reachable_statuses_still_collect() {
+        for status in [
+            "available",
+            "backing-up",
+            "modifying",
+            "maintenance",
+            "rebooting",
+            "upgrading",
+            "storage-optimization",
+            "configuring-enhanced-monitoring",
+            "",
+            "새로운-상태값",
+        ] {
+            let mut r = raw("mysql", "8.4.6");
+            r.status = status.into();
+            assert_eq!(
+                map(&r).expect("매핑").state,
+                InstanceState::Pending,
+                "{status:?} 에서 수집을 멈췄다 — 접속되는 상태다"
+            );
+        }
     }
 
     /// 버전 미달은 `Unsupported` 여야 한다 (FR-DSC-11).
@@ -373,43 +428,5 @@ mod tests {
             Some("123456789012/ap-northeast-2/orders-cluster")
         );
         assert!(i.is_cluster_writer);
-    }
-
-    // ── FR-DSC-07 재조정 ──────────────────────────────────────────────────────
-
-    fn known(missing_count: u32) -> Instance {
-        let mut i = map(&raw("mysql", "8.4.6")).expect("매핑");
-        i.missing_count = missing_count;
-        i
-    }
-
-    /// **1회 미발견으로 삭제하지 않는다.** API 한 번 삐끗해서 500대가 사라지면 안 된다.
-    #[test]
-    fn one_miss_never_marks_deleted() {
-        assert_eq!(
-            reconcile_one(Some(&known(0)), false),
-            Reconcile::Missing { consecutive: 1 },
-            "1회 미발견으로 삭제 판정했다 — 일시적 API 실패가 등록부를 비운다"
-        );
-    }
-
-    /// 2회 연속이면 삭제로 판정한다.
-    #[test]
-    fn two_consecutive_misses_mark_deleted() {
-        assert_eq!(
-            reconcile_one(Some(&known(1)), false),
-            Reconcile::MarkDeleted
-        );
-    }
-
-    /// 중간에 다시 보이면 **연속 카운터가 리셋된다.**
-    #[test]
-    fn reappearing_resets_the_counter() {
-        assert_eq!(reconcile_one(Some(&known(1)), true), Reconcile::Seen);
-    }
-
-    #[test]
-    fn first_sighting_inserts() {
-        assert_eq!(reconcile_one(None, true), Reconcile::Insert);
     }
 }
