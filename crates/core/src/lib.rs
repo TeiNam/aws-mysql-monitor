@@ -104,9 +104,8 @@ mod tests {
         assert_eq!(route_query(exact, boundary), QueryRoute::HotOnly);
     }
 
-    #[test]
-    fn ttl_exceeds_hot_boundary_for_archive_slack() {
-        // 아카이브 잡이 며칠 실패해도 데이터가 사라지기 전에 복구할 여유가 있어야 한다.
-        assert!(HOT_TTL_DAYS > HOT_TIER_DAYS);
-    }
+    /// 아카이브 잡이 며칠 실패해도 데이터가 사라지기 전에 복구할 여유가 있어야 한다.
+    ///
+    /// 컴파일 타임 단정으로 둔다 — 상수 비교라 런타임 테스트는 의미가 없다.
+    const _: () = assert!(HOT_TTL_DAYS > HOT_TIER_DAYS);
 }

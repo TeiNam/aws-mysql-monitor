@@ -34,16 +34,23 @@ pub struct ProcessRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeResult {
     pub rows: Vec<ProcessRow>,
-    /// 대상 DB 의 `NOW(6)`. 추가 왕복 없이 탐지 쿼리에 컬럼으로 붙인다.
-    pub db_now_ms: EpochMs,
+    /// 대상 DB 의 `NOW(6)`. 탐지 쿼리에 컬럼으로 붙이므로 추가 왕복이 없다.
+    ///
+    /// **행이 0개면 `None` 이다** — 정상 상태의 99% 가 그렇다. 컬럼으로 붙인 값은
+    /// 행이 있어야 돌아온다. 초기 설계는 "매 tick 에 함께 읽으므로 추가 왕복이 없다"고
+    /// 적었는데, 0행일 때 시각을 못 받는다는 점을 놓쳤다.
+    /// → 오프셋 갱신은 [`TargetDb::db_now_ms`] 를 낮은 빈도로 호출해 보완한다.
+    pub db_now_ms: Option<EpochMs>,
     /// `LIMIT` 에 걸려 잘렸다 → `detect_overflow` 메트릭.
     pub truncated: bool,
 }
 
 /// `information_schema.PROCESSLIST` 타깃 조회 — 전문 SQL.
 ///
-/// `INFO` 는 `LONGTEXT` 이며 절단되지 않는다(이 전제가 ADR-005 의 근거이며
-/// [OPEN-Q-07](../../../docs/OPEN-QUESTIONS.md) 에서 실측 검증한다).
+/// **`INFO` 는 `varchar(21845)` 이고 65,535바이트에서 절단된다** (M1-1 실측,
+/// [19 §A](../../../docs/19-m1-findings.md)). `LONGTEXT` 가 아니다.
+/// `performance_schema` 의 1,024바이트보다 64배 넉넉하지만 무제한은 아니므로,
+/// 정확히 65,535바이트를 받으면 `sql_text_truncated = true` 로 표시한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullSqlRow {
     pub id: u64,
@@ -232,7 +239,20 @@ pub trait TargetDb: Send + Sync {
     async fn stmt_current(&self, ids: &[u64]) -> Result<Vec<StmtCurrentRow>>;
 
     /// 실행 중 실행계획. **별도 연결에서** 실행해야 폴링이 밀리지 않는다.
+    ///
+    /// ⚠ RDS 에서는 항상 [`PlanFailure::Denied`] 다 — 타인 커넥션 explain 은 정적 전역
+    /// 권한 전체를 요구한다([19 §B](../../../docs/19-m1-findings.md)).
+    /// 실질 기본 경로는 [`TargetDb::explain_rerun`] 이다.
     async fn explain_for_connection(&self, connection_id: u64) -> Result<ExplainOutcome>;
+
+    /// 문장을 `EXPLAIN FORMAT=JSON` 으로 재실행한다. **`SELECT` 권한만으로 동작한다.**
+    ///
+    /// 호출자는 `dbmon_normalize::plan_query()` 로 만든 문장을 넘긴다 — DML 이면
+    /// 조건절이 `SELECT` 로 변환돼 있다. `EXPLAIN` 은 문장을 실행하지 않는다.
+    async fn explain_rerun(&self, sql: &str) -> Result<ExplainOutcome>;
+
+    /// `FORMAT=TREE` 텍스트. 사람이 읽기 쉬워 UI 가치가 크다. 미지원이면 `None`.
+    async fn explain_tree(&self, sql: &str) -> Result<Option<String>>;
 
     /// 다이제스트 스냅샷 (지표 컬럼만). `last_seen_gte_ms` 로 활성 다이제스트만 받는다.
     async fn digest_snapshot(&self, last_seen_gte_ms: Option<EpochMs>) -> Result<DigestSnapshot>;
@@ -245,6 +265,11 @@ pub trait TargetDb: Send + Sync {
 
     /// `SELECT STATEMENT_DIGEST(?)` — 우리 문장의 다이제스트를 계산해 자기 제외에 쓴다.
     async fn statement_digest(&self, sql: &str) -> Result<Option<String>>;
+
+    /// 대상 DB 의 현재 시각. 시계 오프셋 추정용 (F14).
+    ///
+    /// `probe` 가 0행을 반환하면 시각을 못 얻으므로, 낮은 빈도(기본 30초)로 이걸 호출한다.
+    async fn db_now_ms(&self) -> Result<EpochMs>;
 
     async fn ping(&self) -> Result<()>;
 }

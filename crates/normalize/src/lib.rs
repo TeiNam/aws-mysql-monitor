@@ -26,10 +26,12 @@ pub mod canonical;
 pub mod keywords;
 pub mod lexer;
 pub mod postcondition;
+pub mod rewrite;
 pub mod stmt_type;
 
 pub use canonical::MAX_CANONICAL_CHARS;
 pub use postcondition::{LiteralResidue, check_no_literals};
+pub use rewrite::{PlanQuery, plan_query};
 pub use stmt_type::StatementType;
 
 use sha2::{Digest, Sha256};

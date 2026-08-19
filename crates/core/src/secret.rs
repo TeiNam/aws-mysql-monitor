@@ -148,6 +148,6 @@ mod tests {
             "만료 5분 전이면 갱신"
         );
         assert!(t.needs_refresh(20 * 60_000, 0), "이미 만료");
-        assert_eq!(format!("{t:?}").contains("tok"), false);
+        assert!(!format!("{t:?}").contains("tok"));
     }
 }

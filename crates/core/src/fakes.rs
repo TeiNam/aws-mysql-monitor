@@ -188,9 +188,12 @@ impl SlowQueryStore for FakeSlowQueryStore {
 
 // ── DigestStore ─────────────────────────────────────────────────────────────
 
+/// 저장된 롤업 한 건. clippy 의 복잡한 타입 경고를 피하고 의도를 드러낸다.
+pub type StoredRollup = (InstanceId, DigestRollupRow);
+
 #[derive(Default)]
 pub struct FakeDigestStore {
-    pub rollups: Mutex<Vec<(InstanceId, DigestRollupRow)>>,
+    pub rollups: Mutex<Vec<StoredRollup>>,
     pub texts: Mutex<BTreeMap<String, DigestTextEntry>>,
     /// 배치의 앞 N 건만 성공시킨다 (부분 실패 주입, F20).
     partial_success: AtomicUsize,
@@ -238,11 +241,8 @@ impl DigestStore for FakeDigestStore {
             // 맵·집합 원자 갱신을 흉내낸다 — 두 경로가 서로의 엔트리를 잃지 않아야 한다 (F8).
             Some(existing) => {
                 if let Some(md) = &entry.mysql_digest {
-                    if !existing
-                        .mysql_digest
-                        .as_ref()
-                        .is_some_and(|(i, _)| *i == md.0)
-                    {
+                    let already = matches!(&existing.mysql_digest, Some((i, _)) if *i == md.0);
+                    if !already {
                         existing.mysql_digest = Some(md.clone());
                     }
                 }

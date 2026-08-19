@@ -170,8 +170,10 @@ mod tests {
 
     #[test]
     fn key_order_is_priority() {
-        let mut m = EnvMapping::default();
-        m.keys = vec!["tier".into(), "env".into()];
+        let m = EnvMapping {
+            keys: vec!["tier".into(), "env".into()],
+            ..Default::default()
+        };
         assert_eq!(
             m.classify(&tags(&[("env", "dev"), ("tier", "prd")])),
             Env::Prd

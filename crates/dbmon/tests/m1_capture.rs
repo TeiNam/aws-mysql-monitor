@@ -603,7 +603,9 @@ async fn m1_17_innodb_lock_waits_columns_and_truncation() {
         ),
     ];
 
-    let waits: Vec<(u64, u64, Option<String>, Option<String>, Option<String>)> = probe
+    /// `waiting_pid, blocking_pid, locked_table_name, locked_type, waiting_query`
+    type LockWaitRow = (u64, u64, Option<String>, Option<String>, Option<String>);
+    let waits: Vec<LockWaitRow> = probe
         .query(
             "SELECT waiting_pid, blocking_pid, locked_table_name, locked_type, waiting_query \
              FROM sys.innodb_lock_waits",

@@ -75,6 +75,8 @@ pub struct Lexer<'a> {
     pos: usize,
     /// 닫히지 않은 인용부호를 만났다. 후조건 검증이 이걸 보고 실패시킨다.
     pub unterminated_quote: bool,
+    /// 마지막으로 반환한 토큰이 시작한 바이트 위치 (공백·주석을 건너뛴 뒤).
+    token_start: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -83,15 +85,37 @@ impl<'a> Lexer<'a> {
             src: src.as_bytes(),
             pos: 0,
             unterminated_quote: false,
+            token_start: 0,
         }
     }
 
-    pub fn tokenize(mut self) -> (Vec<Tok>, bool) {
-        let mut out = Vec::new();
-        while let Some(t) = self.next_token() {
-            out.push(t);
+    pub fn tokenize(self) -> (Vec<Tok>, bool) {
+        let (toks, _spans, unterminated) = self.tokenize_with_spans();
+        (toks, unterminated)
+    }
+
+    /// 토큰과 함께 **원문 바이트 범위**를 반환한다.
+    ///
+    /// 스팬이 필요한 이유는 [`crate::rewrite`] 가 원문을 잘라 붙여야 하기 때문이다.
+    /// 정규화된 텍스트로는 리터럴이 `?` 가 되어 `EXPLAIN` 재실행에 쓸 수 없다
+    /// (리터럴 값이 플랜의 범위 추정을 바꾼다).
+    pub fn tokenize_with_spans(mut self) -> (Vec<Tok>, Vec<std::ops::Range<usize>>, bool) {
+        let mut toks = Vec::new();
+        let mut spans = Vec::new();
+        loop {
+            // 주석·공백을 건너뛴 **뒤**의 위치가 토큰 시작이다. next_token 안에서
+            // 건너뛰므로 여기서는 반환 후 위치로 끝을 잡고, 시작은 next_token 이 기록한다.
+            let before = self.pos;
+            match self.next_token() {
+                Some(t) => {
+                    let start = self.token_start.max(before);
+                    spans.push(start..self.pos);
+                    toks.push(t);
+                }
+                None => break,
+            }
         }
-        (out, self.unterminated_quote)
+        (toks, spans, self.unterminated_quote)
     }
 
     fn peek(&self, off: usize) -> Option<u8> {
@@ -101,6 +125,7 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<Tok> {
         loop {
             self.skip_whitespace();
+            self.token_start = self.pos;
             let c = self.peek(0)?;
             match c {
                 b'/' if self.peek(1) == Some(b'*') => {
