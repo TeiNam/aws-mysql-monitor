@@ -223,6 +223,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-rds"
+version = "1.96.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76c8f4d5a8389ec68fd386d1b4ce7f4f4dedba21f4ba5c0e7d3a41ed71f19e69"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,6 +847,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "aws-sdk-rds",
  "axum",
  "chrono",
  "clap",

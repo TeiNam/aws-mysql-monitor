@@ -109,33 +109,140 @@ fn worker_id(config: &Config) -> String {
 /// DynamoDB 클라이언트를 만들고 저장소 두 개를 조립한다.
 ///
 /// `endpoint_url` 이 설정에 있으면 그걸 쓴다 — DynamoDB Local 로 개발할 때다.
-async fn build_stores(
-    config: &Config,
-) -> anyhow::Result<(
-    Arc<dbmon::store::DynamoSlowQueryStore>,
-    Arc<dbmon::store::lease::DynamoLeaseStore>,
-)> {
+async fn build_stores(config: &Config) -> anyhow::Result<Stores> {
     use aws_config::BehaviorVersion;
 
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(config.aws.region.clone()));
     if let Some(url) = &config.storage.endpoint_url {
         // **로컬 개발 경로.** SSO 가 만료돼도 저장 경로를 돌릴 수 있다.
-        tracing::info!(%url, "DynamoDB 엔드포인트 재지정 (로컬 개발)");
-        loader = loader.endpoint_url(url);
+        //
+        // ⚠ 더미 자격증명을 함께 넣어야 한다. DynamoDB Local 은 값을 보지 않지만
+        // **SDK 는 서명하려면 자격증명이 있어야 한다** — 없으면 모든 요청이
+        // `NoCredentialsError` 로 죽는다. 처음 이 부분을 빼놨고, 자격증명을 지운
+        // 상태로 실제 바이너리를 돌려서야 드러났다("리스 획득 실패" 15회).
+        // 그러면 "SSO 가 만료돼도 로컬로 개발한다" 는 전제가 무너진다.
+        //
+        // 이 경로는 `endpoint_url` 이 설정된 경우에만 탄다. `deployment_env == prd`
+        // 에서는 설정 검증이 `endpoint_url` 자체를 금지한다.
+        tracing::info!(%url, "DynamoDB 엔드포인트 재지정 (로컬 개발 — 더미 자격증명)");
+        loader = loader.endpoint_url(url).credentials_provider(
+            aws_sdk_dynamodb::config::Credentials::new("local", "local", None, None, "dbmon-local"),
+        );
     }
     let sdk = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&sdk);
 
-    let store = Arc::new(dbmon::store::DynamoSlowQueryStore::new(
-        client.clone(),
-        config.storage.data_table.clone(),
-    ));
-    let lease_store = Arc::new(dbmon::store::lease::DynamoLeaseStore::new(
-        client,
-        config.storage.data_table.clone(),
-    ));
-    Ok((store, lease_store))
+    Ok(Stores {
+        slow_query: Arc::new(dbmon::store::DynamoSlowQueryStore::new(
+            client.clone(),
+            config.storage.data_table.clone(),
+        )),
+        lease: Arc::new(dbmon::store::lease::DynamoLeaseStore::new(
+            client.clone(),
+            config.storage.data_table.clone(),
+        )),
+        registry: Arc::new(dbmon::store::registry::DynamoInstanceRegistry::new(
+            client,
+            config.storage.data_table.clone(),
+        )),
+    })
+}
+
+/// 조립된 저장소들. 인자 5개를 넘기는 대신 묶는다.
+struct Stores {
+    slow_query: Arc<dbmon::store::DynamoSlowQueryStore>,
+    lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
+    registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
+}
+
+/// 리전별 RDS 탐색기.
+///
+/// **DynamoDB 와 달리 `endpoint_url` 을 적용하지 않는다.** RDS 를 로컬로 흉내낼 방법이
+/// 없고, 흉내낸다면 그건 탐색을 검증하는 게 아니라 목(mock)을 검증하는 것이다.
+/// 로컬에서 탐색 로직을 검증하는 방법은 순수 함수 전수 테스트다
+/// ([`dbmon::aws::discovery`], [`dbmon::discovery`]).
+async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> {
+    use aws_config::BehaviorVersion;
+
+    let mut out = Vec::new();
+    for region in config.target_regions() {
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.clone()))
+            .load()
+            .await;
+        out.push(dbmon::aws::rds::RdsDiscovery::new(
+            aws_sdk_rds::Client::new(&sdk),
+            region,
+        ));
+    }
+    out
+}
+
+/// 한 번의 탐색: 리전별 `DescribeDBInstances` → T-37 필터 → 도메인 매핑 → 재조정.
+///
+/// # 필터를 통과하지 못한 것은 등록부에 넣지 않는다
+///
+/// prd 인스턴스를 등록부에 넣고 나중에 걸러도 되지만, 그러면 **한 곳이라도 필터를
+/// 잊으면 prd 를 수집한다.** 애초에 들이지 않는 것이 방어선을 하나로 만든다.
+async fn discovery_round(
+    sources: &[dbmon::aws::rds::RdsDiscovery],
+    registry: &Arc<dbmon::store::registry::DynamoInstanceRegistry>,
+    config: &Config,
+    now_ms: i64,
+) -> anyhow::Result<dbmon::discovery::DiscoveryStats> {
+    use dbmon::aws::discovery::to_instance;
+    use dbmon::aws::filter::Filter;
+    use dbmon_core::env::EnvMapping;
+
+    let filter = Filter {
+        allowed_vpc_ids: config.discovery.allowed_vpc_ids.clone(),
+        required_tags: config.discovery.required_tags.clone(),
+        denied_name_substrings: config.discovery.denied_name_substrings.clone(),
+    };
+    let mapping = EnvMapping::default();
+
+    let mut discovered = Vec::new();
+    // **한 리전이라도 부분 결과면 전체를 부분 결과로 본다.** 리전별로 나눠 판정하면
+    // 실패한 리전의 인스턴스가 "사라졌다" 로 판정된다.
+    let mut truncated = false;
+
+    for source in sources {
+        let page = match source.describe().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %telemetry::Scrubbed(&e), "리전 탐색 실패");
+                truncated = true;
+                continue;
+            }
+        };
+        truncated |= page.truncated;
+
+        for raw in &page.instances {
+            let verdict = filter.judge(&raw.candidate());
+            if !verdict.is_accept() {
+                // 사유를 남긴다 — 조용히 거부하면 "왜 안 보이나" 를 추적할 수 없다.
+                tracing::debug!(
+                    instance = %raw.identifier,
+                    reason = %verdict.reason(),
+                    "탐색 필터가 거부했다"
+                );
+                continue;
+            }
+            match to_instance(raw, &config.aws.account_id, &mapping, now_ms) {
+                Ok(i) => discovered.push(i),
+                // MySQL 이 아닌 엔진은 정상적으로 흔하다. `debug` 로만 남긴다.
+                Err(dbmon::aws::discovery::Unmappable::NotMysql { engine }) => {
+                    tracing::debug!(instance = %raw.identifier, %engine, "MySQL 계열이 아니다");
+                }
+                Err(e) => {
+                    tracing::warn!(instance = %raw.identifier, reason = ?e, "인스턴스 매핑 실패");
+                }
+            }
+        }
+    }
+
+    Ok(dbmon::discovery::reconcile(registry, &discovered, truncated, now_ms).await?)
 }
 
 /// 리더 게이트 루프를 띄운다.
@@ -150,19 +257,27 @@ async fn build_stores(
 fn spawn_leader_loop(
     config: &Config,
     worker_id: String,
-    _store: Arc<dbmon::store::DynamoSlowQueryStore>,
-    lease_store: Arc<dbmon::store::lease::DynamoLeaseStore>,
+    stores: Stores,
     readiness: Arc<Readiness>,
     shutdown: Arc<Shutdown>,
 ) -> tokio::task::JoinHandle<()> {
     use dbmon::worker::{LeaderGate, tick_interval};
-    use dbmon_core::time::SystemClock;
+    use dbmon_core::time::{Clock, SystemClock};
 
     let interval = tick_interval(config.collector.detect_interval_ms);
+    let discovery_interval = Duration::from_secs(config.discovery.interval_secs);
     let runs_collector = config.role.runs_collector();
+    let config = config.clone();
+    let _slow_query = stores.slow_query;
 
     tokio::spawn(async move {
-        let mut gate = LeaderGate::new(lease_store, SystemClock, worker_id);
+        let mut gate = LeaderGate::new(stores.lease, SystemClock, worker_id);
+        // 탐색기는 리더가 될 때까지 만들지 않는다 — standby 워커가 AWS 자격증명을
+        // 요구하면 로컬 개발(SSO 만료)에서 기동만으로 에러가 난다.
+        let mut sources: Option<Vec<dbmon::aws::rds::RdsDiscovery>> = None;
+        // **마지막 탐색 시각.** 0 이면 리더가 된 직후 한 번 돈다 — 5분을 기다리면
+        // 배포 직후 목록이 비어 있고, 그건 장애로 보인다.
+        let mut last_discovery_ms: i64 = 0;
 
         loop {
             // 셧다운 신호가 오면 리스를 반납하고 나간다.
@@ -176,12 +291,38 @@ fn spawn_leader_loop(
             readiness.set_collect_leader(gate.is_leader());
 
             if runs_collector && gate.is_leader() {
-                // TODO(M2-5): 여기서 탐색된 인스턴스마다 `detect_tick()` 을 돈다.
-                // 지금은 리더 게이트만 배선됐다 — 인스턴스 레지스트리가 필요하다.
+                let now_ms = SystemClock.now_ms();
+                if now_ms - last_discovery_ms >= discovery_interval.as_millis() as i64 {
+                    last_discovery_ms = now_ms;
+                    if sources.is_none() {
+                        sources = Some(build_discovery(&config).await);
+                    }
+                    let srcs = sources.as_deref().unwrap_or_default();
+                    match discovery_round(srcs, &stores.registry, &config, now_ms).await {
+                        Ok(s) => tracing::info!(
+                            inserted = s.inserted,
+                            updated = s.updated,
+                            missing = s.missing,
+                            deleted = s.deleted,
+                            skipped = s.skipped_missing_check,
+                            errors = s.errors,
+                            "탐색 완료"
+                        ),
+                        // **탐색 실패로 루프를 죽이지 않는다.** 다음 주기에 다시 시도한다 —
+                        // 여기서 죽으면 리스도 반납되지 않아 최대 60초 수집 공백이 된다.
+                        Err(e) => tracing::warn!(
+                            error = %telemetry::Scrubbed(&e),
+                            "탐색 실패 — 다음 주기에 재시도한다"
+                        ),
+                    }
+                }
+
+                // TODO(M2-6): 등록부의 수집 대상마다 `detect_tick()` 을 돈다.
+                // 대상 접속에는 `AuthTokenProvider`(IAM DB Auth) 가 먼저 필요하다.
                 tracing::trace!(
                     shards = gate.shards_owned(),
                     epoch = ?gate.epoch(),
-                    "수집 tick (인스턴스 레지스트리 대기 중)"
+                    "수집 tick (대상 인증 대기 중)"
                 );
             }
 
@@ -284,15 +425,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // **저장소에 붙지 못해도 기동은 된다.** `/readyz` 가 `storage_unavailable` 을
     // 정확히 보고하는 것이 맞다 — 기동 실패로 재시작 루프를 만들면 원인을 볼 수 없다.
     let leader_task = match build_stores(&config).await {
-        Ok((store, lease_store)) => {
+        Ok(stores) => {
             readiness.set_storage_ok(true);
             let worker_id = worker_id(&config);
             tracing::info!(%worker_id, "저장소 연결됨");
             Some(spawn_leader_loop(
                 &config,
                 worker_id,
-                store,
-                lease_store,
+                stores,
                 readiness.clone(),
                 shutdown.clone(),
             ))

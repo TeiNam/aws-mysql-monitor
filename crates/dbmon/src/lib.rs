@@ -9,6 +9,7 @@
 pub mod aws;
 pub mod collector;
 pub mod config;
+pub mod discovery;
 pub mod health;
 pub mod mysql;
 pub mod shutdown;

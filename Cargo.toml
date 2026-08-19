@@ -51,6 +51,7 @@ rand = "0.9"
 # 재발한 "미배선/불일치" 클래스다.
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
+aws-sdk-rds = "1"
 serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"] }
 
 [profile.release]

@@ -191,9 +191,15 @@ impl Default for CollectorConfig {
 /// 개발계 계정에 프로덕션 워크로드가 함께 있다([18 §6](../../../docs/18-dev-environment.md)).
 /// 네트워크 격리가 1차 방어선이지만, IAM 의 `rds:DescribeDBInstances` 는 `Resource:"*"` 라
 /// prd 인스턴스도 **보인다.** 여기서 걸러야 레지스트리에 등록되지 않는다.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
+    /// 탐색 주기 (초). 기본 5분 (FR-DSC-02).
+    ///
+    /// `detect_interval_ms`(1초)와 **다른 시간축이다.** 탐색은 AWS API 를 치므로
+    /// 조절(throttling) 대상이고, 인스턴스 목록은 초 단위로 바뀌지 않는다.
+    #[serde(default = "default_discovery_interval_secs")]
+    pub interval_secs: u64,
     /// 이 VPC 안의 인스턴스만 수집한다. **AND 조건**이다.
     #[serde(default)]
     pub allowed_vpc_ids: Vec<String>,
@@ -203,6 +209,21 @@ pub struct DiscoveryConfig {
     /// 이름에 이 문자열이 들어가면 제외한다. 화이트리스트가 통과시켜도 거부한다.
     #[serde(default)]
     pub denied_name_substrings: Vec<String>,
+}
+
+fn default_discovery_interval_secs() -> u64 {
+    300
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_discovery_interval_secs(),
+            allowed_vpc_ids: Vec::new(),
+            required_tags: Vec::new(),
+            denied_name_substrings: Vec::new(),
+        }
+    }
 }
 
 impl DiscoveryConfig {
@@ -227,6 +248,9 @@ impl std::fmt::Display for ConfigError {
     }
 }
 impl std::error::Error for ConfigError {}
+
+/// 탐색 주기 하한 (초). AWS API 조절을 피하는 최소값.
+pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 30;
 
 fn err(field: &str, reason: impl Into<String>) -> ConfigError {
     ConfigError {
@@ -399,6 +423,29 @@ impl Config {
         //
         // `prd` 를 예외로 두는 이유: prd 배포는 계정 전체를 수집하는 것이 의도다.
         // 그 의도를 밝히려면 `deployment_env` 를 명시적으로 `prd` 로 적어야 한다.
+        // **프로덕션에서 엔드포인트 재지정을 금지한다.**
+        //
+        // `endpoint_url` 이 설정되면 조립부가 더미 자격증명을 넣는다(로컬 개발 경로).
+        // prd 에서 그게 켜지면 태스크 롤이 무시되고, 그 실패는 "저장이 안 된다" 로만
+        // 나타나 원인을 찾기 어렵다. 설정 단계에서 막는다.
+        if self.deployment_env == Env::Prd && self.storage.endpoint_url.is_some() {
+            return Err(err(
+                "storage.endpoint_url",
+                "prd 에서는 엔드포인트 재지정을 쓸 수 없다 (로컬 개발 전용)",
+            ));
+        }
+
+        // **탐색 주기 하한.** 0 이면 API 를 핫 루프로 때려 조절당하고, 조절은 부분
+        // 결과로 나타나 FR-DSC-07 판정을 흔든다.
+        if self.discovery.interval_secs < MIN_DISCOVERY_INTERVAL_SECS {
+            return Err(err(
+                "discovery.interval_secs",
+                format!(
+                    "{MIN_DISCOVERY_INTERVAL_SECS}초 이상이어야 한다 (받은 값: {})",
+                    self.discovery.interval_secs
+                ),
+            ));
+        }
         if self.deployment_env != Env::Prd && self.discovery.allowed_vpc_ids.is_empty() {
             return Err(err(
                 "discovery.allowed_vpc_ids",
@@ -772,5 +819,77 @@ config_table = "dbmon-config"
         let d = DiscoveryConfig::default_denied_for_dev();
         assert!(d.contains(&"prd".to_string()));
         assert!(d.contains(&"production".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod discovery_and_local_tests {
+    use super::*;
+
+    /// `Config::load` 와 같은 3단 병합을 거친 prd 설정. 기본값 문서를 우회하면
+    /// 검증이 실제 경로와 달라진다.
+    fn prd_config() -> Config {
+        let mut root = default_document();
+        merge(
+            &mut root,
+            toml::from_str(
+                r#"
+deployment_env = "prd"
+[aws]
+region = "ap-northeast-2"
+account_id = "123456789012"
+[storage]
+data_table = "dbmon-data"
+config_table = "dbmon-config"
+"#,
+            )
+            .expect("테스트 TOML"),
+        );
+        Config::from_value(root).expect("기본 prd 설정")
+    }
+
+    /// **prd 에서 엔드포인트 재지정을 막는다.**
+    ///
+    /// 켜지면 조립부가 더미 자격증명을 넣어 태스크 롤이 무시된다. 그 실패는
+    /// "저장이 안 된다" 로만 보여 원인 추적이 어렵다.
+    #[test]
+    fn prd_rejects_the_local_endpoint_override() {
+        let mut c = prd_config();
+        c.storage.endpoint_url = Some("http://127.0.0.1:18000".into());
+        let e = c.validate().expect_err("prd 에서 통과했다");
+        assert_eq!(e.field, "storage.endpoint_url");
+    }
+
+    /// dev 에서는 허용한다 — 그게 로컬 우선 개발의 전제다.
+    #[test]
+    fn dev_allows_the_local_endpoint_override() {
+        let mut c = prd_config();
+        c.deployment_env = Env::Dev;
+        // dev 는 T-37 로 VPC 필터가 필수다.
+        c.discovery.allowed_vpc_ids = vec!["vpc-local".into()];
+        c.storage.endpoint_url = Some("http://127.0.0.1:18000".into());
+        c.validate()
+            .expect("dev 에서 막혔다 — 로컬 개발을 할 수 없다");
+    }
+
+    /// 탐색 주기는 기본 5분이다 (FR-DSC-02).
+    #[test]
+    fn discovery_interval_defaults_to_five_minutes() {
+        assert_eq!(DiscoveryConfig::default().interval_secs, 300);
+    }
+
+    /// **0 초를 막는다.** 핫 루프로 AWS API 를 때리면 조절당하고, 조절은 부분 결과로
+    /// 나타나 FR-DSC-07 미발견 판정을 흔든다.
+    #[test]
+    fn discovery_interval_has_a_floor() {
+        for secs in [0u64, 1, MIN_DISCOVERY_INTERVAL_SECS - 1] {
+            let mut c = prd_config();
+            c.discovery.interval_secs = secs;
+            let e = c.validate().expect_err("{secs}초가 통과했다");
+            assert_eq!(e.field, "discovery.interval_secs");
+        }
+        let mut ok = prd_config();
+        ok.discovery.interval_secs = MIN_DISCOVERY_INTERVAL_SECS;
+        ok.validate().expect("하한값이 막혔다");
     }
 }

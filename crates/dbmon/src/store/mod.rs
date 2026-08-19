@@ -20,6 +20,7 @@
 
 pub mod keys;
 pub mod lease;
+pub mod registry;
 
 use std::collections::HashMap;
 

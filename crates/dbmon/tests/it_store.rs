@@ -546,3 +546,220 @@ async fn lists_shard_leases_without_scanning() {
     assert_eq!(listed.len(), 3, "잡은 3개만 보여야 한다: {listed:?}");
     assert!(listed.iter().all(|l| l.owner == "worker-a"));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 인스턴스 등록부 — FR-DSC-07 (M2-5)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use dbmon::aws::discovery::{RawDbInstance, to_instance};
+use dbmon::store::registry::{DynamoInstanceRegistry, merge_discovered};
+use dbmon_core::instance::InstanceState;
+use dbmon_core::ports::InstanceRegistry;
+
+async fn registry(name: &str) -> Option<DynamoInstanceRegistry> {
+    let _ = store(name).await?;
+    Some(DynamoInstanceRegistry::new(
+        client(),
+        format!("dbmon-test-{name}"),
+    ))
+}
+
+fn discovered(identifier: &str) -> dbmon_core::instance::Instance {
+    let raw = RawDbInstance {
+        identifier: identifier.into(),
+        dbi_resource_id: format!("db-{identifier}"),
+        engine: "mysql".into(),
+        engine_version: "8.4.6".into(),
+        status: "available".into(),
+        endpoint_address: Some(format!("{identifier}.abc.ap-northeast-2.rds.amazonaws.com")),
+        endpoint_port: Some(3306),
+        vpc_id: Some("vpc-dev".into()),
+        region: "ap-northeast-2".into(),
+        tags: [("env".to_string(), "prd".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), T0).expect("매핑")
+}
+
+/// **왕복.** 등록부 항목의 전 필드가 보존돼야 한다.
+#[tokio::test]
+async fn registry_round_trips_the_instance() {
+    let Some(r) = registry("reg-roundtrip").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    let got = r.get(&i.id).await.expect("조회").expect("있어야 한다");
+    assert_eq!(got, i, "왕복에서 필드가 달라졌다");
+}
+
+/// **전체 목록이 `Scan` 없이 나와야 한다** — IAM 이 `dynamodb:Scan` 을 Deny 한다.
+#[tokio::test]
+async fn registry_lists_everything_from_one_partition() {
+    let Some(r) = registry("reg-list").await else {
+        return;
+    };
+    for id in ["orders-01", "orders-02", "billing-01"] {
+        r.upsert(&discovered(id)).await.expect("등록");
+    }
+    let all = r.list().await.expect("나열");
+    assert_eq!(
+        all.len(),
+        3,
+        "{:?}",
+        all.iter().map(|i| i.id.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// **1회 미발견으로 삭제되지 않는다** (FR-DSC-07).
+///
+/// `DescribeDBInstances` 가 한 번 조절되면 500대가 전부 사라진 것으로 보인다.
+/// 그 한 번으로 `deleted_at` 을 찍으면 UI 가 비고 과거 데이터의 메타 참조가 끊긴다.
+#[tokio::test]
+async fn one_missed_discovery_does_not_delete_the_instance() {
+    let Some(r) = registry("reg-onemiss").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    let after = r.mark_missing(&i.id, T0 + 1_000).await.expect("미발견 1회");
+    assert_eq!(after.missing_count, 1);
+    assert_eq!(
+        after.deleted_at_ms, None,
+        "1회 미발견으로 삭제 도장이 찍혔다 — 일시적 API 실패가 등록부를 비운다"
+    );
+    assert_ne!(after.state, InstanceState::Deleted);
+}
+
+/// 2회 연속이면 `deleted_at` 을 찍는다. **항목은 남는다.**
+#[tokio::test]
+async fn two_consecutive_misses_stamp_deleted_but_keep_the_item() {
+    let Some(r) = registry("reg-twomiss").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    let after = r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
+
+    assert_eq!(after.missing_count, 2);
+    assert_eq!(after.deleted_at_ms, Some(T0 + 2_000));
+    assert_eq!(after.state, InstanceState::Deleted);
+
+    // **항목이 지워지지 않았다** — 과거 슬로우 쿼리의 메타 참조가 살아 있어야 한다.
+    assert!(
+        r.get(&i.id).await.expect("조회").is_some(),
+        "삭제 판정이 항목을 지웠다 — 과거 데이터의 인스턴스 메타를 영구히 잃는다"
+    );
+}
+
+/// 3회, 4회 미발견에도 **처음 사라진 시각이 유지돼야** 한다.
+///
+/// 매번 덮으면 30일 보존 기간이 계속 밀려 영구히 보존된다.
+#[tokio::test]
+async fn deleted_at_keeps_the_first_disappearance_time() {
+    let Some(r) = registry("reg-firstgone").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    let first = r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
+    let later = r.mark_missing(&i.id, T0 + 999_000).await.expect("3회");
+
+    assert_eq!(
+        later.deleted_at_ms, first.deleted_at_ms,
+        "삭제 시각이 갱신됐다 — 보존 기간이 계속 밀려 영구 보존이 된다"
+    );
+    assert_eq!(later.missing_count, 3);
+}
+
+/// 중간에 다시 보이면 **카운터가 리셋되고 삭제 도장이 지워진다.**
+#[tokio::test]
+async fn reappearing_clears_the_counter_and_the_delete_stamp() {
+    let Some(r) = registry("reg-revive").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    r.mark_missing(&i.id, T0 + 2_000)
+        .await
+        .expect("2회 — 삭제 판정");
+    assert!(
+        r.get(&i.id)
+            .await
+            .expect("조회")
+            .unwrap()
+            .deleted_at_ms
+            .is_some()
+    );
+
+    // 정지됐던 인스턴스가 다시 떴다.
+    r.mark_seen(&i.id, T0 + 3_000).await.expect("재발견");
+    let back = r.get(&i.id).await.expect("조회").expect("있음");
+    assert_eq!(back.missing_count, 0);
+    assert_eq!(
+        back.deleted_at_ms, None,
+        "삭제 도장이 남으면 되살아난 인스턴스가 목록에서 계속 안 보인다"
+    );
+    assert_eq!(back.last_seen_ms, T0 + 3_000);
+}
+
+/// **등록되지 않은 인스턴스에 미발견을 찍으면 실패해야 한다.**
+///
+/// 성공하면 `missing_count` 만 있는 반쪽 항목이 생기고, 그건 역직렬화에서 터진다.
+#[tokio::test]
+async fn marking_an_unknown_instance_fails_instead_of_creating_a_stub() {
+    let Some(r) = registry("reg-stub").await else {
+        return;
+    };
+    let ghost = discovered("never-registered");
+    let e = r.mark_missing(&ghost.id, T0).await;
+    assert!(e.is_err(), "없는 인스턴스에 카운터만 있는 항목을 만들었다");
+    assert!(
+        r.get(&ghost.id).await.expect("조회").is_none(),
+        "반쪽 항목이 남았다"
+    );
+}
+
+/// **재탐색이 사용자 오버라이드를 지우지 않아야 한다** (FR-DSC-04) — 저장소를 통해서도.
+#[tokio::test]
+async fn rediscovery_preserves_the_user_override_through_the_store() {
+    let Some(r) = registry("reg-override").await else {
+        return;
+    };
+    // 사용자가 UI 에서 dev 로 지정했다.
+    let mut stored = discovered("orders-01");
+    stored.env = dbmon_core::env::EnvResolution::resolve(
+        dbmon_core::env::Env::Prd,
+        Some(dbmon_core::env::Env::Dev),
+    );
+    stored.state = InstanceState::Collecting;
+    r.upsert(&stored).await.expect("등록");
+
+    // 5분 뒤 탐색이 다시 돈다 — 태그는 여전히 prd 다.
+    let fresh = discovered("orders-01");
+    let existing = r.get(&fresh.id).await.expect("조회");
+    let merged = merge_discovered(existing.as_ref(), &fresh);
+    r.upsert(&merged).await.expect("갱신");
+
+    let got = r.get(&fresh.id).await.expect("조회").expect("있음");
+    assert_eq!(
+        got.env.override_value,
+        Some(dbmon_core::env::Env::Dev),
+        "재탐색이 사용자 오버라이드를 덮었다"
+    );
+    assert_eq!(
+        got.state,
+        InstanceState::Collecting,
+        "재탐색이 수집 중 인스턴스를 Pending 으로 되돌렸다 — 수집이 5분마다 멈춘다"
+    );
+}
