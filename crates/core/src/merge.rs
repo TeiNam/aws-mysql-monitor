@@ -274,6 +274,20 @@ fn merge_duration(
             return (span, DurationSource::Span, ended_at_ms);
         }
         // 정밀 시작이 종료보다 늦다 — 정밀값을 신뢰할 수 없다. 조밀값으로 재시도한다.
+        //
+        // # 이때 `duration != ended - precise` 가 된다. 그게 맞다.
+        //
+        // 병합된 `precise` 는 두 레코드의 `min` 이고 병합된 `ended` 도 `min` 이다.
+        // 한쪽 레코드가 정밀값만 갖고 다른 쪽이 종료만 가지면, 서로를 본 적 없는 두 값이
+        // 한 레코드에 모인다 — `precise = +2000` 인데 `ended = +1000` 같은 조합이다.
+        //
+        // 레코드별 필터로는 못 막는다. "내 정밀값이 **남의** 종료보다 이른가" 는
+        // 지역적으로 판정할 수 없고, 병합 후에 판정하면 중간 결과가 달라져
+        // **결합법칙이 깨진다**(4차 H1 이 그 부류였다).
+        //
+        // 그래서 불변식을 실제로 참인 것으로 좁힌다:
+        // **`duration_ms` 는 기록된 두 시작 시각 중 하나로부터의 구간이다.**
+        // 제3의 숫자를 만들지 않으므로 검증 가능하고, 데이터를 버리지도 않는다.
         let coarse_span = end - started_at_ms;
         if coarse_span >= 0 {
             return (coarse_span, DurationSource::Span, ended_at_ms);
@@ -677,13 +691,18 @@ mod tests {
                 // **음수 구간을 포함한다** — 이게 빠졌던 축이다.
                 for end in [None, Some(s0 - 3_000), Some(s0), Some(s0 + 1_000)] {
                     for start in [s0, s0 + 500] {
-                        variants.push(SlowQuery {
-                            duration_ms: dur,
-                            duration_source: src,
-                            ended_at_ms: end,
-                            started_at_ms: start,
-                            ..base()
-                        });
+                        // **정밀 시작도 독립적으로 흔든다.** 4차까지 이 축이 빠져 있었고,
+                        // 그래서 조밀값 재시도 경로를 한 번도 지나지 않았다.
+                        for precise in [None, Some(s0 - 400), Some(s0 + 2_000)] {
+                            variants.push(SlowQuery {
+                                duration_ms: dur,
+                                duration_source: src,
+                                ended_at_ms: end,
+                                started_at_ms: start,
+                                started_at_ms_precise: precise,
+                                ..base()
+                            });
+                        }
                     }
                 }
             }
@@ -694,11 +713,15 @@ mod tests {
         let mut inconsistent = 0usize;
         for a in &variants {
             for b in &variants {
-                // 일관성: 종료가 남아 있으면 duration 이 구간과 맞아야 한다.
+                // 일관성: 종료가 남아 있으면 duration 이 **기록된 두 시작 시각 중
+                // 하나로부터의** 구간이어야 한다. 제3의 숫자면 어디서 왔는지 알 수 없다.
                 let m = merge(a, b);
                 if let Some(end) = m.ended_at_ms {
-                    let span_base = m.started_at_ms_precise.unwrap_or(m.started_at_ms);
-                    if m.duration_source != Slowlog && m.duration_ms != end - span_base {
+                    let from_coarse = m.duration_ms == end - m.started_at_ms;
+                    let from_precise = m
+                        .started_at_ms_precise
+                        .is_some_and(|p| m.duration_ms == end - p);
+                    if m.duration_source == Span && !(from_coarse || from_precise) {
                         inconsistent += 1;
                     }
                 }
@@ -753,7 +776,7 @@ mod tests {
             assert_eq!(
                 m.duration_ms,
                 m.ended_at_ms.unwrap() - precise,
-                "{label}: 정밀 시작 기준으로 일관돼야 한다"
+                "{label}: 정밀값이 종료보다 이르면 그 기준으로 일관돼야 한다"
             );
         }
     }

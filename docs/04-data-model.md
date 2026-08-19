@@ -216,7 +216,7 @@ v         1
 | `db_user` / `db_host` | S | 접속 계정 / 클라이언트 호스트:포트 |
 | `started_at_ms` / `ended_at_ms` | N | 시작 추정 = 최초 관측시각 − 관측 TIME |
 | `duration_ms` | N | 관측된 최대 실행시간(확정값) |
-| `duration_source` | S | `polled`(초 단위 근사) / `timer`(`TIMER_WAIT` 보정, **가장 흔하다**) / `slowlog`(완결된 권위값). `merged` 는 없다 — 그 값은 `capture_source` 쪽이다 |
+| `duration_source` | S | `polled`(초 단위 근사) / `timer`(`TIMER_WAIT` 보정) / **`span`**(관측된 시작·종료의 차 — 확정된 레코드에서 가장 흔하다) / `slowlog`(완결된 권위값). `merged` 는 없다 — 그 값은 `capture_source` 쪽이다.<br>정확도 순위: `polled < timer < span < slowlog` |
 | `sql_text` | S | **평문**. 리터럴 정책에 따라 원문·마스킹·생략 |
 | `sql_text_truncated` | BOOL | **채택한 텍스트가 65,535바이트에 닿았을 때** true. 조회 *실패* 는 `sql_text=None` + 이 값 false 다 — 두 상태를 혼동하면 운영자가 "절단 아님" 을 "전문을 받았다" 로 읽는다 |
 | `literal_policy` | S | `full` / `full_restricted` / `masked` / `off` |
@@ -664,7 +664,7 @@ CREATE TABLE "s3tablescatalog/dbmon-tables-<acct>"."dbmon"."slow_queries" (
   db_user              string,
   db_host              string,
   duration_ms          bigint,
-  duration_source      string,
+  duration_source      string,         -- polled / timer / span / slowlog
   sql_text             string,          -- 평문. LIKE 검색 대상
   sql_text_truncated   boolean,
   literal_policy       string,          -- full / full_restricted / masked / off
