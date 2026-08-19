@@ -22,7 +22,9 @@ env:
   CARGO_TERM_COLOR: always
   # CI 에서 증분 컴파일은 캐시를 키우기만 하고 이득이 없다.
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
+  # `RUSTFLAGS: -D warnings` 를 전역으로 두지 않는다 — RUSTFLAGS 는 **의존성에도**
+  # 적용되므로 업스트림 크레이트의 경고 하나로 CI 가 깨진다. 우리 코드에 대한
+  # `-D warnings` 는 아래 clippy 호출에만 붙인다.
 
 jobs:
   # ── 빠른 게이트: 30초 안에 끝나야 한다 ─────────────────────────────────────
