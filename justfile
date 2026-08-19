@@ -66,9 +66,10 @@ seed-list:
 
 # ── 테스트 ──────────────────────────────────────────────────────────────────
 
-# 단위 테스트만 (Docker 불필요, 1초 이내)
+# 단위 테스트 + 인프라 일관성 (Docker 불필요, 1초 이내)
 test:
     cargo test --workspace --lib
+    cargo test -p dbmon --test it_infra_consistency
 
 # 통합 테스트까지 (Docker 필요)
 test-all:

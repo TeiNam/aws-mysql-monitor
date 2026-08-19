@@ -46,6 +46,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `--locked` 로 Cargo.lock 이 최신인지 함께 검증한다.
       - run: cargo test --workspace --lib --locked
+      # 인프라 일관성 검사는 Docker·AWS 가 필요 없으므로 빠른 잡에 둔다.
+      # (`--lib` 는 `tests/` 를 돌리지 않는다.)
+      - run: cargo test -p dbmon --test it_infra_consistency --locked
 
   # ── 통합 테스트: 실제 MySQL 이 필요하다 ───────────────────────────────────
   #
