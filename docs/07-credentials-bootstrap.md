@@ -210,7 +210,7 @@ GRANT SELECT ON `orders`.*  TO 'dbmon'@'<monitor_host>';
 
 #### 모드 C: `minimal` — 데이터 읽기 권한 없음 (검증 후 결정)
 
-`EXPLAIN FOR CONNECTION`은 이미 만들어진 플랜을 읽는 것이므로 대상 테이블 `SELECT` 권한이
+~~`EXPLAIN FOR CONNECTION` 은 이미 만들어진 플랜을 읽는 것이므로 대상 테이블 `SELECT` 권한이~~ → **기각** ([19 §B](19-m1-findings.md)): RDS 에서 실행 자체가 불가하다. 재실행 경로는 우리 계정으로 테이블을 읽으므로 `SELECT` 권한이
 불필요할 가능성이 있다([OPEN-Q-06](OPEN-QUESTIONS.md)). 사실이면:
 
 ```sql
@@ -441,7 +441,7 @@ RDS 글로벌 CA 번들을 앱 바이너리에 임베드한다(`include_bytes!`)
   "event": "bootstrap.apply",
   "actor": { "sub": "...", "email": "...", "groups": ["admin"] },
   "at_ms": 1755527391000,
-  "instance_id": "ap-northeast-2/orders-prd-01",
+  "instance_id": "123456789012/ap-northeast-2/orders-prd-01",
   "env": "prd",
   "credential_source": "rds_managed_secret",
   "privilege_mode": "least",

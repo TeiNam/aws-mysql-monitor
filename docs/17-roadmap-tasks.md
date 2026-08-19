@@ -5,7 +5,7 @@
 | M | 이름 | 목표 | 산출물 | 선행 |
 |---|---|---|---|---|
 | M0 | 기반 | 저장소·워크스페이스·CI·로컬 환경 | 빌드되는 빈 껍데기 + CI 초록 | — |
-| M1 | 검증 스파이크 | 설계의 위험한 전제 6개를 실측 검증 | OPEN-QUESTIONS 해소 + 문서 갱신 | M0 |
+| M1 | 검증 스파이크 | 설계의 위험한 전제 **17개**를 실측 검증 | OPEN-QUESTIONS 해소 + 문서 갱신 | M0 |
 | M2 | 제어면 | RDS 탐색·환경 분류·인스턴스 레지스트리·자가진단 | 인스턴스 목록 API | M1 |
 | M3 | 부트스트랩 | 마스터 자격증명 3소스 + 모니터링 계정 생성 + IAM DB Auth 연결 | 비밀번호 없이 대상 DB 접속 | M2 |
 | M4 | 수집기 | 슬로우 쿼리 캡처 + in-flight 플랜 + 다이제스트 롤업 | DynamoDB에 데이터 적재 | M3 |
@@ -30,22 +30,22 @@
 
 | # | 태스크 | 수용 기준 |
 |---|---|---|
-| M0-1 | Cargo 워크스페이스 생성 — **크레이트 4개** (`normalize`, `planparse`, `core`, `dbmon`). 나머지는 `dbmon` 안의 모듈 ([ADR-002](03-decisions.md)) | `cargo build` 성공. 각 크레이트에 최소 1개 테스트 |
-| M0-2 | `core` 도메인 타입 초안 (Instance, SlowQuery, Digest, Plan, Env, TimeRange) | 타입만. I/O 의존성 0 |
-| **M0-2a** | **`instance_id` 키 포맷 확정** ([OPEN-Q-20](OPEN-QUESTIONS.md)) | **이 태스크 이후에는 바꿀 수 없다.** 계정 포함 여부를 결정하고 문서 예시를 통일 |
-| M0-3a | `core::ports::AuthTokenProvider` 분리 (MySQL 어댑터가 AWS를 모르게) | `dbmon::mysql` 이 AWS SDK 의존성을 갖지 않음 (F31) |
-| M0-3b | `core::ports::ArchiveQuery` 를 도메인 언어로 정의 (`QueryHandle`/`Cursor`/`AsOf`) | Athena 개념이 `core` 에 노출되지 않음 (F31) |
-| M0-3 | `core` 포트 trait 정의 (SlowQueryStore, InstanceRegistry, TargetDb, MetricSource, Notifier, LlmAdvisor, ArchiveQuery, SecretSource, Clock) | trait 정의 + 페이크 구현 |
-| M0-4 | 설정 로더 (환경변수 > 파일 > DynamoDB > 기본값). 기동 시 필수값 검증 | 필수값 누락 시 명확한 에러로 즉시 종료 |
-| M0-5 | 로깅·트레이싱 (`tracing` JSON) + **마스킹 레이어** | 마스킹 패턴 단위 테스트 통과 |
-| M0-6 | `Secret<T>` 타입 (Debug/Display/Serialize 미구현, Drop 시 zeroize) | 로깅 시도 시 컴파일 에러 |
-| M0-7 | 에러 타입 체계 (`thiserror`) + API 에러 매핑 | [13 §1.2](13-api-spec.md) 코드 전량 정의 |
+| ~~M0-1~~ | ~~Cargo 워크스페이스 생성 — **크레이트 4개** (`normalize`, `planparse`, `core`, `dbmon`). 나머지는 `dbmon` 안의 모듈 ([ADR-002](03-decisions.md))~~ → **완료** | `cargo build` 성공. 4개 크레이트, 각 테스트 있음 |
+| ~~M0-2~~ | ~~`core` 도메인 타입 초안 (Instance, SlowQuery, Digest, Plan, Env, TimeRange)~~ → **완료** | 타입만. I/O 의존성 0 |
+| ~~M0-2a~~ | ~~**`instance_id` 키 포맷 확정** ([OPEN-Q-20](OPEN-QUESTIONS.md))~~ → **완료** | **`<account>/<region>/<identifier>` 로 확정** (2026-08-19). `InstanceId::parse` 가 2성분을 거부한다 |
+| ~~M0-3a~~ | ~~`core::ports::AuthTokenProvider` 분리 (MySQL 어댑터가 AWS를 모르게)~~ → **완료** | `dbmon::mysql` 이 AWS SDK 의존성을 갖지 않음 |
+| ~~M0-3b~~ | ~~`core::ports::ArchiveQuery` 를 도메인 언어로 정의 (`QueryHandle`/`Cursor`/`AsOf`)~~ → **완료** | Athena 개념이 `core` 에 노출되지 않음 |
+| ~~M0-3~~ | ~~`core` 포트 trait 정의 (SlowQueryStore, InstanceRegistry, TargetDb, MetricSource, Notifier, LlmAdvisor, ArchiveQuery, SecretSource, Clock)~~ → **완료** | trait 정의 + 페이크 구현 완료 |
+| ~~M0-4~~ | ~~설정 로더 (환경변수 > 파일 > DynamoDB > 기본값). 기동 시 필수값 검증~~ → **완료** | 3단 병합(기본 문서 → 파일 → 환경변수). 교차 검증 포함 |
+| ~~M0-5~~ | ~~로깅·트레이싱 (`tracing` JSON) + **마스킹 레이어**~~ → **완료** | `scrub`/`Scrubbed`/`sql_fingerprint` 단위 테스트 통과 |
+| ~~M0-6~~ | ~~`Secret<T>` 타입 (Debug/Display/Serialize 미구현, Drop 시 zeroize)~~ → **완료** | 로깅 시도 시 컴파일 에러. `Drop` zeroize 확인 |
+| ~~M0-7~~ | ~~에러 타입 체계 (`thiserror`) + API 에러 매핑~~ → **완료** | `DomainError` + `is_safe_to_expose` 정의 |
 | ~~M0-8~~ | ~~`dbmon` 골격~~ → **완료.** 플래그·조립·그레이스풀 셧다운·`/healthz`·`/readyz` | SIGTERM 시 정상 종료 확인. `dbmon healthcheck` 서브커맨드로 컨테이너 헬스체크(이미지에 `curl` 불필요) |
 | ~~M0-8a~~ | ~~ASG Lifecycle Hook 처리~~ → **불필요.** ECS 의 `stopTimeout` 이 대체한다 ([ADR-022](03-decisions.md)) | 해당 없음 |
 | ~~M0-8b~~ | ~~자체 unhealthy 판정 (`SetInstanceHealth`)~~ → **불필요.** 컨테이너 헬스체크 실패 시 ECS 가 교체한다 | 해당 없음 |
-| M0-9 | 로컬 개발 환경 (docker-compose: MySQL 8.4, 8.0.32, DynamoDB Local) | `just dev` 동작 |
-| M0-10 | `just seed`: 로컬 MySQL에 샘플 스키마 + 슬로우 쿼리 생성기 | 2초 이상 걸리는 쿼리가 반복 발생 |
-| M0-11 | CI 파이프라인 ([14 §6.1](14-infrastructure.md)) — **arm64 러너** | 전 게이트 초록. AL2023 컨테이너에서 `--version` 스모크 통과 (glibc 스큐 게이트) |
+| ~~M0-9~~ | ~~로컬 개발 환경 (docker-compose: MySQL 8.4, 8.0.32, DynamoDB Local)~~ → **완료** | `docker compose up -d` — MySQL 8.4 / 8.4-wide / 8.0 / DynamoDB Local |
+| ~~M0-10~~ | ~~`just seed`: 로컬 MySQL에 샘플 스키마 + 슬로우 쿼리 생성기~~ → **완료** | `local/seed/*.sql` + `local/loadgen.sh` 시나리오 9종 |
+| ~~M0-11~~ | ~~CI 파이프라인 ([14 §6.1](14-infrastructure.md)) — **arm64 러너**~~ → **완료** | **완료.** `.github/workflows/ci.yml` — 6개 잡, AWS 자격증명 불필요. arm64 러너로 이미지 빌드 |
 | M0-11a | GitHub OIDC + CI Role (`dbmon-ci-dev` / `dbmon-ci-prd`) | 장기 액세스 키 미사용. `sub` 조건으로 레포·환경 제한 |
 | M0-11b | 정적 검사 게이트 12종 ([15 §9.1](15-testing.md)) | 각 검사가 위반 코드를 실제로 잡아냄 |
 | M0-12 | 프론트 스캐폴드 (Vite + React 19 + TS + Tailwind + shadcn/ui) | 빌드·lint·타입체크 통과 |
@@ -56,10 +56,14 @@
 | **M0-13d** | 부하 생성기 (`just seed`) — 검증 시나리오 9종 ([18 §5.1](18-dev-environment.md)) | 1024바이트 초과 SQL, DML 장기 실행, 락 경합, 데드락, 다이제스트 1000종 생성 |
 | **M0-13e** | `default_tags` + `prevent_destroy` 규약 ([14 §1](14-infrastructure.md)) | 전 리소스에 `Project=dbmon` 태그. KMS·DynamoDB·테이블버킷에 `prevent_destroy` |
 | **M0-13g** | **Cognito 콜백 URL에 `http://localhost:8080/auth/callback` 등록 가능 여부 확인** ([18 §4](18-dev-environment.md)) | 등록 성공 → dev 접근 모델 확정. 실패 → ALB + ACM 폴백(+$16/월) |
-| **M0-13f** | 탐색 필터 (`allowed_vpc_ids` + 태그 + 이름 거부, AND) — **prd 혼재 계정 격리** (T-37) | dev 환경에서 `allowed_vpc_ids` 미설정 시 기동 거부. prd VPC 인스턴스가 레지스트리에 등록되지 않음 |
+| ~~M0-13f~~ | ~~탐색 필터 (`allowed_vpc_ids` + 태그 + 이름 거부, AND) — **prd 혼재 계정 격리** (T-37)~~ → **완료** | `deployment_env != prd` 면 `allowed_vpc_ids` 필수. Terraform 쪽도 plan 시점에 강제 |
 | M0-14 | `docs/` ADR 템플릿 + 결정 로그 관리 규칙 | — |
 
-**M0 완료 기준** — 빈 바이너리가 EC2에서 기동하고 `/healthz`가 200을 반환하며 CI가 초록.
+**M0 완료 기준** — 빈 바이너리가 **컨테이너에서** 기동하고 `/healthz` 가 200 을 반환하며 CI 가 초록.
+
+**현재 상태 (2026-08-19)**: 이미지 검증 완료(arm64, 154MB, healthy, SIGTERM 0초, PID 1 = dbmon).
+CI 워크플로 작성 완료. 남은 것은 **M0-11a**(GitHub OIDC Role), **M0-11b**(정적 검사 12종),
+**M0-12**(프론트 스캐폴드), 그리고 AWS apply 가 필요한 **M0-13a~g**.
 
 ---
 
@@ -99,7 +103,7 @@
 
 | # | 태스크 | 수용 기준 |
 |---|---|---|
-| M2-1 | `awsinfra`: 리전별 클라이언트 캐시 + 자격증명 공급자 체인 | 로컬 SSO / EC2 Role 양쪽 동작 |
+| M2-1 | `dbmon::aws`: 리전별 클라이언트 캐시 + 자격증명 공급자 체인 | 로컬 SSO / ECS Task Role 양쪽 동작 |
 | M2-2 | Terraform: `dynamodb` 모듈 (테이블 2개, GSI, TTL, PITR, CMK) | `apply` 후 테이블 존재. TTL·PITR 활성 확인 |
 | M2-3 | Terraform: `iam` 모듈 (정책 6개 분리, Instance Profile) | `dbmon-rds-modify`는 기본 미첨부 |
 | M2-4 | `InstanceRegistry` DynamoDB 구현 | 단위(페이크) + 통합(DynamoDB Local) |
@@ -137,7 +141,7 @@
 | M3-1 | `SecretSource`: RDS 관리형 마스터 시크릿 조회 | `SecretStatus=rotating`이면 재시도 |
 | M3-2 | `SecretSource`: 사용자 지정 ARN (태그 조건 검증) | 임의 ARN 차단 |
 | M3-3 | 수동 입력 경로 (`Secret<T>`, 동기 처리, 10분 만료) | 로그·응답·DB에 값 부재 (통합 테스트로 검증) |
-| M3-4 | `mysqlsrc`: 마스터 자격증명으로 임시 연결 (TLS + CA 검증) | 인증서 검증 비활성 옵션 없음 |
+| M3-4 | `dbmon::mysql`: 마스터 자격증명으로 임시 연결 (TLS + CA 검증) | 인증서 검증 비활성 옵션 없음 |
 | M3-5 | 권한 조회·파싱 (`information_schema.*_PRIVILEGES` + `SHOW GRANTS`) | 권한 diff 정확 |
 | M3-6 | 계획 생성 (`/api/bootstrap/plan`), dry-run | SQL 전문 포함. `plan_id` 5분 만료 |
 | M3-7 | 실행 (`/api/bootstrap/apply`) + 타이핑 확인 (prd) | 확인 없으면 거부 |
@@ -146,7 +150,7 @@
 | M3-10 | 비밀번호 폴백 + Secrets Manager 저장 + 로테이션 Lambda (`ALTER USER USER()`) | 로테이션 후 자동 재연결 |
 | M3-11 | IAM DB Auth 토큰 발급 (SigV4, 리전별 서명) | 크로스 리전 인스턴스 접속 성공 |
 | M3-12 | RDS CA 번들 임베드 + 만료 감시 | 90일 미만이면 경고 |
-| M3-13 | 연결 풀 (인스턴스당 1~3, 지터 있는 재생성) | 풀 전체 동시 재생성 없음 |
+| M3-13 | 연결 풀 (인스턴스당 최대 6 (hot 2~4 + bulk 1~2, F7), 지터 있는 재생성) | 풀 전체 동시 재생성 없음 |
 | M3-14 | 수동 부트스트랩 스크립트 생성 (`/api/bootstrap/manual-script`) | 복사해서 실행하면 동작 |
 | M3-15 | 감사 로그 ([07 §4](07-credentials-bootstrap.md)) | 자격증명 값 부재 |
 | M3-16 | Terraform: `secrets` 모듈 (로테이션 Lambda) | |
@@ -191,7 +195,7 @@
 | M4-21b | 시계 오프셋 추정 (`SELECT NOW(6)`) + 시각 계산 보정 | 오프셋 3초 주입 → 병합·파티션 정상 (**F14**, R46) |
 | M4-14c | 플러시 실패 시 hour 별 미완료 큐 재시도 | 배치 부분 실패 → 재시도 후 성공 (**F20**) |
 | M4-15a | `_other` 를 "전체 델타 − 저장분"으로 계산 (임계값 미만 포함) + `total_time_all_ms`·`top_n`·`partial_minutes` 기록 | `상위 N + _other = total_time_all_ms` (**F6**, **F21**, R9) |
-| M4-22 | 부하 자기 계측 (`/* dbmon: */` 주석 기반) | 우리 쿼리 비중 산출 |
+| ~~M4-22~~ | ~~부하 자기 계측 (`/* dbmon: */` 주석 기반)~~ → **성립하지 않는다.** MySQL 다이제스트는 주석을 제거하므로 우리 쿼리를 주석으로 식별할 수 없다 (C-23). M4-29 의 계정 기반 방식을 쓴다 | 우리 쿼리 비중 산출 |
 | M4-23 | 그레이스풀 셧다운 (리스 반납 → 누산기 플러시 → 버퍼 플러시) | 순서 검증 |
 | M4-25 | `plan_normalized` 생성 (플랜 조건식 리터럴 마스킹) (FR-PLN-09) | `masked` 인스턴스의 `plan_normalized`에 리터럴 0개 (**R28**) |
 | M4-26 | 제외 규칙에 걸린 세션의 플랜 미수집 (FR-PLN-10) | 제외 계정 세션의 플랜이 저장되지 않음 |

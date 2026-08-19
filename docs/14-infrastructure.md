@@ -655,7 +655,7 @@ just golden       # 다이제스트 골든 코퍼스 재생성
 2. 나오지 않으면 로그 조회:
    CloudWatch Logs Insights
    fields @timestamp, level, msg, reason
-   | filter instance_id = "ap-northeast-2/orders-prd-01"
+   | filter instance_id = "123456789012/ap-northeast-2/orders-prd-01"
    | sort @timestamp desc | limit 100
 3. 샤드 소유 확인: dbmon-config 에서 해당 인스턴스의 shard_key 소유 워커 확인
 4. 서킷 브레이커 상태 확인 (메트릭 CollectFailures by reason)

@@ -160,6 +160,18 @@ HTML/CSS로 만들기 어려운 구체적 차트(산점도, 트리맵)가 실제
 | `rerun` | **사후 재실행 · 당시 플랜과 다를 수 있음** | 바인드 값·세션 변수·트랜잭션 스냅샷이 다르다 |
 | `none` | **수집 실패: `<사유>`** | 사유를 그대로 표시 (thread_gone / not_explainable / timeout / denied) |
 
+**플랜 출처 배지** — `plan_source` 를 사용자에게 그대로 보이지 않는다:
+
+| `plan_source` | 배지 | 의미 |
+|---|---|---|
+| `for_connection` | (없음) | 실행 중 캡처. **RDS 에서는 나오지 않는다** |
+| `rerun` | (없음) | 사후 재실행. 통계가 변했을 수 있다 |
+| `rerun_as_select` | **근사** (주의색) | DML 의 조건절만 SELECT 로 바꿔 얻었다 — **쓰기 단계가 빠져 있다** |
+| `none` | **플랜 없음** | `plan_error` 를 함께 보여준다 |
+
+`rerun_as_select` 에 배지가 없으면 사용자가 UPDATE 의 완전한 플랜으로 오독한다.
+
+
 **"실제 실행 플랜"이라고 쓰지 않는다.** `EXPLAIN`은 옵티마이저 플랜이고 실행 결과가 아니다.
 과장은 오진을 만든다. `rerun` 배지는 노란 배경으로 항상 눈에 띄게 한다.
 
@@ -276,7 +288,7 @@ CloudWatch 영역은 사용자가 그 탭을 볼 때만 호출한다(비용). �
 ```
 클라이언트 → 서버
   { "t": "auth",      "token": "<access_token>" }              // 연결 후 첫 메시지 필수
-  { "t": "subscribe", "topics": ["slowq:env=prd", "status:inst=ap-northeast-2/orders-prd-01"] }
+  { "t": "subscribe", "topics": ["slowq:env=prd", "status:inst=123456789012/ap-northeast-2/orders-prd-01"] }
   { "t": "unsubscribe", "topics": [...] }
   { "t": "ping" }
 

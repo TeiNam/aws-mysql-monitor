@@ -254,7 +254,7 @@ DynamoDB  PK = RPT#monthly   SK = <env>#<yyyy-mm>
 POST /api/reports/improvement
 {
   "app_digest": "9f2c1a…",
-  "instance_ids": ["ap-northeast-2/orders-prd-01"],   // 비우면 전체
+  "instance_ids": ["123456789012/ap-northeast-2/orders-prd-01"],   // 비우면 전체
   "before": { "from": "2026-07-01T00:00:00Z", "to": "2026-07-15T00:00:00Z" },
   "after":  { "from": "2026-08-01T00:00:00Z", "to": "2026-08-15T00:00:00Z" },
   "change_note": "idx_status_created 추가 (2026-07-28)"

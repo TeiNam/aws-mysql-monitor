@@ -10,7 +10,7 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | # | 1세대에서 확인된 문제 | 2세대 대응 |
 |---|---|---|
 | P1 | `performance_schema.processlist.INFO`가 1024바이트에서 잘려 긴 SQL이 손실 | `information_schema.PROCESSLIST` 타깃 조회로 전문 확보 |
-| P2 | 플랜을 사후에 재실행 → 통계 변동으로 실제 플랜과 불일치, UPDATE/DELETE는 수집 포기 | 탐지 시점 `EXPLAIN FOR CONNECTION` |
+| P2 | 플랜을 사후에 재실행 → 통계 변동으로 실제 플랜과 불일치, UPDATE/DELETE는 수집 포기 | **UPDATE/DELETE를 SELECT로 변환해 재실행**한다. 행을 찾는 접근 경로가 보존되므로 근사 플랜을 얻는다([19 §B](19-m1-findings.md) 실측). 불일치 자체는 남으므로 `plan_source`로 표시한다 |
 | P3 | 1초 폴링이라 1초 미만 쿼리는 전부 미관측 → 워크로드 전체 그림이 없음 | `events_statements_summary_by_digest` 델타 스냅샷으로 전수조사 |
 | P4 | MongoDB 자체 운영 부담, 1년치 집계 쿼리가 느림 | DynamoDB(핫) + S3 Tables/Iceberg(콜드) + Athena |
 | P5 | 인증 없음 → 누구나 접근 | Cognito OIDC + RBAC |
@@ -89,12 +89,12 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | ID | 요구사항 | 우선순위 |
 |---|---|---|
 | FR-CAP-01 | 인스턴스별 폴링 주기(기본 1초)와 슬로우 임계값(기본 2초)을 개별 설정할 수 있다 | P0 |
-| FR-CAP-02 | 탐지는 `performance_schema.processlist`(경량, 뮤텍스 없음)로 하고, 임계값 초과 스레드에 대해서만 `information_schema.PROCESSLIST`를 타깃 조회해 **절단되지 않은 전문 SQL**을 가져온다 | P0 |
+| FR-CAP-02 | 탐지는 `performance_schema.processlist`(경량, 뮤텍스 없음)로 하고, 임계값 초과 스레드에 대해서만 `information_schema.PROCESSLIST`를 타깃 조회한다. **이것도 65,535바이트에서 절단되고 `utf8mb3`라 4바이트 문자를 `?`로 잃는다** — 무손실인 `events_statements_current.SQL_TEXT`(1,024바이트)를 함께 읽어 온전한 쪽을 고른다([19 §A](19-m1-findings.md)) | P0 |
 | FR-CAP-03 | 같은 시점에 `events_statements_current`에서 해당 스레드의 `DIGEST`, `DIGEST_TEXT`, `ROWS_EXAMINED`, `ROWS_SENT`, `CREATED_TMP_DISK_TABLES`, `NO_INDEX_USED`, `NO_GOOD_INDEX_USED`, `SORT_MERGE_PASSES`, `SELECT_FULL_JOIN`을 함께 수집한다 | P0 |
 | FR-CAP-04 | 쿼리의 시작·종료를 추적한다. 종료 시 관측된 최대 실행시간을 확정값으로 저장한다 | P0 |
 | FR-CAP-05 | 폴링 사이에 끝난 쿼리는 미관측을 허용하되, 미관측 구간의 존재를 **다이제스트 스냅샷으로 보정**한다(FR-DGS) | P0 |
 | FR-CAP-06 | 제외 규칙: 스키마·계정·호스트·SQL 정규식 패턴별로 수집 제외를 설정할 수 있다. 기본 제외는 `mysql`/`information_schema`/`performance_schema`/`sys` 스키마와 `rdsadmin`/`system user`/`event_scheduler`/모니터링 계정. 1세대 태그 `real_time_slow_sql`은 `dbmon:enabled`로 대체하되, 기존 태그도 읽어 마이그레이션을 돕는다 | P0 |
-| FR-CAP-07 | 리터럴 값 저장 정책을 인스턴스별로 설정할 수 있다: `full` / `full_restricted`(저장하되 조회를 operator 이상 + 감사) / `masked` / `off`. **기본값은 prd → `full_restricted`, stg·dev → `full`.** 저장 시점 마스킹은 되돌릴 수 없으므로 노출 통제를 우선한다([08 §6.1](08-security-auth.md)) | P0 |
+| FR-CAP-07 | 리터럴 값 저장 정책을 인스턴스별로 설정할 수 있다: `full` / `full_restricted`(저장하되 조회를 operator 이상 + 감사) / `masked` / `off`. **기본값은 prd → `full_restricted`, stg·dev → `full`.** 저장 시점 마스킹은 되돌릴 수 없으므로 노출 통제를 우선한다([08 §6.1](08-security-auth.md)).<br>⚠ **코드의 현재 기본값은 전 환경 `masked` 다.** [OPEN-Q-15](OPEN-QUESTIONS.md) 가 미해소인 상태에서 prd 리터럴 저장을 기본값으로 켜는 것은 소급 취소가 불가능하므로 보수적으로 두었다. 결정되면 한 줄로 바꾼다 | P0 |
 | FR-CAP-08 | 동일 스레드ID 재사용에 의한 오탐을 방지한다(스레드ID + 시작시각 + 다이제스트 조합으로 식별) | P0 |
 | FR-CAP-09 | 대상 DB에 어떤 스키마 오브젝트도 생성하지 않는다. 실행하는 문장은 SELECT / SHOW / EXPLAIN 계열로 제한한다 | P0 |
 | FR-CAP-10 | 수집기가 대상 DB에 주는 부하를 스스로 측정해 노출한다(초당 쿼리 수, 평균 응답시간, 연결 수). **자기 식별은 모니터링 계정 이름으로 한다** — MySQL 다이제스트는 주석을 제거하므로 `/* dbmon: */` 주석으로는 식별할 수 없다([ADR-005](03-decisions.md)) | P1 |
@@ -104,15 +104,15 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 
 | ID | 요구사항 | 우선순위 |
 |---|---|---|
-| FR-PLN-01 | 슬로우 쿼리 탐지 시점에 별도 연결에서 `EXPLAIN FORMAT=JSON FOR CONNECTION <id>`를 실행해 **실행 중 캡처한 옵티마이저 플랜**을 확보한다. 실행 결과(실제 행수·단계별 시간)가 아니므로 "실제 실행 플랜"이라고 표기하지 않는다([ADR-006](03-decisions.md)) | P0 |
+| FR-PLN-01 | ~~탐지 시점 `EXPLAIN FORMAT=JSON FOR CONNECTION <id>`~~ → **RDS에서 실행할 수 없다.** 이 문장은 모든 정적 전역 권한을 요구하고 RDS 마스터 계정도 갖지 못한다([19 §B](19-m1-findings.md) 실측). 시도는 하되 첫 `Denied`에서 영구히 비활성화하고 실패로 세지 않는다 | P0 |
 | FR-PLN-02 | in-flight 수집이 실패하면(쿼리 종료, EXPLAIN 불가 문장 등) 실패 사유를 기록하고 폴백 경로로 넘긴다 | P0 |
-| FR-PLN-03 | 폴백: SELECT 계열에 한해 사후 `EXPLAIN FORMAT=JSON` / `FORMAT=TREE`를 재실행한다. 재실행 플랜임을 `plan_source`로 명확히 구분 저장한다 | P0 |
+| FR-PLN-03 | **기본 경로**(폴백이 아니다): 사후 `EXPLAIN FORMAT=JSON` / `FORMAT=TREE` 재실행. `plan_source`로 구분 저장한다. 우선순위는 `none < rerun_as_select < rerun < for_connection`이고 RDS에서는 사실상 `rerun`이 최선이다 | P0 |
 | FR-PLN-04 | 플랜 수집에는 타임아웃(기본 3초)을 걸고, `EXPLAIN` 자체가 대상 DB를 붙잡지 않도록 한다 | P0 |
 | FR-PLN-05 | 같은 다이제스트에 대해 동일 플랜 지문(plan fingerprint)이면 플랜 본문을 중복 저장하지 않고 참조한다 | P1 |
 | FR-PLN-06 | 플랜 변화를 추적한다: 같은 다이제스트의 플랜 지문이 바뀌면 `PLAN_CHANGE` 이벤트를 남긴다. **알림 소스로도 제공한다**(접근 방식이 나빠진 경우만 발화해 오탐을 줄인다) | P1 |
 | FR-PLN-09 | 플랜의 조건식 필드(`attached_condition`, `index_condition` 등)에는 리터럴이 들어 있다. 정규화 단계에서 리터럴을 마스킹한 `plan_normalized`를 만들고, 리터럴 정책에 따라 원본 보관 여부를 결정한다. **Bedrock에는 항상 정규화본만 보낸다** | P0 |
-| FR-PLN-10 | 수집 제외 규칙(FR-CAP-06)에 걸린 세션의 플랜은 수집하지 않는다. `EXPLAIN FOR CONNECTION`은 `PROCESS` 권한으로 다른 계정 세션의 플랜을 읽으므로, 제외하지 않으면 제외 규칙이 무의미해진다 | P0 |
-| FR-PLN-07 | UPDATE/DELETE/INSERT...SELECT도 in-flight 경로로 플랜을 수집한다(재실행 폴백은 하지 않음) | P0 |
+| FR-PLN-10 | 수집 제외 규칙(FR-CAP-06)에 걸린 세션의 플랜은 수집하지 않는다. 재실행 경로는 **우리 계정으로 대상 테이블을 읽으므로**, 제외 규칙을 무시하면 제외 대상 테이블의 통계를 우리가 읽게 된다 | P0 |
+| FR-PLN-07 | UPDATE/DELETE/INSERT…SELECT는 **조건절을 SELECT로 변환해 재실행**한다(`plan_source=rerun_as_select`, `plan_approximate=true`). in-flight 경로가 RDS에서 불가하므로 이것이 DML의 유일한 플랜 경로다. 변환 불가한 형태(`INSERT … VALUES`, CTE 뒤의 DML)는 플랜을 포기한다 | P0 |
 | FR-PLN-08 | 플랜 JSON이 DynamoDB 항목 한도에 가까우면 S3에 저장하고 포인터만 남긴다 | P0 |
 
 ### 4.5 다이제스트 집계 (FR-DGS)
@@ -141,7 +141,7 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | FR-DGS-12 | 다이제스트 사전에 `seen_users` / `seen_hosts` 집합을 유지한다(상한 20개, 초과 시 절단 플래그) | P1 |
 | FR-DGS-13 | `mysql_digest`가 있는 소스에서는 인스턴스 내 그룹핑에 **서버 `DIGEST`를 권위값으로** 쓴다. 슬로우로그 레코드에는 `STATEMENT_DIGEST(sql)` 서버 함수로 다이제스트를 부여한다. 자체 `app_digest`는 **크로스 인스턴스 그룹핑과 마스킹**에만 쓴다([ADR-011](03-decisions.md)) | P1 |
 | FR-DGS-10 | 신규 등장 다이제스트, 사라진 다이제스트, 급증한 다이제스트를 자동 식별한다 | P1 |
-| FR-DGS-11 | `performance_schema_max_digest_length` / `performance_schema_digests_size` 값을 읽어 다이제스트 절단·오버플로 가능성을 경고한다 | P1 |
+| FR-DGS-11 | **`max_digest_length`** / `performance_schema_max_digest_length` / `performance_schema_digests_size` 를 읽어 절단·오버플로를 경고한다. 세 변수는 역할이 다르다: 첫째만 **해시를 바꾼다**, 둘째는 저장 텍스트 길이, 셋째는 테이블 크기 ([19 §E](19-m1-findings.md)) | P1 |
 
 ### 4.6 CloudWatch 슬로우로그 수집 (FR-CWL)
 
@@ -305,9 +305,9 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | FR-OPS-04 | 자체 메트릭을 EMF로 CloudWatch에 내보낸다(수집 지연, 실패율, DynamoDB 쓰기, Bedrock 토큰, Athena 스캔량) | P0 |
 | FR-OPS-05 | 설정 변경은 프로세스 재시작 없이 반영한다(폴링 주기, 임계값, 제외 규칙) | P1 |
 | FR-OPS-06 | 무중단 배포(ALB + 롤링). 배포 중 수집 중단 최대 30초 | P1 |
-| FR-OPS-07 | 그레이스풀 셧다운: ASG Lifecycle Hook으로 시간을 확보한 뒤 `/readyz` 503 전환 → WS 재연결 요청 → 진행 중 요청 완료 → 리스 반납 → 누산기·버퍼 플러시 → `CompleteLifecycleAction` | P0 |
+| FR-OPS-07 | 그레이스풀 셧다운: ECS `stopTimeout`(최대 120초)으로 시간을 확보한 뒤 `/readyz` 503 전환 → WS 재연결 요청 → 진행 중 요청 완료 → 리스 반납 → 누산기·버퍼 플러시 → 프로세스 종료(ECS가 태스크를 회수한다) | P0 |
 | FR-OPS-08 | 1단계에서는 **active collector 1대 + standby**로 운영한다. standby는 `/readyz` 503으로 ALB에서 빠진다. 샤딩(다중 active)은 펜싱 토큰 구현 이후에만 활성화한다([ADR-018](03-decisions.md)) | P0 |
-| FR-OPS-09 | collector·control 역할은 ALB에 연결되지 않으므로, 리스 보유 실패·`CollectStaleness` 초과가 5분 지속되면 `SetInstanceHealth`로 스스로 Unhealthy를 선언한다 | P1 |
+| FR-OPS-09 | collector·control 역할은 ALB에 연결되지 않으므로, 리스 보유 실패·`CollectStaleness` 초과가 5분 지속되면 컨테이너 헬스체크(`dbmon healthcheck`)를 실패시켜 ECS가 태스크를 교체하게 한다 | P1 |
 | FR-OPS-10 | 각 cron 잡은 성공 시 `JobHeartbeat` 메트릭을 발행한다. CloudWatch 알람이 `TreatMissingData=breaching`으로 침묵을 감지한다 | P0 |
 | FR-OPS-11 | 전역 수집 긴급 정지(kill switch): `CFG/GLOBAL/collection.enabled = false`로 모든 인스턴스 수집을 즉시 중단할 수 있다(admin). 대상 DB 부하 의심 시의 1차 대응 수단 | P0 |
 
@@ -320,7 +320,7 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | NFR-P-01 | 인스턴스 500대를 워커 4대 이하로 1초 주기 수집 | 부하 테스트(모의 MySQL 엔드포인트 500개) |
 | NFR-P-02 | 대상 DB에 주는 부하: 인스턴스당 CPU 1% 미만, 초당 쿼리 3건 이하(정상 상태) | 실 인스턴스 계측 |
 | NFR-P-03 | 슬로우 쿼리 탐지 → 저장 → 화면 표시 지연 p95 3초 이내 | E2E 계측 |
-| NFR-P-04 | in-flight 플랜 수집 성공률 80% 이상(2초 이상 실행 쿼리 대상) | 스테이징 실측 |
+| NFR-P-04 | **플랜** 수집 성공률 80% 이상(2초 이상 실행 SELECT 대상, `rerun` 포함). in-flight(`for_connection`) 성공률은 RDS에서 구조적으로 0%이므로 게이트로 쓰지 않는다 | 스테이징 실측 |
 | NFR-P-05 | DynamoDB 조회 p95 500ms, p99 1s 이내(31일 범위) | 부하 테스트 |
 | NFR-P-06 | Athena 조회 p95 30초 이내(1개월 범위 집계) | 실측 |
 | NFR-P-07 | 프론트엔드 초기 로드 LCP 2.5초 이내, 슬로우 쿼리 1만 행 목록 스크롤 60fps | Lighthouse + 프로파일 |
@@ -381,13 +381,13 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 | ID | 제약 | 영향 |
 |---|---|---|
 | C-01 | 단일 AWS 계정, 멀티 리전 | 크로스 계정 AssumeRole 불필요. 리전별 클라이언트 팬아웃 필요 |
-| C-02 | 앱은 EC2에 배포 (IAM Instance Profile 사용) | 로컬 개발은 AWS SSO 프로파일로 동일 코드 경로 사용 |
+| C-02 | 앱은 **ECS Fargate**(ARM64)에 배포. IAM 은 **Task Role**(앱 권한) + **Execution Role**(이미지 pull·로그)로 분리한다 ([ADR-022](03-decisions.md)) | 로컬 개발은 AWS SSO 프로파일로 동일 코드 경로 사용 |
 | C-03 | 관측 대상 DB에 오브젝트 설치 불가 | 프로시저·이벤트·트리거 방식 배제. 폴링 + 읽기 전용 조회만 |
 | C-04 | CloudWatch 메트릭 최소 granularity 60초, 수집 지연 1~3분 | "실시간"은 자체 수집으로 별도 제공 |
 | C-05 | `performance_schema.threads.PROCESSLIST_INFO`는 1024바이트 절단 | 전문 SQL은 `information_schema.PROCESSLIST` 또는 파라미터 조정 필요 |
-| C-06 | `performance_schema_max_sql_text_length`, `performance_schema_max_digest_length`는 read-only 변수 → 파라미터 그룹 변경 + 재시작 필요 | 기본값(1024) 전제로 설계. 조정은 선택적 최적화로만 |
+| C-06 | `performance_schema_max_sql_text_length`, `performance_schema_max_digest_length`, `max_digest_length` 는 read-only 변수 → 파라미터 그룹 변경 + **재시작** 필요 | 기본값(1024) 전제로 설계. 조정은 선택적 최적화로만. 재시작을 잊으면 apply 는 성공하고 값은 그대로라 측정이 조용히 틀린다 |
 | C-07 | **지원 버전 하한: RDS for MySQL 8.4+, Aurora MySQL 3.x(MySQL 8.0.32+).** MySQL 5.7 및 Aurora MySQL 2.x는 지원하지 않는다 | 5.7 MD5 다이제스트·`SHOW SLAVE STATUS` 분기 코드 없음. 하한 미달 인스턴스는 탐색 목록에 표시하되 수집 비활성 + 업그레이드 안내 |
-| C-07a | 다이제스트는 `performance_schema_max_digest_length`에 따라 절단되므로, 파라미터 그룹이 다른 인스턴스 간에는 긴 쿼리의 `mysql_digest`가 달라질 수 있다 | 크로스 인스턴스 그룹핑 키는 `app_digest` 필수 |
+| C-07a | 다이제스트 **해시**는 **`max_digest_length`** 에 따라 달라진다(실측: 값이 다르면 같은 SQL 의 `DIGEST` 가 다르다, [19 §E](19-m1-findings.md)). 한 인스턴스 안에서도 설정 변경 전후로 갈리므로 관계는 `app_digest` 1 : `mysql_digest` N 이다 | 크로스 인스턴스 그룹핑 키는 `app_digest` **필수**. `mysql_digests` 는 인스턴스별 **집합**으로 저장한다 |
 | C-08 | IAM DB Auth는 MySQL 신규 연결 초당 약 200개 제한, TLS 필수 | 연결 풀 유지로 회피. 풀 재생성 폭주 방지 로직 필요 |
 | C-09 | DynamoDB 항목 최대 400KB | 큰 플랜/SQL은 압축 + S3 오프로드 |
 | C-10 | Athena는 비동기, 콜드 스타트 수 초 | UI는 비동기 조회 UX 전제 |
@@ -434,7 +434,8 @@ MySQL에는 Oracle AWR 같은 표준 성능 리포트가 없다. 상용 APM(Data
 ### MVP (M0~M3)
 - 리전 2개 이상에서 인스턴스가 자동 탐색되고 prd/stg/dev로 분류된다.
 - 부트스트랩으로 IAM DB Auth 모니터링 계정이 생성되고, 이후 비밀번호 없이 수집이 동작한다.
-- 2초 이상 실행되는 SELECT/UPDATE에 대해 전문 SQL과 in-flight 실행계획이 저장된다.
+- 2초 이상 실행되는 SELECT/UPDATE에 대해 전문 SQL과 실행계획이 저장된다
+  (SELECT는 `plan_source=rerun`, UPDATE는 `rerun_as_select` + 근사 표시).
 - 다이제스트 목록에서 그룹을 선택하면 집계 통계와 실제 샘플 쿼리 + 플랜이 함께 보인다.
 - Cognito 로그인 없이는 어떤 데이터도 조회되지 않는다.
 - 인스턴스 100대에 대해 워커 1대로 1초 주기 수집이 안정적으로 유지된다.

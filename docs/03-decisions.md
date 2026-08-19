@@ -32,7 +32,7 @@
    누산기를 메모리에 두는 설계([ADR-009](#adr-009-시계열-저장소를-도입하지-않는다),
    [ADR-010](#adr-010-다이제스트는-시간-롤업--상위-n으로-영속화한다))는 GC 없는 런타임에서
    훨씬 다루기 쉽다.
-4. 단일 정적 바이너리 → EC2 배포가 `systemd` 유닛 하나로 끝난다.
+4. 단일 정적 바이너리 → **컨테이너 이미지가 작고(≈154MB) 런타임 설치가 없다.** ARM64 Fargate 태스크가 바로 실행한다 ([ADR-022](#adr-022)). PID 1 이 앱이므로 SIGTERM 이 곧바로 전달된다.
 5. AWS SDK for Rust는 이 프로젝트가 쓰는 서비스(RDS, CloudWatch, DynamoDB, S3, Athena,
    Secrets Manager, Bedrock Runtime, Cognito IdP, STS)를 모두 지원한다.
 
@@ -48,7 +48,7 @@
 500개 원격 DB 호출과 AWS I/O일 가능성이 크고, 그렇다면 언어 선택의 성능적 필연성은 약해진다.
 정직하게 말하면 **Rust를 택하는 확실한 근거는 성능이 아니라 다음 세 가지**다:
 
-1. **단일 정적 바이너리** — EC2 배포가 systemd 유닛 하나로 끝난다(런타임·의존성 설치 없음).
+1. **단일 정적 바이너리** — 컨테이너 이미지가 작고 런타임·의존성 설치가 없다. 배포 단위가 파일 하나다.
 2. **메모리 예측성** — 링버퍼·누산기를 메모리에 두는 설계에서 GC가 없는 쪽이 다루기 쉽다.
 3. **팀 역량** — Rust 실무 경험이 있다. 이게 없으면 이 결정은 성립하지 않는다.
 
@@ -88,7 +88,7 @@ M1-9 결과가 어떻든 위 1~3은 유효하므로, 이 조건은 성능이 아
 | `core` | 도메인 타입 + 포트 trait. 테스트용 페이크가 "두 번째 구현"이므로 trait이 정당 |
 | `dbmon` | 나머지 전부 (bin). 내부는 평범한 Rust 모듈로 나눈다 |
 
-`collector`/`api`/`awsinfra`/`alerting`/`advisor`/`reporting`/`scheduler`는 **`dbmon` 안의
+`collector`/`api`/`aws`/`alerting`/`advisor`/`reporting`/`scheduler`는 **`dbmon` 안의
 모듈로 시작**한다. 파일당 400줄 상한(NFR-M-01)은 모듈로도 지킬 수 있다.
 독립 배포가 필요해지거나 컴파일 시간이 문제가 되면 그때 크레이트로 승격한다.
 
@@ -220,7 +220,7 @@ Top 목록을 별도 항목으로 만들어 둔다**(AP-17: `PK = TOP#<env>#<hou
 **결정** — 3단 구조.
 1. **탐지**: `performance_schema.processlist`를 1초 주기로 조회 (경량, 뮤텍스 없음)
 2. **심층**: 임계값 초과 스레드에 대해서만
-   - `information_schema.PROCESSLIST WHERE ID = ?` → **절단되지 않은 전문 SQL**
+   - `information_schema.PROCESSLIST WHERE ID IN (…)` → 전문 SQL. **65,535바이트에서 절단되고 `utf8mb3` 라 4바이트 문자를 잃는다** — 무손실 `events_statements_current.SQL_TEXT` 를 함께 읽는다 ([19 §A](19-m1-findings.md))
    - `performance_schema.events_statements_current` → `DIGEST`, `ROWS_EXAMINED` 등 정확 지표
 3. **플랜**: `EXPLAIN FORMAT=JSON FOR CONNECTION <id>` (ADR-006)
 
@@ -246,12 +246,9 @@ Top 목록을 별도 항목으로 만들어 둔다**(AP-17: `PK = TOP#<env>#<hou
 - 탐지와 심층 조회 사이에 시차(수 ms)가 있어, 그 사이 쿼리가 끝나면 심층 정보를 못 얻는다.
   → 전문 SQL 없이 절단된 텍스트만 저장하고 `sql_text_truncated=true`로 표시.
 - 조회 소스가 2개라 코드가 조금 복잡하다.
-- **`information_schema.PROCESSLIST`는 `WHERE ID = ?` 조건이 있어도 내부적으로 전체 스레드
-  목록을 채운 뒤 필터링할 가능성이 크다**(임시 테이블 기반 구현). 즉 "타깃 조회라서 싸다"는
-  전제가 틀릴 수 있다. 슬로우 쿼리가 있을 때만 실행되므로 빈도는 낮지만, 스레드가 수천 개인
-  인스턴스에서 폭주 시 부담이 된다. → [OPEN-Q-07](OPEN-QUESTIONS.md)에서 실측 확인하고,
-  비용이 크면 심층 조회를 **후보 전체에 대해 1회**만 실행하도록 배치한다(이미 `ID IN (...)`
-  형태이므로 코드 변경 없음).
+- ~~`information_schema.PROCESSLIST` 가 전체 스레드를 채운 뒤 필터링해 비쌀 수 있다~~ →
+  **실측으로 기각됐다** ([19 §F](19-m1-findings.md), OPEN-Q-07). `performance_schema` 폴링보다
+  오히려 **0.8~0.9배 싸다**. 심층 조회는 이미 후보 전체에 대해 `ID IN (…)` 로 1회 실행한다.
 - `TIME`은 "현재 상태에 머문 시간"이라 상태 전이가 있으면 실제 총 실행시간보다 짧을 수 있다.
   → `events_statements_current.TIMER_WAIT`가 있으면 그걸 우선한다.
 
@@ -324,9 +321,10 @@ UI와 문서에서 "실제 실행 플랜"이라고 쓰지 않고 **"실행 중 �
   → [OPEN-Q-05](OPEN-QUESTIONS.md). 미지원이면 JSON만 수집하고 TREE는 폴백 경로에서만.
 - 별도 연결이 필요하므로 인스턴스당 연결 1개를 추가로 쓴다.
 
-**부수 효과(이득)** — in-flight 경로는 대상 테이블에 대한 `SELECT` 권한을 요구하지 않을
-가능성이 있다(플랜을 재수립하지 않으므로). 사실이면 모니터링 계정 권한을 크게 줄일 수 있다.
-→ [OPEN-Q-06](OPEN-QUESTIONS.md)에서 검증. 검증 전까지는 `SELECT` 권한을 요구하는 전제로 설계.
+**~~부수 효과(이득)~~ — 기각됐다** (OPEN-Q-06, [19 §B](19-m1-findings.md)).
+`EXPLAIN … FOR CONNECTION` 은 RDS 에서 아예 실행할 수 없으므로 "권한을 줄일 수 있다" 는
+가능성도 사라졌다. 재실행 경로는 **우리 계정으로 대상 테이블을 읽으므로** `SELECT` 권한이
+반드시 필요하고, 이는 in-flight 경로보다 **더 큰** 노출이다. 권한 모드 C 는 폐기한다.
 
 ---
 
@@ -606,10 +604,11 @@ SELECT STATEMENT_DIGEST(?) AS digest, STATEMENT_DIGEST_TEXT(?) AS digest_text
   ```
 
   전환 비용이 크므로 **정규화 규칙 변경은 골든 코퍼스 테스트 실패를 고칠 때만** 한다.
-- **`DIGEST_TEXT` 절단과 `DIGEST` 해시의 관계는 확정되지 않았다.** 절단이 해시까지 바꾸는지
-  (토큰 스트림이 잘려서) 아니면 텍스트만 잘리는지 실측이 필요하다.
-  → [OPEN-Q-16](OPEN-QUESTIONS.md). 해시가 바뀌지 않는다면 `mysql_digest`를 크로스 인스턴스
-  키로도 쓸 수 있어 `app_digest`의 역할이 더 줄어든다.
+- **확정됐다** (OPEN-Q-16, [19 §E](19-m1-findings.md)): **`max_digest_length` 가 다르면
+  같은 SQL 의 `DIGEST` 해시가 다르다.** 텍스트만 잘리는 게 아니다.
+  따라서 `mysql_digest` 는 크로스 인스턴스 키로 쓸 수 없고 **`app_digest` 가 필수**다.
+  주의: `performance_schema_max_digest_length` 는 저장 텍스트 길이만 바꾼다 — 두 변수를
+  혼동해 후자만 올리면 "해시가 같다" 는 반대 결론이 나온다(한 번 실제로 그랬다).
 
 ---
 
@@ -636,7 +635,7 @@ IdP 추가가 API 호출(`CreateIdentityProvider`)로 되므로 관리자 UI에�
 
 | 엔드포인트 | 공개 이유 | 노출되는 정보 |
 |---|---|---|
-| `/healthz` | ALB·systemd 헬스체크 | 없음 (200 고정) |
+| `/healthz` | **컨테이너** 헬스체크 (`dbmon healthcheck`) | 없음 (200 고정) |
 | `/readyz` | ALB 대상 등록 판정 | 의존성 상태(있음/없음). **어떤 의존성인지는 노출하지 않는다** |
 | `/api/auth/config` | SPA가 로그인 전에 필요 | 공개 OIDC 메타데이터(도메인·client_id·IdP 이름) |
 | `/api/openapi.json` | 개발 편의 | API 구조. **프로덕션에서는 인증 필요로 전환한다** (설정) |
@@ -661,7 +660,7 @@ WAF rate-based rule로 IP 단위 제한을 걸어 T-35와 같은 방식으로 �
 
 **결정** — 기존 스택(React, TypeScript, Vite, Tailwind)을 유지하고 React 19로 올린다.
 서버 상태는 TanStack Query, 밀집 테이블은 TanStack Table + Virtual.
-**차트는 밀집 시계열에 uPlot(canvas), 단순 막대·파이에 Recharts.**
+**차트는 uPlot 하나만 쓴다** (막대·비율은 HTML/CSS — 아래 참조).
 
 **근거**
 - 기존 대시보드 자산(플랜 시각화, 다이제스트 테이블, 메트릭 차트)이 그대로 이식된다.
@@ -864,7 +863,7 @@ ZooKeeper/etcd/Consul을 도입하지 않는다. 1단계는 단일 워커로 시
 - 이미 DynamoDB를 쓰고 있다. 조정 전용 인프라를 추가할 이유가 없다.
 - 정확한 리더 선출이 필요한 게 아니다. 최악의 경우 두 워커가 같은 인스턴스를 잠깐 중복 수집
   하는데, 그건 폴링 쿼리 1건이 두 번 나가고 저장 시 같은 키로 덮어써질 뿐이다(멱등).
-- 60초 리스면 워커 장애 시 최대 60초 수집 공백. NFR-R-02와 일치.
+- 60초 리스 + 20초 스캔 주기면 워커 장애 시 **최대 80초** 수집 공백. NFR-R-02(80초)와 일치.
 
 **⚠ 리스만으로는 split-brain을 막지 못한다** — "중복 수집이 잠깐 발생해도 안전하다"는 초기
 주장은 틀렸다. 리스가 만료된 뒤에도 **이전 소유자의 늦은 쓰기가 도착할 수 있고**, 그것을

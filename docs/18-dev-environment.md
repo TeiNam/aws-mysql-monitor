@@ -376,7 +376,7 @@ M1 스파이크 기간에만 apply하고 destroy한다(레이어가 독립이므
 | 인덱스 없는 100만 행 테이블 풀스캔 (4초 이상) | in-flight 플랜 수집(ADR-006), `rows_examined` |
 | **1024바이트 초과 SQL** (긴 `IN` 절) | `information_schema.PROCESSLIST` 절단 여부 ([OPEN-Q-07](OPEN-QUESTIONS.md)) |
 | UPDATE / DELETE 장기 실행 | DML 플랜 수집 |
-| prepared statement 경유 | `EXPLAIN FOR CONNECTION` 지원 여부 |
+| prepared statement 경유 | `DIGEST` 가 텍스트 프로토콜과 같은지 |
 | 락 경합 2세션 | `sys.innodb_lock_waits` 컬럼명·64자 절단 |
 | 의도적 데드락 | `SHOW ENGINE INNODB STATUS` 파싱 |
 | 다이제스트 1000종 이상 | 상위 N hard cap, `_other` 총량 보존 |

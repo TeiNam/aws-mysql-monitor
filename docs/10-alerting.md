@@ -15,7 +15,7 @@
     "envs": ["prd"],
     "instance_ids": [],
     "tags": { "team": "orders" },
-    "exclude_instance_ids": ["ap-northeast-2/orders-prd-analytics"]
+    "exclude_instance_ids": ["123456789012/ap-northeast-2/orders-prd-analytics"]
   },
   "severity": "critical",
   "channels": ["slack-dba", "telegram-oncall", "inapp"],
@@ -207,7 +207,7 @@ INACTIVE ────────► PENDING ───────────�
 🔴 [prd] 복제 지연 · orders-prd-01
 지연 142초 (임계 60초, 2분 이상 지속)
 
-인스턴스   ap-northeast-2/orders-prd-01 (aurora-mysql 8.0.39)
+인스턴스   123456789012/ap-northeast-2/orders-prd-01 (aurora-mysql 8.0.39)
 시작        14:21:03 KST (12분 전)
 소스 호스트 orders-prd-writer.xxx.rds.amazonaws.com
 

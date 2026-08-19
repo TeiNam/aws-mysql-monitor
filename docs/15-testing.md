@@ -213,7 +213,7 @@ async fn capture_slow_query_end_to_end() {
     let r = &records[0];
     assert!(r.duration_ms >= 3500);
     assert_eq!(r.plan_source, "for_connection");        // in-flight 성공
-    assert!(r.sql_text.len() > 1024);                    // 절단되지 않음 ★
+    assert!(r.sql_text.len() > 1024);                    // 절단 지점이 65,535바이트임 ★
     assert!(r.rows_examined > 900_000);
     assert!(r.no_index_used);
 }
@@ -229,11 +229,11 @@ async fn capture_slow_query_end_to_end() {
 | 전문 SQL 확보 | 1024바이트 초과 SQL이 절단되지 않는지 (**ADR-005 회귀**) |
 | in-flight 플랜 | SELECT / UPDATE / DELETE 각각 성공하는지 (**ADR-006**) |
 | in-flight 실패 분류 | 종료된 스레드 / EXPLAIN 불가 문장 |
-| `FORMAT=TREE FOR CONNECTION` | 버전별 지원 여부 확인 (**OPEN-Q-05 해소**) |
-| 최소 권한으로 플랜 수집 | 데이터 SELECT 없는 계정으로 `EXPLAIN FOR CONNECTION` 가능한지 (**OPEN-Q-06 해소**) |
+| ~~`FORMAT=TREE FOR CONNECTION`~~ | **해소됨** — RDS 에서 `FOR CONNECTION` 자체가 불가하다. `FORMAT=TREE` 는 재실행 경로로만 쓴다 ([19 §B](19-m1-findings.md)) |
+| ~~최소 권한으로 플랜 수집~~ | **해소됨** — 재실행 경로는 대상 테이블 `SELECT` 권한이 **필수**다. 권한 모드 C 는 폐기 |
 | 다이제스트 스냅샷 | 실행 → 델타가 정확한지 |
 | `QUERY_SAMPLE_TEXT` | 수집되는지, 절단 여부 |
-| 다이제스트 절단 | 매우 긴 쿼리에서 `...` 종료 감지 + 매핑 학습 |
+| 다이제스트 절단 | 매우 긴 쿼리에서 **4가지 신호**로 감지 (`...` 는 붙지 않는다) + 매핑 학습 |
 | 권한 부트스트랩 | `CREATE USER` + `GRANT` 후 필요한 모든 쿼리가 동작하는지 |
 | 권한 diff | 일부 권한만 준 상태에서 부족분을 정확히 찾는지 |
 | 멱등 부트스트랩 | 2회 실행 후 상태 동일 |

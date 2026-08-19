@@ -233,7 +233,7 @@ MySQL 실측:
 
 ---
 
-## D. `app_digest` 와 `mysql_digest` 의 관계 (M1-6b) — **N:1 이다**
+## D. `app_digest` 와 `mysql_digest` 의 관계 (M1-6b) — **`app_digest` 1 : `mysql_digest` N**
 
 [04 §2.3](04-data-model.md)의 `DigestText.mysql_digests` 는 `{instance_id: mysql_digest}`,
 즉 인스턴스당 값 **하나**를 가정했다. 실측에서 MySQL 은 다음을 **다른 다이제스트**로 본다:
@@ -248,7 +248,8 @@ MySQL 실측:
 MySQL 이 구분하는 것이 맞다. 우리는 수렴성을 위해 접는다.
 
 → **`mysql_digests` 는 인스턴스당 집합이어야 한다**: `{instance_id: Set<mysql_digest>}`.
-M4-16 의 매핑 학습도 N:1 을 다뤄야 한다.
+M4-16 의 매핑 학습도 1:N 을 다뤄야 한다 — 하나의 `app_digest` 아래에 여러 `mysql_digest` 를
+**집합으로 누적**한다. 방향을 헷갈리면 값 하나짜리 슬롯을 만들고 덮어쓰게 된다.
 
 **반영 대상**: [04 §2.3](04-data-model.md), [17](17-roadmap-tasks.md) M4-16.
 

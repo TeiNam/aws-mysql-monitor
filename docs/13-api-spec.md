@@ -188,7 +188,7 @@ limit, cursor
 응답 항목(목록):
 ```json
 {
-  "record_id": "ap-northeast-2/orders-prd-01:8842119:1755500400",
+  "record_id": "123456789012/ap-northeast-2/orders-prd-01:8842119:1755500400",
   "started_at": "2026-08-18T14:23:11Z", "started_at_ms": 1755500591000,
   "ended_at": "2026-08-18T14:23:15Z",
   "duration_ms": 4213, "duration_source": "slowlog",
@@ -245,8 +245,8 @@ limit, cursor
   "samples": [
     {
       "kind": "slowest",
-      "record_id": "ap-northeast-2/orders-prd-01:8842119:1755184320000",
-      "instance_id": "ap-northeast-2/orders-prd-01",
+      "record_id": "123456789012/ap-northeast-2/orders-prd-01:8842119:1755184320000",
+      "instance_id": "123456789012/ap-northeast-2/orders-prd-01",
       "captured_at": "2026-08-14T03:12:00Z",
       "duration_ms": 4213,
       "rows_examined": 8213445,
@@ -261,7 +261,7 @@ limit, cursor
     { "kind": "rows_max",    "…": "…" },
     {
       "kind": "ps_sample",
-      "instance_id": "ap-northeast-2/orders-prd-02",
+      "instance_id": "123456789012/ap-northeast-2/orders-prd-02",
       "captured_at": "2026-08-18T14:20:00Z",
       "sql_text": "SELECT o.* FROM orders o JOIN users…",
       "executable": true,
@@ -353,7 +353,7 @@ limit, cursor
 `POST /api/bootstrap/plan` 요청:
 ```json
 {
-  "instance_ids": ["ap-northeast-2/orders-prd-01"],
+  "instance_ids": ["123456789012/ap-northeast-2/orders-prd-01"],
   "credential_source": { "kind": "rds_managed" },
   "auth_method": "iam",
   "privilege_mode": "least",
@@ -373,7 +373,7 @@ limit, cursor
   "expires_at": "2026-08-18T14:33:00Z",
   "items": [
     {
-      "instance_id": "ap-northeast-2/orders-prd-01",
+      "instance_id": "123456789012/ap-northeast-2/orders-prd-01",
       "env": "prd",
       "current_state": {
         "user_exists": false, "auth_plugin": null,
@@ -400,7 +400,7 @@ limit, cursor
 ```json
 {
   "plan_id": "01J…",
-  "confirmations": { "ap-northeast-2/orders-prd-01": "orders-prd-01" },
+  "confirmations": { "123456789012/ap-northeast-2/orders-prd-01": "orders-prd-01" },
   "credential_source": { "kind": "manual", "username": "…", "password": "…" }
 }
 ```

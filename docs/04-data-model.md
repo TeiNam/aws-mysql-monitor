@@ -16,16 +16,22 @@
 
 | 식별자 | 형식 | 예 |
 |---|---|---|
-| `instance_id` | `<region>/<db_instance_identifier>` | `ap-northeast-2/orders-prd-01` |
-| `cluster_id` | `<region>/<db_cluster_identifier>` | `ap-northeast-2/orders-prd` |
-| `record_id` (슬로우 쿼리) | `<instance_id>:<thread_id>:<started_at_sec>` | `ap-northeast-2/orders-prd-01:8842119:1755500400` |
+| `instance_id` | `<account_id>/<account>/<region>/<db_instance_identifier>` | `123456789012/ap-northeast-2/orders-prd-01` |
+| `cluster_id` | `<account_id>/<region>/<db_cluster_identifier>` | `123456789012/ap-northeast-2/orders-prd` |
+| `record_id` (슬로우 쿼리) | `<instance_id>:<thread_id>:<started_at_sec>` | `123456789012/ap-northeast-2/orders-prd-01:8842119:1755500400` |
 | `app_digest` | `sha256(정규화SQL)` 앞 32 hex | `9f2c1a...` (32자) |
 | `mysql_digest` | MySQL이 계산한 SHA-256 64 hex | `a3f1...` (64자) |
 | `plan_fingerprint` | `sha256(플랜 구조 정규화)` 앞 16 hex | `4b81c9...` |
 | `schema_fingerprint` | `sha256(참조 테이블들의 DDL+인덱스 정규화)` 앞 16 hex | `77de02...` |
 | `hour_bucket` | `YYYY-MM-DDTHH` (UTC) | `2026-08-18T14` |
 | `date_part` | `YYYY-MM-DD` (UTC) | `2026-08-18` |
-| `dur_bucket` | `b0`(2~5s) `b1`(5~15s) `b2`(15~60s) `b3`(60s+) | `b1` |
+| `dur_bucket` | `b0`(**5s 미만 전부**) `b1`(5~15s) `b2`(15~60s) `b3`(60s+) | `b1` |
+
+**`b0` 의 하한을 2초로 두지 않는 이유**: 슬로우 임계값은 **인스턴스별 설정**이고 1초로
+내릴 수 있다. `b0` 을 `2~5s` 로 정의하면 1초 임계값에서 캡처된 쿼리가 어느 버킷에도
+속하지 않거나, "전체 최신순 = 4버킷 병합" 이 조용히 누락된다. 코드는
+`B0 = i64::MIN..5_000` 이다 (`crates/core/src/ids.rs`).
+
 
 ### 1.1 식별자 표
 
@@ -68,7 +74,15 @@ record_id = <instance_id>:<thread_id>:<floor(started_at_ms / 1000)>
 | 방안 | 장점 | 단점 |
 |---|---|---|
 | `region/DbiResourceId` (예: `ap-northeast-2/db-ABCDEFGHIJKL`) | 이름 변경에 불변 | 로그·URL·알림에서 사람이 읽을 수 없다. 디버깅 비용이 매일 발생 |
-| **`region/identifier` (채택)** | 읽기 쉬움 | 이름 변경 시 연결 끊김 |
+| `region/identifier` | 읽기 쉬움 | **계정이 빠져 있다.** 멀티계정에서 같은 이름의 인스턴스가 충돌한다 |
+| **`account/region/identifier` (채택, M0-2a)** | 읽기 쉬움 + 멀티계정 안전 | 이름 변경 시 연결 끊김. 키가 길다(≈45자) |
+
+**결정 (M0-2a, 2026-08-19)**: 계정 ID를 포함한다. `dbmon-data` 는 여러 계정의
+인스턴스를 한 테이블에 담고, 인스턴스 이름은 계정 안에서만 유일하다. 계정이 빠지면
+서로 다른 계정의 동명 인스턴스가 같은 파티션 키를 갖는다.
+
+`crates/core/src/ids.rs` 의 `InstanceId::parse` 는 **2성분 형식을 거부한다** —
+구분자(`/`, `:`, `#`, `\0`)를 값에 넣는 것도 경계에서 막는다.
 
 **채택 이유** — 이름 변경은 드물고(연 수 회), 읽기 어려운 식별자의 비용은 매일 발생한다.
 드문 사건을 위해 상시 비용을 내지 않는다.
@@ -163,18 +177,19 @@ v         1
 | `db_user` / `db_host` | S | 접속 계정 / 클라이언트 호스트:포트 |
 | `started_at_ms` / `ended_at_ms` | N | 시작 추정 = 최초 관측시각 − 관측 TIME |
 | `duration_ms` | N | 관측된 최대 실행시간(확정값) |
-| `duration_source` | S | `polled`(초 단위 근사) / `slowlog`(정확) / `merged` |
+| `duration_source` | S | `polled`(초 단위 근사) / `timer`(`TIMER_WAIT` 보정, **가장 흔하다**) / `slowlog`(완결된 권위값). `merged` 는 없다 — 그 값은 `capture_source` 쪽이다 |
 | `sql_text` | S | **평문**. 리터럴 정책에 따라 원문·마스킹·생략 |
-| `sql_text_truncated` | BOOL | `information_schema` 타깃 조회 실패 시 true |
-| `literal_policy` | S | `full` / `masked` / `off` |
+| `sql_text_truncated` | BOOL | **채택한 텍스트가 65,535바이트에 닿았을 때** true. 조회 *실패* 는 `sql_text=None` + 이 값 false 다 — 두 상태를 혼동하면 운영자가 "절단 아님" 을 "전문을 받았다" 로 읽는다 |
+| `literal_policy` | S | `full` / `full_restricted` / `masked` / `off` |
 | `app_digest` / `digest_algo_version` | S / N | 자체 정규화 해시 |
-| `mysql_digest` | S | PS에서 읽은 값. 없으면 미존재 |
+| `mysql_digest` | S | PS에서 읽은 값. 없으면 미존재. **인스턴스마다 다를 수 있다**(`max_digest_length` 차이) — 크로스 인스턴스 키는 `app_digest` 다 |
 | `statement_type` | S | `SELECT`/`UPDATE`/`DELETE`/`INSERT`/`DDL`/`OTHER` |
 | `rows_examined` / `rows_sent` / `rows_affected` | N | `events_statements_current` |
 | `tmp_tables` / `tmp_disk_tables` / `sort_merge_passes` | N | 동일 |
 | `no_index_used` / `no_good_index_used` / `full_join` | BOOL | 동일 |
 | `lock_time_ms` | N | 동일 (`LOCK_TIME`은 피코초 → ms 변환) |
-| `plan_json` | B | **zstd 압축** EXPLAIN JSON. 300KB 초과 시 미존재 |
+| `plan_normalized` | S | **리터럴을 마스킹한** EXPLAIN JSON (FR-PLN-09). 저장하는 것은 이것뿐이다 |
+| ~~`plan_json`~~ | — | **원문 플랜은 저장하지 않는다.** 마스킹 후 버린다 (T-16). 마스킹 실패 필드는 `<redacted>` 로 대체하고 그 개수를 센다 |
 | `plan_s3_key` | S | 오프로드된 경우의 S3 키. **키에 만료 티어를 포함한다** (F27) |
 | `plan_format_version` | S | `json_v1` / `json_v2` |
 | `plan_tree` | S | `FORMAT=TREE` 텍스트(수집 가능한 경우) |
@@ -216,7 +231,7 @@ SK        META  |  SLOWEST
 | `digest_text` | S | **평문**. 바인드 변수화된 정규화 SQL (MySQL `DIGEST_TEXT` 또는 자체 정규화 결과) |
 | `digest_text_source` | S | `mysql` / `app` |
 | `statement_type` | S | |
-| `mysql_digests` | M | `{instance_id: Set<mysql_digest>}` — PS 다이제스트와의 대응표. **인스턴스당 여러 개다** (§아래 N:1) |
+| `mysql_digests` | M | `{instance_id: {mysql_digest: last_seen_ms}}` — PS 다이제스트와의 대응표. **인스턴스당 여러 개다** (`app_digest` 1 : `mysql_digest` N). 갱신은 **엔트리 추가**여야 한다 — 덮어쓰면 학습이 사라진다 |
 | `first_seen_ms` / `last_seen_ms` | N | |
 | `seen_instances` | SS | 이 다이제스트가 관측된 인스턴스 집합 |
 | `ps_sample_text` | S | `QUERY_SAMPLE_TEXT` (실시간 캡처에 안 걸린 다이제스트의 유일한 실행 가능 샘플) |
@@ -248,7 +263,9 @@ MySQL 이 구분하는 것이 맞다. 우리는 수렴성을 위해 접는다(�
 
 ```
 각 엔트리에 last_seen_ms 를 함께 저장한다
-  mysql_digests  : { "<instance_id>": { "d": "<digest>", "t": <last_seen_ms> } }
+  mysql_digests  : { "<instance_id>": { "<mysql_digest>": <last_seen_ms> } }
+                   ↑ 인스턴스당 **여러** 다이제스트다 (1:N). 값 하나로 두면
+                     max_digest_length 변경 전후의 학습이 덮어써져 사라진다
   seen_users     : SS 대신 M { "<user>": <last_seen_ms> }   ← 정리를 위해 맵으로
   seen_instances : M { "<instance_id>": <last_seen_ms> }
 
@@ -611,7 +628,7 @@ CREATE TABLE "s3tablescatalog/dbmon-tables-<acct>"."dbmon"."slow_queries" (
   duration_source      string,
   sql_text             string,          -- 평문. LIKE 검색 대상
   sql_text_truncated   boolean,
-  literal_policy       string,
+  literal_policy       string,          -- full / full_restricted / masked / off
   app_digest           string,
   digest_algo_version  int,
   mysql_digest         string,
@@ -626,15 +643,29 @@ CREATE TABLE "s3tablescatalog/dbmon-tables-<acct>"."dbmon"."slow_queries" (
   no_index_used        boolean,
   no_good_index_used   boolean,
   full_join            boolean,
-  plan_zstd            binary,          -- 불투명 블롭. 앱만 해제
+  plan_normalized      string,         -- **마스킹된** EXPLAIN JSON. 원문은 저장하지 않는다
   plan_s3_key          string,
   plan_format_version  string,
   plan_tree            string,
   plan_source          string,
+  plan_approximate     boolean,         -- rerun_as_select 면 true. UI 의 "근사" 배지
   plan_error           string,
   plan_fingerprint     string,
   referenced_tables    array<string>,
-  capture_source       string,
+  capture_source       string,          -- processlist / slowlog / merged / backfill
+
+  -- 아래는 아카이브에서 **재도출할 수 없다**. 빠뜨리면 정보가 영구히 사라진다.
+  state                string,          -- in_flight / finalized / abandoned (F4)
+  abandoned_reason     string,          -- disappeared / thread_reused / too_long / shutdown
+  long_running         boolean,
+  is_nested            boolean,         -- 프로시저 내부 문장 (nesting_event_type=STATEMENT)
+  literal_policy_at_ms bigint,          -- 정책을 고정한 시각 (F2)
+  started_at_ms_precise bigint,         -- TIMER_WAIT 보정값
+  ended_at_ms          bigint,
+  owner_worker         string,
+  owner_epoch          bigint,
+  last_seen_at_ms      bigint,          -- 고아 판정 근거 (F4)
+
   schema_version       int
 )
 PARTITIONED BY (day(started_at))
@@ -721,7 +752,7 @@ TBLPROPERTIES ('table_type'='ICEBERG', 'write_compression'='zstd', 'format'='par
 
 ```json
 {"Metadata":{"WriteTimestampMicros":"1755527391000000"},
- "Keys":{"PK":{"S":"SQ#ap-northeast-2/orders-prd-01#2026-08-18"},
+ "Keys":{"PK":{"S":"SQ#123456789012/ap-northeast-2/orders-prd-01#2026-08-18"},
          "SK":{"S":"1755500591000#8842119"}},
  "NewImage":{"PK":{"S":"..."},"SK":{"S":"..."},
              "duration_ms":{"N":"4213"},
@@ -804,7 +835,7 @@ SELECT
   CAST(NewImage['duration_ms']['N'] AS bigint)                       AS duration_ms,
   NewImage['sql_text']['S']                                         AS sql_text,
   NewImage['app_digest']['S']                                       AS app_digest,
-  from_base64(NewImage['plan_json']['B'])                            AS plan_zstd,
+  from_base64(NewImage['plan_json']['B'])                            AS plan_normalized,
   CAST(NewImage['no_index_used']['BOOL'] AS boolean)                 AS no_index_used,
   CAST(json_parse(NewImage['referenced_tables']['S']) AS array(varchar)) AS referenced_tables
   -- ... 나머지 컬럼 동일 패턴
@@ -818,7 +849,7 @@ MERGE INTO "s3tablescatalog/dbmon-tables-<acct>"."dbmon"."slow_queries" AS t
 USING dbmon_raw.v_slow_queries AS s
 ON t.record_id = s.record_id
 WHEN MATCHED THEN UPDATE SET
-  duration_ms = s.duration_ms, plan_zstd = s.plan_zstd /* ... */
+  duration_ms = s.duration_ms, plan_normalized = s.plan_normalized /* ... */
 WHEN NOT MATCHED THEN INSERT (record_id, started_at, /* ... */)
                       VALUES (s.record_id, s.started_at, /* ... */);
 ```
@@ -843,8 +874,9 @@ WHEN NOT MATCHED THEN INSERT (record_id, started_at, /* ... */)
 
    | 속성 | 타입 | 갱신 방식 |
    |---|---|---|
-   | `seen_instances`, `seen_users`, `seen_hosts` | `SS` (String Set) | `ADD` — 원자적 |
-   | `mysql_digests` | `M` (Map) | `SET mysql_digests.#inst = :digest` — 경로 갱신, 원자적 |
+   | `seen_instances`, `seen_users`, `seen_hosts` | `M` (Map) | `SET seen_users.#u = :now` — 경로 갱신, 원자적 |
+   |  |  | ⚠ `SS` + `ADD` 도 원자적이지만 **엔트리별 시각을 담을 수 없어 정리 기준이 없다** (F28). 위 §2.4 와 맞춘다 |
+   | `mysql_digests` | `M` (중첩 Map) | `SET mysql_digests.#inst.#dg = :now` — **엔트리 추가**, 원자적 |
    | `referenced_tables`, `metrics`, `findings`, `bucket_counts` | `S` (JSON) | 생성 시 1회 쓰기 |
 
    대가: 아카이브 언네스팅 SQL에서 `SS`/`M`을 다뤄야 한다. raw 외부 테이블 정의에서

@@ -76,7 +76,7 @@ crates/
                  #   TargetDb, Notifier, LlmAdvisor, ArchiveQuery, SecretSource, Clock
   dbmon/         # 나머지 전부 (bin). 내부는 평범한 Rust 모듈
     aws/         #   DynamoDB(+PITR export), S3, RDS, CloudWatch, Secrets, Athena,
-                 #   Bedrock, Cognito, STS, ASG
+                 #   Bedrock, Cognito, STS, ECS
     mysql/       #   TargetDb 구현 (mysql_async). 엔진/버전별 SQL 격리
     collector/   #   수집 루프, 리스, 백오프, 버퍼
     api/         #   axum 라우터, 인증, DTO, OpenAPI 생성
@@ -84,7 +84,7 @@ crates/
     advisor/     #   컨텍스트 빌더, 프롬프트, 응답 검증
     reporting/   #   Athena 쿼리, 집계, 리포트 렌더
     scheduler/   #   cron 잡, 리더 리스
-    main.rs      #   플래그 파싱, 조립(wiring), sd_notify, 그레이스풀 셧다운
+    main.rs      #   플래그 파싱, 조립(wiring), 그레이스풀 셧다운, healthcheck 서브커맨드
 web/             # React SPA
 infra/           # Terraform
 docs/            # 이 문서들
@@ -353,7 +353,7 @@ DynamoDB 알림 이력 + WebSocket push
 
 | 상태 | 위치 | 이유 |
 |---|---|---|
-| 인스턴스 in-flight 캐시 | 워커 메모리 | 초당 갱신. 유실되면 진행 중 1건만 놓친다 |
+| 인스턴스 in-flight 캐시 | 워커 메모리 | 초당 갱신. **선행 저장 이후로는 유실 범위가 다르다** — 관측된 후보는 이미 저장돼 있고, 유실되면 그 항목들이 고아로 남아 스케줄러 리더의 정리(F4)를 기다린다 |
 | 실시간 지표 링버퍼 | 워커 메모리 | 대량·단기. 유실 허용 |
 | 다이제스트 이전 스냅샷 + `LAST_SEEN` 체크포인트 | 워커 메모리 | 재시작 시 첫 델타 1회 스킵(기준선 재수립). 영속화 불필요 |
 | `DIGEST → app_digest` 캐시 | 워커 메모리 | 2차 텍스트 쿼리를 생략하기 위한 캐시. 유실 시 재조회 |
@@ -378,7 +378,7 @@ DynamoDB 알림 이력 + WebSocket push
 
 - **인스턴스별 태스크 격리**: 인스턴스 1대 = tokio 태스크 1개(+ 플랜 수집용 서브태스크). 한 대의
   패닉이 다른 대에 전파되지 않도록 `JoinHandle` 감시 + 재시작.
-- **연결 풀 격리**: 인스턴스별 독립 풀. 최대 연결 수 인스턴스당 3(폴링 1 + 플랜 1 + 여유 1).
+- **연결 풀 격리**: 인스턴스별 **풀 2개** — hot(탐지·심층 조회, 2~4) + bulk(다이제스트 스냅샷·일일 집계, 1~2). 최대 6이다 (F7, [05 §5](05-collector.md)). 자기 계측이 대상 DB `max_connections` 대비 점유율을 보고할 때 이 값을 쓴다.
 - **서킷 브레이커**: 연속 실패 N회 → open(폴링 중단) → 지수 백오프로 half-open 재시도.
 - **타임아웃 계층**: 연결 5초 / 쿼리 3초 / 플랜 3초 / tick 전체 예산 = 폴링 주기의 80%.
 - **외부 의존성 격리**: Bedrock·Slack·Athena 호출은 별도 태스크 + 큐. 실패해도 수집 루프 무영향.
@@ -387,10 +387,13 @@ DynamoDB 알림 이력 + WebSocket push
 
 ### 1단계 (인스턴스 ~150대)
 ```
-ASG(min=2, desired=2, max=3) c7g.large × 2
-  → 1대 active (리더 리스 보유, 수집·API 담당)
-  → 1대 standby (/readyz 503 → ALB 대상에서 제외)
+ECS Fargate 서비스 (desiredCount=2, ARM64 1 vCPU / 2 GB)
+  → 1 태스크 active (리더 리스 보유, 수집·API 담당)
+  → 1 태스크 standby (/readyz 503 → 대상 그룹에서 제외)
 ALB → 대상 그룹 (스티키 세션 불필요, WS 지원, 헬스체크 /readyz)
+
+컨테이너 헬스체크는 `/healthz`(무조건 200), 대상 그룹 헬스체크는 `/readyz` 다.
+**둘을 바꾸면 standby 가 계속 재시작된다** — standby 는 정상적으로 503 을 낸다.
 ```
 
 **active 1대 원칙** ([ADR-018](03-decisions.md)) — 리스만으로는 split-brain을 막지 못한다
@@ -399,9 +402,9 @@ ALB → 대상 그룹 (스티키 세션 불필요, WS 지원, 헬스체크 /read
 
 ### 2단계 (~500대) — **선행 조건 2개**
 ```
-ASG-api        c7g.large × 2   (--role api, ALB 대상)
-ASG-collector  c7g.xlarge × 4  (--role collector, 리스 샤딩, ALB 미연결)
-ASG-control    c7g.medium × 1  (--role control, 리더 리스)
+service-api        1 vCPU / 2 GB  × 2  (--role api, ALB 대상)
+service-collector  4 vCPU / 8 GB  × 4  (--role collector, 리스 샤딩, ALB 미연결)
+service-control    0.5 vCPU / 1 GB × 1 (--role control, 리더 리스)
 ```
 
 이 단계로 가려면 **먼저 해결해야 하는 것**이 둘이다.
@@ -427,7 +430,7 @@ ASG-control    c7g.medium × 1  (--role control, 리더 리스)
 | DynamoDB 스로틀 | SDK 에러 | 지수 백오프 + 버퍼. 버퍼 초과 시 드롭 + 메트릭 | 일부 유실(관측 가능) |
 | 아카이브 잡 실패 | 잡 상태 + `JobHeartbeat` 결측 알람 | 체크포인트 미갱신 → 다음 실행이 누락 구간을 **24시간 미만 청크로 쪼개** 재시도. 3회 연속 실패 시 알림 | 과거(31일 초과) 조회에 최대 며칠 공백. TTL 35일이라 복구 여유 있음 |
 | cron 잡 침묵 (리더가 멈춤) | `JobHeartbeat` 결측 (`TreatMissingData=breaching`) | 리더 리스 TTL 만료 → 다른 워커 승계 | 잡 최대 1주기 지연 |
-| standby 승격 실패 | `/readyz` 503 지속 + ALB 비정상 대상 알람 | ASG가 교체 | 최대 2분 수집·조회 중단 |
+| standby 승격 실패 | `/readyz` 503 지속 + ALB 비정상 대상 알람 | ECS 가 태스크를 교체 | 최대 2분 수집·조회 중단 |
 | Athena MERGE 충돌 | 커밋 실패 | 재시도(Iceberg 낙관적 커밋). 아카이브 잡은 단일 리더만 실행하므로 경합 자체가 드묾 | 없음 |
 | Athena 실패/느림 | 쿼리 상태 | 사용자에게 실행 상태·경과 시간 표시, 취소 가능 | 과거 조회 지연 |
 | Bedrock 스로틀/에러 | SDK 에러 | 재시도 후 실패 반환. 캐시된 이전 결과 있으면 함께 표시 | 어드바이저만 실패 |
@@ -444,17 +447,16 @@ ASG-control    c7g.medium × 1  (--role control, 리더 리스)
 | 확장 | 비워둔 자리 |
 |---|---|
 | PostgreSQL 지원 | `core::ports::TargetDb` trait만으로는 **부족하다.** 도메인 재모델링 수준 — 아래 참조 |
-| 멀티 계정 | **`account_id` 파라미터로 되지 않는다.** `instance_id = <region>/<identifier>`가 모든 파티션 키에 들어가고, 서로 다른 계정에 같은 리전·같은 식별자가 존재할 수 있다 → **1차 키 포맷 변경 + 전 데이터 마이그레이션**이 선행 조건. IAM `dbuser:*/dbmon` 리소스, 크로스 계정 로그 그룹 접근, KMS 키 정책도 함께 바뀐다 |
+| 멀티 계정 | **키 포맷은 이미 준비됐다** (M0-2a): `instance_id = <account>/<region>/<identifier>` 이므로 마이그레이션이 필요 없다. 남은 것은 IAM `dbuser:*/dbmon` 리소스, 크로스 계정 로그 그룹 접근, KMS 키 정책, 그리고 계정별 자격증명 취득(STS AssumeRole)이다 |
 | 다른 LLM | `core::ports::LlmAdvisor` trait |
 | 다른 알림 채널 | `core::ports::Notifier` trait + 어댑터 |
-| ECS/EKS 배포 | 단일 바이너리 + Dockerfile. IAM은 Instance Profile / Task Role 양쪽 지원 |
+| ~~ECS 배포~~ | **현재 배포 방식이다** ([ADR-022](03-decisions.md)). EKS 로 가려면 리스·헬스체크는 그대로 쓰고 Deployment + Service 로 바꾸면 된다 |
 
-**멀티 계정 완화책 — 지금 비용 0으로 미래 마이그레이션을 피할 수 있다 (F18).**
-`instance_id`를 처음부터 `<account>/<region>/<identifier>`로 정하고 단일 계정에서는 계정 ID를
-고정값으로 넣는다. 키가 길어지는 것 외에 비용이 없고, 나중에 멀티 계정으로 갈 때
-**키 포맷 변경과 전 데이터 마이그레이션이 불필요**해진다.
-→ [OPEN-Q-20](OPEN-QUESTIONS.md)에서 결정한다. 문서 전체가 `<region>/<identifier>` 예시로
-쓰여 있으므로 바꾸려면 구현 착수 전이 마지막 기회다.
+**멀티 계정 완화책은 적용됐다 (F18, M0-2a, 2026-08-19).**
+`instance_id` 를 `<account>/<region>/<identifier>` 로 정했고 단일 계정에서도 계정 ID를 넣는다.
+키가 ≈45자로 길어지는 것 외에 비용이 없고, 멀티 계정으로 갈 때
+**키 포맷 변경과 전 데이터 마이그레이션이 불필요**하다.
+`InstanceId::parse` 가 2성분 형식을 거부하므로 옛 형식이 섞여 들어올 수 없다.
 
 **PostgreSQL 지원도 trait 하나로 되지 않는다 (F19).** 도메인 타입과 규약이 MySQL 전제로 굳어
 있다: `mysql_digest`, `thread_id`, `plan_format_version=json_v1`, `record_id`의 `thread_id`
