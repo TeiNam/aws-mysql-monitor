@@ -1,0 +1,177 @@
+# CI — M0-11.
+#
+# 설계 원칙은 로컬과 같다: **AWS 자격증명 없이 전부 돌아간다.** 여기서 AWS 를 호출하는
+# 잡은 하나도 없다. `terraform validate` 도 `-backend=false` 로 백엔드 없이 돈다.
+#
+# 통합 테스트는 MySQL 이 필요하므로 서비스 컨테이너로 띄운다. 이미지는
+# `public.ecr.aws` 미러다 — Docker Hub 는 로그인을 강제하므로 CI 에서 rate limit 에 걸린다.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 같은 브랜치에 새 푸시가 오면 진행 중인 실행을 취소한다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 에서 증분 컴파일은 캐시를 키우기만 하고 이득이 없다.
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ── 빠른 게이트: 30초 안에 끝나야 한다 ─────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── 단위 테스트: Docker 불필요 ────────────────────────────────────────────
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` 로 Cargo.lock 이 최신인지 함께 검증한다.
+      - run: cargo test --workspace --lib --locked
+
+  # ── 통합 테스트: 실제 MySQL 이 필요하다 ───────────────────────────────────
+  #
+  # 이 잡이 M1 실측 수치의 회귀를 잡는다. 파라미터가 없으면 `max_digest_length` 가
+  # 1024 라 절단 테스트가 통과해 버린다 — 그래서 8.4 를 두 설정으로 띄운다.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql84:
+        image: public.ecr.aws/docker/library/mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: dbmon-local-root
+          MYSQL_DATABASE: shop
+        ports: ["13306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pdbmon-local-root"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      mysql84wide:
+        image: public.ecr.aws/docker/library/mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: dbmon-local-root
+          MYSQL_DATABASE: shop
+        ports: ["13307:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pdbmon-local-root"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      mysql80:
+        image: public.ecr.aws/docker/library/mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: dbmon-local-root
+          MYSQL_DATABASE: shop
+        ports: ["13308:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pdbmon-local-root"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 서비스 컨테이너는 커스텀 my.cnf 나 initdb 마운트를 받을 수 없다.
+      # `SET PERSIST` 로 같은 상태를 만들고 재시작해 정적 파라미터를 적용한다.
+      - name: MySQL 설정과 시드
+        run: |
+          set -euo pipefail
+          m() { mysql -h127.0.0.1 -P"$1" -uroot -pdbmon-local-root "${@:2}"; }
+
+          # 8.4-wide 만 다이제스트 버퍼를 올린다 (M1-13 의 대조군).
+          m 13307 -e "
+            SET PERSIST max_digest_length = 4096;
+            SET PERSIST performance_schema_max_digest_length = 4096;
+            SET PERSIST performance_schema_max_sql_text_length = 4096;"
+          docker restart "$(docker ps --filter publish=13307 -q)"
+
+          for port in 13306 13307 13308; do
+            for _ in $(seq 1 40); do m "$port" -e "SELECT 1" >/dev/null 2>&1 && break; sleep 2; done
+            for f in local/seed/*.sql; do m "$port" -D shop < "$f"; done
+          done
+          # 대조군이 실제로 적용됐는지 확인한다. 아니면 절단 테스트가 조용히 통과한다.
+          m 13307 -N -B -e "SELECT @@max_digest_length" | grep -qx 4096
+
+      - run: cargo test --workspace --locked
+
+  # ── Terraform: AWS 호출 없음 ──────────────────────────────────────────────
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - run: terraform fmt -recursive -check infra
+      - name: 전 레이어 validate
+        run: |
+          set -euo pipefail
+          for d in infra/layers/*/; do
+            ( cd "$d"
+              terraform init -backend=false -input=false >/dev/null
+              terraform validate )
+            echo "  ✓ $(basename "$d")"
+          done
+
+  # ── 문서 링크 ─────────────────────────────────────────────────────────────
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./scripts/check-docs.py
+
+  # ── 컨테이너 이미지: ARM64 를 네이티브 러너에서 빌드한다 ──────────────────
+  #
+  # x86 러너에서 `--platform linux/arm64` 를 쓰면 QEMU 에뮬레이션으로 수십 분이 된다
+  # (aws-lc-rs 가 cmake/clang 로 풀빌드된다). ARM 러너를 쓰면 네이티브다.
+  image:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: 빌드
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: dbmon:ci
+          # 러너 간 캐시. 없으면 매번 aws-lc-rs 풀빌드다.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: 스모크 — 헬스체크와 SIGTERM 반응
+        run: |
+          set -euo pipefail
+          docker run --rm dbmon:ci --version
+          docker run -d --name smoke -p 18080:8080 \
+            -e DBMON__DEPLOYMENT_ENV=prd -e DBMON__AWS__REGION=ap-northeast-2 \
+            -e DBMON__AWS__ACCOUNT_ID=000000000000 \
+            -e DBMON__STORAGE__DATA_TABLE=d -e DBMON__STORAGE__CONFIG_TABLE=c \
+            -e DBMON__HTTP__DEREGISTRATION_WAIT_SECS=0 \
+            dbmon:ci serve
+          for _ in $(seq 1 20); do
+            [ "$(docker inspect smoke --format '{{.State.Health.Status}}')" = healthy ] && break
+            sleep 2
+          done
+          test "$(docker inspect smoke --format '{{.State.Health.Status}}')" = healthy
+          # PID 1 이 dbmon 이면 SIGTERM 이 바로 전달되어 즉시 멈춘다.
+          start=$(date +%s)
+          docker stop -t 60 smoke >/dev/null
+          test $(( $(date +%s) - start )) -lt 10
+          docker rm -f smoke >/dev/null

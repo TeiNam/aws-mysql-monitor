@@ -14,7 +14,7 @@
 #   어긋난다. 환경 분리는 **버킷/계정**으로 한다.
 terraform {
   backend "s3" {
-    key = "10-foundation/terraform.tfstate"
+    key = "50-observability/terraform.tfstate"
 
     encrypt = true
 

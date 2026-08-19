@@ -188,11 +188,24 @@ impl InFlightTracker {
     /// 한 tick 을 처리한다.
     ///
     /// `now_ms` 는 우리 시계, `offset` 은 DB 와의 차이. 시작 시각은 **DB 시계**로 계산한다.
+    /// `list_truncated` 는 detect 조회가 `LIMIT` 에 걸렸는지다.
+    ///
+    /// # 잘린 목록으로 사라짐 판정을 하면 실행 중인 쿼리에 거짓 종료 시각이 박힌다
+    ///
+    /// detect 는 `ORDER BY TIME DESC LIMIT 500` 이다. 동시 슬로우 쿼리가 500개를 넘으면
+    /// 컷 아래의 스레드는 **아직 실행 중인데도** 이번 tick 결과에 없다. 그걸 사라짐으로
+    /// 보면 `Disappeared` → `observed_end() == true` → 거짓 `ended_at_ms` 로 확정되고,
+    /// 다음 tick 에 다시 보이면 같은 실행이 여러 레코드로 쪼개진다.
+    ///
+    /// 동시 슬로우 쿼리 500개 초과는 정확히 "장애 중"이며, 이 도구가 가장 정확해야 하는
+    /// 순간이다. 그래서 잘린 tick 에서는 **사라짐 판정을 건너뛴다.** 실제로 끝난 항목은
+    /// 다음 온전한 tick 에서 확정된다. `too_long` 상한이 여전히 캐시를 제한한다.
     pub fn tick(
         &mut self,
         observations: &[Observation],
         now_ms: EpochMs,
         offset: &ClockOffset,
+        list_truncated: bool,
     ) -> TickResult {
         let mut result = TickResult::default();
         let mut seen: Vec<u64> = Vec::with_capacity(observations.len());
@@ -236,13 +249,16 @@ impl InFlightTracker {
             }
         }
 
-        // 사라진 항목을 확정한다.
-        let disappeared: Vec<u64> = self
-            .entries
-            .keys()
-            .copied()
-            .filter(|id| !seen.contains(id))
-            .collect();
+        // 사라진 항목을 확정한다. **목록이 잘렸으면 판정할 수 없다.**
+        let disappeared: Vec<u64> = if list_truncated {
+            Vec::new()
+        } else {
+            self.entries
+                .keys()
+                .copied()
+                .filter(|id| !seen.contains(id))
+                .collect()
+        };
         for id in disappeared {
             if let Some(t) = self.entries.remove(&id) {
                 result.finalized.push((t, FinalizeReason::Disappeared));
@@ -325,6 +341,42 @@ fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Trac
 mod tests {
     use super::*;
 
+    /// detect 목록이 `LIMIT` 에 잘렸으면 실행 중인 쿼리를 "정상 종료"로 확정하면 안 된다.
+    #[test]
+    fn truncated_list_does_not_finalize_missing_entries() {
+        let mut t = InFlightTracker::default();
+        t.tick(
+            &[obs(1, 5, Some("a")), obs(2, 3, Some("b"))],
+            0,
+            &no_offset(),
+            false,
+        );
+        // 2번이 LIMIT 컷 아래로 밀려 목록에서 빠졌다 — 아직 실행 중이다.
+        let r = t.tick(&[obs(1, 6, Some("a"))], 1_000, &no_offset(), true);
+        assert!(
+            r.finalized.is_empty(),
+            "잘린 목록으로는 사라짐을 판정할 수 없다"
+        );
+        assert_eq!(t.len(), 2, "두 항목 모두 추적을 유지한다");
+
+        // 온전한 tick 이 오면 그때 확정한다.
+        let r = t.tick(&[obs(1, 7, Some("a"))], 2_000, &no_offset(), false);
+        assert_eq!(r.finalized.len(), 1);
+        assert_eq!(r.finalized[0].0.thread_id, 2);
+        assert_eq!(r.finalized[0].1, FinalizeReason::Disappeared);
+    }
+
+    /// 잘린 tick 에서도 `too_long` 상한은 살아 있어야 한다 — 아니면 캐시가 무한히 자란다.
+    #[test]
+    fn truncated_list_still_enforces_max_tracking() {
+        let mut t = InFlightTracker::new(1_000, 3);
+        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
+        let r = t.tick(&[], 5_000, &no_offset(), true);
+        assert_eq!(r.finalized.len(), 1);
+        assert_eq!(r.finalized[0].1, FinalizeReason::TooLong);
+        assert!(t.is_empty());
+    }
+
     fn obs(thread_id: u64, time_secs: i64, digest: Option<&str>) -> Observation {
         Observation {
             thread_id,
@@ -345,7 +397,7 @@ mod tests {
     #[test]
     fn first_observation_requests_deep_probe() {
         let mut t = InFlightTracker::default();
-        let r = t.tick(&[obs(100, 2, None)], 10_000, &no_offset());
+        let r = t.tick(&[obs(100, 2, None)], 10_000, &no_offset(), false);
         assert_eq!(r.needs_deep_probe, vec![100]);
         assert!(r.finalized.is_empty());
         assert_eq!(t.get(100).unwrap().state, TrackedState::Observed);
@@ -356,9 +408,9 @@ mod tests {
     #[test]
     fn continued_observation_updates_max_time() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(100, 2, Some("d1"))], 10_000, &no_offset());
+        t.tick(&[obs(100, 2, Some("d1"))], 10_000, &no_offset(), false);
         t.record_plan_attempt(100, true);
-        let r = t.tick(&[obs(100, 5, Some("d1"))], 13_000, &no_offset());
+        let r = t.tick(&[obs(100, 5, Some("d1"))], 13_000, &no_offset(), false);
         assert!(
             r.needs_deep_probe.is_empty(),
             "플랜을 이미 얻었으면 재시도하지 않는다"
@@ -376,10 +428,10 @@ mod tests {
     #[test]
     fn r4_duration_matches_observed_time() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset());
-        t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset());
-        t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset());
-        let r = t.tick(&[], 3_000, &no_offset());
+        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
+        t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset(), false);
+        t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset(), false);
+        let r = t.tick(&[], 3_000, &no_offset(), false);
         assert_eq!(r.finalized.len(), 1);
         let (tracked, reason) = &r.finalized[0];
         assert_eq!(tracked.duration_ms(), 4_000);
@@ -391,8 +443,18 @@ mod tests {
     #[test]
     fn r5_thread_reuse_with_different_digest_splits() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(100, 3, Some("digest-A"))], 10_000, &no_offset());
-        let r = t.tick(&[obs(100, 2, Some("digest-B"))], 13_000, &no_offset());
+        t.tick(
+            &[obs(100, 3, Some("digest-A"))],
+            10_000,
+            &no_offset(),
+            false,
+        );
+        let r = t.tick(
+            &[obs(100, 2, Some("digest-B"))],
+            13_000,
+            &no_offset(),
+            false,
+        );
 
         assert_eq!(r.finalized.len(), 1, "이전 실행이 확정돼야 한다");
         assert_eq!(r.finalized[0].1, FinalizeReason::ThreadReused);
@@ -416,8 +478,8 @@ mod tests {
     #[test]
     fn r5_decreasing_time_splits_even_with_same_digest() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(100, 10, Some("d"))], 10_000, &no_offset());
-        let r = t.tick(&[obs(100, 2, Some("d"))], 20_000, &no_offset());
+        t.tick(&[obs(100, 10, Some("d"))], 10_000, &no_offset(), false);
+        let r = t.tick(&[obs(100, 2, Some("d"))], 20_000, &no_offset(), false);
         assert_eq!(r.finalized.len(), 1);
         assert_eq!(r.finalized[0].1, FinalizeReason::ThreadReused);
         assert_eq!(r.finalized[0].0.max_time_secs, 10);
@@ -432,11 +494,11 @@ mod tests {
             (Some("app"), Some("10.0.9.9")),
         ] {
             let mut t = InFlightTracker::default();
-            t.tick(&[obs(100, 3, Some("d"))], 10_000, &no_offset());
+            t.tick(&[obs(100, 3, Some("d"))], 10_000, &no_offset(), false);
             let mut second = obs(100, 4, Some("d"));
             second.identity.db_user = user.map(str::to_string);
             second.identity.db_host = host.map(str::to_string);
-            let r = t.tick(&[second], 11_000, &no_offset());
+            let r = t.tick(&[second], 11_000, &no_offset(), false);
             assert_eq!(
                 r.finalized.len(),
                 1,
@@ -449,8 +511,8 @@ mod tests {
     #[test]
     fn missing_digest_does_not_split() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(100, 2, None)], 10_000, &no_offset());
-        let r = t.tick(&[obs(100, 3, Some("d1"))], 11_000, &no_offset());
+        t.tick(&[obs(100, 2, None)], 10_000, &no_offset(), false);
+        let r = t.tick(&[obs(100, 3, Some("d1"))], 11_000, &no_offset(), false);
         assert!(
             r.finalized.is_empty(),
             "뒤늦게 채워진 다이제스트로 분리하면 안 된다"
@@ -464,7 +526,7 @@ mod tests {
         // DB 가 3초 앞서 있다. 시작 시각은 **DB 시계**여야 파티션이 맞는다 (F14).
         let offset = ClockOffset::restored(3_000);
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(1, 2, None)], 10_000, &offset);
+        t.tick(&[obs(1, 2, None)], 10_000, &offset, false);
         assert_eq!(t.get(1).unwrap().started_at_ms, 10_000 + 3_000 - 2_000);
         // 우리 시계 기준 최초 관측 시각은 그대로 보존한다 (고아 판정에 쓴다).
         assert_eq!(t.get(1).unwrap().first_observed_at_ms, 10_000);
@@ -473,7 +535,7 @@ mod tests {
     #[test]
     fn timer_wait_refines_start_time() {
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(1, 4, None)], 10_000, &no_offset());
+        t.tick(&[obs(1, 4, None)], 10_000, &no_offset(), false);
         // TIMER_WAIT = 4.213초 (피코초)
         t.record_deep_probe(
             1,
@@ -494,12 +556,12 @@ mod tests {
     #[test]
     fn plan_attempts_are_capped() {
         let mut t = InFlightTracker::new(DEFAULT_MAX_TRACKING_MS, 2);
-        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset());
+        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
         t.record_plan_attempt(1, false);
-        let r = t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset());
+        let r = t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset(), false);
         assert_eq!(r.needs_deep_probe, vec![1], "1회 실패 후에는 재시도한다");
         t.record_plan_attempt(1, false);
-        let r = t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset());
+        let r = t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset(), false);
         assert!(r.needs_deep_probe.is_empty(), "상한에 도달하면 포기한다");
         assert_eq!(t.get(1).unwrap().plan_attempts, 2);
     }
@@ -507,8 +569,8 @@ mod tests {
     #[test]
     fn too_long_tracking_is_force_finalized_and_removed() {
         let mut t = InFlightTracker::new(1_000, 3);
-        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset());
-        let r = t.tick(&[obs(1, 3, Some("d"))], 5_000, &no_offset());
+        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
+        let r = t.tick(&[obs(1, 3, Some("d"))], 5_000, &no_offset(), false);
         assert_eq!(r.finalized.len(), 1);
         assert_eq!(r.finalized[0].1, FinalizeReason::TooLong);
         assert!(!r.finalized[0].1.observed_end(), "종료를 관측하지 못했다");
@@ -526,6 +588,7 @@ mod tests {
             ],
             0,
             &no_offset(),
+            false,
         );
         assert_eq!(r.needs_deep_probe, vec![1, 2, 3]);
         assert_eq!(t.len(), 3);
@@ -535,6 +598,7 @@ mod tests {
             &[obs(1, 3, Some("a")), obs(3, 10, Some("c"))],
             1_000,
             &no_offset(),
+            false,
         );
         assert_eq!(r.finalized.len(), 1);
         assert_eq!(r.finalized[0].0.thread_id, 2);
@@ -548,8 +612,9 @@ mod tests {
             &[obs(1, 2, Some("a")), obs(2, 3, Some("b"))],
             0,
             &no_offset(),
+            false,
         );
-        let r = t.tick(&[], 1_000, &no_offset());
+        let r = t.tick(&[], 1_000, &no_offset(), false);
         assert_eq!(r.finalized.len(), 2);
         assert!(t.is_empty());
     }
@@ -561,6 +626,7 @@ mod tests {
             &[obs(1, 2, Some("a")), obs(2, 3, Some("b"))],
             0,
             &no_offset(),
+            false,
         );
         let drained = t.drain();
         assert_eq!(drained.len(), 2);
@@ -572,9 +638,9 @@ mod tests {
     fn last_seen_is_updated_for_orphan_detection() {
         // F4 — 스케줄러 리더가 `last_seen_at_ms` 로 고아를 판정한다.
         let mut t = InFlightTracker::default();
-        t.tick(&[obs(1, 2, Some("a"))], 1_000, &no_offset());
+        t.tick(&[obs(1, 2, Some("a"))], 1_000, &no_offset(), false);
         assert_eq!(t.get(1).unwrap().last_seen_at_ms, 1_000);
-        t.tick(&[obs(1, 3, Some("a"))], 5_000, &no_offset());
+        t.tick(&[obs(1, 3, Some("a"))], 5_000, &no_offset(), false);
         assert_eq!(t.get(1).unwrap().last_seen_at_ms, 5_000);
     }
 

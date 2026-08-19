@@ -92,6 +92,8 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
     // 전문이 있으면 그걸 쓴다. 없으면 `DIGEST_TEXT`(이미 `?` 로 치환된 것)를 쓴다.
     // 둘 다 없으면 다이제스트를 계산할 수 없다.
     let digest_text = stmt.and_then(|s| s.digest_text.as_deref());
+    let ps_sql = stmt.and_then(|s| s.sql_text.as_deref());
+    let full_sql = pick_sql_text(full_sql, ps_sql);
     let source_text = full_sql.or(digest_text);
     let normalized = source_text.map(normalize);
 
@@ -251,6 +253,32 @@ fn exec_stats(s: &StmtCurrentRow) -> ExecStats {
         no_index_used: s.no_index_used,
         no_good_index_used: s.no_good_index_used,
         full_join: s.select_full_join.map(|v| v > 0),
+    }
+}
+
+/// 두 전문 SQL 소스 중 **온전한 쪽**을 고른다.
+///
+/// 두 소스는 상보적이고, 어느 쪽도 단독으로는 충분하지 않다 (19 §A-2):
+///
+/// | 소스 | 상한 | 4바이트 문자 |
+/// |---|---|---|
+/// | `information_schema.PROCESSLIST.INFO` | 65,535바이트 | **`?` 로 손실** (`utf8mb3`) |
+/// | `events_statements_current.SQL_TEXT` | 1,024바이트 (기본) | 보존 (`utf8mb4`) |
+///
+/// 손실은 서버가 IS 테이블을 채울 때 일어나므로 `CONVERT` 로 되돌릴 수 없다. 이모지가
+/// 섞인 SQL 을 그대로 저장하면 운영자가 복사해 재현할 때 **다른 쿼리**가 된다.
+///
+/// # 판정에 서버 변수를 쓰지 않는다
+///
+/// `performance_schema_max_sql_text_length` 를 읽어 비교하면 인스턴스마다 값을 캐시해야
+/// 하고 설정 변경을 놓친다. 대신 **문자 수**를 비교한다 — `?` 치환은 1문자를 1문자로
+/// 바꾸므로 두 소스의 문자 수는 절단이 없을 때만 같다.
+fn pick_sql_text<'a>(is_text: Option<&'a str>, ps_text: Option<&'a str>) -> Option<&'a str> {
+    match (is_text, ps_text) {
+        // PS 가 IS 보다 짧지 않으면 PS 는 절단되지 않았다 → 무손실 쪽을 쓴다.
+        (Some(is), Some(ps)) if ps.chars().count() >= is.chars().count() => Some(ps),
+        (Some(is), _) => Some(is),
+        (None, ps) => ps,
     }
 }
 

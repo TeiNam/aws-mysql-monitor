@@ -47,8 +47,20 @@ locals {
 # 후자만 올리면 저장 길이만 늘어나고 절단은 그대로다.
 #
 # 아래 `apply_method = "pending-reboot"` 항목은 **정적 파라미터**다. 재부팅해야 적용된다.
+# 퍼블릭 접근에는 IGW 라우트가 있는 서브넷이 필요하다 (`db_subnet_group_name` 설명).
+resource "aws_db_subnet_group" "public" {
+  count       = var.publicly_accessible ? 1 : 0
+  name_prefix = "${local.name}-pub-"
+  subnet_ids  = var.public_subnet_ids
+  description = "dbmon seed: IGW-routed subnets so a public endpoint is actually reachable"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_db_parameter_group" "seed" {
-  name        = local.name
+  name_prefix = "${local.name}-"
   family      = "mysql8.4"
   description = "dbmon seed target: performance_schema and slow log tuned for observation"
 
@@ -82,6 +94,18 @@ resource "aws_db_parameter_group" "seed" {
   parameter {
     name         = "performance_schema_digests_size"
     value        = "20000"
+    apply_method = "pending-reboot"
+  }
+
+  # **버퍼 풀을 명시적으로 낮춘다.** t4g.micro 는 메모리 1 GiB 이고 RDS 기본
+  # `innodb_buffer_pool_size` 는 `DBInstanceClassMemory*3/4`(≈750 MB) 다. 위의
+  # performance_schema 설정(다이제스트 20,000 × 4,096 바이트만 대략 100~160 MB)과
+  # IAM DB Auth 가 얹히면 mysqld 가 기동에 실패해 인스턴스가 `incompatible-parameters`
+  # 로 빠진다 — 재부팅으로 풀리지 않고 파라미터를 되돌려야 한다.
+  # RDS 가 작은 인스턴스에서 performance_schema 기본값을 0 으로 두는 이유가 이것이다.
+  parameter {
+    name         = "innodb_buffer_pool_size"
+    value        = "{DBInstanceClassMemory*1/2}"
     apply_method = "pending-reboot"
   }
 
@@ -120,7 +144,7 @@ resource "aws_db_parameter_group" "seed" {
 # 접근 제어
 # ─────────────────────────────────────────────────────────────────────────────
 resource "aws_security_group" "seed" {
-  name        = local.name
+  name_prefix = "${local.name}-"
   description = "dbmon seed MySQL target"
   vpc_id      = data.aws_vpc.target.id
 
@@ -177,7 +201,9 @@ resource "aws_db_instance" "seed" {
   # **IAM DB 인증** — ADR-007 의 전제. 활성화에 재부팅이 필요한지가 M1-5 다.
   iam_database_authentication_enabled = true
 
-  db_subnet_group_name   = var.db_subnet_group_name
+  db_subnet_group_name = var.publicly_accessible ? (
+    aws_db_subnet_group.public[0].name
+  ) : var.db_subnet_group_name
   vpc_security_group_ids = [aws_security_group.seed.id]
   parameter_group_name   = aws_db_parameter_group.seed.name
 
@@ -189,6 +215,9 @@ resource "aws_db_instance" "seed" {
   # 슬로우로그를 CloudWatch 로 내보낸다. 3소스 병합의 소스 C 다.
   enabled_cloudwatch_logs_exports = ["slowquery", "error"]
 
+  # 로그 그룹을 **먼저** 만들어야 보존기간이 박힌다 (아래 aws_cloudwatch_log_group).
+  depends_on = [aws_cloudwatch_log_group.rds]
+
   # dev 이므로 백업을 최소화한다. 단 PITR 을 완전히 끄지는 않는다 —
   # 실수로 시드 데이터를 날렸을 때 되돌릴 수 있어야 한다.
   backup_retention_period = var.backup_retention_days
@@ -198,18 +227,29 @@ resource "aws_db_instance" "seed" {
   # dev 비용 절감: 다중 AZ 를 쓰지 않는다.
   multi_az = var.environment == "prd"
 
-  auto_minor_version_upgrade = true
+  # **끈다.** 켜면 유지보수 창에서 마이너가 올라가고, 아래 `ignore_changes` 때문에
+  # Terraform 이 드리프트를 보고하지도 않는다 — 측정 기준선이 조용히 바뀐다.
+  # 업그레이드는 `engine_version` 을 바꾸는 의도적 커밋으로 한다.
+  auto_minor_version_upgrade = false
   apply_immediately          = var.environment != "prd"
 
   # Enhanced Monitoring 은 OS 지표(M12-11)에 필요하지만 월 비용이 있다. dev 는 끈다.
   monitoring_interval = 0
 
-  lifecycle {
-    ignore_changes = [
-      # AWS 가 마이너 버전을 올릴 수 있다. Terraform 이 되돌리지 않게 한다.
-      engine_version,
-    ]
-  }
+  # `ignore_changes = [engine_version]` 을 두지 않는다. 핀할 의도와 플로팅 허용을
+  # 동시에 넣으면 서로를 무력화한다. 버전이 바뀌면 drift 로 보여야 한다.
 }
 
 data "aws_caller_identity" "current" {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RDS 로그 그룹 — **보존기간을 미리 박는다**
+# ─────────────────────────────────────────────────────────────────────────────
+# RDS 가 알아서 만든 로그 그룹은 **Never Expire** 다. `long_query_time = 1` 에
+# 부하 생성기까지 돌면 계속 쌓인다(서울 ingest $0.76/GB + 저장). RDS 는 기존 그룹이
+# 있으면 재사용하므로 먼저 선언하면 된다.
+resource "aws_cloudwatch_log_group" "rds" {
+  for_each          = toset(["slowquery", "error"])
+  name              = "/aws/rds/instance/${local.name}/${each.value}"
+  retention_in_days = var.log_retention_days
+}

@@ -55,6 +55,55 @@ resource "aws_kms_key" "data" {
   }
 }
 
+# 키 정책을 **명시한다.** 기본 키 정책은 계정 root 위임뿐이고, CloudWatch Logs 는
+# IAM 위임이 아니라 **서비스 주체**로 키를 쓴다. 정책이 없으면 `CreateLogGroup(kmsKeyId=...)`
+# 이 거부되어 40-compute 첫 apply 가 로그 그룹에서 즉시 실패한다.
+#
+# ⚠ 이 정책은 기본 정책을 **덮어쓴다.** root 위임 statement 를 빼면 키가 잠기고
+# 되돌릴 방법이 없다 (`prevent_destroy` + 30일 삭제 대기).
+data "aws_iam_policy_document" "kms_data" {
+  statement {
+    sid    = "EnableIAMUserPermissions"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "AllowCloudWatchLogs"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${data.aws_region.current.region}.amazonaws.com"]
+    }
+    actions = [
+      "kms:Encrypt*",
+      "kms:Decrypt*",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:Describe*",
+    ]
+    resources = ["*"]
+
+    # 이 계정의 로그 그룹에만 쓰도록 좁힌다 — 다른 계정이 우리 키로 로그를 암호화하는
+    # 것을 막는다(confused deputy).
+    condition {
+      test     = "ArnLike"
+      variable = "kms:EncryptionContext:aws:logs:arn"
+      values   = ["arn:aws:logs:${data.aws_region.current.region}:${local.account_id}:log-group:*"]
+    }
+  }
+}
+
+resource "aws_kms_key_policy" "data" {
+  key_id = aws_kms_key.data.id
+  policy = data.aws_iam_policy_document.kms_data.json
+}
+
 resource "aws_kms_alias" "data" {
   name          = "alias/dbmon-data-${var.environment}"
   target_key_id = aws_kms_key.data.key_id
@@ -271,21 +320,27 @@ resource "aws_s3_bucket_lifecycle_configuration" "plans" {
 # NAT 를 거치지 않으므로 데이터 처리 비용($0.045/GB)도 사라진다 — DynamoDB 트래픽이
 # 월 수십 GB 이므로 이것만으로 의미 있는 절감이다.
 #
-# 라우트 테이블은 **기존 것을 참조**한다. 새로 만들지 않는다.
-data "aws_route_tables" "target" {
-  vpc_id = data.aws_vpc.target.id
-}
-
+# 라우트 테이블은 **호출자가 명시한다.** VPC 의 전체 목록을 쓰면 남의 서브넷 라우트까지
+# 건드리고, destroy 가 그 워크로드의 유일한 S3 경로를 끊는다 (`endpoint_route_table_ids`).
 resource "aws_vpc_endpoint" "dynamodb" {
   vpc_id            = data.aws_vpc.target.id
   service_name      = "com.amazonaws.${data.aws_region.current.region}.dynamodb"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = data.aws_route_tables.target.ids
+  route_table_ids   = var.endpoint_route_table_ids
+}
+
+# S3 는 dev VPC 에 **이미 있다.** 기본값이 `false` 인 이유는 `create_s3_gateway_endpoint`
+# 설명에 있다. 이미 있는 것을 참조만 한다.
+data "aws_vpc_endpoint" "s3_existing" {
+  count        = var.create_s3_gateway_endpoint ? 0 : 1
+  vpc_id       = data.aws_vpc.target.id
+  service_name = "com.amazonaws.${data.aws_region.current.region}.s3"
 }
 
 resource "aws_vpc_endpoint" "s3" {
+  count             = var.create_s3_gateway_endpoint ? 1 : 0
   vpc_id            = data.aws_vpc.target.id
   service_name      = "com.amazonaws.${data.aws_region.current.region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = data.aws_route_tables.target.ids
+  route_table_ids   = var.endpoint_route_table_ids
 }

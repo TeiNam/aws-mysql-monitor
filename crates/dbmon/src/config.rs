@@ -335,12 +335,23 @@ impl Config {
             ));
         }
 
-        // **T-37 게이트** — dev 배포는 탐색 필터 없이 기동할 수 없다.
-        if self.deployment_env == Env::Dev && self.discovery.allowed_vpc_ids.is_empty() {
+        // **T-37 게이트** — 탐색 필터 없이 기동할 수 있는 것은 `prd` 하나뿐이다.
+        //
+        // 이전 구현은 `== Env::Dev` 만 막았다. 그런데 기본값은 `unknown` 이고
+        // (`Env::Unknown.treat_as_production() == true`), `unknown` 으로 뜬 배포는
+        // 다른 모든 곳에서 프로덕션 취급을 받으면서 **이 게이트만 통과했다.**
+        // `rds:DescribeDBInstances` 는 `Resource:"*"` 라 계정 내 prd 인스턴스가 다 보이므로,
+        // 안전해 보이는 기본값이 최후 방어선을 무력화하고 있었다.
+        //
+        // `prd` 를 예외로 두는 이유: prd 배포는 계정 전체를 수집하는 것이 의도다.
+        // 그 의도를 밝히려면 `deployment_env` 를 명시적으로 `prd` 로 적어야 한다.
+        if self.deployment_env != Env::Prd && self.discovery.allowed_vpc_ids.is_empty() {
             return Err(err(
                 "discovery.allowed_vpc_ids",
-                "dev 배포에서는 필수다. 개발계 계정에 프로덕션 워크로드가 함께 있을 수 있고 \
-                 IAM 의 rds:DescribeDBInstances 는 Resource:\"*\" 이므로 prd 인스턴스도 보인다 (T-37)",
+                "deployment_env 가 prd 가 아니면 필수다. 개발계 계정에 프로덕션 워크로드가 \
+                 함께 있을 수 있고 IAM 의 rds:DescribeDBInstances 는 Resource:\"*\" 이므로 \
+                 prd 인스턴스도 보인다. 계정 전체를 수집할 의도라면 deployment_env=prd 로 \
+                 명시한다 (T-37)",
             ));
         }
         Ok(())

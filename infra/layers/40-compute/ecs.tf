@@ -12,7 +12,7 @@ resource "aws_ecs_cluster" "main" {
   setting {
     # Container Insights 는 태스크당 월 몇 달러다. dev 에서는 끈다.
     name  = "containerInsights"
-    value = var.enable_container_insights ? "enhanced" : "disabled"
+    value = var.container_insights_mode
   }
 }
 
@@ -28,7 +28,7 @@ resource "aws_ecs_cluster_capacity_providers" "main" {
     # Spot 중단은 그 공백을 예측 불가하게 만든다.
     capacity_provider = var.use_spot ? "FARGATE_SPOT" : "FARGATE"
     weight            = 1
-    base              = 1
+    base              = 0
   }
 }
 
@@ -142,7 +142,10 @@ resource "aws_ecs_task_definition" "app" {
       initProcessEnabled = var.enable_ecs_exec
     }
 
-    readonlyRootFilesystem = true
+    # **ECS Exec 과 양립하지 않는다.** SSM 에이전트가 컨테이너 파일시스템에 써야 하고,
+    # AWS 문서는 "읽기 전용 루트 파일시스템은 어떤 방법으로도 지원하지 않는다"고 명시한다.
+    # 앱 자체는 디스크를 쓰지 않으므로(로그는 stdout, zstd 는 메모리) prd 에서는 true 다.
+    readonlyRootFilesystem = !var.enable_ecs_exec
     user                   = "10001:10001"
   }])
 
@@ -165,6 +168,20 @@ resource "aws_ecs_service" "app" {
   desired_count = var.desired_count
 
   enable_execute_command = var.enable_ecs_exec
+
+  # **전략을 서비스에 명시한다.** 클러스터 기본 전략에만 의존하면
+  # `aws_ecs_cluster_capacity_providers` 와 이 리소스가 형제 노드라 Terraform 이 병렬로
+  # 만들고, 기본 전략이 아직 없는 순간에 ECS 가 `launchType=EC2` 로 해석해
+  # `No Container Instances were found` 로 apply 가 실패한다. 재실행하면 통과하는
+  # 종류라 CI 에서 간헐적으로 터진다.
+  capacity_provider_strategy {
+    capacity_provider = var.use_spot ? "FARGATE_SPOT" : "FARGATE"
+    weight            = 1
+    # `base` 는 0 이다. 공급자가 하나뿐이면 1 과 결과가 같지만, 나중에 On-Demand+Spot
+    # 혼합으로 갈 때 Spot 항목에 `base=1` 이 남아 있으면 "prd 는 On-Demand" 원칙과
+    # 정면으로 충돌한다.
+    base = 0
+  }
 
   # 배포 중 최소 가용 태스크. active 가 내려가는 순간 다른 태스크가 리더를 인수한다.
   deployment_minimum_healthy_percent = 50
@@ -193,8 +210,9 @@ resource "aws_ecs_service" "app" {
     }
   }
 
-  # 대상 그룹이 만들어지기 전에 서비스를 만들면 실패한다.
-  depends_on = [aws_lb_listener.https]
+  # 대상 그룹 의존은 `load_balancer` 블록의 ARN 참조가 암시적으로 만든다.
+  # 리스너 의존은 `count=0` 일 때 무해하게 사라진다(리소스 블록 주소를 참조하므로).
+  depends_on = [aws_ecs_cluster_capacity_providers.main, aws_lb_listener.https]
 
   lifecycle {
     # 배포 파이프라인이 task_definition 을 갱신하는 경우 Terraform 이 되돌리지 않게 한다.

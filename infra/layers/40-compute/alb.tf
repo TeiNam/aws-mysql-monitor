@@ -10,7 +10,7 @@
 
 resource "aws_security_group" "alb" {
   count       = var.enable_alb ? 1 : 0
-  name        = "${local.name}-alb"
+  name_prefix = "${local.name}-alb-"
   description = "dbmon ALB"
   # 인바운드는 var.alb_ingress_cidr 로 좁힌다.
   vpc_id = data.aws_vpc.target.id
@@ -65,7 +65,7 @@ resource "aws_lb" "app" {
 resource "aws_lb_target_group" "app" {
   count = var.enable_alb ? 1 : 0
 
-  name        = local.name
+  name_prefix = substr(local.name, 0, 6) # 대상 그룹 name_prefix 는 6자 이하다
   port        = var.container_port
   protocol    = "HTTP"
   target_type = "ip" # awsvpc 모드는 IP 대상이다

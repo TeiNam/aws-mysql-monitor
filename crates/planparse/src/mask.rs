@@ -33,7 +33,6 @@ const SAFE_KEYS: &[&str] = &[
     "index_name",
     "key",
     "key_length",
-    "operation",
     "possible_keys",
     "prefix_cost",
     "query_cost",
@@ -53,13 +52,32 @@ const SAFE_KEYS: &[&str] = &[
     "using_join_buffer",
     "using_temporary_table",
     "partitions",
-    "ranges",
     "index_access_type",
 ];
 
 /// 조건식·표현식을 담는 키. 표현식 마스킹을 적용한다.
 const EXPR_KEYS: &[&str] = &[
     "attached_condition",
+    // `ranges` 는 값이 **범위 표현식**이다 — 리터럴 경계가 그대로 들어간다.
+    //
+    // 8.4 기본값(`explain_json_format_version=1`)에서는 나오지 않지만 v2 로 켜면 나오고,
+    // MySQL 9.x 는 v2 가 기본이다. 실측 (19 §A-3):
+    //
+    // ```sql
+    // SET explain_json_format_version=2;
+    // EXPLAIN FORMAT=JSON SELECT * FROM orders WHERE id BETWEEN 100 AND 200;
+    // -- "ranges": ["(100 <= id <= 200)"]
+    // ```
+    //
+    // SAFE_KEYS 에 있으면 `mask_str` 이 **먼저** 반환해 마스킹을 아예 시도하지 않고,
+    // `redactions` 도 0 이라 후조건이 걸리지 않는다 — 무성 유출이다.
+    "ranges",
+    // v2 의 **주 조건식 캐리어**다. v1 에는 이 키가 없다. 실측:
+    // `"operation": "Filter: ((orders.memo = 'kim@example.com') and (orders.id between 100 and 200))"`
+    "operation",
+    // v2 가 `attached_condition` 대신 쓰는 이름. 휴리스틱이 잡긴 하지만
+    // 명시해 두는 편이 낫다 — 인용부호 없는 리터럴에는 휴리스틱이 약하다.
+    "condition",
     "index_condition",
     "pushed_condition",
     "having",
@@ -140,6 +158,53 @@ fn may_contain_literal(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-16 — `explain_json_format_version=2` 의 실측 출력에 리터럴이 남으면 안 된다.
+    ///
+    /// 아래 JSON 은 MySQL 8.4.11 에서 실제로 받은 것이다:
+    ///
+    /// ```sql
+    /// SET explain_json_format_version=2;
+    /// EXPLAIN FORMAT=JSON
+    ///   SELECT * FROM orders WHERE memo = 'kim@example.com' AND id BETWEEN 100 AND 200;
+    /// ```
+    ///
+    /// `operation` · `ranges` 는 한때 `SAFE_KEYS` 에 있어서 **마스킹을 시도조차 하지
+    /// 않았다** — `redactions` 도 0 이라 후조건이 걸리지 않는 무성 유출이었다.
+    /// 8.4 기본값은 v1 이라 잠재 결함이었지만 MySQL 9.x 는 v2 가 기본이다.
+    #[test]
+    fn format_v2_operation_and_ranges_are_masked() {
+        let plan = serde_json::json!({
+            "query_plan": {
+                "operation": "Filter: ((orders.memo = 'kim@example.com') and (orders.id between 100 and 200))",
+                "condition": "((orders.memo = 'kim@example.com') and (orders.id between 100 and 200))",
+                "inputs": [{
+                    "operation": "Index range scan on orders using PRIMARY over (100 <= id <= 200)",
+                    "table_name": "orders",
+                    "access_type": "range",
+                    "ranges": ["(100 <= id <= 200)"],
+                    "index_name": "PRIMARY"
+                }]
+            }
+        });
+        let (masked, redactions) = mask_plan(&plan);
+        let text = serde_json::to_string(&masked).expect("직렬화");
+
+        assert!(!text.contains("kim@example.com"), "리터럴이 남았다: {text}");
+        assert!(
+            !text.contains("100") && !text.contains("200"),
+            "범위 경계 리터럴이 남았다: {text}"
+        );
+        // 식별자는 남아야 한다 — 남지 않으면 플랜이 쓸모없어진다.
+        assert!(text.contains("orders"), "테이블 이름은 보존한다: {text}");
+        assert!(text.contains("PRIMARY"), "인덱스 이름은 보존한다: {text}");
+        // 마스킹을 **시도했다는** 증거. 0 이면 allowlist 로 빠져나간 것이다.
+        assert!(
+            redactions > 0 || text.contains('?'),
+            "마스킹 흔적이 없다: {text}"
+        );
+    }
+
     use serde_json::json;
 
     #[test]

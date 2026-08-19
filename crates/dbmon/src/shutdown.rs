@@ -29,12 +29,18 @@
 //! 플러시해 **누산기가 이중 계산**된다.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
 /// 셧다운 조정자. 서브시스템은 [`Shutdown::wait`] 로 신호를 기다린다.
 #[derive(Debug)]
 pub struct Shutdown {
+    /// **`Notify` 만으로는 안 된다.** `notify_waiters()` 는 그 순간 이미 대기 등록된
+    /// 태스크만 깨우고 permit 을 남기지 않는다. `select!` 로 감시하는 루프는 매
+    /// iteration 마다 재등록하므로, DB 조회 중에 `trigger()` 가 오면 **알림이 영구히
+    /// 사라지고** 루프는 SIGKILL 까지 계속 돈다 — 리스 반납·버퍼 플러시가 실행되지 않는다.
+    triggered: AtomicBool,
     notify: Notify,
     /// `stopTimeout` 안에 끝내야 하는 총 예산.
     grace: Duration,
@@ -43,6 +49,7 @@ pub struct Shutdown {
 impl Shutdown {
     pub fn new(grace: Duration) -> Arc<Self> {
         Arc::new(Self {
+            triggered: AtomicBool::new(false),
             notify: Notify::new(),
             grace,
         })
@@ -50,12 +57,27 @@ impl Shutdown {
 
     /// 셧다운을 시작한다. 여러 번 호출해도 안전하다.
     pub fn trigger(&self) {
+        self.triggered.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
 
-    /// 셧다운 신호를 기다린다.
+    /// 이미 셧다운이 시작됐는가.
+    pub fn is_triggered(&self) -> bool {
+        self.triggered.load(Ordering::SeqCst)
+    }
+
+    /// 셧다운 신호를 기다린다. **`trigger()` 가 이미 지나갔으면 즉시 반환한다.**
     pub async fn wait(&self) {
-        self.notify.notified().await;
+        // 등록 전에 먼저 확인한다. 이 순서가 뒤바뀌면 확인과 등록 사이에 온 신호를 놓친다.
+        if self.is_triggered() {
+            return;
+        }
+        let notified = self.notify.notified();
+        // 등록 후 한 번 더 확인한다 — 그 사이에 `trigger()` 가 왔을 수 있다.
+        if self.is_triggered() {
+            return;
+        }
+        notified.await;
     }
 
     pub fn grace(&self) -> Duration {
@@ -107,16 +129,19 @@ pub async fn wait_for_signal() -> &'static str {
 /// 마지막 단계(버퍼 플러시)가 데이터 유실과 직결되므로 앞 단계가 시간을 다 먹으면 안 된다.
 pub async fn run_stages(total: Duration, stages: Vec<(&'static str, ShutdownStage)>) {
     let started = tokio::time::Instant::now();
-    let count = stages.len().max(1) as u32;
-    for (name, stage) in stages {
+    let total_stages = stages.len();
+    for (i, (name, stage)) in stages.into_iter().enumerate() {
+        // **남은** 단계 수로 나눈다. 전체 수로 나누면 예산이 기하급수로 줄어
+        // 마지막 단계(버퍼 플러시)가 가장 적게 받는다 — 5단계·45초면 3.7초만 받고
+        // 14.7초가 미사용으로 남는다. 문서가 요구한 것과 정반대다.
+        let stages_left = (total_stages - i).max(1) as u32;
         let elapsed = started.elapsed();
         let remaining = total.saturating_sub(elapsed);
         if remaining.is_zero() {
             tracing::warn!(stage = name, "셧다운 예산 소진 — 이 단계를 건너뛴다");
             continue;
         }
-        // 남은 단계 수로 예산을 나눠 한 단계가 전부 먹지 못하게 한다.
-        let budget = remaining / count.max(1);
+        let budget = remaining / stages_left;
         match tokio::time::timeout(budget.max(Duration::from_millis(100)), stage).await {
             Ok(()) => {
                 tracing::info!(stage = name, elapsed_ms = %started.elapsed().as_millis(), "정리 완료")

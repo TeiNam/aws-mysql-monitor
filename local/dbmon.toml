@@ -1,0 +1,42 @@
+# 로컬 개발 설정. **AWS 없이 기동된다.**
+#
+#   cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+#
+# 실제 AWS 리소스에 붙이려면 `10-foundation` 을 apply 하고 그 출력을 환경변수로 덮어쓴다:
+#
+#   cd infra/layers/10-foundation && eval "$(terraform output -raw app_env)"
+#   cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+#
+# 환경변수가 파일보다 우선한다.
+
+# dev 로 두면 `discovery.allowed_vpc_ids` 가 **필수**가 된다 (T-37).
+# 개발계 계정에 프로덕션 워크로드가 함께 있을 수 있으므로 이 게이트를 켜 둔다.
+deployment_env = "dev"
+role = "all"
+
+[http]
+bind = "127.0.0.1"
+port = 8080
+# 로컬에는 로드밸런서가 없다. 0 이면 등록 해제 대기를 건너뛴다.
+deregistration_wait_secs = 0
+
+[aws]
+region = "ap-northeast-2"
+# 로컬 전용 자리표. 실제 계정 ID 가 아니다.
+# instance_id 의 첫 성분이므로 형식(12자리 숫자)만 맞으면 된다.
+account_id = "000000000000"
+
+[storage]
+# DynamoDB Local 을 쓰려면 endpoint_url 을 함께 지정한다.
+data_table = "dbmon-data-local"
+config_table = "dbmon-config-local"
+
+[collector]
+# 로컬 컨테이너는 빠르므로 임계값을 낮춰 시나리오를 빨리 관측한다.
+slow_threshold_secs = 2
+monitor_db_user = "dbmon"
+
+[discovery]
+# 로컬에는 VPC 가 없지만 dev 게이트를 통과하려면 값이 있어야 한다.
+# 이 게이트가 실제로 동작하는지 확인하려면 이 줄을 지우고 기동해 본다.
+allowed_vpc_ids = ["vpc-local"]

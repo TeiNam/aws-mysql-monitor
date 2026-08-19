@@ -31,6 +31,7 @@
 //! 달라진다. 그래서 [`crate::lexer::Lexer::tokenize_with_spans`] 로 **원문을 잘라 붙인다.**
 
 use crate::lexer::{Lexer, Tok};
+use crate::stmt_type::StatementType;
 
 /// 변환 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,23 @@ pub struct PlanQuery {
 /// - `INSERT ... SELECT` / `REPLACE ... SELECT` → 내부 `SELECT` (`is_exact = false`)
 /// - `INSERT ... VALUES` / DDL / 기타 → `None` (플랜이 의미 없다)
 pub fn plan_query(sql: &str) -> Option<PlanQuery> {
+    // **버전 조건 주석을 거부한다.** `/*!NNNNN ... */` 의 내용은 렉서가 버리지만
+    // 서버 버전이 NNNNN 이상이면 MySQL 이 **실행한다**. SELECT 경로는 검증한 토큰이 아니라
+    // 원문 부분문자열을 그대로 서버에 보내므로, 렉서가 못 본 코드가 실행된다
+    // (검증기-실행기 불일치). 실측:
+    //
+    // ```text
+    // SELECT COUNT(*) FROM orders WHERE id=1              → 1행
+    // SELECT COUNT(*) FROM orders WHERE id=1 /*!11111 OR 1=1 */ → 60,000행
+    // ```
+    //
+    // 우리 정규화 결과는 두 입력 모두 `SELECT count ( * ) FROM orders WHERE id = ?` 다.
+    // SQL 은 `information_schema.PROCESSLIST.INFO` 에서 온다 — 우리가 쓴 문자열이 아니다.
+    //
+    // `/*+ ... */`(옵티마이저 힌트)는 무해하므로 막지 않는다. `/*!` 만 거부한다.
+    if sql.contains("/*!") {
+        return None;
+    }
     let (toks, spans, unterminated) = Lexer::new(sql).tokenize_with_spans();
     if unterminated {
         // 인용부호가 닫히지 않았다 → 잘린 SQL 이다. 실행하면 구문 오류이거나,
@@ -72,10 +90,23 @@ pub fn plan_query(sql: &str) -> Option<PlanQuery> {
     let end = trimmed_end(sql, &toks, &spans);
 
     match kw {
-        "SELECT" | "WITH" => Some(PlanQuery {
+        "SELECT" => Some(PlanQuery {
             sql: sql[spans[first].start..end].to_string(),
             is_exact: true,
         }),
+        // `WITH` 는 첫 키워드만으로 판정할 수 없다. `WITH c AS (...) UPDATE t ...` 는
+        // MySQL 8 의 유효 문법이고, 그걸 원문 그대로 통과시키면 **관측 도구가 EXPLAIN 을
+        // 붙여 DML 을 서버로 보낸다.** `classify` 는 이미 괄호 깊이를 보고 `Update` 로
+        // 정확히 판정하는데 여기서 그 결과를 쓰지 않았다 — 방어가 배선되지 않았다.
+        "WITH" => match crate::stmt_type::classify(&toks) {
+            StatementType::Select => Some(PlanQuery {
+                sql: sql[spans[first].start..end].to_string(),
+                is_exact: true,
+            }),
+            // CTE 뒤의 DML 은 재작성 대상이 아니다(어느 절이 조건절인지 이 코드는 모른다).
+            // 플랜을 포기한다 — 잘못된 문장을 보내는 것보다 낫다.
+            _ => None,
+        },
         "UPDATE" => rewrite_update(sql, &toks, &spans, first, end),
         "DELETE" => rewrite_delete(sql, &toks, &spans, first, end),
         "INSERT" | "REPLACE" => rewrite_insert(sql, &toks, &spans, first, end),
@@ -195,6 +226,62 @@ fn join_sql(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **버전 조건 주석을 서버로 보내면 안 된다.**
+    ///
+    /// `/*!NNNNN ... */` 의 내용은 렉서가 버리지만 서버 버전이 NNNNN 이상이면 MySQL 이
+    /// 실행한다. SELECT 경로는 검증한 토큰이 아니라 **원문 부분문자열**을 그대로
+    /// `EXPLAIN FORMAT=JSON ` 뒤에 붙이므로, 렉서가 못 본 코드가 실행된다.
+    /// MySQL 8.4.11 실측 (server version 80400 > 11111 이라 내용이 실행된다):
+    ///
+    /// ```text
+    /// SELECT COUNT(*) FROM orders WHERE id=1                    → 1행
+    /// SELECT COUNT(*) FROM orders WHERE id=1 /*!11111 OR 1=1 */ → 60,000행
+    /// ```
+    ///
+    /// 두 입력의 정규화 결과는 동일하다 — 즉 우리 눈에는 같은 쿼리로 보인다.
+    /// SQL 은 `information_schema.PROCESSLIST.INFO` 에서 온다: 우리가 쓴 문자열이 아니다.
+    #[test]
+    fn version_execution_comments_are_rejected() {
+        for sql in [
+            "SELECT COUNT(*) FROM orders WHERE id=1 /*!11111 OR 1=1 */",
+            "SELECT 1 /*!11111 ;DROP TABLE x */",
+            "SELECT 1 /*!11111 UNION SELECT password FROM users */",
+            "SELECT /*!50000 a */ FROM t",
+            "UPDATE t SET a=1 WHERE id=1 /*!11111 OR 1=1 */",
+        ] {
+            assert!(
+                plan_query(sql).is_none(),
+                "버전 주석이 포함된 SQL 은 거부해야 한다: {sql}"
+            );
+        }
+        // 옵티마이저 힌트는 무해하므로 계속 통과해야 한다.
+        let hinted = "SELECT /*+ MAX_EXECUTION_TIME(1000) */ a FROM t WHERE id = 1";
+        assert!(
+            plan_query(hinted).is_some(),
+            "옵티마이저 힌트는 막지 않는다: {hinted}"
+        );
+    }
+
+    /// `WITH ... UPDATE/DELETE` 는 MySQL 8 의 유효 문법이다. 첫 키워드가 `WITH` 라고
+    /// exact SELECT 로 통과시키면 **관측 도구가 EXPLAIN 으로 DML 을 서버에 보낸다.**
+    #[test]
+    fn cte_followed_by_dml_is_not_treated_as_select() {
+        for sql in [
+            "WITH c AS (SELECT id FROM s) UPDATE t JOIN c USING(id) SET t.x=1",
+            "WITH c AS (SELECT id FROM s) DELETE t FROM t JOIN c USING(id)",
+        ] {
+            assert!(
+                plan_query(sql).is_none(),
+                "CTE 뒤의 DML 은 재실행하지 않는다: {sql}"
+            );
+        }
+        // 순수 CTE SELECT 는 계속 통과해야 한다.
+        let pure = "WITH c AS (SELECT id FROM s) SELECT * FROM c WHERE id = 3";
+        let q = plan_query(pure).expect("CTE SELECT 는 통과한다");
+        assert!(q.is_exact);
+    }
+
     use crate::{StatementType, normalize};
 
     fn q(sql: &str) -> PlanQuery {

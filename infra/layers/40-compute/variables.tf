@@ -36,6 +36,9 @@ variable "subnet_ids" {
   }
 }
 
+# T-37 게이트의 Terraform 측 짝. 앱은 기동 시 거부하지만 `terraform apply` 는
+# steady state 를 기다리지 않으므로 **성공으로 표시된다** — 실패를 알려면
+# `aws ecs describe-services` 를 봐야 한다. plan 시점에 잡는 편이 낫다.
 variable "allowed_vpc_ids" {
   description = <<-EOT
     앱의 탐색 필터 (T-37). **dev 에서는 비어 있으면 앱이 기동을 거부한다.**
@@ -44,8 +47,16 @@ variable "allowed_vpc_ids" {
   EOT
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = var.environment == "prd" || length(var.allowed_vpc_ids) > 0
+    error_message = "prd 가 아니면 allowed_vpc_ids 가 필수다. 비우면 앱이 기동을 거부해 배포가 FAILED 로 끝난다 (T-37)."
+  }
 }
 
+# **fail-open 이었다.** 비어 있으면 `iam.tf` 가 `dbuser:*/<user>` 로 폴백해, 아무 값도
+# 주지 않은 apply 가 계정 내 **모든 RDS(prd 포함)** 에 대한 IAM DB 인증을 허용했다.
+# 주석은 "dev 에서는 반드시 열거한다"고 했지만 코드가 그걸 강제하지 않았다.
 variable "db_auth_resource_ids" {
   description = <<-EOT
     IAM DB 인증을 허용할 DbiResourceId 목록 (예: db-ABCDEFGH...).
@@ -53,6 +64,11 @@ variable "db_auth_resource_ids" {
   EOT
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = var.environment == "prd" || length(var.db_auth_resource_ids) > 0
+    error_message = "prd 가 아니면 db_auth_resource_ids 를 명시해야 한다. 비우면 계정 내 모든 RDS 에 IAM DB 인증이 허용된다 (T-37)."
+  }
 }
 
 variable "monitor_db_user" {
@@ -127,6 +143,15 @@ variable "stop_timeout_secs" {
     condition     = var.stop_timeout_secs <= 120
     error_message = "Fargate 의 stopTimeout 상한은 120초다."
   }
+
+  # **이 검증이 없으면 조용히 통과하고 프로덕션 배포·Spot 중단 때만 데이터가 유실된다.**
+  # 앱은 `stopTimeout` 값을 알 수 없으므로(환경변수로 주지 않는다) 여기서 막아야 한다.
+  # ADR-022 는 "설정 검증으로 강제한다"고 적었지만 앱은 deregistration_wait < grace
+  # 만 검증한다 — 그 짝이 여기 없었다.
+  validation {
+    condition     = var.stop_timeout_secs > var.shutdown_grace_secs
+    error_message = "stop_timeout_secs 는 shutdown_grace_secs 보다 커야 한다. 작으면 SIGKILL 이 먼저 도착해 다이제스트 누산기와 쓰기 버퍼가 유실된다."
+  }
 }
 
 variable "deregistration_wait_secs" {
@@ -157,6 +182,11 @@ variable "alb_subnet_ids" {
   description = "ALB 를 둘 퍼블릭 서브넷. enable_alb=true 일 때만 쓴다."
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = !var.enable_alb || length(var.alb_subnet_ids) >= 2
+    error_message = "ALB 는 서로 다른 AZ 의 서브넷 2개 이상이 필요하다."
+  }
 }
 
 variable "alb_ingress_cidr" {
@@ -172,6 +202,13 @@ variable "acm_certificate_arn" {
   description = "HTTPS 리스너용 인증서. enable_alb=true 면 필수."
   type        = string
   default     = ""
+
+  # 없으면 리스너에서 ValidationError 로 실패하는데, ALB·SG 는 이미 만들어진 뒤라
+  # 부분 적용 상태로 남는다.
+  validation {
+    condition     = !var.enable_alb || var.acm_certificate_arn != ""
+    error_message = "enable_alb=true 면 acm_certificate_arn 이 필요하다."
+  }
 }
 
 variable "enable_ecs_exec" {
@@ -180,10 +217,21 @@ variable "enable_ecs_exec" {
   default     = false
 }
 
-variable "enable_container_insights" {
-  description = "Container Insights. 태스크당 월 몇 달러이므로 dev 는 false."
-  type        = bool
-  default     = false
+variable "container_insights_mode" {
+  description = <<-EOT
+    `disabled` | `enabled` | `enhanced`.
+
+    이전 이름은 `enable_container_insights`(bool) 였는데, `true` 가 옛 `enabled` 가 아니라
+    **Enhanced observability**(태스크당 과금이 훨씬 크다)로 갔다. "예전 그거" 로 오인해
+    켤 위험이 있어 값을 그대로 받는다.
+  EOT
+  type        = string
+  default     = "disabled"
+
+  validation {
+    condition     = contains(["disabled", "enabled", "enhanced"], var.container_insights_mode)
+    error_message = "container_insights_mode 는 disabled, enabled, enhanced 중 하나여야 한다."
+  }
 }
 
 variable "log_retention_days" {
@@ -195,4 +243,23 @@ variable "log_level" {
   description = "DBMON_LOG 환경변수 (tracing EnvFilter 형식)."
   type        = string
   default     = "info"
+}
+
+variable "slowlog_log_group_arns" {
+  description = <<-EOT
+    슬로우로그를 읽을 CloudWatch 로그 그룹 ARN 목록.
+
+    비우면 `arn:aws:logs:<region>:<account>:log-group:/aws/rds/*` 로 폴백한다 —
+    계정 내 **모든** RDS 슬로우로그를 읽을 수 있고, 슬로우로그에는 SQL 리터럴이 들어간다.
+    이 계정에는 프로덕션 워크로드가 함께 있으므로(T-37) prd 가 아니면 열거해야 한다.
+
+    `rds:Describe*` 의 `Resource:"*"` 는 API 제약이라 불가피하지만 이건 아니다.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = var.environment == "prd" || length(var.slowlog_log_group_arns) > 0
+    error_message = "prd 가 아니면 slowlog_log_group_arns 를 명시해야 한다."
+  }
 }

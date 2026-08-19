@@ -70,6 +70,11 @@ pub struct StmtCurrentRow {
     pub current_schema: Option<String>,
     pub digest: Option<String>,
     pub digest_text: Option<String>,
+    /// `events_statements_current.SQL_TEXT` — **무손실 `utf8mb4`** 원문.
+    /// `performance_schema_max_sql_text_length`(기본 1024)로 잘린다.
+    /// `information_schema.PROCESSLIST.INFO` 와 상보적이다: 이쪽은 짧지만 정확하고,
+    /// 저쪽은 길지만 4바이트 문자를 잃는다 (19 §A-2).
+    pub sql_text: Option<String>,
     pub timer_wait_ps: Option<u64>,
     pub lock_time_ps: Option<u64>,
     pub rows_examined: Option<u64>,

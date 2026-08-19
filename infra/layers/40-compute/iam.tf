@@ -174,10 +174,14 @@ resource "aws_iam_role_policy" "task_discovery" {
         }
       },
       {
-        Sid      = "SlowLogRead"
-        Effect   = "Allow"
-        Action   = ["logs:FilterLogEvents", "logs:DescribeLogStreams"]
-        Resource = "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/*"
+        Sid    = "SlowLogRead"
+        Effect = "Allow"
+        Action = ["logs:FilterLogEvents", "logs:DescribeLogStreams"]
+        # 슬로우로그에는 SQL 리터럴이 들어간다. 비-prd 는 열거를 강제한다
+        # (`slowlog_log_group_arns` 의 validation).
+        Resource = length(var.slowlog_log_group_arns) > 0 ? var.slowlog_log_group_arns : [
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/*"
+        ]
       },
     ]
   })

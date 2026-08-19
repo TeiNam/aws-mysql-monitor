@@ -8,7 +8,9 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
-.terraform.lock.hcl
+# `.terraform.lock.hcl` 은 **커밋한다** (HashiCorp 권고). provider 6.x 에서
+# GSI 의 hash_key 가 deprecated 되어 `key_schema` 로 바꿀 정도로 버전에 민감한 코드다.
+# 커밋하지 않으면 다른 사람·CI 가 다른 6.x 를 받아 다르게 동작한다.
 
 # 프론트
 web/node_modules
@@ -16,6 +18,9 @@ web/dist
 web/.vite
 
 # 로컬 개발 산출물
-/local
+# `/local` 전체를 무시하면 시드 SQL·설정·부하 생성기가 클론에 없어서
+# "AWS 없이 전부 돌아간다"가 성립하지 않는다. 데이터와 비밀만 무시한다.
+/local/data/
+/local/*.local.toml
 build.log
 *.log

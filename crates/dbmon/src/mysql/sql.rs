@@ -53,6 +53,14 @@ LIMIT ?"
 /// 전문 SQL — 임계값 초과 스레드만.
 ///
 /// `INFO` 는 `varchar(21845)` 이고 65,535바이트에서 잘린다([19 §A](../../../../docs/19-m1-findings.md)).
+///
+/// # 이 컬럼은 `utf8mb3` 다 — 4바이트 문자가 `?` 로 손실된다 (19 §A-2)
+///
+/// 실측: `SELECT '📊emoji'` 를 실행하면
+/// `information_schema.PROCESSLIST.INFO` 는 `27 3F 65...`(`'?emoji'`),
+/// `performance_schema.events_statements_current.SQL_TEXT` 는 `27 F0 9F 93 8A 65...` 다.
+/// 손실은 서버가 IS 테이블을 채울 때 일어나므로 `CONVERT(... USING utf8mb4)` 로 복구할 수 없다.
+/// 그래서 `stmt_current` 가 무손실 `SQL_TEXT` 를 함께 읽고 `pick_sql_text` 가 고른다.
 pub fn full_sql(id_count: usize) -> String {
     format!(
         "/* dbmon:fulltext */
@@ -72,7 +80,7 @@ pub fn stmt_current(id_count: usize) -> String {
         "/* dbmon:stmtcurrent */
 SELECT t.PROCESSLIST_ID, t.THREAD_ID,
        e.EVENT_NAME, e.CURRENT_SCHEMA,
-       e.DIGEST, e.DIGEST_TEXT,
+       e.DIGEST, e.DIGEST_TEXT, e.SQL_TEXT,
        e.TIMER_WAIT, e.LOCK_TIME,
        e.ROWS_EXAMINED, e.ROWS_SENT, e.ROWS_AFFECTED,
        e.CREATED_TMP_TABLES, e.CREATED_TMP_DISK_TABLES,

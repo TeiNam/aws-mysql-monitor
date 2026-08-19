@@ -40,52 +40,68 @@ pub fn parse_failure_fingerprint(input: &str, byte_offset: usize) -> String {
 /// 애초에 리터럴을 담지 않아야 한다.
 ///
 /// 지우는 것:
-/// - 인용부호로 감싼 구간 (`'...'`, `"..."`, `` `...` ``) → `'?'`
+/// - **첫 인용부호부터 마지막 인용부호까지 통째로** → `'?'`
 /// - 3자리 이상 숫자 → `?` (에러 코드·짧은 카운트는 남긴다)
 ///
-/// 백틱 구간까지 지우는 이유: MySQL 에러의 `` `db`.`table` `` 은 스키마 정보이고,
-/// 스키마 이름이 사업 정보를 담는 경우가 있다. 식별자가 필요하면 구조화 필드로 따로 넣는다.
+/// # 짝맞추기로는 안 된다
+///
+/// 이전 구현은 여는 부호를 만나면 같은 부호까지 소비하는 방식이었다. MySQL 에러는
+/// `... near '<조각>' at line N` 형태이고 **그 조각 안에 또 인용부호가 있으므로**
+/// 짝이 한 칸씩 밀린다 — 닫는 부호와 다음 여는 부호 사이의 내용이 평문으로 새어 나온다:
+///
+/// ```text
+/// IN : near 'WHERE email = 'kim@example.com' AND ssn = '900101-1234567'' at line 1
+/// OUT: near '?'kim@example.com'?'?-?'?' at line 1
+///                ^^^^^^^^^^^^^^^ 유출
+/// ```
+///
+/// 어느 부호가 여는 것인지는 문자열만 보고 판정할 수 없다. 그래서 판정을 포기하고
+/// **범위 전체를 버린다.** `Unknown column '?'` 처럼 뒷부분 진단이 조금 손실되지만,
+/// 이건 보안 통제다 — 진단은 `sql_fingerprint` 와 구조화 필드가 담당한다.
+///
+/// 백틱까지 지우는 이유: MySQL 에러의 `` `db`.`table` `` 은 스키마 정보이고,
+/// 스키마 이름이 사업 정보를 담는 경우가 있다.
 pub fn scrub(input: &str) -> String {
+    const QUOTES: [char; 3] = ['\'', '"', '`'];
+    let is_quote = |c: char| QUOTES.contains(&c);
+
+    // 인용부호가 하나라도 있으면 첫 것부터 마지막 것까지 전부 버린다.
+    let (head, tail) = match (input.find(is_quote), input.rfind(is_quote)) {
+        // 여는 부호와 닫는 부호가 따로 있다 → 그 사이를 버리고 양쪽을 남긴다.
+        (Some(first), Some(last)) if last > first => (&input[..first], &input[last + 1..]),
+        // 인용부호가 **하나뿐**이다 → 닫히지 않았으므로 뒤를 전부 버린다.
+        // (`value 'oops` 에서 `oops` 가 남으면 안 된다.)
+        (Some(first), Some(_)) => (&input[..first], ""),
+        // 인용부호가 없으면 숫자만 처리한다.
+        _ => (input, ""),
+    };
+
+    let mut out = mask_digit_runs(head);
+    if head.len() + tail.len() != input.len() {
+        out.push_str("'?'");
+    }
+    out.push_str(&mask_digit_runs(tail));
+    out
+}
+
+/// 3자리 이상 연속 숫자를 `?` 로. 에러 코드(`1064`)는 4자리라 지워지지만, 그건
+/// 구조화 필드로 따로 넣는다 — 숫자 길이로 값을 역추정할 여지를 남기지 않는다.
+fn mask_digit_runs(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut chars = input.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                // 닫는 같은 부호까지 소비한다. 없으면 끝까지.
-                out.push_str("'?'");
-                let quote = c;
-                let mut escaped = false;
-                for (_, n) in chars.by_ref() {
-                    if escaped {
-                        escaped = false;
-                        continue;
-                    }
-                    if n == '\\' {
-                        escaped = true;
-                        continue;
-                    }
-                    if n == quote {
-                        break;
-                    }
-                }
-            }
-            d if d.is_ascii_digit() => {
-                let mut run = String::from(d);
-                while let Some((_, n)) = chars.peek() {
-                    if n.is_ascii_digit() {
-                        run.push(*n);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if run.len() >= 3 {
-                    out.push('?');
-                } else {
-                    out.push_str(&run);
-                }
-            }
-            other => out.push(other),
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !c.is_ascii_digit() {
+            out.push(c);
+            continue;
+        }
+        let mut run = String::from(c);
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            run.push(chars.next().expect("peek 가 확인했다"));
+        }
+        if run.len() >= 3 {
+            out.push('?');
+        } else {
+            out.push_str(&run);
         }
     }
     out
@@ -132,6 +148,39 @@ pub fn init(json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **인용부호 짝맞추기로는 안 된다.** MySQL 에러는 `near '<조각>'` 형태이고
+    /// 그 조각 안에 또 인용부호가 있으므로 짝이 한 칸씩 밀려 내용이 새어 나왔다.
+    #[test]
+    fn nested_quotes_do_not_leak_interior_content() {
+        let msg = "You have an error in your SQL syntax near \
+                   'WHERE email = 'kim@example.com' AND ssn = '900101-1234567'' at line 1";
+        let out = scrub(msg);
+        assert!(!out.contains("kim@example.com"), "이메일이 유출됐다: {out}");
+        assert!(!out.contains("900101"), "주민번호가 유출됐다: {out}");
+        assert!(!out.contains('@'), "인용 구간의 흔적이 남았다: {out}");
+        // 앞뒤의 구조는 남아야 진단이 가능하다.
+        assert!(out.contains("SQL syntax near"), "문맥이 사라졌다: {out}");
+        assert!(out.contains("at line"), "꼬리가 사라졌다: {out}");
+    }
+
+    /// 짝이 없는 어포스트로피 하나로 메시지 전체가 사라지지 않아야 한다.
+    #[test]
+    fn unpaired_apostrophe_keeps_surrounding_text() {
+        let out = scrub("Table `shop`.`orders` doesn't exist");
+        assert!(!out.contains("shop"), "스키마 이름이 남았다: {out}");
+        assert!(out.starts_with("Table "), "머리가 사라졌다: {out}");
+        assert!(out.ends_with(" exist"), "꼬리가 사라졌다: {out}");
+    }
+
+    /// 인용부호가 없으면 숫자만 처리한다.
+    #[test]
+    fn digit_runs_masked_without_quotes() {
+        assert_eq!(
+            scrub("Lock wait timeout exceeded 50 tries 1205"),
+            "Lock wait timeout exceeded 50 tries ?"
+        );
+    }
 
     #[test]
     fn fingerprint_hides_content_but_is_stable() {

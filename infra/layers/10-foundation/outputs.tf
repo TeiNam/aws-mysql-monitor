@@ -34,3 +34,14 @@ output "app_env" {
     export DBMON__DISCOVERY__ALLOWED_VPC_IDS=${var.vpc_id}
   EOT
 }
+
+output "s3_gateway_endpoint_id" {
+  description = "새로 만든 것이든 기존 것이든 하나로 노출한다."
+  value = var.create_s3_gateway_endpoint ? (
+    aws_vpc_endpoint.s3[0].id
+  ) : data.aws_vpc_endpoint.s3_existing[0].id
+}
+
+output "dynamodb_gateway_endpoint_id" {
+  value = aws_vpc_endpoint.dynamodb.id
+}

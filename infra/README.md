@@ -67,3 +67,53 @@ resource "aws_vpc" "target" { ... }
 | 삭제 방지 | KMS 키·DynamoDB 테이블·S3 테이블버킷에 `prevent_destroy` |
 | 이름 | `dbmon-<용도>-<환경>`. 전역 유일해야 하는 것(S3)은 계정 ID 접미 |
 | 변수 | 필수값에 기본값을 두지 않는다. `terraform plan` 이 물어보게 한다 |
+
+## apply 순서 (이 순서를 어기면 plan 이 안 된다)
+
+`40-compute` 는 `terraform_remote_state` 로 `10-foundation` 의 state **객체를 직접
+읽는다.** data source 는 plan 시점에 읽히므로, 객체가 없으면 `plan` 자체가
+`Unable to find remote state` 로 죽는다. apply 실패가 아니라 **plan 불가**다.
+
+```bash
+# 0. 자격증명. `terraform_remote_state` 는 provider 블록이 아니라 환경 체인을 쓴다.
+export AWS_PROFILE=teinam-primary-123456789012
+aws sts get-caller-identity --query Account --output text   # backends/dev.hcl 의 버킷과 맞는지
+
+# 1. state 버킷과 락을 만든다 (로컬 state)
+cd infra/layers/00-bootstrap && terraform init && terraform apply
+
+# 2. 부트스트랩 state 를 S3 로 이관한다 (backend.tf 의 주석을 해제한 뒤)
+terraform init -backend-config=../../backends/dev.hcl -migrate-state
+
+# 3. 기반 레이어. 라우트 테이블을 **명시**해야 한다 (endpoint_route_table_ids)
+cd ../10-foundation
+terraform init -backend-config=../../backends/dev.hcl
+terraform apply -var environment=dev -var vpc_id=vpc-... \
+  -var 'endpoint_route_table_ids=["rtb-priv","rtb-pub"]'
+
+# 4. state 객체가 실제로 생겼는지 확인한다. 이 확인을 건너뛰면 5번이 죽는다.
+aws s3api head-object --bucket dbmon-tfstate-<account> --key 10-foundation/terraform.tfstate
+
+# 5. 컴퓨트
+cd ../40-compute
+terraform init -backend-config=../../backends/dev.hcl
+terraform plan -var environment=dev -var vpc_id=vpc-... \
+  -var state_bucket=dbmon-tfstate-<account> \
+  -var 'allowed_vpc_ids=["vpc-..."]' -var 'db_auth_resource_ids=["db-XXXX"]' \
+  -var 'slowlog_log_group_arns=["arn:aws:logs:...:log-group:/aws/rds/instance/dbmon-seed-dev/slowquery"]'
+```
+
+`terraform workspace` 는 쓰지 않는다 — 이유는 각 레이어의 `backend.tf` 주석에 있다.
+
+## destroy 로는 되돌아가지 않는다
+
+"레이어 destroy 로 되돌린다"는 서술은 사실이 아니다. 다음이 **의도적으로** 막는다:
+
+| 레이어 | 막는 것 | 증상 |
+|---|---|---|
+| `10-foundation` | `prevent_destroy` (KMS 키, DynamoDB 2개) | plan 단계에서 실패 |
+| `10-foundation` | `aws_s3_bucket.plans` 에 `force_destroy` 없음 | `BucketNotEmpty` |
+| `40-compute` | `aws_ecr_repository` 에 `force_delete` 없음 | `RepositoryNotEmptyException` |
+
+안전한 쪽으로 실패하는 것이니 그대로 둔다. 정말 지워야 하면 객체·이미지를 먼저 비우고
+`prevent_destroy` 를 **의도적 커밋**으로 제거한다.

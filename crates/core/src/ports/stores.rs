@@ -71,7 +71,22 @@ pub struct DigestTextEntry {
     pub digest_text: String,
     pub digest_text_source: DigestTextSource,
     pub statement_type: String,
-    /// 이 인스턴스에서 관측된 `mysql_digest` — 맵 경로 갱신 대상.
+    /// 이 인스턴스에서 **이번에** 관측된 `mysql_digest`.
+    ///
+    /// # 어댑터는 반드시 집합에 **추가**해야 한다 (19 §D)
+    ///
+    /// `max_digest_length` 가 인스턴스마다 다르면 같은 SQL 이 인스턴스별로 다른
+    /// `mysql_digest` 를 갖는다. 한 인스턴스 안에서도 설정 변경 전후로 값이 달라진다.
+    /// 따라서 관계는 `app_digest` 1 : `mysql_digest` N 이고, 저장 형태는
+    /// `mysql_digests = { <instance_id>: Set<mysql_digest> }` 여야 한다.
+    ///
+    /// ```text
+    /// 올바름:  ADD mysql_digests.#inst :new_set     ← 학습이 누적된다
+    /// 틀림:    SET mysql_digests.#inst = :digest    ← 이전 학습을 덮어써 잃는다
+    /// ```
+    ///
+    /// 이 필드가 값 하나인 것은 **한 번의 관측**이 하나라는 뜻이지, 저장 슬롯이
+    /// 하나라는 뜻이 아니다. 덮어쓰면 M4-16 무성 유실이 재발한다.
     pub mysql_digest: Option<(InstanceId, String)>,
     pub seen_instance: InstanceId,
     pub referenced_tables: Vec<String>,

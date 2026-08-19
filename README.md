@@ -52,6 +52,28 @@ RDS를 자동 탐색해 환경(prd/stg/dev)별로 분류하고, MySQL 워크로�
 | 19 | [M1 검증 스파이크 실측 결과](docs/19-m1-findings.md) | **실제 MySQL 8.4.11/8.0.46 측정.** ADR-006 무효화, 정규화 규칙 11건 정정, 절단 상한 |
 | — | [미해결 이슈](docs/OPEN-QUESTIONS.md) | 검증 필요 + 결정 대기 21건 (3건 실측으로 해소) |
 
+## 개발 시작하기
+
+**AWS 없이 전부 돌아간다.** SSO 세션이 만료돼도 개발이 멈추지 않는다.
+
+```bash
+docker compose up -d                 # MySQL 8.4 / 8.4-wide / 8.0 / DynamoDB Local
+cargo test --workspace               # 단위 + 통합 테스트 302건
+./local/loadgen.sh all               # 검증 시나리오 9종 생성
+cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+```
+
+[`just`](https://github.com/casey/just) 가 있으면 `just dev` · `just test` · `just check` ·
+`just spike` 로 줄여 쓸 수 있다([justfile](justfile) 에 전 명령이 있다). 없어도 된다.
+
+| 확인하고 싶은 것 | 명령 |
+|---|---|
+| M1 실측 수치 재현 | `cargo test -p dbmon --test m1_digest -- --nocapture --test-threads=1` |
+| 캡처 파이프라인 E2E | `cargo test -p dbmon --test it_collector -- --nocapture` |
+| 컨테이너 스모크 | `docker build --platform linux/arm64 -t dbmon:dev . && docker run --rm dbmon:dev --version` |
+| Terraform 전 레이어 | `for d in infra/layers/*/; do (cd $d && terraform init -backend=false >/dev/null && terraform validate); done` |
+| 문서 링크 | `./scripts/check-docs.py` |
+
 ## 읽는 순서
 
 - **처음 보는 사람**: 01 → 02 → 03 → 17

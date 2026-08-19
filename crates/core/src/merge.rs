@@ -15,26 +15,25 @@
 //! |---|---|
 //! | `record_id` | **먼저 저장된 쪽을 유지** — 키가 바뀌면 멱등성이 깨진다 |
 //! | `literal_policy` | 먼저 기록된 쪽 유지 (F2). 소급 마스킹은 불가하므로 정책을 고정한다 |
-//! | `duration_ms` 계열 | 정확도 높은 소스(slowlog > timer > polled) |
+//! | `duration_ms` | `slowlog` 가 있으면 그것, 없으면 **관측된 최대값** |
+//! | `stats` 카운터 | 필드별 **최대값** (같은 실행의 하한이므로 큰 쪽이 참에 가깝다) |
 //! | `sql_text` | 더 긴 쪽. **단 고정된 정책이 허용하는 범위 안에서만** |
 //! | `plan_*` | `for_connection > rerun > none` |
 //! | `started_at_ms` | 더 이른 쪽 |
 
 use crate::slow_query::{
-    CaptureSource, ExecStats, LiteralPolicy, PlanBundle, SlowQuery, SlowQueryState, duration_rank,
+    CaptureSource, DurationSource, ExecStats, LiteralPolicy, PlanBundle, SlowQuery, SlowQueryState,
 };
 
 /// 두 레코드를 병합한다. `existing` 이 이미 저장된 쪽이다.
 ///
 /// **새 값을 반환하며 입력을 변경하지 않는다.**
 pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
-    let inc_wins_duration =
-        duration_rank(incoming.duration_source) > duration_rank(existing.duration_source);
-    let (better, worse) = if inc_wins_duration {
-        (incoming, existing)
-    } else {
-        (existing, incoming)
-    };
+    // **"더 나은 레코드 하나를 골라 그 필드를 쓴다"는 방식을 버렸다.**
+    // 그 방식은 (a) 미완결 `Timer` 가 완결 `Polled` 를 이기게 만들고(62초 → 2.1초),
+    // (b) 동률일 때 `existing` 이 이겨 `merge(a,b) != merge(b,a)` 가 됐다.
+    // 이제 속성마다 그 속성에 맞는 규칙으로 병합한다.
+    let duration = merge_duration(existing, incoming);
 
     // 정책은 **먼저 기록된 쪽**을 고정한다. 두 레코드의 `literal_policy_at_ms` 중 이른 쪽.
     let (policy, policy_at) = if existing.literal_policy_at_ms <= incoming.literal_policy_at_ms {
@@ -42,6 +41,7 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
     } else {
         (incoming.literal_policy, incoming.literal_policy_at_ms)
     };
+    let chosen_text = merge_sql_text(existing, incoming, policy);
 
     SlowQuery {
         // 키와 신원 — 먼저 저장된 쪽을 유지한다.
@@ -72,25 +72,21 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
 
         // 시각 — 더 이른 시작, 더 정확한 종료.
         started_at_ms: existing.started_at_ms.min(incoming.started_at_ms),
-        started_at_ms_precise: existing
-            .started_at_ms_precise
-            .or(incoming.started_at_ms_precise),
-        ended_at_ms: better.ended_at_ms.or(worse.ended_at_ms),
+        // `started_at_ms` 와 같은 규칙(더 이른 쪽)이어야 한다. `or` 로 두면 두 필드가
+        // 어긋나 `coarse < precise` 같은 모순 조합이 나온다.
+        started_at_ms_precise: min_opt(
+            existing.started_at_ms_precise,
+            incoming.started_at_ms_precise,
+        ),
+        // 종료는 사실이다. 두 관측이 다르면 이른 쪽이 참에 가깝다 (탐지는 지연된다).
+        ended_at_ms: min_opt(existing.ended_at_ms, incoming.ended_at_ms),
         captured_at_ms: existing.captured_at_ms.min(incoming.captured_at_ms),
-        duration_ms: if inc_wins_duration {
-            incoming.duration_ms
-        } else if duration_rank(existing.duration_source) == duration_rank(incoming.duration_source)
-        {
-            // 같은 정확도면 관측된 최대값을 쓴다 (보수적).
-            existing.duration_ms.max(incoming.duration_ms)
-        } else {
-            existing.duration_ms
-        },
-        duration_source: better.duration_source,
+        duration_ms: duration.0,
+        duration_source: duration.1,
 
-        sql_text: merge_sql_text(existing, incoming, policy),
-        // 둘 중 하나라도 온전한 전문을 가졌으면 절단이 아니다.
-        sql_text_truncated: existing.sql_text_truncated && incoming.sql_text_truncated,
+        sql_text: chosen_text.map(|(t, _)| t.clone()),
+        // **채택한 텍스트**의 속성이다. 버린 쪽이 온전했어도 의미가 없다.
+        sql_text_truncated: chosen_text.is_some_and(|(_, truncated)| truncated),
         literal_policy: policy,
         literal_policy_at_ms: policy_at,
 
@@ -105,7 +101,7 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         statement_type: existing.statement_type,
         is_nested: existing.is_nested || incoming.is_nested,
 
-        stats: merge_stats(&existing.stats, &incoming.stats, inc_wins_duration),
+        stats: merge_stats(&existing.stats, &incoming.stats),
         plan: merge_plan(&existing.plan, &incoming.plan),
         capture_source: merge_capture_source(existing.capture_source, incoming.capture_source),
 
@@ -139,45 +135,116 @@ fn merge_state(a: SlowQueryState, b: SlowQueryState) -> SlowQueryState {
 /// 정책이 전환되는 중이라면 두 레코드의 정책이 다를 수 있다. 고정 정책이 `masked` 인데
 /// 상대가 `full` 로 만든 원문을 "더 길다"는 이유로 채택하면 **리터럴이 유출된다**.
 /// 이 함수가 없으면 F2 의 방어가 병합 경로에서 무력화된다.
-fn merge_sql_text(a: &SlowQuery, b: &SlowQuery, policy: LiteralPolicy) -> Option<String> {
+/// 저장할 SQL 텍스트와 **그 텍스트의 절단 여부**를 함께 고른다.
+///
+/// 플래그를 따로 계산하면(`a.truncated && b.truncated`) 절단된 텍스트를 채택하면서
+/// 플래그만 `false` 가 될 수 있다 — UI 가 절단 배지를 못 붙이고 사용자는 잘린 SQL 을
+/// 전문으로 오독한다. 그래서 선택과 플래그를 한 곳에서 결정한다.
+fn merge_sql_text<'a>(
+    a: &'a SlowQuery,
+    b: &'a SlowQuery,
+    policy: LiteralPolicy,
+) -> Option<(&'a String, bool)> {
     if policy.stores_nothing() {
         return None;
     }
     /// 고정 정책이 이 레코드의 텍스트를 받아들일 수 있는가.
-    fn usable(q: &SlowQuery, policy: LiteralPolicy) -> Option<&String> {
+    fn usable(q: &SlowQuery, policy: LiteralPolicy) -> Option<(&String, bool)> {
         let t = q.sql_text.as_ref()?;
         if policy.stores_literals() || !q.literal_policy.stores_literals() {
-            Some(t)
+            Some((t, q.sql_text_truncated))
         } else {
             // 고정 정책은 마스킹인데 이 텍스트는 원문이다 → 쓸 수 없다.
             None
         }
     }
     match (usable(a, policy), usable(b, policy)) {
-        (Some(x), Some(y)) => Some(if y.len() > x.len() {
-            y.clone()
-        } else {
-            x.clone()
-        }),
-        (Some(x), None) => Some(x.clone()),
-        (None, Some(y)) => Some(y.clone()),
+        (Some(x), Some(y)) => Some(if y.0.len() > x.0.len() { y } else { x }),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
         (None, None) => None,
     }
 }
 
-fn merge_stats(a: &ExecStats, b: &ExecStats, prefer_b: bool) -> ExecStats {
-    let (p, s) = if prefer_b { (b, a) } else { (a, b) };
+/// 지속시간과 그 출처를 함께 고른다.
+///
+/// # `Timer > Polled` 순위만으로는 62초 쿼리가 2.1초로 저장된다
+///
+/// 선행 저장은 첫 tick 의 `TIMER_WAIT` 를 쓴다 — 그건 **실행 도중** 값이므로 총
+/// 실행시간의 하한이다. 확정 경로는 스레드가 이미 사라져 `stmt` 를 다시 조회할 수
+/// 없어 `Polled`(관측된 최대 `TIME`)를 붙인다. 순위만 보면 미완결 `Timer` 가 이긴다:
+///
+/// ```text
+/// merge(선행 = Timer 2,100ms, 확정 = Polled 62,000ms)
+///   duration_ms = 2,100          ← 62초 쿼리가 2.1초로 기록된다
+///   ended_at - started_at = 62,000ms   ← 레코드 내부 자기모순
+///   dur_bucket = b0 (b3 이어야 한다)   ← GSI2PK 라 "느린 것만" 조회에서 사라진다
+/// ```
+///
+/// 느린 쿼리 모니터가 **가장 느린 쿼리를 가장 크게 축소 보고**한다.
+///
+/// # 규칙
+///
+/// | 조합 | 채택 | 이유 |
+/// |---|---|---|
+/// | 한쪽이 `slowlog` | 그쪽 | 완결된 실행의 권위 있는 측정값이다 |
+/// | 그 외 | **최대값** | 둘 다 같은 실행의 하한이다 — 큰 쪽이 참에 가깝다 |
+///
+/// 정확도 순위(`duration_rank`)는 **완결성**을 담지 못한다. 그래서 `slowlog` 여부만
+/// 순위로 쓰고, in-flight 관측끼리는 크기로 비교한다.
+fn merge_duration(a: &SlowQuery, b: &SlowQuery) -> (i64, DurationSource) {
+    let authoritative = |q: &SlowQuery| q.duration_source == DurationSource::Slowlog;
+    match (authoritative(a), authoritative(b)) {
+        (true, false) => (a.duration_ms, a.duration_source),
+        (false, true) => (b.duration_ms, b.duration_source),
+        // 둘 다 슬로우로그이거나 둘 다 in-flight → 큰 쪽.
+        _ if b.duration_ms > a.duration_ms => (b.duration_ms, b.duration_source),
+        _ => (a.duration_ms, a.duration_source),
+    }
+}
+
+/// 두 `Option` 중 작은 값. 한쪽만 있으면 그것.
+fn min_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// 두 `Option` 중 큰 값. 한쪽만 있으면 그것.
+fn max_opt<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// 실행 통계를 **필드별 최대값**으로 병합한다.
+///
+/// 이전 구현은 `prefer_b` 하나로 레코드를 통째로 골랐다. 동률이면 `existing` 이 이겨서
+/// `merge(a,b) != merge(b,a)` 였다 — 같은 두 레코드가 도착 순서에 따라 다른 결과를 냈다.
+///
+/// 카운터는 같은 실행에 대해 **단조 증가**한다(실행 도중 관측은 하한이다). 그래서
+/// 필드별 최대값이 정답이고, 동시에 교환법칙을 만족한다.
+fn merge_stats(a: &ExecStats, b: &ExecStats) -> ExecStats {
+    // 불리언은 **한 번이라도 참이면 참**이다 (관측 시점에 따라 달라진다).
+    fn any(x: Option<bool>, y: Option<bool>) -> Option<bool> {
+        match (x, y) {
+            (Some(p), Some(q)) => Some(p || q),
+            (p, q) => p.or(q),
+        }
+    }
     ExecStats {
-        rows_examined: p.rows_examined.or(s.rows_examined),
-        rows_sent: p.rows_sent.or(s.rows_sent),
-        rows_affected: p.rows_affected.or(s.rows_affected),
-        lock_time_ms: p.lock_time_ms.or(s.lock_time_ms),
-        tmp_tables: p.tmp_tables.or(s.tmp_tables),
-        tmp_disk_tables: p.tmp_disk_tables.or(s.tmp_disk_tables),
-        sort_merge_passes: p.sort_merge_passes.or(s.sort_merge_passes),
-        no_index_used: p.no_index_used.or(s.no_index_used),
-        no_good_index_used: p.no_good_index_used.or(s.no_good_index_used),
-        full_join: p.full_join.or(s.full_join),
+        rows_examined: max_opt(a.rows_examined, b.rows_examined),
+        rows_sent: max_opt(a.rows_sent, b.rows_sent),
+        rows_affected: max_opt(a.rows_affected, b.rows_affected),
+        lock_time_ms: max_opt(a.lock_time_ms, b.lock_time_ms),
+        tmp_tables: max_opt(a.tmp_tables, b.tmp_tables),
+        tmp_disk_tables: max_opt(a.tmp_disk_tables, b.tmp_disk_tables),
+        sort_merge_passes: max_opt(a.sort_merge_passes, b.sort_merge_passes),
+        no_index_used: any(a.no_index_used, b.no_index_used),
+        no_good_index_used: any(a.no_good_index_used, b.no_good_index_used),
+        full_join: any(a.full_join, b.full_join),
     }
 }
 
@@ -232,6 +299,137 @@ fn pick_str(a: &str, b: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 선행 저장의 **실행 도중** `TIMER_WAIT` 가 확정된 총 실행시간을 이기면 안 된다.
+    ///
+    /// 이 테스트가 없으면 62초 쿼리가 2.1초로 저장되고, `dur_bucket` 이 GSI2PK 라
+    /// "느린 것만" 조회에서 아예 사라진다 — 느린 쿼리 모니터의 핵심 실패다.
+    #[test]
+    fn midflight_timer_does_not_beat_completed_polled_duration() {
+        // 선행 저장: 첫 tick 의 TIMER_WAIT = 2.1초 (실행 도중이라 하한이다).
+        let pre = SlowQuery {
+            state: SlowQueryState::InFlight,
+            duration_ms: 2_100,
+            duration_source: DurationSource::Timer,
+            ended_at_ms: None,
+            ..base()
+        };
+        // 확정: 스레드가 사라져 stmt 재조회 불가 → Polled, 관측된 최대 TIME = 62초.
+        let fin = SlowQuery {
+            state: SlowQueryState::Finalized,
+            duration_ms: 62_000,
+            duration_source: DurationSource::Polled,
+            ended_at_ms: Some(base().started_at_ms + 62_000),
+            ..base()
+        };
+
+        for (a, b, label) in [(&pre, &fin, "선행→확정"), (&fin, &pre, "확정→선행")] {
+            let m = merge(a, b);
+            assert_eq!(m.duration_ms, 62_000, "{label}: 관측된 최대값이어야 한다");
+            assert_eq!(m.duration_source, DurationSource::Polled, "{label}");
+            // 레코드 내부 자기모순이 없어야 한다.
+            let span = m.ended_at_ms.expect("종료 관측됨") - m.started_at_ms;
+            assert_eq!(
+                m.duration_ms, span,
+                "{label}: duration 과 구간이 일치해야 한다"
+            );
+        }
+    }
+
+    /// `slowlog` 는 완결된 실행의 권위 있는 측정값이므로 크기와 무관하게 이긴다.
+    /// 폴링 `TIME` 은 초 단위라 실제보다 최대 1초 크게 나올 수 있다.
+    #[test]
+    fn slowlog_wins_even_when_smaller_than_polled() {
+        let polled = SlowQuery {
+            duration_ms: 6_000,
+            duration_source: DurationSource::Polled,
+            ..base()
+        };
+        let slowlog = SlowQuery {
+            duration_ms: 5_200,
+            duration_source: DurationSource::Slowlog,
+            ..base()
+        };
+        for (a, b) in [(&polled, &slowlog), (&slowlog, &polled)] {
+            let m = merge(a, b);
+            assert_eq!(m.duration_ms, 5_200);
+            assert_eq!(m.duration_source, DurationSource::Slowlog);
+        }
+    }
+
+    /// R43 — 병합은 교환법칙을 만족해야 한다. 도착 순서가 결과를 바꾸면 두 워커가
+    /// 같은 두 레코드를 보고 다른 값을 저장한다.
+    #[test]
+    fn merge_is_commutative_for_stats_and_times() {
+        let a = SlowQuery {
+            stats: ExecStats {
+                rows_examined: Some(100),
+                lock_time_ms: Some(5),
+                no_index_used: Some(false),
+                ..Default::default()
+            },
+            started_at_ms_precise: Some(base().started_at_ms + 900),
+            ended_at_ms: Some(base().started_at_ms + 4_100),
+            ..base()
+        };
+        let b = SlowQuery {
+            stats: ExecStats {
+                rows_examined: Some(999_999),
+                lock_time_ms: Some(12),
+                no_index_used: Some(true),
+                ..Default::default()
+            },
+            started_at_ms_precise: Some(base().started_at_ms + 500),
+            ended_at_ms: Some(base().started_at_ms + 4_000),
+            ..base()
+        };
+        let ab = merge(&a, &b);
+        let ba = merge(&b, &a);
+        assert_eq!(ab.stats, ba.stats, "통계가 순서에 따라 달라진다");
+        assert_eq!(ab.ended_at_ms, ba.ended_at_ms);
+        assert_eq!(ab.started_at_ms_precise, ba.started_at_ms_precise);
+        // 카운터는 같은 실행의 하한이므로 큰 쪽이 참에 가깝다.
+        assert_eq!(ab.stats.rows_examined, Some(999_999));
+        assert_eq!(ab.stats.lock_time_ms, Some(12));
+        // 한 번이라도 인덱스를 못 썼다고 관측되면 참이다.
+        assert_eq!(ab.stats.no_index_used, Some(true));
+        // 시각은 `started_at_ms` 와 같은 규칙(더 이른 쪽)이어야 한다.
+        assert_eq!(ab.started_at_ms_precise, Some(base().started_at_ms + 500));
+    }
+
+    /// 절단 플래그는 **채택된 텍스트**의 속성이어야 한다. 어긋나면 UI 가 잘린 SQL 에
+    /// 배지를 못 붙이고 사용자가 전문으로 오독한다.
+    #[test]
+    fn truncation_flag_describes_the_chosen_text() {
+        let short_complete = SlowQuery {
+            sql_text: Some("SELECT a FROM t".into()),
+            sql_text_truncated: false,
+            ..base()
+        };
+        let long_truncated = SlowQuery {
+            sql_text: Some("SELECT a FROM t WHERE id IN (1,2,3) AND x =".into()),
+            sql_text_truncated: true,
+            ..base()
+        };
+        let m = merge(&short_complete, &long_truncated);
+        assert!(
+            m.sql_text.as_deref().unwrap().len() > 15,
+            "더 긴 쪽을 채택한다"
+        );
+        assert!(
+            m.sql_text_truncated,
+            "채택한 텍스트가 절단본이면 true 여야 한다"
+        );
+
+        // 반대로 온전한 쪽을 채택했으면 false 다.
+        let long_complete = SlowQuery {
+            sql_text: Some("SELECT a FROM t WHERE id IN (1,2,3) AND x = 1".into()),
+            sql_text_truncated: false,
+            ..base()
+        };
+        let m = merge(&long_complete, &long_truncated);
+        assert!(!m.sql_text_truncated);
+    }
+
     use crate::env::Env;
     use crate::ids::{InstanceId, RecordId};
     use crate::instance::Engine;

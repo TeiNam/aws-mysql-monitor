@@ -51,6 +51,9 @@ pub struct TickStats {
     pub deep_probed: usize,
     /// 심층 조회 상한에 걸려 지표만 받은 후보 수.
     pub deep_probe_skipped: usize,
+    /// **심층 조회 자체가 실패했다** (권한·타임아웃). 0 이 아니면 이 tick 의 레코드에는
+    /// SQL·지표가 없다 — "SQL 을 못 읽는 느린 쿼리" 와 "권한이 빠진 상태" 는 다르다.
+    pub deep_probe_failed: usize,
     pub prefetch_saved: usize,
     pub finalized: usize,
     pub plans_for_connection: usize,
@@ -208,7 +211,9 @@ where
             })
             .collect();
 
-        let tick = self.tracker.tick(&observations, now_ms, &self.offset);
+        let tick = self
+            .tracker
+            .tick(&observations, now_ms, &self.offset, probe.truncated);
 
         // ── 심층 조회 ──────────────────────────────────────────────────────
         // 느린 순으로 상한까지만. 나머지는 지표만 남는다.
@@ -223,8 +228,37 @@ where
         stats.deep_probed = targets.len();
 
         if !targets.is_empty() {
-            let full = self.db.full_sql(&targets).await.unwrap_or_default();
-            let stmts = self.db.stmt_current(&targets).await.unwrap_or_default();
+            // **`unwrap_or_default()` 로 삼키면 안 된다.** 조회가 권한 오류(1142)나
+            // 타임아웃으로 실패하면 빈 Vec 이 되고, 그대로 진행하면 `sql_text=None`,
+            // `app_digest="unknown-<tid>"`, 지표 전부 None 인 레코드가 저장된다.
+            // tick 은 `Ok` 를 반환하므로 헬스·서킷도 정상으로 본다 — 운영자가 원인을
+            // 알 방법이 없다. 실패를 세고 로그로 남긴 뒤 **선행 저장을 건너뛴다.**
+            let full = match self.db.full_sql(&targets).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    stats.deep_probe_failed += targets.len();
+                    tracing::warn!(
+                        instance = %self.instance.id,
+                        targets = targets.len(),
+                        error = %e,
+                        "전문 SQL 조회 실패 — 이 tick 은 선행 저장을 건너뛴다"
+                    );
+                    return Ok(stats);
+                }
+            };
+            let stmts = match self.db.stmt_current(&targets).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    stats.deep_probe_failed += targets.len();
+                    tracing::warn!(
+                        instance = %self.instance.id,
+                        targets = targets.len(),
+                        error = %e,
+                        "정확 지표 조회 실패 — 이 tick 은 선행 저장을 건너뛴다"
+                    );
+                    return Ok(stats);
+                }
+            };
 
             for id in &targets {
                 let f = full.iter().find(|r| r.id == *id);
