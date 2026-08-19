@@ -1028,3 +1028,69 @@ SK = <hour_bucket>#<db_user>
 **재검토 조건** — 계정 축이 실제 조사에 쓰이지 않으면 롤업만 남기고 화면을 제거.
 
 ---
+
+## ADR-022. 배포를 EC2 ASG 에서 **ECS Fargate** 로 바꾼다
+
+**상태**: 채택 (2026-08-20)
+
+**맥락** — 초기 설계는 EC2 Auto Scaling Group + systemd 였다. 그 선택이 데려온 것들:
+
+| 항목 | 필요했던 이유 |
+|---|---|
+| AMI 빌드·패치 파이프라인 | OS 를 우리가 관리한다 |
+| `sd_notify(READY=1)` · `WatchdogSec` | systemd 가 준비 상태를 알아야 한다 |
+| ASG Lifecycle Hook (`Terminating:Wait`) | 정리 시간을 보장받아야 한다 (M0-8a) |
+| `SetInstanceHealth` 자체 unhealthy 판정 | 프로세스가 wedge 되면 스스로 교체 요청 (M0-8b) |
+| Launch Template · user-data · CloudWatch agent | 부팅 스크립트와 로그 수집 |
+| `LimitCORE=0` · `AF_NETLINK` 하드닝 | systemd 유닛 설정 |
+
+이 여섯 줄이 전부 **"컨테이너 오케스트레이터가 이미 하는 일"** 이다.
+
+**결정** — ECS Fargate 로 배포한다. 단일 Rust 바이너리 + Dockerfile 이므로 컨테이너화 비용이
+거의 없다([02 §10](02-architecture.md)의 확장 지점에 이미 "ECS/EKS 배포: 단일 바이너리 +
+Dockerfile" 로 적혀 있었다).
+
+| EC2 + systemd | ECS Fargate |
+|---|---|
+| `sd_notify(READY=1)` | 태스크 정의 `healthCheck` → `/healthz` |
+| `WatchdogSec` | 헬스체크 실패 → ECS 가 교체 |
+| Lifecycle Hook `Terminating:Wait` | `stopTimeout` (Fargate 상한 120초) |
+| `SetInstanceHealth` | 프로세스 종료 → 태스크 종료 → ECS 가 교체 |
+| AMI 패치 | 이미지 재빌드 |
+| CloudWatch agent | `awslogs` 로그 드라이버 |
+
+→ **M0-8a·M0-8b 태스크가 사라진다.**
+
+**두 헬스체크의 역할이 다르다** — 이걸 혼동하면 무한 재시작 루프가 난다.
+
+| 헬스체크 | 보는 경로 | 실패 시 | 왜 |
+|---|---|---|---|
+| 컨테이너 (`healthCheck`) | `/healthz` (항상 200) | 태스크 교체 | standby 도 **살아 있다.** `/readyz` 를 보면 ECS 가 standby 를 계속 죽인다 |
+| 대상 그룹 (ALB) | `/readyz` | 라우팅에서 제외 | standby 는 데이터가 없으므로 트래픽을 받으면 안 된다 (F1) |
+
+**비용** — Fargate 가 EC2 보다 규모에서 조금 비싸다. 정직하게 적는다
+(ap-northeast-2, Graviton/ARM64 기준).
+
+| 구성 | EC2 | Fargate | 차이 |
+|---|---|---|---|
+| 1단계 (1 vCPU / 2GB × 2) | `c7g.medium` × 2 ≈ **$56** | ≈ **$66** | +18% |
+| 2단계 collector (4 vCPU / 8GB × 4) | `c7g.xlarge` × 4 ≈ **$447** | ≈ **$530** | +19% |
+| dev (Spot) | `t4g.small` × 1 ≈ $12 | Spot ≈ **$10** | −17% |
+
+월 $10~80 을 더 내고 AMI 파이프라인·패치·에이전트 운영을 없앤다. 이 규모에서 그건 남는 거래다
+— 인프라 담당자 반나절이 월 $80 보다 비싸다.
+
+**대가**
+1. **컨테이너 이미지가 배포 전제**가 된다. `40-compute` 레이어만 앱 코드에 의존하고
+   나머지 레이어는 독립이다.
+2. Fargate 에는 인스턴스 스토어가 없다. 로컬 디스크에 캐시를 두는 설계를 할 수 없다
+   (현재 설계는 메모리와 DynamoDB 만 쓰므로 무관하다).
+3. `stopTimeout` 상한이 120초다. 그레이스풀 셧다운 예산(45초)이 그 안에 들어야 한다.
+   앱의 `shutdown_grace_secs < stopTimeout` 를 설정 검증으로 강제한다.
+4. Spot 중단 시 리스 재분배로 최대 80초의 수집 공백이 생긴다 → **prd 는 On-Demand.**
+
+**재검토 조건**
+- 2단계에서 collector 가 4 vCPU × 8대를 넘으면 Fargate 프리미엄이 월 $200 을 넘는다.
+  그때 EC2 capacity provider(ECS on EC2)로 옮긴다 — 태스크 정의는 그대로 쓴다.
+- 로컬 디스크 캐시가 필요해지면(플랜 압축 임시 파일 등) 재검토한다.
+

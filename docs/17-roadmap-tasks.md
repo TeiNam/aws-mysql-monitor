@@ -40,16 +40,16 @@
 | M0-5 | 로깅·트레이싱 (`tracing` JSON) + **마스킹 레이어** | 마스킹 패턴 단위 테스트 통과 |
 | M0-6 | `Secret<T>` 타입 (Debug/Display/Serialize 미구현, Drop 시 zeroize) | 로깅 시도 시 컴파일 에러 |
 | M0-7 | 에러 타입 체계 (`thiserror`) + API 에러 매핑 | [13 §1.2](13-api-spec.md) 코드 전량 정의 |
-| M0-8 | `dbmon` 골격: 플래그 파싱, 조립, 그레이스풀 셧다운, `/healthz`(200 고정) `/readyz`(의존성+리더) | SIGTERM 시 45초 내 정상 종료. **`sd_notify(READY=1)` 전송 후 `/readyz` 200**. `WatchdogSec` 대응 |
-| M0-8a | ASG Lifecycle Hook 처리 (`Terminating:Wait` 감지 → 정리 → `CompleteLifecycleAction`) | 훅 없이는 정리 시간이 보장되지 않는다 ([14 §6.2](14-infrastructure.md)) |
-| M0-8b | 자체 unhealthy 판정 (`SetInstanceHealth`) — collector/control 역할용 | 프로세스가 wedge되면 스스로 교체 요청 |
+| ~~M0-8~~ | ~~`dbmon` 골격~~ → **완료.** 플래그·조립·그레이스풀 셧다운·`/healthz`·`/readyz` | SIGTERM 시 정상 종료 확인. `dbmon healthcheck` 서브커맨드로 컨테이너 헬스체크(이미지에 `curl` 불필요) |
+| ~~M0-8a~~ | ~~ASG Lifecycle Hook 처리~~ → **불필요.** ECS 의 `stopTimeout` 이 대체한다 ([ADR-022](03-decisions.md)) | 해당 없음 |
+| ~~M0-8b~~ | ~~자체 unhealthy 판정 (`SetInstanceHealth`)~~ → **불필요.** 컨테이너 헬스체크 실패 시 ECS 가 교체한다 | 해당 없음 |
 | M0-9 | 로컬 개발 환경 (docker-compose: MySQL 8.4, 8.0.32, DynamoDB Local) | `just dev` 동작 |
 | M0-10 | `just seed`: 로컬 MySQL에 샘플 스키마 + 슬로우 쿼리 생성기 | 2초 이상 걸리는 쿼리가 반복 발생 |
 | M0-11 | CI 파이프라인 ([14 §6.1](14-infrastructure.md)) — **arm64 러너** | 전 게이트 초록. AL2023 컨테이너에서 `--version` 스모크 통과 (glibc 스큐 게이트) |
 | M0-11a | GitHub OIDC + CI Role (`dbmon-ci-dev` / `dbmon-ci-prd`) | 장기 액세스 키 미사용. `sub` 조건으로 레포·환경 제한 |
 | M0-11b | 정적 검사 게이트 12종 ([15 §9.1](15-testing.md)) | 각 검사가 위반 코드를 실제로 잡아냄 |
 | M0-12 | 프론트 스캐폴드 (Vite + React 19 + TS + Tailwind + shadcn/ui) | 빌드·lint·타입체크 통과 |
-| M0-13 | Terraform **레이어 골격** (`layers/00`~`60`, 레이어별 독립 state) ([14 §1](14-infrastructure.md)) | 각 레이어 `terraform validate` 통과. 레이어 간 `terraform_remote_state` 참조 확인 |
+| ~~M0-13~~ | ~~Terraform 레이어 골격~~ → **완료.** 7개 레이어 전부 `terraform validate` 통과 ([infra/](../infra/README.md)) | `10-foundation`·`40-compute`·`60-seed` 는 실제 리소스 포함. `20`·`30`·`50` 은 골격 |
 | **M0-13a** | `00-bootstrap` apply — state 백엔드 (S3 + DynamoDB 락) | `dbmon-tfstate-123456789012` 생성. 이후 레이어가 원격 state 사용 |
 | **M0-13b** | `10-foundation` apply — DynamoDB·S3·KMS·DynamoDB 게이트웨이 엔드포인트. **기존 VPC는 data source로만 참조** | **로컬 앱이 실제 DynamoDB에 쓴다.** `terraform destroy`가 `dev-vpc-01`을 건드리지 않음을 `plan`으로 확인 |
 | **M0-13c** | `60-seed` apply — 시드 MySQL 8.4 (`db.t4g.micro`) + 파라미터 그룹 ([18 §5](18-dev-environment.md)) | `performance_schema=ON`, `slow_query_log=ON`, IAM auth 활성. **모니터링 대상 확보** |
@@ -234,7 +234,7 @@
 | M5-15 | 프론트: 다이제스트 목록 (정렬·필터·배지) | |
 | M5-16 | 프론트: **다이제스트 상세** ([09 §3.1](09-frontend.md)) | 샘플 4종 출처 구분, 복사, 플랜 링크 |
 | M5-17 | 프론트: 에러·빈 상태 전량 ([09 §8](09-frontend.md)) | |
-| M5-18 | Terraform: `compute` 모듈 (ASG, ALB, ACM, WAF) + 프론트 임베드 배포 | dev 환경 배포 성공 |
+| M5-18 | Terraform: `40-compute` (ECR, ECS Fargate, 조건부 ALB) + 프론트 임베드 배포 | **골격 완료.** dev 는 `enable_alb=false` 로 네트워크 비용 $0 |
 | M5-19 | E2E S1, S2, S3, S6 | S3(다이제스트 → 샘플 복사) 통과 |
 
 **M5 완료 기준** — Cognito 로그인 없이는 어떤 데이터도 조회되지 않고, 로그인 후

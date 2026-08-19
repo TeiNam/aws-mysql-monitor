@@ -71,8 +71,15 @@ pub struct Config {
 pub struct HttpConfig {
     pub bind: String,
     pub port: u16,
-    /// 그레이스풀 셧다운 예산. ALB 등록 해제 + 진행 중 작업 정리.
+    /// 그레이스풀 셧다운 예산. 로드밸런서 등록 해제 + 진행 중 작업 정리.
+    ///
+    /// ECS 태스크 정의의 `stopTimeout` 보다 **작아야** 한다. 크면 SIGKILL 이 먼저 온다.
     pub shutdown_grace_secs: u64,
+    /// 종료 시 로드밸런서 등록 해제를 기다리는 시간.
+    ///
+    /// 로드밸런서가 없으면(로컬 개발·collector 전용 워커) 0 이 맞다.
+    /// 0이 아니면 이만큼 기다린 뒤에야 나머지 정리가 시작된다.
+    pub deregistration_wait_secs: u64,
 }
 
 impl Default for HttpConfig {
@@ -82,6 +89,7 @@ impl Default for HttpConfig {
             bind: "0.0.0.0".into(),
             port: 8080,
             shutdown_grace_secs: 45,
+            deregistration_wait_secs: 20,
         }
     }
 }
@@ -311,6 +319,13 @@ impl Config {
                      넘으면 tick 이 겹쳐 탐지 해상도가 조용히 떨어진다",
                     c.detect_interval_ms
                 ),
+            ));
+        }
+        if self.http.deregistration_wait_secs >= self.http.shutdown_grace_secs {
+            return Err(err(
+                "http.deregistration_wait_secs",
+                "shutdown_grace_secs 보다 작아야 한다 — 등록 해제만 기다리다 \
+                 버퍼 플러시를 못 하면 데이터를 잃는다",
             ));
         }
         if c.bulk_query_timeout_ms < c.query_timeout_ms {

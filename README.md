@@ -22,7 +22,7 @@ RDS를 자동 탐색해 환경(prd/stg/dev)별로 분류하고, MySQL 워크로�
 | 조회 엔진 | Athena 단독. Spark 미도입 | [ADR-020](docs/03-decisions.md) |
 | 인증 | Cognito OIDC (PKCE) + 서버측 RBAC | [ADR-012](docs/03-decisions.md) |
 | DB 계정 | IAM DB Auth (비밀번호 없음) | [ADR-007](docs/03-decisions.md) |
-| 배포 | EC2 ASG (active 1 + standby 1) | [14-infrastructure.md](docs/14-infrastructure.md) |
+| 배포 | **ECS Fargate (ARM64)** — active 1 + standby 1 | [ADR-022](docs/03-decisions.md), [14](docs/14-infrastructure.md) |
 | IaC | **Terraform 7개 레이어, 레이어별 독립 state** — 앱 코드와 무관하게 apply 가능 | [14 §1](docs/14-infrastructure.md) |
 | 개발계 | 계정 `123456789012` / ap-northeast-2. **네트워크 비용 $0** (SSM 포트 포워딩) | [18-dev-environment.md](docs/18-dev-environment.md) |
 | 지원 버전 | RDS MySQL 8.4+, Aurora MySQL 3.05+ | [ADR-019](docs/03-decisions.md) |
@@ -33,7 +33,7 @@ RDS를 자동 탐색해 환경(prd/stg/dev)별로 분류하고, MySQL 워크로�
 |---|---|---|
 | 01 | [요구사항](docs/01-requirements.md) | 기능(FR)·비기능(NFR) 요구사항, 범위, 제약, 가정 |
 | 02 | [시스템 아키텍처](docs/02-architecture.md) | 컴포넌트 경계, 데이터 흐름, 배치 구조, 실패 모드 |
-| 03 | [기술 결정 기록(ADR)](docs/03-decisions.md) | 21개 결정의 근거·대가·재검토 조건 |
+| 03 | [기술 결정 기록(ADR)](docs/03-decisions.md) | 22개 결정의 근거·대가·재검토 조건 |
 | 04 | [데이터 모델](docs/04-data-model.md) | DynamoDB 단일테이블, Iceberg 스키마, 증분 적재 SQL |
 | 05 | [수집기 설계](docs/05-collector.md) | 3중 소스 캡처, 사용 SQL 전량, 정규화, 샤딩 |
 | 06 | [RDS 탐색 & 메트릭](docs/06-discovery-metrics.md) | 자동 탐색, 환경 분류, CloudWatch 비용 통제 |

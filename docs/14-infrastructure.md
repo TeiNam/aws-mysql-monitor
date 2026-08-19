@@ -1,5 +1,26 @@
 # 14. 인프라와 운영
 
+> **⚠ 배포 방식이 ECS Fargate 로 바뀌었다** ([ADR-022](03-decisions.md), 2026-08-20).
+> 이 문서의 EC2 ASG · systemd · Launch Template · `sd_notify` · Lifecycle Hook ·
+> `SetInstanceHealth` 관련 절은 **더 이상 적용되지 않는다.**
+> 실제 구성은 [`infra/layers/40-compute`](../infra/layers/40-compute) 와
+> [`Dockerfile`](../Dockerfile) 이 정본이다.
+>
+> | 이 문서의 서술 | 실제 |
+> |---|---|
+> | EC2 ASG (min2/desired2) | ECS 서비스 `desired_count = 2` |
+> | systemd `Type=notify` + `sd_notify` | 태스크 정의 `healthCheck` → `/healthz` |
+> | ASG Lifecycle Hook `Terminating:Wait` | `stopTimeout = 60` (Fargate 상한 120초) |
+> | `SetInstanceHealth` 자체 판정 | 프로세스 종료 → ECS 가 태스크 교체 |
+> | CloudWatch agent | `awslogs` 로그 드라이버 |
+> | AMI 빌드·패치 | 컨테이너 이미지 재빌드 |
+>
+> **두 헬스체크의 역할이 다르다.** 컨테이너 헬스체크는 `/healthz`(항상 200)를 보고,
+> 대상 그룹 헬스체크는 `/readyz` 를 본다. 컨테이너 쪽이 `/readyz` 를 보면 standby 를
+> 계속 죽이는 무한 루프가 난다(F1).
+>
+> 나머지(DynamoDB·S3·KMS·알람·런북·재해복구)는 그대로 유효하다.
+
 ## 1. Terraform 구성
 
 **인프라 배포는 애플리케이션 코드와 독립적으로 동작한다.** 레이어를 나누고 각 레이어에

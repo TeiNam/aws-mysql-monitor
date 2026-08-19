@@ -1,0 +1,4 @@
+# cp terraform.tfvars.example terraform.tfvars 후 값을 채운다.
+environment = "dev"
+# dev-vpc-01 (10.1.0.0/16). prd-lla-vpc 를 넣지 않도록 주의한다.
+vpc_id = "vpc-CHANGEME"

@@ -42,6 +42,16 @@ enum Command {
     },
     /// 설정을 검증하고 종료한다. 배포 전 게이트로 쓴다.
     Check,
+    /// 자기 `/healthz` 를 확인하고 종료 코드로 알린다.
+    ///
+    /// **컨테이너 이미지에 `curl` 을 넣지 않기 위해** 존재한다. ECS 태스크 정의의
+    /// `healthCheck.command` 가 이걸 호출한다:
+    /// `["CMD", "/usr/local/bin/dbmon", "healthcheck"]`
+    Healthcheck {
+        /// 확인할 포트. 기본은 설정의 `http.port`.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[tokio::main]
@@ -65,12 +75,53 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Healthcheck { port } => {
+            let port = port.unwrap_or(config.http.port);
+            if let Err(e) = healthcheck(port).await {
+                // 종료 코드가 계약이다. 메시지는 stderr 로만 남긴다.
+                eprintln!("healthcheck 실패: {e}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Serve { role } => {
             if let Some(r) = role {
                 config.role = parse_role(&r)?;
             }
             serve(config).await
         }
+    }
+}
+
+/// `/healthz` 에 최소 HTTP/1.1 요청을 보낸다.
+///
+/// **HTTP 클라이언트 의존성을 추가하지 않는다.** 컨테이너 이미지에 `curl` 을 넣거나
+/// `reqwest` 를 링크하는 대신 25줄을 쓴다 — 헬스체크는 200 여부만 알면 된다.
+async fn healthcheck(port: u16) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .context("연결 타임아웃")??;
+
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .context("요청 전송 실패")?;
+
+    let mut buf = Vec::with_capacity(256);
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf))
+        .await
+        .context("응답 타임아웃")??;
+
+    let head = String::from_utf8_lossy(&buf[..buf.len().min(64)]);
+    if head.starts_with("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        anyhow::bail!("예상치 못한 응답: {}", head.lines().next().unwrap_or(""))
     }
 }
 
@@ -138,7 +189,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // ① 먼저 준비 상태를 내려 로드밸런서 등록 해제를 유도한다.
     readiness.begin_draining();
 
-    let drain = shutdown.drain_budget();
+    // 로드밸런서가 없으면 기다리지 않는다. 로컬 개발에서 22초를 버리지 않도록.
+    let drain = Duration::from_secs(config.http.deregistration_wait_secs);
     let r = readiness.clone();
     let s = shutdown.clone();
     run_stages(
@@ -147,9 +199,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             (
                 "deregister",
                 stage(async move {
-                    // 로드밸런서가 우리를 빼는 데 필요한 최소 시간을 준다.
-                    tracing::info!(wait_ms = %drain.as_millis(), "등록 해제 대기");
-                    tokio::time::sleep(drain).await;
+                    if drain.is_zero() {
+                        tracing::info!("로드밸런서 없음 — 등록 해제 대기 생략");
+                    } else {
+                        tracing::info!(wait_ms = %drain.as_millis(), "등록 해제 대기");
+                        tokio::time::sleep(drain).await;
+                    }
                     let _ = r.snapshot();
                 }),
             ),

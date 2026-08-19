@@ -1,5 +1,17 @@
 # 18. 개발계(dev) 배포 설계
 
+> **⚠ 두 가지가 바뀌었다** (2026-08-20)
+> 1. **배포가 ECS Fargate 다** ([ADR-022](03-decisions.md)). 이 문서의 EC2 + SSM 포트
+>    포워딩 서술은 컨테이너 기준으로 읽는다 — dev 접근은 `aws ecs execute-command`
+>    (ECS Exec) 로 하고, 포트 포워딩이 필요하면 SSM 의 ECS 타깃을 쓴다.
+>    **네트워크 비용 $0 는 그대로다**: 퍼블릭 서브넷 + `assign_public_ip=true` 로
+>    IGW 를 통해 나가므로 NAT 가 필요 없고, `enable_alb=false` 로 ALB 도 만들지 않는다.
+> 2. **M0~M5 는 배포조차 필요 없다.** 로컬 `cargo run` 이 `10-foundation` 의 실제
+>    DynamoDB 와 `60-seed` 의 실제 MySQL 에 붙는다. `40-compute` 는 상시 가동이
+>    필요해지는 M6 부터 올린다.
+>
+> Terraform 실제 구성은 [`infra/`](../infra/README.md) 가 정본이다.
+
 이 문서는 **실제 계정을 조사해 작성했다.** 추정이 아니라 측정값이다.
 조사 시점: 2026-08-19 / 프로파일 `teinam-primary-123456789012`
 

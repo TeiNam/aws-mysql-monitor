@@ -1,5 +1,26 @@
 # 16. 비용 모델
 
+> **⚠ 컴퓨트 비용이 ECS Fargate 기준으로 바뀌었다** ([ADR-022](03-decisions.md), 2026-08-20).
+> 이 문서의 EC2 인스턴스 요금 계산은 아래 표로 대체된다. 나머지 항목(DynamoDB·S3·
+> CloudWatch·Athena·Bedrock·데이터 전송)은 그대로다.
+>
+> ap-northeast-2, ARM64(Graviton) 기준:
+>
+> | 구성 | EC2 (기존 계산) | **Fargate** | 차이 |
+> |---|---|---|---|
+> | 1단계 (1 vCPU / 2GB × 2) | `c7g.medium` × 2 ≈ $56 | **≈ $66** | +18% |
+> | 2단계 collector (4 vCPU / 8GB × 4) | `c7g.xlarge` × 4 ≈ $447 | **≈ $530** | +19% |
+> | 2단계 api (1 vCPU / 2GB × 2) | ≈ $56 | **≈ $66** | +18% |
+> | 2단계 control (0.5 vCPU / 1GB × 1) | ≈ $14 | **≈ $17** | +21% |
+> | dev (Spot, 0.5 vCPU / 1GB × 1) | `t4g.small` ≈ $12 | **Spot ≈ $5** | −58% |
+>
+> **500대 총액: $1,005 → 약 $1,090** (컴퓨트 $536 → $621).
+> dev 는 Spot 으로 오히려 싸다.
+>
+> 월 $85 를 더 내고 AMI 파이프라인·패치·CloudWatch agent 운영을 없앤다.
+> 재검토 조건은 [ADR-022](03-decisions.md) 에 있다 — collector 가 4 vCPU × 8대를 넘으면
+> ECS on EC2 capacity provider 로 옮긴다(태스크 정의는 그대로 쓴다).
+
 ## 0. 요약
 
 | 규모 | 월 비용 추정 |
