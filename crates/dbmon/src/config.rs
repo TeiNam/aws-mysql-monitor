@@ -311,6 +311,11 @@ impl std::error::Error for ConfigError {}
 /// 탐색 주기 하한 (초). AWS API 조절을 피하는 최소값.
 pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 30;
 
+/// 주기 잡(고아 스윕·백필)의 하한. `0` 은 매 tick 반복이라 API 폭주가 된다.
+pub const MIN_JOB_INTERVAL_SECS: u64 = 5;
+/// 주기 잡의 상한 (24시간). `secs * 1000` 오버플로도 함께 막는다.
+pub const MAX_JOB_INTERVAL_SECS: u64 = 86_400;
+
 /// 로컬 개발용 엔드포인트인가. **호스트가 루프백이어야 한다.**
 ///
 /// URL 파서 의존성을 넣지 않는다 — 스킴과 호스트만 보면 충분하다.
@@ -583,6 +588,30 @@ impl Config {
                 "deployment_env=dev 가 아닌 배포에 폴백 비밀번호가 주입돼 있다 — \
                  태스크 정의에서 제거하고 값을 로테이션한다",
             ));
+        }
+
+        // **새 주기 필드도 같은 규칙을 받는다.**
+        //
+        // `0` 은 "비활성" 이 아니라 "매 tick 반복" 이다. `backfill_secs = 0` 이면
+        // 창이 비어 **백필이 조용히 아무것도 하지 않으면서** 인스턴스당 초당 1회
+        // CloudWatch 를 때린다(500대면 확정적으로 조절당하고 그 오류는 debug 다).
+        // 상한도 둔다 — `secs * 1000` 오버플로를 막는다.
+        for (name, value) in [
+            (
+                "collector.orphan_sweep_secs",
+                self.collector.orphan_sweep_secs,
+            ),
+            ("collector.backfill_secs", self.collector.backfill_secs),
+        ] {
+            if !(MIN_JOB_INTERVAL_SECS..=MAX_JOB_INTERVAL_SECS).contains(&value) {
+                return Err(err(
+                    name,
+                    format!(
+                        "{MIN_JOB_INTERVAL_SECS}~{MAX_JOB_INTERVAL_SECS} 이어야 한다 \
+                         (받은 값: {value}). 0 은 비활성이 아니라 매 tick 반복이다"
+                    ),
+                ));
+            }
         }
 
         // **로컬 슬로우로그 파일은 `dev` 에서만 허용한다.**
@@ -1303,5 +1332,68 @@ config_table = "c"
             !filter.judge(&misplaced).is_accept(),
             "dev 배포가 dev VPC 안의 prd 인스턴스를 통과시켰다"
         );
+    }
+}
+
+#[cfg(test)]
+mod job_interval_tests {
+    use super::*;
+
+    fn base() -> Config {
+        let mut root = default_document();
+        merge(
+            &mut root,
+            toml::from_str(
+                r#"
+deployment_env = "prd"
+[aws]
+region = "ap-northeast-2"
+account_id = "123456789012"
+[storage]
+data_table = "d"
+config_table = "c"
+"#,
+            )
+            .expect("테스트 TOML"),
+        );
+        Config::from_value(root).expect("기본 설정")
+    }
+
+    /// **`0` 은 비활성이 아니라 매 tick 반복이다.**
+    ///
+    /// `backfill_secs = 0` 이면 창이 비어 백필이 아무것도 하지 않으면서 인스턴스당
+    /// 초당 1회 CloudWatch 를 때린다 — 500대면 확정적으로 조절당한다.
+    #[test]
+    fn zero_job_intervals_are_rejected() {
+        for field in ["orphan_sweep_secs", "backfill_secs"] {
+            let mut c = base();
+            match field {
+                "orphan_sweep_secs" => c.collector.orphan_sweep_secs = 0,
+                _ => c.collector.backfill_secs = 0,
+            }
+            let Err(e) = c.validate() else {
+                panic!("{field} = 0 이 통과했다");
+            };
+            assert!(e.field.ends_with(field), "{field}: {e}");
+        }
+    }
+
+    /// 상한을 넘으면 거부한다 — `secs * 1000` 오버플로를 막는다.
+    #[test]
+    fn absurd_job_intervals_are_rejected() {
+        let mut c = base();
+        c.collector.backfill_secs = u64::MAX;
+        assert!(
+            c.validate().is_err(),
+            "u64::MAX 가 통과했다 — 곱셈이 오버플로한다"
+        );
+    }
+
+    /// 기본값은 통과한다.
+    #[test]
+    fn the_defaults_are_valid() {
+        base().validate().expect("기본값이 막혔다");
+        assert_eq!(CollectorConfig::default().orphan_sweep_secs, 300);
+        assert_eq!(CollectorConfig::default().backfill_secs, 60);
     }
 }

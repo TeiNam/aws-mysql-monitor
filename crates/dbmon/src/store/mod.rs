@@ -212,6 +212,29 @@ impl DynamoSlowQueryStore {
     /// 레코드를 항목으로. **키는 [`keys`] 가 만든다** — 쓰기·읽기가 각자 만들면
     /// 한쪽만 바뀔 때 조회가 조용히 0건이 된다.
     fn to_item(&self, q: &SlowQuery) -> Result<HashMap<String, AttributeValue>> {
+        self.to_item_keyed(q, q)
+    }
+
+    /// 레코드를 항목으로 만들되 **키는 `key_source` 에서** 가져온다.
+    ///
+    /// # 왜 키를 분리해야 하는가
+    ///
+    /// `merge` 는 `started_at_ms` 를 **더 이른 쪽**으로 정한다(더 정확한 추정을
+    /// 채택한다). 그런데 `SK` 가 `started_at_ms` 에서 파생되므로, 병합이 시작 시각을
+    /// 앞당기면 **항목의 키가 이동한다.** 그러면 조건부 쓰기(`SK = <읽은 SK>`)가
+    /// 가리키는 자리에 항목이 없어 조건 실패 → 재시도 → 5회 초과로 죽는다.
+    /// 실제로 그렇게 죽었다("낙관적 잠금 재시도 5회 초과").
+    ///
+    /// 그래서 **항목은 처음 저장된 자리에 머문다.** 더 정확한 시작 시각은 속성으로
+    /// 남고(`started_at_ms`), 키는 움직이지 않는다.
+    ///
+    /// 대가: `SK` 가 실제 시작 시각과 최대 1초 어긋날 수 있어 시간 범위 조회의
+    /// 경계가 그만큼 부정확해진다. 한 실행이 두 레코드로 갈리는 것보다 훨씬 낫다.
+    fn to_item_keyed(
+        &self,
+        q: &SlowQuery,
+        key_source: &SlowQuery,
+    ) -> Result<HashMap<String, AttributeValue>> {
         let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(q)
             .map_err(|e| DomainError::Internal(format!("레코드 직렬화 실패: {e}")))?;
 
@@ -219,8 +242,14 @@ impl DynamoSlowQueryStore {
         let (g2pk, g2sk) = keys::gsi2(q.env, q.duration_ms, q.started_at_ms);
 
         for (k, v) in [
-            ("PK", keys::slow_query_pk(&q.instance_id, q.started_at_ms)),
-            ("SK", keys::slow_query_sk(q.started_at_ms, q.thread_id)),
+            (
+                "PK",
+                keys::slow_query_pk(&key_source.instance_id, key_source.started_at_ms),
+            ),
+            (
+                "SK",
+                keys::slow_query_sk(key_source.started_at_ms, key_source.thread_id),
+            ),
             ("GSI1PK", g1pk),
             ("GSI1SK", g1sk),
             ("GSI2PK", g2pk),
@@ -309,14 +338,51 @@ pub(crate) fn is_conditional_failure<E: std::fmt::Debug, R: std::fmt::Debug>(
 impl SlowQueryStore for DynamoSlowQueryStore {
     async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
         for attempt in 0..MAX_UPSERT_RETRIES {
-            let existing = self.find_by_record_id(&q.record_id).await?;
+            // ① `record_id` 직접 조회.
+            let mut existing = self.find_by_record_id(&q.record_id).await?;
+
+            // ② **±2초 보조 조회.** 없으면 같은 실행이 두 레코드로 갈린다.
+            //
+            // # 왜 필수인가
+            //
+            // 두 경로의 시작 시각 추정이 다르다:
+            //
+            // | 경로 | 시작 시각 | 정밀도 |
+            // |---|---|---|
+            // | 실시간 | `now − PROCESSLIST.TIME × 1000` | **정수 초** — 최대 1초 오차 |
+            // | 슬로우로그 | `# Time − Query_time` | 밀리초 |
+            //
+            // `record_id` 는 시작 시각을 **초 버킷**으로 접으므로, 두 추정이 초 경계를
+            // 사이에 두면 버킷이 갈린다 — 시작 시각의 밀리초가 균등분포면 **약 50%** 다.
+            // 그러면 한 실행이 레코드 2건이 되고, 한쪽은 정확 지표만·다른 쪽은 플랜만
+            // 갖는다. **F5 병합의 목적 자체가 달성되지 않는다.**
+            //
+            // ⚠ `find_merge_candidate` 는 이 문제를 위해 만들어졌는데(05 §8.2)
+            // **프로덕션 호출부가 없었다.** 페이크 저장소에는 이 폴백이 있어서
+            // 모든 단위 테스트가 통과했다 — 페이크와 실제의 계약이 갈린 상태였다.
+            if existing.is_none() {
+                existing = self
+                    .find_merge_candidate(
+                        &q.instance_id,
+                        q.thread_id,
+                        &q.app_digest,
+                        q.started_at_ms,
+                        dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS,
+                    )
+                    .await?;
+            }
             let merged = match &existing {
                 // **`merge(existing, incoming)`** 순서를 지킨다. `record_id`·`literal_policy`
                 // 는 "먼저 저장된 쪽 유지" 가 문서화된 의도다.
                 Some(prev) => merge(prev, q),
                 None => q.clone(),
             };
-            let item = self.to_item(&merged)?;
+            // **키는 기존 항목 자리를 유지한다.** 병합이 시작 시각을 앞당기면
+            // 키가 이동해 조건부 쓰기가 깨진다(위 `to_item_keyed` 참고).
+            let item = match &existing {
+                Some(prev) => self.to_item_keyed(&merged, prev)?,
+                None => self.to_item(&merged)?,
+            };
 
             let mut put = self
                 .client

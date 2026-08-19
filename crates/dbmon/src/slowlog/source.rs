@@ -29,13 +29,32 @@ use dbmon_core::time::EpochMs;
 
 use super::SlowLogEntry;
 
+/// 저장할 SQL 텍스트의 바이트 상한.
+///
+/// DynamoDB 항목 한도(400KB)보다 훨씬 작게 둔다 — 한 항목에 플랜·지표도 들어간다.
+const MAX_STORED_SQL_BYTES: usize = 64 * 1024;
+
 /// 백필 결과. 조용히 넘기지 않기 위해 센다.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillStats {
     pub merged: usize,
-    /// 정규화·마스킹에서 버려진 수.
+    /// 도메인 레코드를 만들 수 없어 버린 수 (식별자 위반 등).
     pub unnormalizable: usize,
+    /// **마스킹을 포기하고 텍스트 없이 저장한 수.**
+    ///
+    /// `unnormalizable` 과 섞으면 마스킹 회귀가 파서 문제로 오인된다.
+    pub masking_degraded: usize,
     pub errors: usize,
+    /// **로그를 읽지 못한 인스턴스 수.**
+    ///
+    /// 이게 없으면 "로그를 못 읽었다" 와 "읽을 게 없었다" 가 구분되지 않는다 —
+    /// 전자는 장애고 후자는 정상이다.
+    pub fetch_errors: usize,
+    /// **한 라운드에 다 읽지 못한 인스턴스 수** (`has_more`).
+    ///
+    /// `FilterLogEvents` 는 페이지당 10,000건 상한이 있다. 세지 않으면 바쁜
+    /// 인스턴스가 계속 뒤처지는 것을 알 수 없다.
+    pub incomplete: usize,
 }
 
 /// 엔트리를 도메인 레코드로 옮긴다.
@@ -53,28 +72,48 @@ pub fn to_slow_query(
 
     let normalized = dbmon_normalize::normalize(&entry.sql_text);
 
-    // **인용부호가 닫히지 않았으면 파싱을 신뢰할 수 없다.** 그 상태로 마스킹하면
-    // 리터럴이 남을 수 있다 — 이 프로젝트에서 마스킹 누출이 다섯 번 재발했다.
-    // 다이제스트도 의미가 없으므로 엔트리를 버린다(fail-closed).
-    if normalized.unterminated_quote {
-        return None;
-    }
-
-    let sql_text = match literal_policy {
+    // **텍스트를 포기하되 레코드는 남긴다.**
+    //
+    // 처음에는 인용부호 미종료·리터럴 잔류에서 엔트리 전체를 버렸다. 그러면
+    // **렉서가 못 다루는 문장 — 즉 가장 조사할 필요가 큰 문장 — 의 `rows_examined` 와
+    // 정확한 소요 시간이 영구히 없다.** 실시간 경로는 같은 상황에서 텍스트만
+    // 포기하고 레코드를 남긴다(`masking_degraded`). 여기서도 그렇게 한다.
+    let mut degraded = false;
+    let mut sql_text = match literal_policy {
         // 저장하지 않는다. 다이제스트만 남는다.
         LiteralPolicy::Off => None,
         // **정규 텍스트만 저장한다.** 슬로우 로그에는 리터럴이 그대로 있으므로
         // 여기서 원문을 쓰면 정책이 `masked` 인데 리터럴이 저장된다.
         LiteralPolicy::Masked => {
-            // 정규화가 리터럴을 남겼다면 저장하지 않는다 — 정책 위반보다 결측이 낫다.
-            if normalized.check_no_literals().is_err() {
-                return None;
+            // 인용부호가 닫히지 않았으면 파싱을 신뢰할 수 없다 — 마스킹이 리터럴을
+            // 남길 수 있다. 리터럴 잔류도 같다. **텍스트만 버린다.**
+            if normalized.unterminated_quote || normalized.check_no_literals().is_err() {
+                degraded = true;
+                None
+            } else {
+                Some(normalized.canonical.clone())
             }
-            Some(normalized.canonical.clone())
         }
         // 정책이 원문 저장을 허용한다. `full_restricted` 의 열람 제한은 조회 계층의 일이다.
         LiteralPolicy::Full | LiteralPolicy::FullRestricted => Some(entry.sql_text.clone()),
     };
+
+    // **길이 상한.** 없으면 400KB 를 넘는 문장 하나가 `upsert_merged` 를 결정적으로
+    // 실패시키고, 그 실패가 `errors > 0` 이 되어 **체크포인트가 전진하지 못한다** —
+    // 다음 라운드도 같은 엔트리로 실패해 그 인스턴스의 백필이 영구히 멈춘다.
+    // DB 계정 하나로 유발할 수 있었다.
+    let mut truncated = normalized.truncated;
+    if let Some(t) = sql_text.as_mut()
+        && t.len() > MAX_STORED_SQL_BYTES
+    {
+        // UTF-8 경계에서 자른다.
+        let mut cut = MAX_STORED_SQL_BYTES;
+        while cut > 0 && !t.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        t.truncate(cut);
+        truncated = true;
+    }
 
     let record_id = RecordId::new(&instance.id, entry.thread_id, entry.started_at_ms);
     Some(SlowQuery {
@@ -99,9 +138,12 @@ pub fn to_slow_query(
         // **슬로우로그가 권위값이다** — `merge` 가 이 값을 이긴 것으로 취급한다.
         duration_source: DurationSource::Slowlog,
         sql_text,
-        // 슬로우 로그는 절단하지 않는다. 그게 이 경로의 장점이다.
-        sql_text_truncated: false,
-        sql_text_lossy: false,
+        // **원문은 절단되지 않지만 저장하는 텍스트는 절단될 수 있다.**
+        // `canonical` 은 8,192자에서 잘리고, 위 길이 상한도 자른다. 플래그를
+        // `false` 로 박아 두면 UI 가 잘린 SQL 에 절단 배지를 못 붙인다.
+        sql_text_truncated: truncated,
+        // 마스킹을 포기했으면 손실이 있었다는 사실을 남긴다.
+        sql_text_lossy: degraded,
         literal_policy,
         literal_policy_at_ms: captured_at_ms,
         app_digest: normalized.app_digest.clone(),
@@ -141,10 +183,14 @@ pub async fn backfill<S: SlowQueryStore>(
 
     for entry in entries {
         let Some(q) = to_slow_query(entry, instance, literal_policy, now_ms) else {
-            // 정규화가 거부했다(파라미터 자리표, 힌트 등). 사유를 세어 둔다.
+            // 도메인 레코드를 만들 수 없었다(식별자 규칙 위반 등).
             stats.unnormalizable += 1;
             continue;
         };
+        if q.sql_text_lossy {
+            // 텍스트는 포기했지만 레코드는 저장한다 — 정확 지표가 목적이다.
+            stats.masking_degraded += 1;
+        }
         match store.upsert_merged(&q).await {
             Ok(_) => stats.merged += 1,
             Err(e) => {
@@ -162,7 +208,14 @@ pub async fn backfill<S: SlowQueryStore>(
     if stats.unnormalizable > 0 {
         tracing::warn!(
             count = stats.unnormalizable,
-            "정규화할 수 없는 슬로우로그 엔트리를 건너뛰었다"
+            "도메인 레코드를 만들 수 없는 엔트리를 건너뛰었다"
+        );
+    }
+    if stats.masking_degraded > 0 {
+        // **마스킹 회귀의 신호다.** 파서 문제와 섞이지 않게 따로 센다.
+        tracing::warn!(
+            count = stats.masking_degraded,
+            "마스킹을 신뢰할 수 없어 SQL 텍스트 없이 저장했다 (지표는 남는다)"
         );
     }
     Ok(stats)
@@ -267,23 +320,71 @@ mod tests {
         assert!(!q.app_digest.is_empty());
     }
 
-    /// **`record_id` 가 실시간 경로와 같아야 병합된다.**
+    /// **마스킹을 신뢰할 수 없으면 텍스트만 포기하고 레코드는 남긴다.**
     ///
-    /// 다르면 같은 실행이 두 레코드로 저장되고, 화면에 중복으로 보인다.
+    /// 엔트리를 버리면 렉서가 못 다루는 문장 — 가장 조사할 필요가 큰 문장 — 의
+    /// `rows_examined` 와 정확한 소요 시간이 영구히 없다.
     #[test]
-    fn record_id_matches_the_realtime_path_for_the_same_execution() {
+    fn unmaskable_sql_keeps_the_record_without_text() {
+        // 닫히지 않은 인용부호 — 파싱을 신뢰할 수 없다.
+        let mut e = entry("SELECT a FROM t WHERE s = 'unterminated");
+        e.rows_examined = Some(900_000);
+
+        let q =
+            to_slow_query(&e, &instance(), LiteralPolicy::Masked, 0).expect("레코드는 남아야 한다");
+        assert_eq!(q.sql_text, None, "신뢰할 수 없는 마스킹 결과를 저장했다");
+        assert!(q.sql_text_lossy, "손실 사실이 기록되지 않았다");
+        // **정확 지표는 살아 있다** — 이게 이 경로의 목적이다.
+        assert_eq!(q.stats.rows_examined, Some(900_000));
+        assert_eq!(q.duration_ms, 8_004);
+    }
+
+    /// **저장 텍스트가 길면 자르고 플래그를 세운다.**
+    ///
+    /// 없으면 400KB 초과 문장 하나가 `upsert_merged` 를 결정적으로 실패시키고,
+    /// 그 실패가 체크포인트를 막아 그 인스턴스의 백필이 영구히 멈춘다.
+    #[test]
+    fn oversized_sql_is_truncated_not_left_to_fail_the_write() {
+        let huge = format!("SELECT {}", "a".repeat(200_000));
+        let q = to_slow_query(&entry(&huge), &instance(), LiteralPolicy::Full, 0).expect("변환");
+        let stored = q.sql_text.as_deref().unwrap_or_default();
+        assert!(
+            stored.len() <= 64 * 1024,
+            "저장 텍스트가 {}바이트다",
+            stored.len()
+        );
+        assert!(
+            q.sql_text_truncated,
+            "절단 배지가 없다 — 잘린 SQL 을 전문으로 오독한다"
+        );
+    }
+
+    /// **`record_id` 는 정확한 시작 시각에서 만든다.**
+    ///
+    /// ⚠ 이전 테스트는 "실시간" 키를 슬로우로그 값으로 만들어 비교해서
+    /// `RecordId::new(x) == RecordId::new(x)` 를 확인했다 — 공허했다(2차 리뷰가 지적).
+    ///
+    /// **두 경로의 키가 초 버킷을 걸쳐 갈릴 수 있다는 것이 실제 문제**이고,
+    /// 그건 저장소의 ±2초 보조 조회가 해결한다 —
+    /// `it_store::one_execution_never_splits_across_second_buckets` 가 실제 저장소로
+    /// 검증한다. 여기서는 키의 구성만 고정한다.
+    #[test]
+    fn record_id_is_built_from_the_precise_start() {
         use dbmon_core::ids::RecordId;
 
         let e = entry("SELECT 1");
         let q = to_slow_query(&e, &instance(), LiteralPolicy::Masked, 0).expect("변환");
+        assert_eq!(
+            q.record_id,
+            RecordId::new(&instance().id, e.thread_id, e.started_at_ms)
+        );
 
-        // 실시간 경로는 같은 (인스턴스, 스레드, 시작 초) 로 키를 만든다.
-        let realtime = RecordId::new(&instance().id, e.thread_id, e.started_at_ms);
-        assert_eq!(q.record_id, realtime);
-
-        // ±1초 흔들림도 같은 키로 접힌다 — `record_id` 가 초 단위인 이유다.
-        let jittered = RecordId::new(&instance().id, e.thread_id, e.started_at_ms + 300);
-        assert_eq!(q.record_id, jittered);
+        // **초 버킷을 걸치면 키가 달라진다** — 이 사실을 명시적으로 고정한다.
+        let earlier = RecordId::new(&instance().id, e.thread_id, e.started_at_ms - 800);
+        assert_ne!(
+            q.record_id, earlier,
+            "초 버킷이 갈리는 사실이 사라졌다 — 저장소의 보조 조회가 왜 필요한지의 근거다"
+        );
     }
 
     /// **한 건이 정규화에 실패해도 나머지를 병합한다.**

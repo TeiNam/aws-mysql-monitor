@@ -846,3 +846,131 @@ async fn retention_ttl_is_set_only_when_deleted() {
         "되살아난 인스턴스에 TTL 이 남았다 — 30일 뒤 등록부에서 사라진다"
     );
 }
+
+/// **한 실행이 두 레코드로 갈리지 않아야 한다 (F5).**
+///
+/// # 이 테스트가 존재하는 이유
+///
+/// 두 경로의 시작 시각 추정 정밀도가 다르다:
+///
+/// | 경로 | 시작 시각 | 정밀도 |
+/// |---|---|---|
+/// | 실시간 | `now − PROCESSLIST.TIME × 1000` | **정수 초** |
+/// | 슬로우로그 | `# Time − Query_time` | 밀리초 |
+///
+/// `record_id` 는 시작 시각을 초 버킷으로 접으므로 두 추정이 초 경계를 사이에 두면
+/// **버킷이 갈린다** — 밀리초가 균등분포면 약 50%다. 그러면 한 실행이 레코드 2건이
+/// 되고 한쪽은 정확 지표만, 다른 쪽은 플랜만 갖는다.
+///
+/// ⚠ 이전 단위 테스트는 "실시간" 키를 슬로우로그 값으로 만들어 비교해서
+/// `RecordId::new(x) == RecordId::new(x)` 를 확인하고 있었다 — 공허했다.
+/// 그리고 페이크 저장소에는 ±2초 폴백이 있었지만 **실제 저장소에는 없었다.**
+#[tokio::test]
+async fn one_execution_never_splits_across_second_buckets() {
+    let Some(s) = store("bucket-split").await else {
+        return;
+    };
+    let i = instance();
+
+    // 진짜 시작 시각: 어떤 초의 300ms 지점.
+    let true_start = T0 + 300;
+    let duration = 8_004;
+
+    // 실시간 경로: `PROCESSLIST.TIME` 이 정수 초라 최대 1초 오차가 난다.
+    // 여기서는 800ms 이르게 추정 → **이전 초 버킷**으로 떨어진다.
+    let realtime_start = true_start - 800;
+    let mut realtime = sample(7001, realtime_start);
+    realtime.state = SlowQueryState::InFlight;
+    realtime.ended_at_ms = None;
+    realtime.stats = Default::default(); // 실시간은 정확 지표를 줄 수 없다
+    realtime.plan.normalized_json = Some(r#"{"query_block":{"table":"orders"}}"#.into());
+    realtime.plan.tree_text = Some("-> Table scan on orders".into());
+    realtime.duration_source = DurationSource::Polled;
+    realtime.record_id = RecordId::new(&i, 7001, realtime_start);
+
+    // 슬로우로그 경로: 정확한 시작(655ms).
+    let mut slowlog = sample(7001, true_start);
+    slowlog.state = SlowQueryState::Finalized;
+    slowlog.ended_at_ms = Some(true_start + duration);
+    slowlog.duration_ms = duration;
+    slowlog.duration_source = DurationSource::Slowlog;
+    slowlog.capture_source = CaptureSource::Slowlog;
+    slowlog.stats = ExecStats {
+        rows_examined: Some(180_000),
+        ..Default::default()
+    };
+    slowlog.plan = Default::default(); // 슬로우로그에는 플랜이 없다
+    slowlog.record_id = RecordId::new(&i, 7001, true_start);
+
+    // **전제 확인**: 두 키가 실제로 다르다. 같으면 이 테스트가 무의미하다.
+    assert_ne!(
+        realtime.record_id, slowlog.record_id,
+        "두 키가 같으면 이 테스트는 아무것도 검증하지 않는다"
+    );
+
+    s.upsert_merged(&realtime).await.expect("실시간 저장");
+    s.upsert_merged(&slowlog).await.expect("백필 저장");
+
+    // **레코드가 하나여야 한다.**
+    let range = TimeRange::new(T0 - 10_000, T0 + 60_000).expect("구간");
+    let all = s.list_by_instance(&i, range, 50).await.expect("조회");
+    let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 7001).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "한 실행이 {}건으로 갈렸다 — 정확 지표와 플랜이 서로 다른 레코드에 있다",
+        mine.len()
+    );
+
+    // 그리고 두 경로의 기여가 **모두** 살아 있어야 한다.
+    let merged = mine[0];
+    assert_eq!(
+        merged.stats.rows_examined,
+        Some(180_000),
+        "슬로우로그의 정확 지표가 없다"
+    );
+    assert!(merged.plan.has_plan(), "실시간이 채운 플랜이 없다");
+    assert_eq!(merged.duration_source, DurationSource::Slowlog);
+    assert_eq!(merged.duration_ms, duration);
+}
+
+/// 반대 도착 순서도 같은 결과여야 한다 (병합 대칭성).
+#[tokio::test]
+async fn bucket_split_merge_is_order_independent() {
+    let Some(s) = store("bucket-split-rev").await else {
+        return;
+    };
+    let i = instance();
+    let true_start = T0 + 655;
+
+    let mut slowlog = sample(7002, true_start);
+    slowlog.duration_source = DurationSource::Slowlog;
+    slowlog.capture_source = CaptureSource::Slowlog;
+    slowlog.stats = ExecStats {
+        rows_examined: Some(180_000),
+        ..Default::default()
+    };
+    slowlog.record_id = RecordId::new(&i, 7002, true_start);
+
+    let mut realtime = sample(7002, true_start - 800);
+    realtime.stats = Default::default();
+    realtime.plan.normalized_json = Some(r#"{"query_block":{}}"#.into());
+    realtime.plan.tree_text = Some("-> Table scan".into());
+    realtime.record_id = RecordId::new(&i, 7002, true_start - 800);
+
+    // 백필이 **먼저** 도착한다.
+    s.upsert_merged(&slowlog).await.expect("백필 먼저");
+    s.upsert_merged(&realtime).await.expect("실시간 나중");
+
+    let range = TimeRange::new(T0 - 10_000, T0 + 60_000).expect("구간");
+    let mine: Vec<_> = s
+        .list_by_instance(&i, range, 50)
+        .await
+        .expect("조회")
+        .into_iter()
+        .filter(|q| q.thread_id == 7002)
+        .collect();
+    assert_eq!(mine.len(), 1, "도착 순서가 결과를 바꿨다");
+    assert_eq!(mine[0].stats.rows_examined, Some(180_000));
+    assert!(mine[0].plan.has_plan());
+}

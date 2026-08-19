@@ -176,11 +176,18 @@ resource "aws_iam_role_policy" "task_discovery" {
       {
         Sid    = "SlowLogRead"
         Effect = "Allow"
-        Action = ["logs:FilterLogEvents", "logs:DescribeLogStreams"]
-        # 슬로우로그에는 SQL 리터럴이 들어간다. 비-prd 는 열거를 강제한다
-        # (`slowlog_log_group_arns` 의 validation).
+        # `DescribeLogStreams` 는 코드가 부르지 않는다 — `FilterLogEvents` 만 쓴다.
+        # 쓰지 않는 액션을 남겨 두면 권한 범위가 근거 없이 넓어진다.
+        Action = ["logs:FilterLogEvents"]
+        # 슬로우로그에는 **SQL 리터럴이 들어간다** — 개인정보가 실릴 수 있다.
+        #
+        # 열거된 그룹이 있으면 그것만. 없으면 인스턴스 슬로우로그 그룹으로 좁힌다:
+        # `/aws/rds/instance/*/slowquery` 는 `/aws/rds/*` 보다 훨씬 좁다 —
+        # 후자는 error/general/audit 로그와 클러스터 로그까지 포함한다.
+        # 특히 **audit 로그는 모든 문장을 담으므로** 노출 범위가 전혀 다르다.
         Resource = length(var.slowlog_log_group_arns) > 0 ? var.slowlog_log_group_arns : [
-          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/*"
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/instance/*/slowquery:*",
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/instance/*/slowquery"
         ]
       },
     ]

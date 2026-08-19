@@ -49,14 +49,28 @@ pub enum Verdict {
 
 /// 고아인가. **순수 함수** — `now_ms` 와 임계를 받는다.
 ///
-/// `owner_worker` 가 나 자신이면 [`Verdict::Mine`] 이다. 기동 시에는 재수화를
-/// 시도해야 하고(같은 `thread_id` 가 아직 살아 있을 수 있다), 스윕에서는 내
-/// 레코드가 고아일 수 없다 — 내가 살아 있으므로 `last_seen_at_ms` 를 갱신하고 있다.
-pub fn judge(q: &SlowQuery, me: &str, now_ms: EpochMs, threshold_ms: i64) -> Verdict {
+/// # `Mine` 은 이름만으로 판정하지 않는다 (epoch 를 함께 본다)
+///
+/// `worker_id` 는 `{role}-{HOSTNAME}` 이고, docker compose·k8s StatefulSet·로컬은
+/// **재시작해도 같은 문자열**이다. 이름만 보면 급사한 프로세스가 남긴 진행 중
+/// 레코드를 같은 이름의 새 프로세스가 `Mine` 으로 보고 **매 스윕 건너뛴다** —
+/// F4 가 없애려던 유령이 정확히 그 경로로 TTL(35일)까지 남는다.
+///
+/// 리스 획득은 항상 `epoch + 1` 이므로(`store::lease`), **`owner_epoch` 가 현재
+/// epoch 보다 작으면 그 레코드는 이전 생애의 것**이다 — 지금 살아 있을 수 없다.
+/// 그 근거는 이미 레코드에 저장돼 있는데 판정이 쓰지 않고 있었다.
+pub fn judge(
+    q: &SlowQuery,
+    me: &str,
+    my_epoch: Option<u64>,
+    now_ms: EpochMs,
+    threshold_ms: i64,
+) -> Verdict {
     if q.state != SlowQueryState::InFlight {
         return Verdict::NotInFlight;
     }
-    if q.owner_worker.as_deref() == Some(me) {
+    // 이름이 같고 **epoch 도 같을 때만** 내 것이다.
+    if q.owner_worker.as_deref() == Some(me) && q.owner_epoch == my_epoch {
         return Verdict::Mine;
     }
     // `last_seen_at_ms` 가 없으면 선행 저장 직후다 — `started_at_ms` 를 쓴다.
@@ -105,6 +119,7 @@ pub struct SweepStats {
 pub async fn sweep<S: SlowQueryStore>(
     store: Arc<S>,
     me: &str,
+    my_epoch: Option<u64>,
     now_ms: EpochMs,
     threshold_ms: i64,
     limit: usize,
@@ -114,7 +129,7 @@ pub async fn sweep<S: SlowQueryStore>(
     stats.scanned = in_flight.len();
 
     for q in &in_flight {
-        match judge(q, me, now_ms, threshold_ms) {
+        match judge(q, me, my_epoch, now_ms, threshold_ms) {
             Verdict::Orphaned { silent_for_ms } => {
                 let abandoned = abandon(q, now_ms);
                 match store.upsert_merged(&abandoned).await {
@@ -191,10 +206,10 @@ mod tests {
     #[test]
     fn recently_seen_records_are_left_alone() {
         let q = in_flight("other-worker", Some(NOW - 5_000));
-        assert_eq!(judge(&q, "me", NOW, THRESHOLD), Verdict::Alive);
+        assert_eq!(judge(&q, "me", Some(7), NOW, THRESHOLD), Verdict::Alive);
         // 임계 직전도 살아 있다.
         let q = in_flight("other-worker", Some(NOW - THRESHOLD));
-        assert_eq!(judge(&q, "me", NOW, THRESHOLD), Verdict::Alive);
+        assert_eq!(judge(&q, "me", Some(7), NOW, THRESHOLD), Verdict::Alive);
     }
 
     /// 임계를 넘으면 고아다.
@@ -202,17 +217,44 @@ mod tests {
     fn silent_records_past_the_threshold_are_orphaned() {
         let q = in_flight("dead-worker", Some(NOW - THRESHOLD - 1));
         assert!(matches!(
-            judge(&q, "me", NOW, THRESHOLD),
+            judge(&q, "me", Some(7), NOW, THRESHOLD),
             Verdict::Orphaned { .. }
         ));
     }
 
-    /// **내 레코드는 고아가 아니다.** 내가 살아 있으므로 관측을 갱신하고 있다.
+    /// **현재 생애의 내 레코드는 고아가 아니다.** 내가 관측을 갱신하고 있다.
     #[test]
-    fn my_own_records_are_never_orphaned() {
-        // 아주 오래 침묵했어도 내 것이면 재수화 대상이다.
+    fn my_own_records_in_this_lease_are_never_orphaned() {
         let q = in_flight("me", Some(NOW - 10 * 60_000));
-        assert_eq!(judge(&q, "me", NOW, THRESHOLD), Verdict::Mine);
+        assert_eq!(judge(&q, "me", Some(7), NOW, THRESHOLD), Verdict::Mine);
+    }
+
+    /// **이전 생애의 내 레코드는 고아다** (2차 리뷰 CRITICAL).
+    ///
+    /// `worker_id` 는 `{role}-{HOSTNAME}` 이라 재시작해도 같다. 이름만 보면 급사한
+    /// 프로세스의 레코드를 새 프로세스가 `Mine` 으로 보고 **영구히 건너뛴다** —
+    /// F4 가 없애려던 유령이 그 경로로 TTL(35일)까지 남는다.
+    #[test]
+    fn my_records_from_a_previous_lease_are_orphaned() {
+        // 레코드의 epoch 는 7, 지금 내 epoch 는 8 (리스를 다시 잡았다).
+        let q = in_flight("me", Some(NOW - 10 * 60_000));
+        assert!(
+            matches!(
+                judge(&q, "me", Some(8), NOW, THRESHOLD),
+                Verdict::Orphaned { .. }
+            ),
+            "같은 이름이라고 이전 생애의 유령을 건너뛰었다"
+        );
+    }
+
+    /// 리더가 아니면(epoch 없음) 이름이 같아도 내 것이 아니다.
+    #[test]
+    fn without_a_lease_nothing_counts_as_mine() {
+        let q = in_flight("me", Some(NOW - 10 * 60_000));
+        assert!(matches!(
+            judge(&q, "me", None, NOW, THRESHOLD),
+            Verdict::Orphaned { .. }
+        ));
     }
 
     /// `last_seen_at_ms` 가 없으면 `started_at_ms` 를 쓴다 — 선행 저장 직후다.
@@ -221,13 +263,13 @@ mod tests {
         // 시작이 2분 전이고 임계가 33초 → 고아다.
         let q = in_flight("dead-worker", None);
         assert!(matches!(
-            judge(&q, "me", NOW, THRESHOLD),
+            judge(&q, "me", Some(7), NOW, THRESHOLD),
             Verdict::Orphaned { .. }
         ));
         // 시작이 방금이면 살아 있다.
         let mut fresh = in_flight("dead-worker", None);
         fresh.started_at_ms = NOW - 1_000;
-        assert_eq!(judge(&fresh, "me", NOW, THRESHOLD), Verdict::Alive);
+        assert_eq!(judge(&fresh, "me", Some(7), NOW, THRESHOLD), Verdict::Alive);
     }
 
     /// 확정된 레코드는 스윕 대상이 아니다.
@@ -235,7 +277,10 @@ mod tests {
     fn finalized_records_are_not_swept() {
         let mut q = in_flight("other", Some(NOW - 10 * 60_000));
         q.state = SlowQueryState::Finalized;
-        assert_eq!(judge(&q, "me", NOW, THRESHOLD), Verdict::NotInFlight);
+        assert_eq!(
+            judge(&q, "me", Some(7), NOW, THRESHOLD),
+            Verdict::NotInFlight
+        );
     }
 
     /// **완료 시각을 만들어 내지 않는다.**
@@ -292,7 +337,7 @@ mod tests {
             store.upsert_merged(q).await.expect("저장");
         }
 
-        let stats = sweep(Arc::clone(&store), "me", NOW, THRESHOLD, 100)
+        let stats = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100)
             .await
             .expect("스윕");
         assert_eq!(stats.abandoned, 1, "{stats:?}");
@@ -326,13 +371,13 @@ mod tests {
         let orphan = in_flight("dead-worker", Some(NOW - 10 * 60_000));
         store.upsert_merged(&orphan).await.expect("저장");
 
-        let first = sweep(Arc::clone(&store), "me", NOW, THRESHOLD, 100)
+        let first = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100)
             .await
             .expect("1회");
         assert_eq!(first.abandoned, 1);
 
         // 확정 후에는 희소 인덱스에서 빠지므로 두 번째 스윕은 아무것도 보지 않는다.
-        let second = sweep(Arc::clone(&store), "me", NOW, THRESHOLD, 100)
+        let second = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100)
             .await
             .expect("2회");
         assert_eq!(second.abandoned, 0, "같은 레코드를 또 확정했다");

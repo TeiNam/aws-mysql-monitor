@@ -251,3 +251,43 @@ fn container_and_target_group_healthchecks_are_not_swapped() {
         "대상 그룹 헬스체크는 /readyz 여야 한다 (standby 를 대상에서 빼기 위해)"
     );
 }
+
+/// **슬로우로그 IAM 범위가 코드가 실제로 쓰는 것과 일치해야 한다.**
+///
+/// 슬로우로그에는 SQL 리터럴 — 즉 개인정보가 실릴 수 있는 텍스트 — 가 들어간다.
+/// `/aws/rds/*` 는 audit 로그까지 포함하고, audit 로그는 **모든 문장**을 담으므로
+/// 노출 범위가 전혀 다르다.
+#[test]
+fn slowlog_iam_scope_matches_what_the_code_reads() {
+    let iam = std::fs::read_to_string("../../infra/layers/40-compute/iam.tf").expect("iam.tf");
+
+    // 코드는 `FilterLogEvents` 만 부른다.
+    let uses_describe_streams = std::fs::read_to_string("src/slowlog/fetch.rs")
+        .expect("fetch.rs")
+        .contains("describe_log_streams");
+    assert!(
+        !uses_describe_streams,
+        "코드가 DescribeLogStreams 를 쓴다 — IAM 에 다시 추가해야 한다"
+    );
+    assert!(
+        !iam.contains("logs:DescribeLogStreams"),
+        "IAM 에 쓰지 않는 액션이 남아 있다 — 권한이 근거 없이 넓다"
+    );
+
+    // 폴백 범위가 `/aws/rds/*` 로 넓어지면 안 된다.
+    assert!(
+        !iam.contains(r#"log-group:/aws/rds/*""#),
+        "슬로우로그 IAM 이 /aws/rds/* 로 열려 있다 — audit 로그(모든 문장)까지 읽힌다"
+    );
+    assert!(
+        iam.contains("/aws/rds/instance/*/slowquery"),
+        "슬로우로그 그룹으로 좁혀지지 않았다"
+    );
+
+    // 코드가 만드는 로그 그룹 이름 규칙과 IAM 패턴이 맞아야 한다.
+    let fetch = std::fs::read_to_string("src/slowlog/fetch.rs").expect("fetch.rs");
+    assert!(
+        fetch.contains("/aws/rds/instance/{}/slowquery"),
+        "로그 그룹 이름 규칙이 바뀌었다 — IAM 패턴도 함께 고쳐야 한다"
+    );
+}

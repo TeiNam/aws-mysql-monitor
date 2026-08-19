@@ -44,41 +44,90 @@ pub trait SlowLogFetcher: Send + Sync {
 ///
 /// RDS 가 만드는 이름 규칙이다. **인스턴스 식별자만 들어간다** — 계정·리전은 API
 /// 호출의 자격증명·엔드포인트가 정한다.
+/// **`InstanceId` 의 접근자를 쓴다.** 문자열을 다시 파싱하면 검증 규칙이 두 곳이 된다 —
+/// `validate_identifier` 가 이미 `/`·`:`·`#` 를 거부하므로 경로 조작은 불가능하다.
 pub fn slowquery_log_group(instance: &InstanceId) -> Result<String> {
-    let (_, _, identifier) = split_instance(instance)?;
-    Ok(format!("/aws/rds/instance/{identifier}/slowquery"))
-}
-
-fn split_instance(instance: &InstanceId) -> Result<(String, String, String)> {
-    let mut it = instance.as_str().split('/');
-    match (it.next(), it.next(), it.next(), it.next()) {
-        (Some(a), Some(r), Some(i), None) => Ok((a.into(), r.into(), i.into())),
-        _ => Err(dbmon_core::error::DomainError::InvalidInput {
-            field: "instance_id".into(),
-            reason: format!("형식이 아니다: {}", instance.as_str()),
-        }),
-    }
+    Ok(format!(
+        "/aws/rds/instance/{}/slowquery",
+        instance.identifier()
+    ))
 }
 
 /// CloudWatch Logs 에서 가져온다. **프로덕션 경로.**
+///
+/// # 리전별 클라이언트가 필요하다
+///
+/// 로그 그룹 이름에는 리전이 없다(`/aws/rds/instance/<id>/slowquery`) — 리전은
+/// **클라이언트가** 정한다. 등록부는 `target_regions` 전체를 담으므로 홈 리전
+/// 클라이언트 하나로 돌리면 두 가지가 깨진다:
+///
+/// 1. 타 리전 인스턴스는 `ResourceNotFound` 로 조용히 건너뛰어진다 → 정확 지표 영구 결측
+/// 2. **같은 식별자가 홈 리전에도 있으면 다른 DB 의 슬로우로그를 파싱해 엉뚱한
+///    `instance_id` 로 저장한다** — 원문 리터럴을 포함한 오귀속이고, prd↔dev 경계를
+///    넘을 수 있다
+///
+/// 그래서 리전을 함께 들고 **불일치를 fail-closed** 로 거부한다.
 pub struct CloudWatchFetcher {
     client: aws_sdk_cloudwatchlogs::Client,
+    /// 이 클라이언트가 붙는 리전.
+    region: String,
     /// 한 번에 가져올 이벤트 상한. 레이트 리밋과 메모리를 함께 막는다.
     max_events: i32,
 }
 
 impl CloudWatchFetcher {
-    pub fn new(client: aws_sdk_cloudwatchlogs::Client) -> Self {
+    pub fn new(client: aws_sdk_cloudwatchlogs::Client, region: impl Into<String>) -> Self {
         Self {
             client,
+            region: region.into(),
             max_events: 10_000,
         }
+    }
+}
+
+/// 리전별 CloudWatch 페처 묶음.
+pub struct RegionalFetchers {
+    by_region: std::collections::BTreeMap<String, CloudWatchFetcher>,
+}
+
+impl RegionalFetchers {
+    pub fn new(by_region: std::collections::BTreeMap<String, CloudWatchFetcher>) -> Self {
+        Self { by_region }
+    }
+}
+
+#[async_trait::async_trait]
+impl SlowLogFetcher for RegionalFetchers {
+    async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
+        let region = instance.region();
+        // **다른 리전 클라이언트로 대신하지 않는다.** 같은 식별자가 그 리전에도
+        // 있으면 남의 DB 로그를 파싱해 엉뚱한 인스턴스로 저장한다.
+        let f = self.by_region.get(region).ok_or_else(|| {
+            dbmon_core::error::DomainError::Unavailable {
+                dependency: "cloudwatchlogs",
+                reason: format!("{region}: 이 리전의 로그 클라이언트가 없다"),
+            }
+        })?;
+        f.fetch(instance, since_ms).await
     }
 }
 
 #[async_trait::async_trait]
 impl SlowLogFetcher for CloudWatchFetcher {
     async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
+        // **리전 불일치는 거부한다.** 로그 그룹 이름에 리전이 없으므로, 틀린 리전
+        // 클라이언트로 조회하면 같은 이름의 **다른 DB** 로그를 읽을 수 있다.
+        if instance.region() != self.region {
+            return Err(dbmon_core::error::DomainError::InvalidInput {
+                field: "region".into(),
+                reason: format!(
+                    "{}: 인스턴스 리전({})과 클라이언트 리전({})이 다르다",
+                    instance.as_str(),
+                    instance.region(),
+                    self.region
+                ),
+            });
+        }
         let group = slowquery_log_group(instance)?;
         let out = self
             .client
@@ -120,6 +169,9 @@ impl SlowLogFetcher for CloudWatchFetcher {
     }
 }
 
+/// 로컬 슬로우로그 파일 크기 상한 (32MB). 넘으면 거부한다.
+const MAX_LOCAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// 로컬 파일에서 가져온다. **개발 전용.**
 ///
 /// SSO 가 만료돼도 백필 경로를 끝까지 돌릴 수 있게 한다 — 이 프로젝트의 로컬 우선
@@ -137,14 +189,40 @@ impl FileFetcher {
 #[async_trait::async_trait]
 impl SlowLogFetcher for FileFetcher {
     async fn fetch(&self, _instance: &InstanceId, _since_ms: EpochMs) -> Result<LogChunk> {
+        let fail = |reason: String| dbmon_core::error::DomainError::Unavailable {
+            dependency: "slowlog_file",
+            reason: crate::telemetry::scrub(&reason),
+        };
+
+        // **일반 파일인지 확인한다.** FIFO(`mkfifo`)나 `/dev/stdin` 을 주면
+        // `read_to_string` 이 영구 블록되고 **리더 루프 전체가 멈춘다** —
+        // 고아 스윕·탐색·백필이 함께 죽는다.
+        let meta = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
+        if !meta.is_file() {
+            return Err(fail(format!(
+                "{}: 일반 파일이 아니다 (FIFO·장치 파일은 루프를 멈춘다)",
+                self.path.display()
+            )));
+        }
+        if meta.len() > MAX_LOCAL_FILE_BYTES {
+            return Err(fail(format!(
+                "{}: 파일이 너무 크다 ({} 바이트, 상한 {MAX_LOCAL_FILE_BYTES})",
+                self.path.display(),
+                meta.len()
+            )));
+        }
+
         // 파일 전체를 읽고 파서가 시간 필터를 하도록 둔다 — 로컬 파일은 작고,
         // 오프셋 추적을 흉내내면 프로덕션과 다른 코드를 검증하게 된다.
-        let text = tokio::fs::read_to_string(&self.path).await.map_err(|e| {
-            dbmon_core::error::DomainError::Unavailable {
-                dependency: "slowlog_file",
-                reason: format!("{}: {e}", self.path.display()),
-            }
-        })?;
+        let text = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::fs::read_to_string(&self.path),
+        )
+        .await
+        .map_err(|_| fail(format!("{}: 읽기 시간 초과", self.path.display())))?
+        .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
         Ok(LogChunk {
             text,
             // 파일 소스는 체크포인트를 옮기지 않는다 — 병합이 멱등이라 안전하다.

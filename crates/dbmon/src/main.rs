@@ -208,6 +208,23 @@ const BACKFILL_INITIAL_LOOKBACK_MS: i64 = 5 * 60_000;
 /// 잘린 구간은 로그로 알린다 — 그만큼 정확 지표가 영구히 없다.
 const BACKFILL_MAX_LOOKBACK_MS: i64 = 60 * 60_000;
 
+/// 리더 루프 안의 작업을 **예산 안에서** 돌린다.
+///
+/// # 왜 모든 블록에 필요한가
+///
+/// 리더 루프와 같은 태스크에서 도는 작업이 길어지면 그 동안 `gate.refresh()` 가
+/// 불리지 않아 **리스가 만료된다.** 그러면 다른 워커가 리더가 되는데, 우리 수집
+/// 태스크는 별도 태스크라 계속 돌며 자기 epoch 으로 레코드를 쓴다 —
+/// `abort_all()` 은 루프가 이 블록에서 **돌아온 뒤에야** 실행된다.
+///
+/// 즉 예산이 없는 블록 하나가 "태스크는 자기 epoch 보다 오래 살 수 없다" 는
+/// 불변식을 깨뜨린다. 탐색 블록만 예산을 지키고 스윕·백필은 지키지 않았다.
+async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::result::Result<T, ()> {
+    tokio::time::timeout(dbmon::worker::work_budget(), f)
+        .await
+        .map_err(|_| ())
+}
+
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
 const ORPHAN_SWEEP_LIMIT: usize = 500;
 
@@ -222,14 +239,28 @@ async fn build_slowlog_fetcher(config: &Config) -> Arc<dyn dbmon::slowlog::SlowL
         tracing::info!(%path, "슬로우로그 소스: 로컬 파일 (dev)");
         return Arc::new(dbmon::slowlog::FileFetcher::new(path));
     }
-    let sdk = aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(config.aws.region.clone()))
-        .load()
-        .await;
-    tracing::info!("슬로우로그 소스: CloudWatch Logs");
-    Arc::new(dbmon::slowlog::CloudWatchFetcher::new(
-        aws_sdk_cloudwatchlogs::Client::new(&sdk),
-    ))
+    // **리전별 클라이언트를 만든다.** 로그 그룹 이름에는 리전이 없으므로 리전은
+    // 클라이언트가 정한다 — 홈 리전 하나로 돌리면 타 리전 인스턴스는 조용히 결측되고,
+    // 같은 식별자가 홈 리전에 있으면 **다른 DB 의 로그를 엉뚱한 인스턴스로 저장한다.**
+    let mut by_region = std::collections::BTreeMap::new();
+    for region in config.target_regions() {
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.clone()))
+            .load()
+            .await;
+        by_region.insert(
+            region.clone(),
+            dbmon::slowlog::CloudWatchFetcher::new(
+                aws_sdk_cloudwatchlogs::Client::new(&sdk),
+                region,
+            ),
+        );
+    }
+    tracing::info!(
+        regions = ?by_region.keys().collect::<Vec<_>>(),
+        "슬로우로그 소스: CloudWatch Logs"
+    );
+    Arc::new(dbmon::slowlog::fetch::RegionalFetchers::new(by_region))
 }
 
 /// 슬로우로그 백필 한 라운드.
@@ -284,14 +315,22 @@ async fn backfill_round(
         let chunk = match fetcher.fetch(&instance.id, since_ms).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
+                // **`debug` 가 아니라 세고 보고한다.** 조용히 건너뛰면 "이 인스턴스는
+                // 정확 지표가 영구히 없다" 를 아무도 모른다.
+                total.fetch_errors += 1;
+                tracing::warn!(
                     instance = %instance.id.as_str(),
                     error = %telemetry::Scrubbed(&e),
-                    "슬로우로그를 가져올 수 없다 — 이 인스턴스를 건너뛴다"
+                    "슬로우로그를 가져올 수 없다 — 이 인스턴스는 정확 지표가 비어 있다"
                 );
                 continue;
             }
         };
+        if chunk.has_more {
+            // 한 라운드에 다 못 읽었다. 체크포인트가 있으므로 다음 라운드가 이어받지만,
+            // 계속 뒤처지면 그걸 알아야 한다.
+            total.incomplete += 1;
+        }
         let mut parsed = dbmon::slowlog::parse(&chunk.text, min_ms);
         // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
         //
@@ -329,6 +368,7 @@ async fn backfill_round(
             Ok(s) => {
                 total.merged += s.merged;
                 total.unnormalizable += s.unnormalizable;
+                total.masking_degraded += s.masking_degraded;
                 total.errors += s.errors;
 
                 // **체크포인트를 옮긴다.** 처리한 마지막 엔트리 시각 + 1ms 다.
@@ -1160,16 +1200,24 @@ fn spawn_leader_loop(
                     last_sweep_ms = now_ms;
                     let threshold =
                         dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
-                    match dbmon::orphan::sweep(
+                    // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면
+                    // `gate.refresh()` 가 불리지 않아 리스가 만료되고, 그 사이
+                    // 수집 태스크는 계속 돌아 두 리더가 같은 인스턴스를 수집한다.
+                    // `work_budget()` 의 주석이 설명하는 그 불변식이다.
+                    match run_in_budget(dbmon::orphan::sweep(
                         Arc::clone(&stores.slow_query),
                         &collect_deps.worker_id,
+                        // **현재 리스 epoch 를 넘긴다.** 이름만 보면 재시작한 자기
+                        // 유령을 영구히 건너뛴다.
+                        gate.epoch(),
                         now_ms,
                         threshold,
                         ORPHAN_SWEEP_LIMIT,
-                    )
+                    ))
                     .await
                     {
-                        Ok(s) if s.scanned > 0 => tracing::info!(
+                        Err(()) => tracing::warn!("고아 스윕이 예산을 초과했다 — 중단한다"),
+                        Ok(Ok(s)) if s.scanned > 0 => tracing::info!(
                             scanned = s.scanned,
                             abandoned = s.abandoned,
                             alive = s.alive,
@@ -1177,8 +1225,8 @@ fn spawn_leader_loop(
                             errors = s.errors,
                             "고아 스윕"
                         ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
                             error = %telemetry::Scrubbed(&e),
                             "고아 스윕 실패 — 다음 주기에 재시도한다"
                         ),
@@ -1194,22 +1242,35 @@ fn spawn_leader_loop(
                     if fetcher.is_none() {
                         fetcher = Some(build_slowlog_fetcher(&config).await);
                     }
-                    if let (Some(f), Ok(instances)) =
-                        (fetcher.as_ref(), stores.registry.list().await)
-                    {
-                        let s = backfill_round(
+                    if let (Some(f), Ok(Ok(instances))) = (
+                        fetcher.as_ref(),
+                        run_in_budget(stores.registry.list()).await,
+                    ) {
+                        // 백필도 예산 안에서 돈다 — 인스턴스 N개를 순차로 돌므로
+                        // 예산이 없으면 리스 만료까지 갈 수 있다.
+                        let s = match run_in_budget(backfill_round(
                             f,
                             &stores.slow_query,
                             &stores.checkpoint,
                             &instances,
                             &config,
                             now_ms,
-                        )
-                        .await;
-                        if s.merged > 0 || s.errors > 0 {
+                        ))
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(()) => {
+                                tracing::warn!("슬로우로그 백필이 예산을 초과했다 — 중단한다");
+                                Default::default()
+                            }
+                        };
+                        if s.merged > 0 || s.errors > 0 || s.fetch_errors > 0 || s.incomplete > 0 {
                             tracing::info!(
                                 merged = s.merged,
                                 unnormalizable = s.unnormalizable,
+                                masking_degraded = s.masking_degraded,
+                                fetch_errors = s.fetch_errors,
+                                incomplete = s.incomplete,
                                 errors = s.errors,
                                 "슬로우로그 백필"
                             );
