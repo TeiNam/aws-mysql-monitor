@@ -311,6 +311,41 @@ impl Config {
 
         // **교차 검증** — 탐지 타임아웃이 tick 예산(주기의 80%)을 넘으면 tick 이 겹친다.
         let tick_budget = c.detect_interval_ms * 80 / 100;
+        // `connect_timeout_ms + detect_timeout_ms <= tick_budget` 은 **검증하지 않는다.**
+        // 커넥션 획득 5초는 콜드 경로(TLS 핸드셰이크 + IAM 토큰 인증)에 실제로 필요하고,
+        // 합을 강제하면 detect 예산이 200ms 로 밀려 정상 설정이 거부된다.
+        // 대신 `probe` 가 **획득+조회 전체**를 한 interval 안으로 묶는다
+        // (`crates/dbmon/src/mysql/mod.rs`) — tick 이 겹쳐 쌓이지 않게 하는 것이 목적이다.
+        // **모든 루프 주기를 검증한다.** `detect_interval_ms` 만 검사하면 나머지가 0 일 때
+        // 핫 루프가 되어 대상 DB 와 CPU 를 태운다. 0 은 "비활성" 이 아니라 "즉시 반복" 이다.
+        for (name, value, min, max) in [
+            (
+                "collector.digest_interval_ms",
+                c.digest_interval_ms,
+                10_000,
+                3_600_000,
+            ),
+            (
+                "collector.status_interval_ms",
+                c.status_interval_ms,
+                1_000,
+                600_000,
+            ),
+            (
+                "collector.health_interval_ms",
+                c.health_interval_ms,
+                5_000,
+                3_600_000,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(err(
+                    name,
+                    format!("{min}~{max}ms 이어야 한다 (받은 값 {value})"),
+                ));
+            }
+        }
+
         if c.detect_timeout_ms > tick_budget {
             return Err(err(
                 "collector.detect_timeout_ms",

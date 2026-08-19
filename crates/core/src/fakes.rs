@@ -191,7 +191,6 @@ impl SlowQueryStore for FakeSlowQueryStore {
 /// 저장된 롤업 한 건. clippy 의 복잡한 타입 경고를 피하고 의도를 드러낸다.
 pub type StoredRollup = (InstanceId, DigestRollupRow);
 
-#[derive(Default)]
 pub struct FakeDigestStore {
     pub rollups: Mutex<Vec<StoredRollup>>,
     pub texts: Mutex<BTreeMap<String, DigestTextEntry>>,
@@ -199,11 +198,22 @@ pub struct FakeDigestStore {
     partial_success: AtomicUsize,
 }
 
+impl Default for FakeDigestStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FakeDigestStore {
+    /// **`Default` 를 직접 derive 하지 않는 이유**: `AtomicUsize::default()` 는 0 이고
+    /// 그건 `accept_only(0)`, 즉 **전부 거부**를 뜻한다. `new()` 는 전부 수락(`MAX`)이라
+    /// 두 생성자가 정반대로 동작했다 — `default()` 로 만든 페이크는 아무것도 저장하지
+    /// 않으면서 성공을 반환했다. 이제 둘이 같다.
     pub fn new() -> Self {
         Self {
             partial_success: AtomicUsize::new(usize::MAX),
-            ..Default::default()
+            rollups: Default::default(),
+            texts: Default::default(),
         }
     }
 

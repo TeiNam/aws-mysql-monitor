@@ -45,17 +45,31 @@ pub struct Timeouts {
     /// **탐지 쿼리 전용.** tick 예산(폴링 주기의 80%) 안에 들어야 한다.
     /// 심층 조회와 같은 값을 쓰면 3초 타임아웃이 1초 케이던스를 깨뜨린다.
     pub detect: Duration,
+    /// **detect 경로 전체**(커넥션 획득 + 조회)의 상한.
+    ///
+    /// `detect` 만 제한하면 총 소요가 `connect + detect` 까지 늘어난다(5,000 + 800ms).
+    /// 그러면 1초 케이던스가 무너지고 tick 이 겹쳐 쌓인다. 콜드 경로에 5초가 실제로
+    /// 필요하므로 `connect` 를 줄이는 대신 **경로 전체**를 한 interval 안으로 묶는다 —
+    /// 초과하면 그 tick 을 버리고, 그 사이 풀은 커넥션을 확보하므로 다음 tick 은 warm 이다.
+    pub detect_total: Duration,
     /// 심층 조회·플랜. tick 밖의 병렬 태스크에서 돈다.
     pub query: Duration,
     /// `daily` 루프처럼 무거운 조회.
     pub bulk_query: Duration,
 }
 
+/// `detect` 조회의 폭주 방어 상한 (`LIMIT`).
+///
+/// 설정(`collector.detect_limit`)에서 온다. 예전에는 모듈 상수가 항상 이겨서 설정값이
+/// 조용히 무시됐고, `truncated` 판정도 상수 기준으로 나왔다.
+pub const DEFAULT_DETECT_LIMIT: u64 = 500;
+
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(5),
             detect: Duration::from_millis(800),
+            detect_total: Duration::from_millis(1_000),
             query: Duration::from_secs(3),
             bulk_query: Duration::from_secs(30),
         }
@@ -67,6 +81,7 @@ pub struct TargetMysql {
     hot: Pool,
     bulk: Pool,
     timeouts: Timeouts,
+    detect_limit: u64,
     /// 진단 로그에 쓰는 라벨. 엔드포인트를 그대로 쓰지 않는다(호스트명이 사업 정보일 수 있다).
     label: String,
 }
@@ -74,12 +89,22 @@ pub struct TargetMysql {
 impl TargetMysql {
     /// 풀을 만든다. **연결은 지연 생성**이므로 이 호출은 네트워크를 타지 않는다.
     pub fn connect(base: Opts, timeouts: Timeouts, label: impl Into<String>) -> Result<Self> {
+        Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label)
+    }
+
+    pub fn connect_with_limit(
+        base: Opts,
+        timeouts: Timeouts,
+        detect_limit: u64,
+        label: impl Into<String>,
+    ) -> Result<Self> {
         let hot = pool(base.clone(), 2, 4, timeouts.query)?;
         let bulk = pool(base, 1, 2, timeouts.bulk_query)?;
         Ok(Self {
             hot,
             bulk,
             timeouts,
+            detect_limit,
             label: label.into(),
         })
     }
@@ -241,14 +266,35 @@ impl TargetDb for TargetMysql {
         params.extend(excludes.schemas.iter().map(|s| Value::from(s.as_str())));
         params.extend(excludes.users.iter().map(|s| Value::from(s.as_str())));
         // `LIMIT ?` 는 문장 마지막이다. 폭주 방어 상한.
-        params.push(Value::from(DETECT_LIMIT));
+        //
+        // **설정값을 쓴다.** 예전에는 `DETECT_LIMIT` 상수가 항상 이겨서
+        // `collector.detect_limit` 이 조용히 무시됐고, `truncated` 판정도 500 기준으로
+        // 나왔다 — 설정을 200 으로 낮춰도 300건이 돌아오면서 truncated=false 였다.
+        let limit = self.detect_limit;
+        params.push(Value::from(limit));
 
         // **탐지 전용 타임아웃**을 쓴다. tick 예산을 넘기면 케이던스가 무너진다.
-        let rows: Vec<Row> = self
-            .run(self.hot_conn().await?, stmt, params, self.timeouts.detect)
-            .await?;
+        // 커넥션 획득까지 포함해 `detect_total` 안으로 묶는다.
+        let inner = async {
+            let conn = self.hot_conn().await?;
+            self.run::<Row>(conn, stmt, params, self.timeouts.detect)
+                .await
+        };
+        let rows: Vec<Row> = match tokio::time::timeout(self.timeouts.detect_total, inner).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(DomainError::Unavailable {
+                    dependency: "target-mysql",
+                    reason: format!(
+                        "{}: detect 경로 전체 타임아웃 ({}ms)",
+                        self.label,
+                        self.timeouts.detect_total.as_millis()
+                    ),
+                });
+            }
+        };
         let db_now_ms = rows.first().and_then(|r| unix_seconds_to_ms(opt(r, 7)));
-        let truncated = rows.len() as u64 >= DETECT_LIMIT;
+        let truncated = rows.len() as u64 >= limit;
         Ok(ProbeResult {
             rows: rows
                 .iter()
@@ -423,9 +469,6 @@ impl TargetDb for TargetMysql {
 }
 
 /// `detect` 쿼리의 `LIMIT`. 설정에서 주입하는 것이 맞지만, 포트 시그니처를 넓히지 않기 위해
-/// 상한을 상수로 둔다. 설정값이 이보다 작으면 수집기가 결과를 잘라 쓴다.
-const DETECT_LIMIT: u64 = 500;
-
 fn digest_row(r: &Row) -> DigestSnapshotRow {
     DigestSnapshotRow {
         schema_name: opt(r, 0),

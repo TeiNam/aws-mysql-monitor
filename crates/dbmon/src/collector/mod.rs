@@ -357,6 +357,13 @@ where
     }
 
     /// 플랜을 얻는다. 세 경로를 순서대로 시도한다.
+    ///
+    /// # 절단된 SQL 로는 재실행하지 않는다
+    ///
+    /// `information_schema.PROCESSLIST.INFO` 는 65,535바이트에서 잘린다. 잘린 지점이
+    /// 우연히 문법적으로 유효하면(`… WHERE a=1 AND b=2` → `… WHERE a=1`)
+    /// **다른 쿼리의 플랜이 `is_exact` 로 저장된다.** 그게 최악이다 — 틀린 플랜을
+    /// 정확한 플랜이라고 표시하는 것보다 플랜이 없는 편이 낫다.
     async fn collect_plan(
         &mut self,
         thread_id: u64,
@@ -394,14 +401,30 @@ where
         }
 
         // ② 원문 재실행. `SELECT` 권한만으로 된다.
-        let sql = full
-            .and_then(|r| r.info.as_deref())
-            .or_else(|| stmt.and_then(|s| s.digest_text.as_deref()));
+        //
+        // **바이트 절단된 텍스트는 쓰지 않는다.** `plan_query` 는 닫히지 않은 인용부호를
+        // 잡지만, 절단 지점이 우연히 유효하면 통과한다 — 그러면 서버가 **다른 쿼리**를
+        // 설명하고 우리는 그걸 `is_exact` 로 저장한다.
+        let is_sql = full.and_then(|r| r.info.as_deref()).filter(|t| {
+            if crate::mysql::is_info_truncated(t) {
+                tracing::debug!(
+                    thread_id,
+                    len = t.len(),
+                    "전문 SQL 이 절단됐다 — 재실행하지 않는다"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        // PS 의 무손실 텍스트도 절단될 수 있다(1,024바이트). 그건 `plan_query` 가
+        // 대부분 걸러내지만, 여기서는 IS 가 없을 때의 차선으로만 쓴다.
+        let sql = is_sql.or_else(|| stmt.and_then(|s| s.digest_text.as_deref()));
         let Some(sql) = sql else {
             stats.plans_failed += 1;
             return PlanResult::failed(PlanFailure::NoStatement);
         };
-        // 멀티문장·잘린 SQL 은 여기서 거부된다.
+        // 멀티문장·버전 주석·닫히지 않은 인용부호는 여기서 거부된다.
         let Some(pq) = dbmon_normalize::plan_query(sql) else {
             stats.plans_failed += 1;
             return PlanResult::failed(PlanFailure::NotExplainable);

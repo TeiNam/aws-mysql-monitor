@@ -292,7 +292,12 @@ fn scan_operation_flags(v: &serde_json::Value) -> (bool, bool) {
     (fs, tmp)
 }
 
-/// 최상위 `cost_info.query_cost` 를 찾는다. 없으면 트리에서 가장 큰 값을 쓴다.
+/// **최상위** `cost_info.query_cost` 를 쓴다. 없으면 트리에서 가장 큰 값으로 대체한다.
+///
+/// 이전 구현은 doc 과 달리 항상 트리 전체의 최대값을 썼다. 서브쿼리 비용이 상위보다
+/// 크면 그 값이 `query_cost` 로 보고되어, 리포트의 "가장 비싼 쿼리" 순위가 뒤틀린다.
+/// v1 은 `query_block.cost_info.query_cost` 가 최상위이고, v2 는 그 키가 없어
+/// 트리 최대값이 유일한 근거다 — 그래서 폴백을 남긴다.
 fn find_query_cost(v: &serde_json::Value) -> Option<f64> {
     fn as_f64(v: &serde_json::Value) -> Option<f64> {
         v.as_f64()
@@ -316,6 +321,17 @@ fn find_query_cost(v: &serde_json::Value) -> Option<f64> {
             _ => {}
         }
     }
+    // ① 최상위 우선. `query_block.cost_info.query_cost`(v1) 를 직접 본다.
+    if let Some(top) = v
+        .get("query_block")
+        .or(Some(v))
+        .and_then(|b| b.get("cost_info"))
+        .and_then(|c| c.get("query_cost"))
+        .and_then(as_f64)
+    {
+        return Some(top);
+    }
+    // ② 없으면 트리 최대값 (v2 경로).
     let mut best = None;
     scan(v, &mut best);
     best

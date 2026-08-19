@@ -48,13 +48,21 @@ impl HourBucket {
     }
 
     /// `YYYY-MM` — `DR#<instance_id>#<yyyy-mm>` 파티션 키에 쓴다.
+    ///
+    /// 형식이 깨져 있으면 전체를 반환한다. **패닉하지 않는다** — 이 값은
+    /// DynamoDB 에서 역직렬화되므로 손상된 항목 하나로 프로세스가 죽으면 안 된다.
     pub fn year_month(&self) -> &str {
-        &self.0[..7]
+        self.0.get(..7).unwrap_or(&self.0)
     }
 
     /// `YYYY-MM-DD`
     pub fn date_part(&self) -> DatePart {
-        DatePart(self.0[..10].to_string())
+        DatePart(self.0.get(..10).unwrap_or(&self.0).to_string())
+    }
+
+    /// 형식이 올바른가. `start_ms()` 가 성공하는 것과 같은 조건이다.
+    pub fn is_valid(&self) -> bool {
+        self.start_ms().is_some()
     }
 }
 
@@ -97,6 +105,10 @@ pub struct TimeRange {
     to_ms: EpochMs,
 }
 
+/// `date_parts()` 가 만들 수 있는 최대 파티션 수. 약 27년이다 —
+/// 이보다 긴 조회는 아카이브 설계(400일 티어)에 존재하지 않는다.
+pub const MAX_DATE_PARTS: usize = 10_000;
+
 impl TimeRange {
     /// 뒤집힌 구간은 거부한다. `None` 을 무한 구간으로 해석하는 경로를 만들지 않는다
     /// (아카이브 쿼리가 전체 스캔이 되는 가장 흔한 원인).
@@ -122,9 +134,15 @@ impl TimeRange {
         let start = self.from_ms.div_euclid(DAY_MS) * DAY_MS;
         let mut out = Vec::new();
         let mut t = start;
-        while t <= self.to_ms {
+        // **상한을 둔다.** 이 구간은 API 질의 파라미터에서 오고 `TimeRange::new` 는
+        // 길이를 제한하지 않는다. `to_ms = i64::MAX` 면 `t += DAY_MS` 가 오버플로하고
+        // Vec 은 OOM 까지 자란다.
+        while t <= self.to_ms && out.len() < MAX_DATE_PARTS {
             out.push(DatePart::from_epoch_ms(t));
-            t += DAY_MS;
+            match t.checked_add(DAY_MS) {
+                Some(next) => t = next,
+                None => break,
+            }
         }
         out
     }

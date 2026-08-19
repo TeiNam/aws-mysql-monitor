@@ -34,6 +34,7 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
     // (b) 동률일 때 `existing` 이 이겨 `merge(a,b) != merge(b,a)` 가 됐다.
     // 이제 속성마다 그 속성에 맞는 규칙으로 병합한다.
     let duration = merge_duration(existing, incoming);
+    let digest = merge_digest(existing, incoming);
 
     // 정책은 **먼저 기록된 쪽**을 고정한다. 두 레코드의 `literal_policy_at_ms` 중 이른 쪽.
     let (policy, policy_at) = if existing.literal_policy_at_ms <= incoming.literal_policy_at_ms {
@@ -90,10 +91,11 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         literal_policy: policy,
         literal_policy_at_ms: policy_at,
 
-        app_digest: pick_str(&existing.app_digest, &incoming.app_digest),
-        digest_algo_version: existing
-            .digest_algo_version
-            .max(incoming.digest_algo_version),
+        // **다이제스트와 알고리즘 버전은 짝이다.** 따로 고르면 버전 필드가 그 다이제스트를
+        // 설명하지 않게 되어 "리포트가 알고리즘 경계를 표시할 수 있어야 한다" 는 목적이
+        // 깨진다 (예: app_digest=aaaa 인데 algo_version=2).
+        app_digest: digest.0.clone(),
+        digest_algo_version: digest.1,
         mysql_digest: existing
             .mysql_digest
             .clone()
@@ -200,6 +202,21 @@ fn merge_duration(a: &SlowQuery, b: &SlowQuery) -> (i64, DurationSource) {
         // 둘 다 슬로우로그이거나 둘 다 in-flight → 큰 쪽.
         _ if b.duration_ms > a.duration_ms => (b.duration_ms, b.duration_source),
         _ => (a.duration_ms, a.duration_source),
+    }
+}
+
+/// `app_digest` 와 그것을 만든 알고리즘 버전을 **함께** 고른다.
+///
+/// 더 새 버전의 다이제스트를 쓴다. 같은 버전이면 사전순으로 결정론적으로 고른다
+/// (`pick_str` 과 같은 규칙 — 교환법칙을 만족해야 한다).
+fn merge_digest(a: &SlowQuery, b: &SlowQuery) -> (String, u32) {
+    match a.digest_algo_version.cmp(&b.digest_algo_version) {
+        std::cmp::Ordering::Greater => (a.app_digest.clone(), a.digest_algo_version),
+        std::cmp::Ordering::Less => (b.app_digest.clone(), b.digest_algo_version),
+        std::cmp::Ordering::Equal => (
+            pick_str(&a.app_digest, &b.app_digest).to_string(),
+            a.digest_algo_version,
+        ),
     }
 }
 

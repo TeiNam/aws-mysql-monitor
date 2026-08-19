@@ -110,6 +110,12 @@ pub enum FinalizeReason {
     ThreadReused,
     /// 최대 추적 시간을 넘겼다.
     TooLong,
+    /// 그레이스풀 셧다운·리더 상실로 강제 확정했다.
+    ///
+    /// `TooLong` 과 구분하는 이유: 저장된 레코드의 `abandoned_reason` 이 사후 분석의
+    /// 유일한 단서다. 둘을 합치면 "쿼리가 1시간을 넘겼다" 와 "우리가 재배포했다" 를
+    /// 구분할 수 없고, `long_running` 이 잘못 붙는다.
+    Shutdown,
 }
 
 impl FinalizeReason {
@@ -118,6 +124,7 @@ impl FinalizeReason {
             Self::Disappeared => "disappeared",
             Self::ThreadReused => "thread_reused",
             Self::TooLong => "too_long",
+            Self::Shutdown => "shutdown",
         }
     }
     /// 실제로 종료를 관측했는가. `false` 면 `duration_ms` 가 하한이다.
@@ -211,6 +218,12 @@ impl InFlightTracker {
         let mut seen: Vec<u64> = Vec::with_capacity(observations.len());
 
         for obs in observations {
+            // **DB 출력은 신뢰할 수 없는 입력이다.** 같은 tick 에 동일 `thread_id` 가
+            // 두 번 오면 방금 만든 엔트리를 `ThreadReused` 로 즉시 확정해 쓰레기
+            // 레코드를 만든다. 첫 관측만 쓴다.
+            if seen.contains(&obs.thread_id) {
+                continue;
+            }
             seen.push(obs.thread_id);
             match self.entries.get_mut(&obs.thread_id) {
                 Some(existing) => {
@@ -314,7 +327,7 @@ impl InFlightTracker {
     pub fn drain(&mut self) -> Vec<(Tracked, FinalizeReason)> {
         std::mem::take(&mut self.entries)
             .into_values()
-            .map(|t| (t, FinalizeReason::TooLong))
+            .map(|t| (t, FinalizeReason::Shutdown))
             .collect()
     }
 }

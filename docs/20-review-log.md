@@ -175,6 +175,10 @@ dev 기본값 `use_spot = true` + ARM64 를 **유지한다.** 실제로 태스�
 
 ## 잔여 항목 (다음 라운드)
 
+> **1차 마무리 (2026-08-19)**: 아래 중 취소선이 그어진 10건은 1차에서 처리했다.
+> 배선이 필요한 항목(M11~M16, M24~M26)만 남았다.
+
+
 우선순위 순. 실재하지만 이번 라운드에서 처리하지 않았다.
 
 | # | 항목 | 왜 지금 아닌가 |
@@ -186,21 +190,21 @@ dev 기본값 `use_spot = true` + ARM64 를 **유지한다.** 실제로 태스�
 | M14 | `SnapshotCache` 에 축출이 없다 → 장기 실행 워커 메모리가 무한 증가 | 동일 |
 | M15 | `per_digest` 가 `app_digest` 만 키로 써서 멀티테넌트 인스턴스에서 스키마가 오귀속된다 | 동일 |
 | M16 | 심층 조회가 tick 안에서 **직렬**로 돈다. 문서는 "tick 밖의 병렬 태스크" 라고 명시 | M4-21(리스) 이후 구조 변경과 함께 |
-| M17 | 연결 획득 타임아웃(5초)이 detect 예산(800ms) **밖**에 있어 총 5.8초 가능 | 설정 교차 검증에 `connect_timeout_ms` 추가 — 작다, 다음 라운드 |
+| ~~M17~~ | 연결 획득 타임아웃(5초)이 detect 예산(800ms) **밖**에 있어 총 5.8초 가능 | ✅ **검증이 아니라 코드로 고쳤다.** `connect + detect <= tick_budget` 를 강제하면 콜드 경로(TLS+IAM)에 필요한 5초가 거부되고 정상 기본값이 무효가 된다 — 내가 처음 넣은 검증이 실제로 기본값을 깨뜨렸다. 대신 `probe` 가 **획득+조회 전체**를 `detect_total`(1 interval) 안으로 묶는다. 초과하면 그 tick 을 버리고, 그 사이 풀이 커넥션을 확보하므로 다음 tick 은 warm 이다 |
 | M18 | `UNIX_TIMESTAMP(FIRST_SEEN)*1000` 은 DECIMAL 로 온다(`timestamp(6)`). `num::<i64>` 가 실패해 **조용히 0** | 실인스턴스 타입 확인 후. 같은 파일이 `db_now` 는 `f64` 로 읽는다 |
-| M20 | 절단된 SQL 로 EXPLAIN 을 재실행한다. 잘린 지점이 우연히 유효하면 **다른 쿼리의 플랜이 `is_exact` 로 저장된다** | `collect_plan` 이 `sql_text_truncated` 를 봐야 한다 — 작다 |
+| ~~M20~~ | 절단된 SQL 로 EXPLAIN 을 재실행한다. 잘린 지점이 우연히 유효하면 **다른 쿼리의 플랜이 `is_exact` 로 저장된다** | ✅ `collect_plan` 이 `is_info_truncated` 를 확인한다. 기존 주석은 '잘린 SQL 은 거부된다' 고 했지만 `plan_query` 는 닫히지 않은 인용부호만 잡았다 |
 | M21 | `DELETE … USING` / `INSERT … ON DUPLICATE KEY UPDATE` 가 깨진 문장을 만든다 | 데이터 변경 위험은 없다(EXPLAIN 은 실행하지 않는다). 플랜을 영구히 못 얻는 것이 비용 |
-| M22 | `HourBucket` 이 `serde(transparent)` 로 **검증 없이** 역직렬화된다. `&self.0[..7]` 가 손상된 값에 패닉 | `try_from = "String"` 로. 다른 ID 타입은 이미 그렇다 |
-| M23 | `TimeRange::date_parts()` 가 구간 길이 제한 없이 커진다. API 파라미터 경로다 | 상한을 넣는다 |
+| ~~M22~~ | `HourBucket` 이 `serde(transparent)` 로 **검증 없이** 역직렬화된다. `&self.0[..7]` 가 손상된 값에 패닉 | ✅ `year_month`/`date_part` 를 `get(..n)` 으로. `is_valid()` 추가 |
+| ~~M23~~ | `TimeRange::date_parts()` 가 구간 길이 제한 없이 커진다. API 파라미터 경로다 | ✅ `MAX_DATE_PARTS = 10_000` + `checked_add` |
 | M24 | IAM 토큰 만료(1045)를 재시도 불가로 분류한다. RDS IAM 토큰은 15분마다 만료된다 | 토큰 갱신 배선(M3)과 함께 |
 | M25 | `rbac` 의 빈 토큰 스코프가 "전체 허용" 이고, `Full`/`FullRestricted` 구분이 인가 경로에서 죽어 있다 | M5(인증) 에서 |
 | M26 | `last_collect_ok_ms` 가 준비 판정에 안 들어간다 — "살아 있지만 아무것도 수집하지 않는" 상태가 200 이다 | M4-21 에서 리더 게이트와 함께 |
-| M27 | `digest/status/health_interval_ms` 범위 검증 없음(0 이면 핫 루프). `collector.detect_limit` 이 상수에 밀려 **조용히 무시**된다 | 작다, 다음 라운드 |
-| M28 | `FakeDigestStore::new()` 와 `default()` 가 **반대로** 동작한다(전부 수락 vs 전부 거부) | 테스트 전용이지만 혼란의 씨앗 |
-| L30 | `drain()` 이 셧다운을 `TooLong` 으로 기록해 사후 분석이 원인을 구분할 수 없다 | `FinalizeReason::Shutdown` 추가 |
-| L31 | 같은 tick 에 동일 `thread_id` 가 두 번 오면 쓰레기 레코드가 생긴다 | DB 출력은 신뢰 불가 입력이다 — 중복 검사 |
-| L32 | `app_digest` 는 existing 유지, `digest_algo_version` 은 `max()` → 버전이 다이제스트를 설명하지 않는다 | 함께 유지해야 한다 |
-| L39 | `find_query_cost` 의 doc 과 구현이 다르다(항상 트리 최대) | 서브쿼리 비용이 상위보다 크면 그 값이 보고된다 |
+| ~~M27~~ | `digest/status/health_interval_ms` 범위 검증 없음(0 이면 핫 루프). `collector.detect_limit` 이 상수에 밀려 **조용히 무시**된다 | ✅ `digest`/`status`/`health_interval_ms` 범위 검증 추가(0 은 '비활성' 이 아니라 '즉시 반복' 이다). `detect_limit` 은 `TargetMysql::connect_with_limit` 으로 전달 — 상수가 항상 이겨서 `truncated` 판정까지 500 기준이었다 |
+| ~~M28~~ | `FakeDigestStore::new()` 와 `default()` 가 **반대로** 동작한다(전부 수락 vs 전부 거부) | ✅ `Default` derive 를 제거하고 `Default = new()`. `AtomicUsize::default()` 가 0(=전부 거부)이라 두 생성자가 정반대였다 |
+| ~~L30~~ | `drain()` 이 셧다운을 `TooLong` 으로 기록해 사후 분석이 원인을 구분할 수 없다 | ✅ `FinalizeReason::Shutdown` 추가. `long_running` 오탐과 사후 분석 혼동을 막는다 |
+| ~~L31~~ | 같은 tick 에 동일 `thread_id` 가 두 번 오면 쓰레기 레코드가 생긴다 | ✅ 같은 tick 의 중복 `thread_id` 는 첫 관측만 쓴다 |
+| ~~L32~~ | `app_digest` 는 existing 유지, `digest_algo_version` 은 `max()` → 버전이 다이제스트를 설명하지 않는다 | ✅ `merge_digest` 가 `app_digest` 와 `digest_algo_version` 을 짝으로 고른다 |
+| ~~L39~~ | `find_query_cost` 의 doc 과 구현이 다르다(항상 트리 최대) | ✅ 최상위 `query_block.cost_info.query_cost` 우선, 없으면 트리 최대값(v2 경로) |
 
 **결정 대기** (사용자):
 
