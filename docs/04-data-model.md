@@ -142,7 +142,7 @@ v    (N)  스키마 버전
 | AP-10 | 기간별 알림 이력 | 기본 | `PK = AL#<date>`, SK 범위 |
 | AP-11 | 어드바이저 결과 캐시 조회 | 기본 | `PK = AD#<app_digest>`, `SK = <schema_fp>#<ver>#<prompt_ver>` |
 | AP-12 | 인스턴스 이벤트(락/데드락/복제/플랜변경) | 기본 | `PK = EV#<instance_id>#<date>`, SK 범위 |
-| AP-13 | 환경·종류별 이벤트 | GSI2 | `GSI2PK = EVK#<env>#<kind>#<date>` |
+| AP-13 | 환경·종류별 이벤트 | GSI2 | `GSI2PK = EVK#<env>#<kind>#<date_part>` |
 | AP-14 | 일별 스냅샷(인덱스 위생/스키마/테이블 크기) | 기본 | `PK = SNAP#<kind>#<instance_id>`, `SK = <date>#<obj>` |
 | AP-15 | 인스턴스 자체 지표 시간 롤업 | 기본 | `PK = MR#<instance_id>#<yyyy-mm>`, `SK = <hour_bucket>` |
 | AP-16 | 계정별 워크로드 시간 롤업 ([ADR-021](03-decisions.md)) | 기본 | `PK = UR#<instance_id>#<yyyy-mm>`, `SK = <hour_bucket>#<db_user>` |
@@ -152,17 +152,38 @@ v    (N)  스키마 버전
 | AP-20 | 발송 의도 큐 ([10 §2.0](10-alerting.md)) | 기본 | `PK = NOTIFY`, `SK = <epoch_ms>#<fingerprint>` |
 | AP-21 | AI 토큰 사용량 누적 (F30) | 기본 | `PK = USAGE#<env>`, `SK = <yyyy-mm>` |
 
+### 2.2a 정렬 키에 들어가는 숫자는 **고정 폭**이어야 한다
+
+DynamoDB 의 `S` 타입 정렬 키는 **사전순**으로 비교한다. 숫자를 그대로 문자열에 넣으면
+자릿수가 다를 때 순서가 뒤집힌다:
+
+```
+사전순:  "1000" < "999"      ← 틀렸다
+숫자순:  1000   > 999
+```
+
+epoch 밀리초는 2286년까지 항상 13자리이므로 **프로덕션 값끼리는 우연히 맞는다.** 그래서
+이 결함은 테스트나 백필에서만 드러난다 — 작은 값(`10000`)을 섞으면 순서가 깨지고,
+`SK 범위 조회`(AP-1)와 고아 스윕(`GSI1SK < 임계`, AP-18)이 조용히 잘못된 집합을 반환한다.
+
+**규약**: 정렬 키에 들어가는 epoch 밀리초는 **13자리로 0 패딩**한다.
+영향받는 키: `SlowQuery.SK`, `SlowQuery.GSI1SK`(in_flight), `SlowQuery.GSI2SK`,
+`Alert.GSI1SK`, `NOTIFY.SK`.
+
+`hour_bucket`(`YYYY-MM-DDTHH`)·`date_part`(`YYYY-MM-DD`) 는 이미 고정 폭이라 안전하다 —
+그래서 대부분의 키가 숫자 대신 이 형식을 쓴다.
+
 ### 2.3 엔티티 상세
 
 #### SlowQuery — 실시간 캡처된 개별 슬로우 쿼리
 
 ```
 PK        SQ#<instance_id>#<date_part>
-SK        <started_at_ms>#<thread_id>
+SK        <started_at_ms:013>#<thread_id>
 GSI1PK    state == in_flight ? SQS#in_flight : DG#<app_digest>     ← 상태에 따라 바뀐다
-GSI1SK    state == in_flight ? <last_seen_at_ms>  : Q#<started_at_ms>#<instance_id>
+GSI1SK    state == in_flight ? <last_seen_at_ms:013> : Q#<started_at_ms:013>#<instance_id>
 GSI2PK    ENV#<env>#<dur_bucket>#<hour_bucket>
-GSI2SK    <started_at_ms>#<thread_id>
+GSI2SK    <started_at_ms:013>#<thread_id>
 ttl       started_at_ms/1000 + 35일
 v         1
 ```

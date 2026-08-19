@@ -10,6 +10,27 @@ use std::fmt;
 /// UTC epoch milliseconds.
 pub type EpochMs = i64;
 
+/// epoch 밀리초를 **정렬 키에 쓸 수 있는 고정 폭 문자열**로 만든다.
+///
+/// # DynamoDB 의 `S` 정렬 키는 사전순이다
+///
+/// 숫자를 그대로 넣으면 자릿수가 다를 때 순서가 뒤집힌다:
+///
+/// ```text
+/// 사전순:  "1000" < "999"      ← 틀렸다
+/// 숫자순:  1000   > 999
+/// ```
+///
+/// epoch 밀리초는 2286년까지 13자리이므로 **프로덕션 값끼리는 우연히 맞는다.** 그래서
+/// 이 결함은 테스트나 백필에서만 드러나고, `SK 범위 조회`(AP-1)와 고아 스윕
+/// (`GSI1SK < 임계`, AP-18)이 조용히 잘못된 집합을 반환한다.
+///
+/// 음수(1970 이전)는 실무에 없지만 `i64` 이므로 표현 가능하다. 부호가 붙으면 사전순이
+/// 완전히 깨지므로 **0 으로 클램프**한다 — 그런 값이 오면 데이터가 이미 잘못됐다.
+pub fn sort_key_ms(ms: EpochMs) -> String {
+    format!("{:013}", ms.max(0))
+}
+
 /// `YYYY-MM-DDTHH` (UTC). 시간 롤업의 축.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -171,6 +192,32 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_key_ms_is_lexicographically_ordered() {
+        // 이 테스트의 요점: **작은 값과 큰 값을 섞어도** 사전순 = 숫자순이어야 한다.
+        let mut pairs: Vec<(EpochMs, String)> = vec![999, 1_000, 10_000, 1_755_500_400_000, 0, 42]
+            .into_iter()
+            .map(|ms| (ms, sort_key_ms(ms)))
+            .collect();
+
+        let mut by_number = pairs.clone();
+        by_number.sort_by_key(|(ms, _)| *ms);
+        pairs.sort_by(|a, b| a.1.cmp(&b.1));
+
+        assert_eq!(
+            pairs.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(),
+            by_number.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(),
+            "사전순 정렬이 숫자순과 달라졌다"
+        );
+        // 패딩하지 않으면 이 단정이 깨진다.
+        assert!("1000" < "999", "전제 확인: 패딩 없는 사전순은 뒤집힌다");
+        assert!(sort_key_ms(1_000) > sort_key_ms(999), "패딩하면 바로잡힌다");
+        assert_eq!(sort_key_ms(1_755_500_400_000), "1755500400000");
+        assert_eq!(sort_key_ms(42), "0000000000042");
+        // 음수는 부호가 사전순을 깨뜨리므로 0 으로 클램프한다.
+        assert_eq!(sort_key_ms(-5), "0000000000000");
+    }
 
     // 2026-08-20T05:23:11.500Z
     const T: EpochMs = 1_787_203_391_500;
