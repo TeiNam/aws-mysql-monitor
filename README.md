@@ -49,6 +49,7 @@ RDS를 자동 탐색해 환경(prd/stg/dev)별로 분류하고, MySQL 워크로�
 | 16 | [비용 모델](docs/16-cost.md) | 100/500대 월비용, 비용 폭발 시나리오와 방어 |
 | 17 | [로드맵 & 할일 목록](docs/17-roadmap-tasks.md) | M0~M12, 태스크 300여 개, 수용 기준 |
 | 18 | [개발계(dev) 배포 설계](docs/18-dev-environment.md) | **실제 계정 실측 기반.** Terraform 레이어, dev 접근 모델, prd 혼재 격리, 시드 MySQL, dev 비용 |
+| 19 | [M1 검증 스파이크 실측 결과](docs/19-m1-findings.md) | **실제 MySQL 8.4.11/8.0.46 측정.** ADR-006 무효화, 정규화 규칙 11건 정정, 절단 상한 |
 | — | [미해결 이슈](docs/OPEN-QUESTIONS.md) | 검증 필요 + 결정 대기 21건 (3건 실측으로 해소) |
 
 ## 읽는 순서
@@ -66,7 +67,7 @@ M4~M7에서 재작업이 발생한다. 설계가 전제하는 17가지 동작을
 
 | 항목 | 실패 시 |
 |---|---|
-| `information_schema.PROCESSLIST.INFO` 비절단 ([OPEN-Q-07](docs/OPEN-QUESTIONS.md)) | 파라미터 그룹 변경 + 재시작이 기본 경로가 된다 |
+| ~~`information_schema.PROCESSLIST.INFO` 비절단~~ → **해소**. 65,535바이트 상한 확인 ([19 §A](docs/19-m1-findings.md)) | 해당 없음 |
 | Athena `MERGE INTO` 멱등성 ([OPEN-Q-03](docs/OPEN-QUESTIONS.md)) | 플레인 S3 Parquet + 자체 컴팩션으로 전환 |
 | 워커 1대가 500대를 커버 ([OPEN-Q-01](docs/OPEN-QUESTIONS.md)) | 펜싱 토큰·팬아웃이 M12가 아니라 선행 조건이 된다 |
 
@@ -92,7 +93,8 @@ prd 인스턴스까지 커버한다(T-37). 3중 격리를 [18 §6](docs/18-dev-e
 | 항목 | 1세대 | 2세대 | 이유 |
 |---|---|---|---|
 | 캡처 소스 | `performance_schema.processlist` | PS 탐지 + `information_schema.PROCESSLIST` 타깃 조회 + PS 다이제스트 + CW 슬로우로그 | PS `processlist.INFO`는 1024바이트 절단 ([ADR-005](docs/03-decisions.md)) |
-| 실행계획 | 사후 `EXPLAIN` 재실행 (DML 포기) | 탐지 시점 `EXPLAIN FOR CONNECTION` | 실행 중 플랜 확보, DML 커버 ([ADR-006](docs/03-decisions.md)) |
+| 실행계획 (SELECT) | 사후 `EXPLAIN` 재실행 | **사후 재실행 (같다)** | `FOR CONNECTION` 이 RDS 에서 불가 ([19 §B](docs/19-m1-findings.md)) |
+| 실행계획 (DML) | 없음 | 조건절을 SELECT 로 바꾼 **근사** 플랜 | `EXPLAIN UPDATE` 는 DML 권한 필요(1142) |
 | 워크로드 전수조사 | 없음 (1초 미만 쿼리 미관측) | 다이제스트 델타 스냅샷 + 시간 롤업 | sub-second 워크로드 커버 ([ADR-010](docs/03-decisions.md)) |
 | 저장소 | MongoDB | DynamoDB(31일) + S3 Tables/Iceberg(1년) | 운영 부담 제거, 장기 SQL 집계 |
 | 백엔드 | Python/FastAPI | Rust/axum | 단일 바이너리·메모리 예측성·팀 역량 |

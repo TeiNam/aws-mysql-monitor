@@ -178,7 +178,8 @@ v         1
 | `plan_s3_key` | S | 오프로드된 경우의 S3 키. **키에 만료 티어를 포함한다** (F27) |
 | `plan_format_version` | S | `json_v1` / `json_v2` |
 | `plan_tree` | S | `FORMAT=TREE` 텍스트(수집 가능한 경우) |
-| `plan_source` | S | `for_connection` / `rerun` / `none` |
+| `plan_source` | S | `for_connection` / `rerun` / `rerun_as_select` / `none`. **`rerun` 이 실질 기본값**이고 `for_connection` 은 RDS 에서 불가하다 ([19 §B](19-m1-findings.md)) |
+| `plan_approximate` | BOOL | `plan_source=rerun_as_select` 면 true. DML 의 조건절만 SELECT 로 바꿔 얻은 플랜이므로 쓰기 단계가 빠져 있다 |
 | `plan_error` | S | 실패 사유 |
 | `plan_fingerprint` | S | 플랜 구조 해시 |
 | `referenced_tables` | L(S) | 플랜에서 추출한 `schema.table` 목록 |
@@ -215,7 +216,7 @@ SK        META  |  SLOWEST
 | `digest_text` | S | **평문**. 바인드 변수화된 정규화 SQL (MySQL `DIGEST_TEXT` 또는 자체 정규화 결과) |
 | `digest_text_source` | S | `mysql` / `app` |
 | `statement_type` | S | |
-| `mysql_digests` | M | `{instance_id: mysql_digest}` — PS 다이제스트와의 대응표 |
+| `mysql_digests` | M | `{instance_id: Set<mysql_digest>}` — PS 다이제스트와의 대응표. **인스턴스당 여러 개다** (§아래 N:1) |
 | `first_seen_ms` / `last_seen_ms` | N | |
 | `seen_instances` | SS | 이 다이제스트가 관측된 인스턴스 집합 |
 | `ps_sample_text` | S | `QUERY_SAMPLE_TEXT` (실시간 캡처에 안 걸린 다이제스트의 유일한 실행 가능 샘플) |
@@ -224,6 +225,20 @@ SK        META  |  SLOWEST
 | `digest_algo_version` | N | |
 | `ttl` | N | `last_seen_ms/1000 + 400일` (쓰기마다 갱신) |
 | `item_size_bytes` | N | 항목 크기 추정 (400KB 한도 감시용) |
+
+**`app_digest` : `mysql_digest` 는 1:N 이다 (M1-6b 실측, [19 §D](19-m1-findings.md)).**
+초기 설계는 인스턴스당 `mysql_digest` **하나**를 가정했다. MySQL 은 다음을 서로 다른
+다이제스트로 본다.
+
+| 차이 | MySQL | 우리 |
+|---|---|---|
+| 공백·주석·키워드 대소문자·백틱 | 같음 | 같음 |
+| **식별자 대소문자** (`orders` vs `ORDERS`) | **다름** | 같음 |
+| **후행 세미콜론** | **다름** | 같음 |
+
+`lower_case_table_names=0`(리눅스 기본)에서 식별자 대소문자는 실제로 다른 테이블일 수 있으므로
+MySQL 이 구분하는 것이 맞다. 우리는 수렴성을 위해 접는다(불가피하다 — [19 §C-1](19-m1-findings.md)).
+→ 매핑 학습(M4-16)이 **집합에 추가**하는 연산이어야 한다. 덮어쓰면 학습이 소실된다.
 
 **맵·집합에 정리 주체가 필요하다 (F28)** — 활성 다이제스트의 `META`는 TTL이 계속 갱신되어
 사실상 **영구 항목**인데, 인스턴스가 삭제되거나 이름이 바뀌어도(`renamed_from` 체인)

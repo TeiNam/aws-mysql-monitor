@@ -210,6 +210,13 @@ Top 목록을 별도 항목으로 만들어 둔다**(AP-17: `PK = TOP#<env>#<hou
 
 ## ADR-005. 슬로우 쿼리 캡처: 경량 탐지 + 타깃 심층 조회
 
+> **M1 실측 반영 (2026-08-20)** — 전제가 **부분적으로만** 맞았다.
+> `information_schema.PROCESSLIST.INFO` 는 `LONGTEXT` 가 아니라 `varchar(21845)` 이고
+> **65,535바이트에서 절단**된다. 1,024 → 65,535 는 64배 개선이므로 이 결정은 유효하지만,
+> "절단되지 않는다"는 서술은 틀렸다. 65KB 초과 SQL 은 `sql_text_truncated=true` 로 표시한다.
+> 조회 비용 우려도 해소됐다 — 타깃 조회가 PS 폴링보다 오히려 싸다(0.8~0.9배, 스레드 88개).
+> → [19 §A](19-m1-findings.md), [19 §F](19-m1-findings.md)
+
 **결정** — 3단 구조.
 1. **탐지**: `performance_schema.processlist`를 1초 주기로 조회 (경량, 뮤텍스 없음)
 2. **심층**: 임계값 초과 스레드에 대해서만
@@ -266,6 +273,21 @@ Top 목록을 별도 항목으로 만들어 둔다**(AP-17: `PK = TOP#<env>#<hou
 ---
 
 ## ADR-006. 실행계획: 탐지 시점 `EXPLAIN FOR CONNECTION` (기회적 옵티마이저 플랜)
+
+> **⚠ M1 실측으로 이 결정이 깨졌다 (2026-08-20)** — `EXPLAIN ... FOR CONNECTION` 은
+> 타인 커넥션에 대해 **정적 전역 권한 전체**를 요구한다. `PROCESS` 도 `SUPER` 도 부족하고,
+> RDS 는 마스터 유저에게도 `SUPER`·`FILE`·`SHUTDOWN` 을 주지 않으므로 **RDS·Aurora 에서는
+> 어떤 계정으로도 불가능하다.** MySQL 버그 [#95850](https://bugs.mysql.com/bug.php?id=95850)
+> 참조.
+>
+> **대체 결정**: `plan_source` 우선순위를 `none < rerun_as_select < rerun < for_connection`
+> 으로 두고, RDS 에서는 `rerun`(원문 `EXPLAIN` 재실행, `SELECT` 권한만 필요)을 기본으로 한다.
+> DML 은 `EXPLAIN UPDATE` 가 DML 권한을 요구하므로(`ERROR 1142`) 조건절을 `SELECT` 로 바꿔
+> **근사 플랜**을 얻는다(`rerun_as_select`, UI 에 "근사" 배지).
+> `for_connection` 은 자체 관리 MySQL 에서만 쓴다.
+>
+> 잃는 것: "실행 중 실제 플랜"은 RDS 에서 얻을 수 없다. DML 플랜은 1세대(없음)보다는
+> 낫지만 정확하지 않다. → [19 §B](19-m1-findings.md)
 
 **결정** — 슬로우 쿼리를 탐지한 즉시, 별도 연결에서
 `EXPLAIN FORMAT=JSON FOR CONNECTION <processlist_id>`를 실행한다.
@@ -507,6 +529,12 @@ bucket_timer_low/high, count_bucket)을 누적하므로, 버킷 카운트를 차
 ---
 
 ## ADR-011. 3중 소스를 `app_digest`로 조인한다
+
+> **M1 실측 확인 (2026-08-20)** — `max_digest_length` 가 다른 인스턴스 사이에서 같은 쿼리의
+> `DIGEST` 해시가 **달라진다**(1024 → `61416d95…`, 4096 → `033f75ac…`).
+> `app_digest` 는 필수다. **결정 유지.**
+> 단 정규화 규칙표는 실측으로 11건 정정했고([19 §C](19-m1-findings.md)),
+> `app_digest` : `mysql_digest` 가 **1:N** 임이 드러났다([19 §D](19-m1-findings.md)).
 
 **결정** — 캡처 소스 3개를 모두 쓰고, **자체 정규화 해시 `app_digest`** 를 공통 조인 키로 삼는다.
 `mysql_digest`는 인스턴스별 메타데이터로 함께 저장한다.

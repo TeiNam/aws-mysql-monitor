@@ -79,15 +79,29 @@ impl CaptureSource {
 }
 
 /// 실행계획 출처. 순서가 **우선순위**다 (병합 시 큰 쪽이 이긴다).
+///
+/// # M1-4 실측이 우선순위를 뒤집었다
+///
+/// `ForConnection` 이 가장 정확하지만 **RDS 에서는 쓸 수 없다.**
+/// `EXPLAIN ... FOR CONNECTION` 은 타인 커넥션에 대해 **정적 전역 권한 전체**를 요구하고,
+/// RDS 는 마스터 유저에게도 `SUPER`·`FILE`·`SHUTDOWN` 을 주지 않는다
+/// ([19-m1-findings.md](../../../docs/19-m1-findings.md) B).
+/// → 실질 기본 경로는 `Rerun` 이다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanSource {
     /// 플랜 없음.
     #[default]
     None,
-    /// 사후 재실행 (`SELECT` 만).
+    /// **근사 플랜.** DML 의 대상·조건절을 `SELECT` 로 바꿔 얻었다.
+    ///
+    /// 읽기 전용 계정은 `EXPLAIN UPDATE` 를 실행할 수 없다(`ERROR 1142`).
+    /// 행을 찾아가는 접근 경로는 같으므로 튜닝에 필요한 정보는 보존되지만,
+    /// 쓰기 단계(인덱스 갱신·트리거)는 플랜에 나타나지 않는다.
+    RerunAsSelect,
+    /// 원문을 그대로 `EXPLAIN` 재실행. `SELECT` 권한만으로 된다. **기본 경로.**
     Rerun,
-    /// 실행 중 `EXPLAIN FOR CONNECTION` — 가장 정확하다 (ADR-006).
+    /// 실행 중 `EXPLAIN FOR CONNECTION`. 가장 정확하지만 RDS 에서는 권한이 나오지 않는다.
     ForConnection,
 }
 
@@ -95,9 +109,15 @@ impl PlanSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::RerunAsSelect => "rerun_as_select",
             Self::Rerun => "rerun",
             Self::ForConnection => "for_connection",
         }
+    }
+
+    /// 실제 실행된 문장의 플랜인가. `false` 면 UI 에 "근사" 배지를 붙여야 한다.
+    pub fn is_exact(self) -> bool {
+        matches!(self, Self::ForConnection | Self::Rerun)
     }
 }
 
@@ -274,7 +294,19 @@ mod tests {
     fn plan_source_priority_ordering() {
         // 병합이 이 순서에 의존한다.
         assert!(PlanSource::ForConnection > PlanSource::Rerun);
-        assert!(PlanSource::Rerun > PlanSource::None);
+        assert!(PlanSource::Rerun > PlanSource::RerunAsSelect);
+        assert!(PlanSource::RerunAsSelect > PlanSource::None);
+    }
+
+    #[test]
+    fn only_real_statement_plans_are_exact() {
+        assert!(PlanSource::ForConnection.is_exact());
+        assert!(PlanSource::Rerun.is_exact());
+        assert!(
+            !PlanSource::RerunAsSelect.is_exact(),
+            "DML→SELECT 변환은 근사다"
+        );
+        assert!(!PlanSource::None.is_exact());
     }
 
     #[test]

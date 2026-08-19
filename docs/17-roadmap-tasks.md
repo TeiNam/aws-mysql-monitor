@@ -70,23 +70,23 @@
 
 | # | 태스크 | 검증 대상 | 실패 시 대응 |
 |---|---|---|---|
-| M1-1 | `information_schema.PROCESSLIST.INFO` 절단 여부 | [OPEN-Q-07](OPEN-QUESTIONS.md) / ADR-005 | `performance_schema_max_sql_text_length` 상향 경로로 전환 |
-| M1-2 | `EXPLAIN FORMAT=JSON FOR CONNECTION` 동작 (SELECT/UPDATE/DELETE, 성공률) | ADR-006 / NFR-P-04 | 사후 재실행 비중 상향, 문서 갱신 |
-| M1-3 | `EXPLAIN FORMAT=TREE FOR CONNECTION` 지원 여부 (8.4 / 8.0.32) | [OPEN-Q-05](OPEN-QUESTIONS.md) | JSON만 수집 |
-| M1-4 | 데이터 `SELECT` 권한 없이 `EXPLAIN FOR CONNECTION` 가능한가 | [OPEN-Q-06](OPEN-QUESTIONS.md) | 권한 모드 B 고정 |
+| ~~M1-1~~ | ~~`information_schema.PROCESSLIST.INFO` 절단 여부~~ → **완료**. `varchar(21845)`, 65,535바이트 상한 ([19 §A](19-m1-findings.md)) | [OPEN-Q-07](OPEN-QUESTIONS.md) **해소** | 65KB 초과 시 `sql_text_truncated=true` |
+| ~~M1-2~~ | ~~`EXPLAIN FORMAT=JSON FOR CONNECTION` 동작~~ → **완료. ADR-006 깨짐.** 정적 전역 권한 전체 필요 → RDS 불가 ([19 §B](19-m1-findings.md)) | ADR-006 **대체** | `rerun` 이 기본, DML 은 `rerun_as_select` |
+| ~~M1-3~~ | ~~`EXPLAIN FORMAT=TREE FOR CONNECTION` 지원 여부~~ → **완료. 지원됨** (8.4.11). 단 `FOR CONNECTION` 자체가 RDS 불가 | [OPEN-Q-05](OPEN-QUESTIONS.md) **해소** | 재실행 경로에서 TREE 수집 |
+| ~~M1-4~~ | ~~데이터 `SELECT` 권한 없이 `EXPLAIN FOR CONNECTION` 가능한가~~ → **완료. 질문 전제가 틀렸다** — `SELECT` 가 있어도 타인 커넥션은 불가 | [OPEN-Q-06](OPEN-QUESTIONS.md) **해소** | **권한 모드 B 고정. 모드 C 폐기** |
 | M1-5 | IAM DB Auth: 활성화에 재부팅이 필요한가, 연결·토큰 갱신 동작 | [OPEN-Q-10](OPEN-QUESTIONS.md) / ADR-007 | UI 문구·절차 확정 |
-| M1-6 | 다이제스트 골든 코퍼스 생성 + 정규화 규칙 확정 | ADR-011 / [05 §3.2](05-collector.md) | 규칙표 수정 |
+| ~~M1-6~~ | ~~다이제스트 골든 코퍼스 생성 + 정규화 규칙 확정~~ → **완료. 131건 전량 수렴**, 규칙 11건 정정 ([19 §C](19-m1-findings.md)) | ADR-011 유지 | 코퍼스는 `tests/fixtures/digest_corpus.sql` |
 | M1-7 | ~~S3 Tables 리전 가용성 + Athena 연동~~ **완료**. 남은 것: `MERGE INTO` / `DELETE` 동작·멱등성, 관리형 컴팩션, `s3tables:*` IAM 액션명 (`20-data` apply 후) | [OPEN-Q-03](OPEN-QUESTIONS.md) **대부분 해소** | 플레인 S3 Parquet + Glue로 전환 |
 | M1-8 | DynamoDB 증분 내보내기 → 언네스팅 SQL 작성 (모든 타입) | [04 §4.3](04-data-model.md) | 배열·맵을 JSON 문자열로 저장하는 방침 확정 |
 | M1-9 | Rust 수집 루프 벤치마크 — 모의 엔드포인트 **125 / 250 / 500개** × 다이제스트 500 / 2000행. A-08(워커 1대 500대) 판정에 500개 조건이 필수 | [OPEN-Q-01](OPEN-QUESTIONS.md) / ADR-001 / A-08 | 워커 수·주기 재산정. 125대도 못 커버하면 펜싱 토큰(M12-21)이 선행 조건 |
 | ~~M1-10~~ | ~~크로스 리전 지연 측정~~ → **현재 불필요**. 타 리전 RDS 0개 ([18 §1.3](18-dev-environment.md)). 코드 경로는 만들되 검증은 M12로 연기 | [OPEN-Q-02](OPEN-QUESTIONS.md) | 해당 없음 |
 | M1-11 | **다이제스트 스냅샷 실측** (시드 인스턴스 대상. M0-13c·M0-13d 선행): 실제 인스턴스에서 `digests_size` 사용량, 활성 다이제스트 수, `LAST_SEEN` 필터 적용 전후 응답 크기 | [05 §2.5.3](05-collector.md) / [16 §2.9](16-cost.md) | 필터·컬럼분리 설계 검증. 예상보다 크면 스냅샷 주기 상향 |
 | ~~M1-12~~ | ~~플릿 능력 인벤토리~~ → **완료 (2026-08-19)**. 전 리전 RDS 0개 ([18 §1.3](18-dev-environment.md)) | [OPEN-Q-12](OPEN-QUESTIONS.md) **해소** | 8.4+ 고정이 업그레이드 프로젝트가 될 위험 없음. 시드를 8.4로 만든다 |
-| M1-13 | `DIGEST_TEXT` 절단이 `DIGEST` 해시도 바꾸는가 (`max_digest_length` 다른 두 컨테이너 비교) + `STATEMENT_DIGEST()` 함수 동작 | [OPEN-Q-16](OPEN-QUESTIONS.md) / ADR-011 | 해시가 같으면 `app_digest` 역할 축소 (자체 lexer 부담 감소) |
+| ~~M1-13~~ | ~~`DIGEST_TEXT` 절단이 `DIGEST` 해시도 바꾸는가~~ → **완료. 바꾼다** → `app_digest` 필수 ([19 §E](19-m1-findings.md)) | [OPEN-Q-16](OPEN-QUESTIONS.md) **해소** | ADR-011 유지. `max_digest_length` 를 읽어야 한다 |
 | M1-14 | IAM DB Auth 활성화 전후 대상 인스턴스 `FreeableMemory` 비교 (`db.t4g.small`) | [OPEN-Q-17](OPEN-QUESTIONS.md) / ADR-007 | 작은 인스턴스는 비밀번호 방식 기본으로 |
 | M1-15 | Cognito access token에 `cognito:groups`를 넣는 방법 확인 (트리거 V1/V2, 실제 그룹 멤버십) | [OPEN-Q-18](OPEN-QUESTIONS.md) | `USER` 레코드만으로 인가하면 트리거 자체가 불필요할 수 있다 |
-| M1-16 | `information_schema.PROCESSLIST WHERE ID = ?` 의 실제 비용 측정 (스레드 수천 개 환경) | ADR-005 대가 항목 | 비싸면 심층 조회를 후보 전체에 1회로 배치 |
-| M1-17 | `sys.innodb_lock_waits` 컬럼명·절단 실측 + `metadata_locks` 수집 가능성 | [05 §2.8](05-collector.md) / FR-OBS-12 | 락 화면 쿼리 확정 |
+| ~~M1-16~~ | ~~`information_schema.PROCESSLIST WHERE ID = ?` 비용 측정~~ → **완료(부분). 타깃 조회가 PS 폴링보다 싸다**(0.8~0.9배, 스레드 88개) ([19 §F](19-m1-findings.md)) | ADR-005 대가 해소 | 수천 스레드 재측정은 M12-8 |
+| ~~M1-17~~ | ~~`sys.innodb_lock_waits` 컬럼명·절단 실측~~ → **완료. 컬럼 14개 전부 존재**, `waiting_query` 절단 확인, 2차 조회로 전문 확보 ([19 §G](19-m1-findings.md)) | [05 §2.8](05-collector.md) 확인 | `metadata_locks` 는 M8-15 |
 
 **M1 완료 기준** — [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)의 검증 항목이 모두 해소되고,
 관련 ADR과 요구사항이 갱신되었다.

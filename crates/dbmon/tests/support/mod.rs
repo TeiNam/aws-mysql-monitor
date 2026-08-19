@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 테스트 바이너리마다 쓰는 함수가 다르다
+
 //! M1 검증 스파이크 공용 지원 코드.
 //!
 //! 로컬 `docker compose` 의 MySQL 컨테이너에 붙는다. 컨테이너가 없으면 테스트를
@@ -126,24 +128,28 @@ pub async fn var(conn: &mut Conn, name: &str) -> Option<String> {
     conn.query_first(q).await.ok().flatten()
 }
 
-/// 리터럴이 아주 많은 `IN` 절로 목표 바이트 길이에 가까운 SQL 을 만든다.
+/// 목표 바이트 길이의 **장기 실행** SQL 을 만든다.
 ///
-/// 1세대의 실제 버그(1024바이트 절단)를 재현하기 위한 것이다. `id IN (...)` 은
-/// PK 범위 스캔이 되므로 행수를 통제할 수 있고, `SLEEP()` 으로 실행시간을 만든다.
-pub fn long_running_sql(target_bytes: usize, sleep_per_row: f64) -> String {
-    let head = "SELECT COUNT(*) FROM orders WHERE id IN (";
-    let tail = format!(") AND SLEEP({sleep_per_row}) = 0");
-    let mut sql = String::with_capacity(target_bytes + tail.len() + 16);
-    sql.push_str(head);
+/// 1세대의 실제 버그(1024바이트 절단)를 재현하기 위한 것이다.
+///
+/// **형태가 중요하다.** `id = 1` 로 1행만 읽게 해서 `SLEEP(초)` 이 정확히 한 번
+/// 평가되게 하고, 길이는 뒤의 `IN` 리스트로 채운다. `IN` 리스트로 행수를 만들면
+/// 실행시간이 (리스트 길이 × 행당 sleep) 이 되어 목표 시간을 맞출 수 없다.
+pub fn long_running_sql(target_bytes: usize, seconds: f64) -> String {
+    let head =
+        format!("SELECT COUNT(*) FROM orders WHERE id = 1 AND SLEEP({seconds}) = 0 AND id IN (");
+    let tail = ")";
+    let mut sql = String::with_capacity(target_bytes + head.len() + 8);
+    sql.push_str(&head);
     let mut n = 1u32;
-    while sql.len() < target_bytes.saturating_sub(tail.len()) {
+    while sql.len() + tail.len() < target_bytes {
         if n > 1 {
             sql.push(',');
         }
         sql.push_str(&n.to_string());
         n += 1;
     }
-    sql.push_str(&tail);
+    sql.push_str(tail);
     sql
 }
 
@@ -167,21 +173,86 @@ pub struct RunningQuery {
 pub async fn start_long_query(
     target: Target,
     cred: (&str, &str),
-    sql: String,
+    sql: impl Into<String>,
+) -> Option<RunningQuery> {
+    start_long_statements(target, cred, vec![sql.into()]).await
+}
+
+/// 여러 문장을 순서대로 실행하고 **마지막 문장이 실행 중인 상태**로 돌려준다.
+///
+/// DML 플랜 검증(ADR-006)에 필요하다: `START TRANSACTION` 후 `UPDATE`/`DELETE` 를 걸고
+/// 커밋하지 않는다. 커넥션이 드롭되면 롤백되므로 시드 데이터가 오염되지 않는다.
+pub async fn start_long_statements(
+    target: Target,
+    cred: (&str, &str),
+    statements: Vec<String>,
 ) -> Option<RunningQuery> {
     let mut conn = connect(target, cred).await?;
     let connection_id: u64 = conn.query_first("SELECT CONNECTION_ID()").await.ok()??;
     let handle = tokio::spawn(async move {
-        // 실패해도 무해하다 — 측정이 끝난 뒤 KILL 당할 수 있다.
-        let _ = conn.query_drop(sql).await;
+        for s in statements {
+            // 실패해도 무해하다 — 측정이 끝난 뒤 KILL 당할 수 있다.
+            if conn.query_drop(s).await.is_err() {
+                break;
+            }
+        }
+        // 커밋하지 않는다. 드롭 시 롤백된다.
         let _ = conn.disconnect().await;
     });
     // 서버가 문장을 접수하고 processlist 에 나타날 시간을 준다.
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     Some(RunningQuery {
         connection_id,
         handle,
     })
+}
+
+/// 실행 중인 커넥션의 문장을 세 소스에서 각각 읽어 길이를 잰다 (M1-1).
+pub struct TextLengths {
+    /// `performance_schema.processlist.INFO` — 1024바이트 절단이 예상된다.
+    pub ps_processlist_info: Option<u64>,
+    /// `information_schema.PROCESSLIST.INFO` — `LONGTEXT`. 절단되지 않아야 한다.
+    pub is_processlist_info: Option<u64>,
+    /// `events_statements_current.SQL_TEXT` — `max_sql_text_length` 로 잘린다.
+    pub stmt_current_sql_text: Option<u64>,
+}
+
+pub async fn measure_text_lengths(conn: &mut Conn, connection_id: u64) -> TextLengths {
+    let ps: Option<u64> = conn
+        .exec_first(
+            "SELECT LENGTH(INFO) FROM performance_schema.processlist WHERE ID = ?",
+            (connection_id,),
+        )
+        .await
+        .ok()
+        .flatten();
+    let is: Option<u64> = conn
+        .exec_first(
+            "SELECT LENGTH(INFO) FROM information_schema.PROCESSLIST WHERE ID = ?",
+            (connection_id,),
+        )
+        .await
+        .ok()
+        .flatten();
+    let cur: Option<u64> = conn
+        .exec_first(
+            "SELECT LENGTH(e.SQL_TEXT) FROM performance_schema.events_statements_current e \
+             JOIN performance_schema.threads t USING (THREAD_ID) WHERE t.PROCESSLIST_ID = ?",
+            (connection_id,),
+        )
+        .await
+        .ok()
+        .flatten();
+    TextLengths {
+        ps_processlist_info: ps,
+        is_processlist_info: is,
+        stmt_current_sql_text: cur,
+    }
+}
+
+/// 실행 중인 문장을 강제 종료한다. 측정이 끝난 뒤 정리용.
+pub async fn kill_query(conn: &mut Conn, connection_id: u64) {
+    let _ = conn.query_drop(format!("KILL QUERY {connection_id}")).await;
 }
 
 /// 측정 결과를 사람이 읽을 표로 출력한다. 스파이크의 산출물은 pass/fail 이 아니라

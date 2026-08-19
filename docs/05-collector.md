@@ -56,10 +56,27 @@ FROM information_schema.PROCESSLIST
 WHERE ID IN (?, ?, ...)
 ```
 
-`information_schema.PROCESSLIST.INFO`는 `LONGTEXT`이며 절단되지 않는다.
-→ 이 전제가 ADR-005의 근거이므로 [OPEN-Q-07](OPEN-QUESTIONS.md)에서 실측 검증한다.
-검증 실패 시 폴백: 파라미터 그룹에서 `performance_schema_max_sql_text_length=8192` 설정 후
-`events_statements_current.SQL_TEXT`를 전문 소스로 쓴다(재시작 필요).
+**⚠ 초기 설계는 "`INFO`는 `LONGTEXT`이며 절단되지 않는다"고 적었다. 사실이 아니다**
+([19 §A](19-m1-findings.md), MySQL 8.4.11 · 8.0.46 실측).
+
+```
+information_schema.PROCESSLIST.INFO   varchar(21845)  →  LENGTH() 기준 65,535바이트에서 절단
+performance_schema.processlist.INFO   longtext        →  내용이 1,024바이트로 절단
+```
+
+두 컬럼의 제약 방향이 **반대**다. `information_schema` 쪽은 컬럼 타입이 좁고,
+`performance_schema` 쪽은 타입은 무제한이지만 서버가 내용을 자른다
+(`performance_schema_max_sql_text_length`). 21845 × 3바이트(utf8mb3) = 65535 이므로
+이 상한은 컬럼 정의에서 오며 **설정으로 바뀌지 않는다.**
+
+그래도 1,024 → 65,535 는 **64배 개선**이고 실무 SQL 길이 분포를 생각하면 사실상 전부를
+커버한다. ADR-005 는 유효하다. 단 다음을 지킨다.
+
+| 실측값 | 대응 |
+|---|---|
+| 65,535바이트 정확히 반환 | `sql_text_truncated = true`. 상한이 컬럼 정의라 값이 고정이므로 이 판정이 정확하다 |
+| `performance_schema_max_sql_text_length` 상향 (1024 → 8192) | `events_statements_current.SQL_TEXT` 가 8,192바이트를 반환한다. **폴백은 동작한다**(재시작 필요) |
+| 그 폴백으로도 65,535 초과는 불가 | 65KB 넘는 SQL 의 전문은 어느 경로로도 못 얻는다. 정직하게 표시한다 |
 
 ### 2.3 정확 지표 + 다이제스트 — 임계값 초과 스레드만
 
@@ -89,6 +106,13 @@ WHERE t.PROCESSLIST_ID IN (?, ?, ...)
 
 ### 2.4 실행계획 — 별도 연결
 
+**⚠ 이 경로는 RDS·Aurora 에서 쓸 수 없다** ([19 §B](19-m1-findings.md) 실측).
+타인 커넥션을 explain 하려면 **정적 전역 권한 전체**가 필요하고, RDS 는 마스터 유저에게도
+`SUPER`·`FILE`·`SHUTDOWN` 을 주지 않는다. `PROCESS` 도 `SUPER` 도 부족하다.
+→ 실질 기본 경로는 **`plan_source=rerun`**(원문 재실행)이고, DML 은
+**`rerun_as_select`**(조건절을 SELECT 로 변환한 근사 플랜)다.
+아래 문장은 **자체 관리 MySQL**에서만 쓰인다.
+
 ```sql
 /* dbmon:plan */ EXPLAIN FORMAT=JSON FOR CONNECTION 8842119
 ```
@@ -107,7 +131,9 @@ WHERE t.PROCESSLIST_ID IN (?, ?, ...)
 |---|---|---|
 | `1094` `ER_NO_SUCH_THREAD` | 스레드가 이미 종료됨 | `plan_source=none`, `plan_error=thread_gone`. 폴백 시도 |
 | `3012` `ER_EXPLAIN_NOT_SUPPORTED` | SELECT/UPDATE/INSERT/DELETE/REPLACE 이외 (CALL, SET, DDL 등) | `plan_error=not_explainable`. 폴백 없음 |
-| `1044`/`1045`/`1227` (권한 계열) | `PROCESS` 미부여 | `plan_error=denied` + 자가진단 실패로 승격 |
+| `1044`/`1045`/`1227` (권한 계열) | **타인 커넥션 explain 권한 부족. RDS 에서는 상시 발생** | `plan_error=denied` → `rerun` 폴백. **자가진단 실패로 승격하지 않는다** (사용자가 고칠 수 없다) |
+| `1142` `ER_TABLEACCESS_DENIED_ERROR` | 읽기 전용 계정으로 DML 을 `EXPLAIN` 했다 | `plan_error=dml_privilege_missing` → `rerun_as_select` 로 전환 |
+| (에러 없음, 빈 결과) | 유휴 커넥션이었다 | `plan_error=no_statement`. **에러로 세지 않는다** — 정상을 실패로 센다 |
 | 클라이언트 타임아웃 | 서버가 플랜 직렬화 시점에 도달 못 함 | `plan_error=timeout`. 연결 폐기 |
 | 그 외 | — | `plan_error=other:<code>`. 코드를 기록해 나중에 분류에 추가 |
 
@@ -453,7 +479,23 @@ testcontainers로 MySQL 8.4 / 8.0.32 기동
 ### 3.3 절단 문제와 `mysql_digest` 매핑
 
 `DIGEST_TEXT`는 `performance_schema_max_digest_length`(기본 1024바이트)에서 잘리고,
-잘렸을 때 `...`로 끝난다. 파라미터 그룹이 다른 인스턴스 사이에서는 같은 쿼리의
+잘린다. **초기 설계는 "잘렸을 때 `...`로 끝난다"고 적었는데 사실이 아니다** —
+토큰 중간에서 그냥 끝난다([19 §E](19-m1-findings.md)):
+
+```
+max_digest_length=1024 → 끝: "… `id` AS `a_00047` ,"
+max_digest_length=4096 → 끝: "… AS `a_00193` , `id`"
+```
+
+그래서 절단 판정을 4신호로 한다: ① `...` 접미 ② 백틱 개수 홀수 ③ 완결 불가 토큰으로 끝남
+④ 길이가 `max_digest_length` 에 근접. **오탐은 무해**(매핑 경로를 타는 것뿐)하고 누락은
+조용한 오분류이므로 넓게 잡는다.
+
+**⚠ 읽어야 할 변수는 `max_digest_length` 다.** `performance_schema_max_digest_length` 는
+저장 길이만 바꾸고 해시를 바꾸지 않는다 — 그것만 올려서 측정하면 "해시가 같다"는 잘못된
+결론이 나온다(실제로 첫 측정에서 그렇게 됐다).
+
+파라미터 그룹이 다른 인스턴스 사이에서는 같은 쿼리의
 `DIGEST_TEXT`가 다르게 잘릴 수 있고, 그러면 `app_digest`도 달라진다.
 
 **해결 — 학습된 매핑 테이블**
@@ -925,7 +967,7 @@ FilterLogEvents(logGroupName='/aws/rds/instance/<id>/slowquery',
 | `performance_schema` | `SELECT @@performance_schema` | `ps_off` + 파라미터 그룹 변경 안내 |
 | consumer 활성 | `SELECT NAME,ENABLED FROM performance_schema.setup_consumers WHERE NAME IN ('events_statements_current','statements_digest','global_instrumentation','thread_instrumentation')` | 어느 소스가 불가한지 명시 |
 | 계정 권한 | `SHOW GRANTS FOR CURRENT_USER()` | 부족한 GRANT 목록 표시 |
-| 다이제스트 길이 | `SELECT @@performance_schema_max_digest_length` | 4096 미만이면 권고 |
+| 다이제스트 길이 | `SELECT @@max_digest_length, @@performance_schema_max_digest_length` | 4096 미만이면 권고. **해시를 바꾸는 것은 앞쪽 변수다** ([19 §E](19-m1-findings.md)) |
 | SQL 텍스트 길이 | `SELECT @@performance_schema_max_sql_text_length` | 참고 정보 |
 | 다이제스트 테이블 크기 | `SELECT @@performance_schema_digests_size` + 오버플로 행 존재 | 오버플로 시 상향 권고 |
 | 슬로우로그 설정 | RDS API `EnabledCloudwatchLogsExports` + `SELECT @@slow_query_log, @@long_query_time` | FR-CWL 미적용 표시 |

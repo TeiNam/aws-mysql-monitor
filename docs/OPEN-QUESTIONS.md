@@ -134,9 +134,18 @@ DynamoDB Streams로 처리하는 혼합도 가능하다(후자는 초 단위 지
 
 ---
 
-## OPEN-Q-05 (V) `EXPLAIN FORMAT=TREE FOR CONNECTION`이 지원되는가
+## OPEN-Q-05 (V) `EXPLAIN FORMAT=TREE FOR CONNECTION`이 지원되는가 — **해소**
 
-**상태**: 미해소 · M1-3
+**상태**: **해소** (2026-08-20 실측, [19 §B](19-m1-findings.md))
+
+**결과** — MySQL 8.4.11 에서 `FORMAT=TREE FOR CONNECTION` 이 **지원된다.**
+SELECT·UPDATE·DELETE·`INSERT ... SELECT` 모두 결과를 반환했다. `FORMAT=TRADITIONAL` 도 된다.
+
+**단 이 질문의 실효성이 사라졌다** — `FOR CONNECTION` 자체가 RDS 에서 쓸 수 없기 때문이다
+([OPEN-Q-06](#open-q-06-v-데이터-select-권한-없이-explain-for-connection이-되는가) 참조).
+`FORMAT=TREE` 는 사후 재실행 경로에서 얻는다(권한 문제 없음).
+
+**원래 상태**: 미해소 · M1-3
 
 **왜** — [05 §2.4](05-collector.md)에서 JSON은 확실하다고 보고 TREE는 "버전별 확인 필요"로
 적었다. TREE 형식은 사람이 읽기 훨씬 쉬워서 UI 가치가 크다.
@@ -151,9 +160,20 @@ TREE 텍스트는 있을 때만 탭으로 제공한다.
 
 ---
 
-## OPEN-Q-06 (V) 데이터 `SELECT` 권한 없이 `EXPLAIN FOR CONNECTION`이 되는가
+## OPEN-Q-06 (V) 데이터 `SELECT` 권한 없이 `EXPLAIN FOR CONNECTION`이 되는가 — **해소(부정)**
 
-**상태**: 미해소 · M1-4
+**상태**: **해소** (2026-08-20 실측, [19 §B](19-m1-findings.md)). **ADR-006 이 깨졌다.**
+
+**결과** — 질문의 전제 자체가 틀렸다. `SELECT` 권한이 있어도 **타인 커넥션은 explain 할 수 없다.**
+필요한 것은 **정적 전역 권한 전체**이고, RDS 는 마스터 유저에게도 `SUPER`·`FILE`·`SHUTDOWN` 을
+주지 않는다. `PROCESS` 도 `SUPER` 도 부족하다. 대상 테이블이 없는 문장(`SELECT SLEEP(20)`)에서도
+같은 결과이므로 테이블 권한 문제가 아니다.
+
+→ 권한 모드 C(`minimal`)를 도입할 이유가 없어졌다. 모드 B(`least`)가 기본이며,
+플랜은 **사후 재실행**으로 얻는다(`SELECT` 권한만 필요).
+DML 은 조건절을 `SELECT` 로 바꿔 근사 플랜을 얻는다(`ERROR 1142` 회피).
+
+**원래 상태**: 미해소 · M1-4
 
 **왜** — 사실이면 모니터링 계정에 운영 데이터 읽기 권한을 **전혀 주지 않고도** 플랜을 얻을
 수 있다. 보안상 큰 차이다([07 §2.3](07-credentials-bootstrap.md) 모드 C).
@@ -186,9 +206,26 @@ GRANT SELECT ON sys.* TO 'minimal'@'%';
 
 ---
 
-## OPEN-Q-07 (V) `information_schema.PROCESSLIST.INFO`가 정말 절단되지 않는가
+## OPEN-Q-07 (V) `information_schema.PROCESSLIST.INFO`가 정말 절단되지 않는가 — **해소(부분)**
 
-**상태**: 미해소 · M1-1. **[ADR-005](03-decisions.md)의 핵심 전제**
+**상태**: **해소** (2026-08-20 실측, [19 §A](19-m1-findings.md))
+
+**결과** — **절단된다. 단 65,535바이트에서다.**
+컬럼 타입이 `varchar(21845)` 이고 `LONGTEXT` 가 아니다(21845 × 3바이트 = 65535).
+`performance_schema.processlist.INFO` 는 `longtext` 이지만 내용이 1,024바이트로 잘린다 —
+두 컬럼의 제약 방향이 반대다.
+
+| SQL 길이 | PS `processlist` | IS `PROCESSLIST` | `events_statements_current` |
+|---|---|---|---|
+| 4,097 | 1,024 | 4,097 | 1,024 |
+| 16,387 | 1,024 | 16,387 | 1,024 |
+| 65,541 | 1,024 | **65,535** | 1,024 |
+| 1,048,577 | 1,024 | **65,535** | 1,024 |
+
+→ ADR-005 는 **유효**하다(64배 개선). 다만 65KB 초과 시 `sql_text_truncated=true` 를 세운다.
+폴백(`performance_schema_max_sql_text_length` 상향)도 동작을 확인했다(1024 → 8192).
+
+**원래 상태**: 미해소 · M1-1. **[ADR-005](03-decisions.md)의 핵심 전제**
 
 **왜** — 1세대의 실제 버그(1024바이트 절단)를 고치는 방법이 이것이다. 만약
 `information_schema.PROCESSLIST`도 어떤 한도에서 잘린다면 다른 경로가 필요하다.
@@ -405,9 +442,26 @@ prd에 있다.**
 
 ---
 
-## OPEN-Q-16 (V) `DIGEST_TEXT` 절단이 `DIGEST` 해시도 바꾸는가
+## OPEN-Q-16 (V) `DIGEST_TEXT` 절단이 `DIGEST` 해시도 바꾸는가 — **해소(바꾼다)**
 
-**상태**: 미해소 · M1-6과 함께 검증
+**상태**: **해소** (2026-08-20 실측, [19 §E](19-m1-findings.md))
+
+**결과** — **해시가 달라진다.** 3,330바이트 SQL(서로 다른 식별자 300개):
+
+| `max_digest_length` | `DIGEST_TEXT` 길이 | `DIGEST` |
+|---|---|---|
+| 1,024 | 958 | `61416d954598164e…` |
+| 4,096 | 3,826 | `033f75ac13c2b45a…` |
+
+→ `app_digest` 는 **필수**다. [ADR-011](03-decisions.md) 유지. 자체 lexer 부담이 남는다.
+
+**⚠ 두 변수를 혼동하면 반대 결론이 나온다.** `performance_schema_max_digest_length` 만
+올리면 해시가 같게 나온다(첫 측정에서 실제로 그랬다). 해시를 바꾸는 것은
+**`max_digest_length`** 다. 자가진단이 읽는 변수를 정정했다([05 §9](05-collector.md)).
+
+부수 발견: 절단된 `DIGEST_TEXT` 는 `...` 로 끝나지 **않는다**. 토큰 중간에서 그냥 끝난다.
+
+**원래 상태**: 미해소 · M1-6과 함께 검증
 
 **왜** — [ADR-011](03-decisions.md)이 "파라미터 그룹이 다른 인스턴스 사이에서는 긴 쿼리의
 `mysql_digest`가 달라진다"를 전제로 `app_digest`를 도입했다. 하지만 **절단이 텍스트만 자르는지

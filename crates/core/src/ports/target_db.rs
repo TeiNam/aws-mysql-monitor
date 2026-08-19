@@ -114,8 +114,20 @@ pub enum PlanFailure {
     ThreadGone,
     /// 3012 `ER_EXPLAIN_NOT_SUPPORTED` — CALL·SET·DDL 등. 폴백 없음.
     NotExplainable,
-    /// 1044 / 1045 / 1227 — `PROCESS` 미부여. 자가진단 실패로 승격.
+    /// 1044 / 1045 / 1227 — 타인 커넥션을 explain 할 권한이 없다.
+    ///
+    /// **RDS 에서는 항상 이 결과다** (M1-4 실측). `PROCESS` 도 `SUPER` 도 부족하고
+    /// 정적 전역 권한 전체가 필요하다 → `Rerun` 폴백으로 전환한다.
+    /// 자가진단 실패로 승격하지 **않는다** — 고칠 수 있는 설정이 아니다.
     Denied,
+    /// 1142 `ER_TABLEACCESS_DENIED_ERROR` — 읽기 전용 계정으로 DML 을 `EXPLAIN` 했다.
+    /// → `RerunAsSelect`(DML 을 SELECT 로 변환) 경로로 전환한다.
+    DmlPrivilegeMissing,
+    /// `EXPLAIN` 은 성공했지만 결과가 비어 있다 (유휴 커넥션이었다).
+    ///
+    /// 실측: 유휴 커넥션에 `FOR CONNECTION` 을 걸면 **에러가 아니라 빈 결과**다.
+    /// 에러로 취급하면 정상 상태를 실패로 센다.
+    NoStatement,
     /// 클라이언트 타임아웃. 연결을 폐기한다.
     Timeout,
     /// 분류되지 않은 코드. 기록해 두고 나중에 표에 추가한다.
@@ -123,10 +135,13 @@ pub enum PlanFailure {
 }
 
 impl PlanFailure {
+    /// 실측으로 확정한 매핑 (MySQL 8.4.11 / 8.0.46,
+    /// [19 §B](../../../docs/19-m1-findings.md)).
     pub fn from_mysql_error_code(code: u16) -> Self {
         match code {
             1094 => Self::ThreadGone,
             3012 => Self::NotExplainable,
+            1142 => Self::DmlPrivilegeMissing,
             1044 | 1045 | 1227 => Self::Denied,
             other => Self::Other(other),
         }
@@ -138,21 +153,34 @@ impl PlanFailure {
             Self::ThreadGone => "thread_gone".into(),
             Self::NotExplainable => "not_explainable".into(),
             Self::Denied => "denied".into(),
+            Self::DmlPrivilegeMissing => "dml_privilege_missing".into(),
+            Self::NoStatement => "no_statement".into(),
             Self::Timeout => "timeout".into(),
             Self::Other(c) => format!("other:{c}"),
         }
     }
 
-    /// 사후 재실행 폴백을 시도할 가치가 있는가.
+    /// 원문 그대로 `EXPLAIN` 재실행을 시도할 가치가 있는가.
     ///
-    /// `NotExplainable` 은 재실행해도 같은 결과다. `Denied` 는 권한 문제이므로 무의미하다.
+    /// `Denied` 도 포함한다 — 타인 커넥션 explain 권한이 없어도 **우리 커넥션에서
+    /// 재실행**하는 것은 `SELECT` 권한만으로 된다(M1-4b).
+    /// `NotExplainable` 은 재실행해도 같은 결과다.
     pub fn allows_rerun_fallback(&self) -> bool {
-        matches!(self, Self::ThreadGone | Self::Timeout | Self::Other(_))
+        !matches!(self, Self::NotExplainable | Self::NoStatement)
+    }
+
+    /// DML 을 `SELECT` 로 변환해 근사 플랜을 얻어야 하는가.
+    pub fn requires_select_conversion(&self) -> bool {
+        *self == Self::DmlPrivilegeMissing
     }
 
     /// 자가진단 실패로 승격해야 하는가.
+    ///
+    /// **`Denied` 는 승격하지 않는다.** RDS 에서는 정상이며 사용자가 고칠 수 없다.
+    /// 초기 설계는 이걸 "`PROCESS` 미부여"로 해석해 승격시켰는데, 그러면 모든 RDS
+    /// 인스턴스가 상시 자가진단 실패로 표시된다.
     pub fn escalates_to_diagnostic(&self) -> bool {
-        *self == Self::Denied
+        false
     }
 
     /// 연결을 폐기해야 하는가 (취소해도 서버 측 작업이 남을 수 있다).
@@ -253,12 +281,42 @@ mod tests {
             "재실행해도 같은 결과다"
         );
         assert!(
-            !PlanFailure::Denied.allows_rerun_fallback(),
-            "권한 문제는 재실행이 무의미하다"
+            PlanFailure::Denied.allows_rerun_fallback(),
+            "타인 커넥션 explain 권한이 없어도 우리 커넥션에서 재실행하는 것은 된다 (M1-4b)"
         );
-        assert!(PlanFailure::Denied.escalates_to_diagnostic());
+        assert!(
+            !PlanFailure::NoStatement.allows_rerun_fallback(),
+            "실행 중 문장이 없었다"
+        );
+
+        assert!(PlanFailure::DmlPrivilegeMissing.requires_select_conversion());
+        assert!(!PlanFailure::Denied.requires_select_conversion());
+
         assert!(PlanFailure::Timeout.requires_connection_drop());
         assert!(!PlanFailure::ThreadGone.requires_connection_drop());
+    }
+
+    /// RDS 에서는 `Denied` 가 상시 발생한다. 승격하면 모든 인스턴스가 자가진단 실패가 된다.
+    #[test]
+    fn denied_does_not_escalate_to_diagnostic_failure() {
+        for f in [
+            PlanFailure::Denied,
+            PlanFailure::DmlPrivilegeMissing,
+            PlanFailure::ThreadGone,
+            PlanFailure::NotExplainable,
+            PlanFailure::NoStatement,
+            PlanFailure::Timeout,
+        ] {
+            assert!(!f.escalates_to_diagnostic(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn dml_privilege_error_is_classified() {
+        assert_eq!(
+            PlanFailure::from_mysql_error_code(1142),
+            PlanFailure::DmlPrivilegeMissing
+        );
     }
 
     #[test]
