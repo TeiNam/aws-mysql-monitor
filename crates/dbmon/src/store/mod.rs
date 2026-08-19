@@ -19,6 +19,7 @@
 //! 개발·검증할 수 있다 — 이 프로젝트의 로컬 우선 원칙이다.
 
 pub mod keys;
+pub mod lease;
 
 use std::collections::HashMap;
 
@@ -263,7 +264,9 @@ impl DynamoSlowQueryStore {
     }
 }
 
-fn map_sdk_err<E: std::fmt::Debug, R: std::fmt::Debug>(e: SdkError<E, R>) -> DomainError {
+pub(crate) fn map_sdk_err<E: std::fmt::Debug, R: std::fmt::Debug>(
+    e: SdkError<E, R>,
+) -> DomainError {
     DomainError::Unavailable {
         dependency: "dynamodb",
         reason: format!("{e:?}"),
@@ -271,7 +274,9 @@ fn map_sdk_err<E: std::fmt::Debug, R: std::fmt::Debug>(e: SdkError<E, R>) -> Dom
 }
 
 /// 조건부 쓰기 실패인가. 그러면 다시 읽어 병합해야 한다.
-fn is_conditional_failure<E: std::fmt::Debug, R: std::fmt::Debug>(e: &SdkError<E, R>) -> bool {
+pub(crate) fn is_conditional_failure<E: std::fmt::Debug, R: std::fmt::Debug>(
+    e: &SdkError<E, R>,
+) -> bool {
     // SDK 의 오류 타입을 문자열로 판정한다. 타입으로 매칭하면 `PutItemError` 변형이
     // 버전마다 달라져 컴파일이 깨진다.
     format!("{e:?}").contains("ConditionalCheckFailed")

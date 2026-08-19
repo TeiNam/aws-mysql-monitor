@@ -546,7 +546,7 @@ crates/dbmon/src/collector/mod.rs:323:    pub async fn warm_if_needed(&mut self)
 | # | 필요한 것 | 로드맵 | 상태 |
 |---|---|---|---|
 | 1 | ~~`SlowQueryStore` 구현 (DynamoDB)~~ | M2-4 | **완료 (2026-08-19).** `DynamoSlowQueryStore` + DynamoDB Local 통합 테스트 9건. AWS 자격증명 불필요 |
-| 2 | 샤드 리스 + 수집 리더 게이트 (F1) | M4-21 | `LeaseStore` 구현 없음. `ShardsOwned 합계 = 64 또는 0` 불변식을 코드가 강제하지 않는다 |
+| 2 | 샤드 리스 + 수집 리더 게이트 (F1) | M4-21 | **어댑터 완료 (2026-08-19).** `DynamoLeaseStore` + `target_shard_count(is_leader)`. 불변식 `합계 = 64 또는 0` 을 코드가 강제하고 테스트가 워커 1~10대에서 확인한다. 남은 것: 수집 루프에 배선 |
 | 3 | RDS 인스턴스 탐색 | M2-5 | `InstanceRegistry` 페이크만 있다 |
 
 ### M2-4 가 리뷰로는 알 수 없던 것을 두 개 잡았다

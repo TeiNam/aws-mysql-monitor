@@ -383,3 +383,166 @@ async fn item_carries_a_ttl_attribute() {
         "TTL 이 핫 경계보다 짧다: {secs} <= {boundary}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 리스 — F1 (M4-21)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use dbmon::store::lease::{DynamoLeaseStore, target_shard_count};
+use dbmon_core::ports::{COLLECT_LEADER_KEY, LEASE_TTL_MS, LeaseStore};
+
+async fn lease_store(name: &str) -> Option<DynamoLeaseStore> {
+    // 리스는 슬로우 쿼리와 같은 테이블을 쓴다(단일 테이블 설계). 테이블을 먼저 만든다.
+    let _ = store(name).await?;
+    Some(DynamoLeaseStore::new(
+        client(),
+        format!("dbmon-test-{name}"),
+    ))
+}
+
+/// **F1 의 핵심.** 두 워커가 같은 리스를 동시에 잡으려 하면 하나만 성공해야 한다.
+///
+/// 실패하면 두 워커가 모든 샤드를 소유하고 같은 인스턴스를 중복 수집한다 —
+/// 다이제스트 누산기가 last-writer-wins 로 조용히 손상된다.
+#[tokio::test]
+async fn only_one_worker_wins_the_collect_leader_lease() {
+    let Some(s) = lease_store("lease-mutex").await else {
+        return;
+    };
+    let now = T0;
+
+    let a = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-a", now)
+        .await
+        .expect("A");
+    let b = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-b", now)
+        .await
+        .expect("B");
+
+    assert!(a.is_some(), "첫 워커는 잡아야 한다");
+    assert!(
+        b.is_none(),
+        "두 번째 워커가 유효한 리스를 빼앗았다 — 중복 수집이 된다"
+    );
+
+    // **F1 불변식**: 합계가 SHARD_COUNT 를 넘지 않는다.
+    let total = target_shard_count(a.is_some()) + target_shard_count(b.is_some());
+    assert_eq!(total, dbmon_core::ports::SHARD_COUNT, "합계 {total}");
+}
+
+/// 만료 후에는 다른 워커가 잡을 수 있고, `epoch` 가 올라간다.
+#[tokio::test]
+async fn expired_lease_is_taken_over_with_a_higher_epoch() {
+    let Some(s) = lease_store("lease-takeover").await else {
+        return;
+    };
+
+    let first = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-a", T0)
+        .await
+        .expect("A")
+        .expect("잡아야 한다");
+
+    // TTL 이 지난 시점.
+    let later = T0 + LEASE_TTL_MS + 1;
+    let second = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-b", later)
+        .await
+        .expect("B")
+        .expect("만료됐으므로 잡아야 한다");
+
+    assert_eq!(second.owner, "worker-b");
+    assert!(
+        second.epoch > first.epoch,
+        "epoch 가 올라가지 않았다 ({} → {}) — 펜싱 근거가 없다",
+        first.epoch,
+        second.epoch
+    );
+}
+
+/// **갱신은 `owner` + `epoch` 가 모두 맞을 때만** 성공해야 한다.
+///
+/// 우리가 만료를 눈치채지 못한 사이 다른 워커가 잡았다 놓았을 수 있다. `owner` 만
+/// 비교하면 우리 것으로 착각하고 계속 쓴다 — 중복 수집이다.
+#[tokio::test]
+async fn renew_fails_after_another_worker_took_over() {
+    let Some(s) = lease_store("lease-renew").await else {
+        return;
+    };
+
+    let stale = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-a", T0)
+        .await
+        .expect("A")
+        .expect("잡음");
+
+    // 갱신은 아직 된다.
+    assert!(
+        s.renew(&stale, T0 + 1_000).await.expect("갱신").is_some(),
+        "유효한 리스는 갱신돼야 한다"
+    );
+
+    // 다른 워커가 만료 후 가져간다.
+    let later = T0 + LEASE_TTL_MS * 3;
+    s.try_acquire(COLLECT_LEADER_KEY, "worker-b", later)
+        .await
+        .expect("B")
+        .expect("가져감");
+
+    // 예전 리스로 갱신하면 실패해야 한다 — epoch 가 다르다.
+    assert!(
+        s.renew(&stale, later + 1)
+            .await
+            .expect("갱신 시도")
+            .is_none(),
+        "빼앗긴 리스가 갱신됐다 — 두 워커가 리더라고 믿는다"
+    );
+}
+
+/// 명시적 반납은 즉시 재분배를 허용해야 한다 (그레이스풀 셧다운).
+#[tokio::test]
+async fn release_allows_immediate_takeover() {
+    let Some(s) = lease_store("lease-release").await else {
+        return;
+    };
+
+    let mine = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-a", T0)
+        .await
+        .expect("A")
+        .expect("잡음");
+    s.release(&mine).await.expect("반납");
+
+    // TTL 을 기다리지 않고 잡을 수 있어야 한다.
+    let next = s
+        .try_acquire(COLLECT_LEADER_KEY, "worker-b", T0 + 1)
+        .await
+        .expect("B");
+    assert!(
+        next.is_some(),
+        "반납 후에도 TTL 을 기다려야 했다 — 수집 공백이 길어진다"
+    );
+
+    // `epoch` 는 보존돼야 한다 — 항목을 지우면 펜싱 근거가 사라진다.
+    assert!(
+        next.unwrap().epoch > mine.epoch,
+        "반납이 epoch 를 초기화했다"
+    );
+}
+
+/// 샤드 리스를 나열할 수 있어야 한다 — **`Scan` 없이**.
+#[tokio::test]
+async fn lists_shard_leases_without_scanning() {
+    let Some(s) = lease_store("lease-list").await else {
+        return;
+    };
+    for shard in [0u32, 7, 63] {
+        s.try_acquire(&dbmon_core::ports::shard_key(shard), "worker-a", T0)
+            .await
+            .expect("획득");
+    }
+    let listed = s.list("SHARD").await.expect("나열");
+    assert_eq!(listed.len(), 3, "잡은 3개만 보여야 한다: {listed:?}");
+    assert!(listed.iter().all(|l| l.owner == "worker-a"));
+}
