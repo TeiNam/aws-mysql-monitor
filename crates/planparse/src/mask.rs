@@ -205,7 +205,27 @@ fn mask_label(s: &str, redactions: &mut usize) -> String {
         if is_literal {
             out.push('?');
         } else {
-            out.push_str(&s[span.start..span.end]);
+            // **리터럴이 아닌 토큰의 원문에도 인용부호가 들어갈 수 있다.**
+            //
+            // 백틱 식별자는 임의 내용을 담는다. 라벨에 짝 없는 백틱이 섞이면 렉서가
+            // 그 뒤 전체를 **하나의 식별자**로 읽고, 원문 복사가 그 안의 리터럴을 그대로
+            // 내보낸다. 내 속성 테스트가 이걸 찾았다:
+            //
+            // ```text
+            // Filter: ` (t.c = 'ssn900101')  idx `
+            //   → 전체가 백틱 식별자 하나 → 원문 복사 → 'ssn900101' 유출
+            // ```
+            //
+            // 간격 검사(공백만 허용)로는 못 잡는다 — 내용이 **토큰 안**에 있다.
+            //
+            // 백틱 자체는 허용한다. MySQL 이 라벨에서 식별자를 감쌀 때 쓰기 때문이다
+            // (`` (`c/*`.email >= ?) ``). 위험한 것은 식별자 안의 `'`·`"` 다.
+            let raw = &s[span.start..span.end];
+            if raw.contains('\'') || raw.contains('"') {
+                *redactions += 1;
+                return REDACTED.to_string();
+            }
+            out.push_str(raw);
         }
         cursor = span.end;
     }
@@ -381,6 +401,60 @@ mod tests {
             .filter(|k| EXPR_KEYS.contains(k))
             .collect();
         assert!(dup.is_empty(), "두 목록에 겹치는 키가 있다: {dup:?}");
+    }
+
+    /// **인용된 리터럴 안의 값은 어떤 문맥에서도 살아남지 못한다.**
+    ///
+    /// 리뷰어가 이 성질로 19.2% 유출을 찾았다(주석 경로). 성질을 저장소 테스트로
+    /// 남겨야 다음 회귀가 잡힌다 — 외부 퍼징은 한 번 돌고 사라진다.
+    ///
+    /// 마커를 **항상 인용부호 안에** 넣고, 그 바깥을 온갖 조합으로 흔든다.
+    #[test]
+    fn quoted_values_never_survive_in_any_context() {
+        const MARKER: &str = "ssn900101";
+        // 라벨 바깥을 흔드는 조각들. 주석 시작·백틱·이스케이프·도입자를 포함한다.
+        let noise = [
+            "", " ", "/*", "*/", "--", "#", "`", "\\", "x", "_binary", "(", ")", "/*+",
+        ];
+
+        let mut checked = 0usize;
+        for a in noise {
+            for b in noise {
+                for c in noise {
+                    // 마커는 항상 `'...'` 안에 있다.
+                    let label = format!("Filter: {a} (t.c = '{MARKER}') {b} idx {c}");
+                    let plan = serde_json::json!({ "query_plan": { "operation": label } });
+                    let (masked, _) = mask_plan(&plan);
+                    let out = serde_json::to_string(&masked).expect("직렬화");
+                    assert!(
+                        !out.contains(MARKER),
+                        "유출\n  라벨: {label}\n  출력: {out}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, noise.len().pow(3));
+    }
+
+    /// 같은 성질을 **`heading`** 과 알 수 없는 키에서도 확인한다.
+    /// `LABEL_KEYS` 가 다른 목록보다 먼저 검사되므로 경로가 다르다.
+    #[test]
+    fn quoted_values_never_survive_for_any_key() {
+        const MARKER: &str = "ssn900101";
+        let label = format!("Filter: /* (t.c = '{MARKER}')");
+        for key in [
+            "operation",
+            "heading",
+            "condition",
+            "attached_condition",
+            "future_key",
+        ] {
+            let plan = serde_json::json!({ "query_plan": { key: label.clone() } });
+            let (masked, _) = mask_plan(&plan);
+            let out = serde_json::to_string(&masked).expect("직렬화");
+            assert!(!out.contains(MARKER), "키 {key} 에서 유출: {out}");
+        }
     }
 
     /// 패닉하지 않아야 한다 — 릴리스 빌드는 `panic = "abort"` 라 한 번이면 컨테이너가 죽는다.
