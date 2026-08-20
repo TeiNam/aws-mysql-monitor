@@ -320,7 +320,7 @@ export function MySQLMonitorPage() {
             />
             <Note>
               <strong>진행 중</strong>은 실행시간이 지금까지의 값이고,{" "}
-              <strong>추적 끊김</strong>은 하한이다(언제 끝났는지 모른다). 행을 누르면 전체 SQL 을 본다. 시각은 {tz} 기준이고, 자동 새로고침은{" "}
+              <strong>추적 끊김</strong>은 하한이다(언제 끝났는지 모른다). 행을 누르면 <strong>저장된</strong> SQL 을 본다 — 마스킹·절단·권한 제한이 그대로 표시된다. 시각은 {tz} 기준이고, 자동 새로고침은{" "}
               {autoRefresh ? `${interval}초` : "꺼짐"} — 새 슬로우 쿼리가 방송되면 주기를
               기다리지 않고 즉시 다시 읽는다.
             </Note>

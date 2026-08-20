@@ -273,12 +273,16 @@ pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usiz
 /// 남는다**(8라운드 지적). 저장소의 병합 규칙과 같게 "없음" 으로 본다.
 fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
     const WINDOW_MS: i64 = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
+    /// 쌍둥이의 시작 시각 차이 상한 (1초).
+    ///
+    /// 실시간 추정은 `now − PROCESSLIST.TIME × 1000` 이라 **정수 초로 절단**되므로
+    /// 슬로우로그의 밀리초 값과 최대 1초 어긋난다. 그보다 더 떨어진 두 행은 같은
+    /// 실행의 두 관측이 아니다 — 시계 편차가 더 큰 경우는 저장소가 더 넓은 창으로
+    /// 이미 하나로 합쳐 준다(`BASE_MERGE_WINDOW_MS` + 편차).
+    const START_SPREAD_MS: i64 = 1_000;
 
-    // (인스턴스, 스레드)로 묶고 시간순으로 본다.
-    //
-    // **다이제스트를 정렬 키에 넣지 않는다.** 자리표(`unknown-<thread>`)와 진짜
-    // 다이제스트는 문자열이 달라 정렬하면 서로 떨어지고, 그러면 인접 비교가 그 쌍을
-    // 영원히 만나지 못한다. 같은 스레드의 시간순이면 쌍둥이는 반드시 인접한다.
+    // (인스턴스, 스레드)로 묶고 시간순으로 본다. **다이제스트는 정렬 키가 아니다** —
+    // 자리표와 진짜 값은 문자열이 달라 정렬하면 서로 떨어진다.
     views.sort_by(|a, b| {
         (a.instance_id.as_str(), a.thread_id, a.started_at_ms).cmp(&(
             b.instance_id.as_str(),
@@ -287,42 +291,66 @@ fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
         ))
     });
 
-    let mut out: Vec<SlowQueryView> = Vec::with_capacity(views.len());
-    // **묶음의 첫(가장 이른) 행을 기준으로 창을 잰다.** 남긴 행 기준으로 재면 이긴 행이
-    // 더 늦은 쪽일 때 기준이 밀려 **사슬처럼 이어 붙는다** — 2초 창이 실제로는
-    // 무한히 늘어날 수 있다. 입력이 시간 오름차순이므로 첫 행 기준이면 한 묶음은
-    // 최대 2초 폭이다.
-    let mut anchor_ms = i64::MIN;
+    // `Option` 슬롯으로 둔다 — 승자를 고르려면 값을 꺼내야 한다.
+    let mut out: Vec<Option<SlowQueryView>> = Vec::with_capacity(views.len());
+    // 현재 (인스턴스, 스레드) 묶음에서 **창 안에 남아 있는 행들**의 `out` 인덱스.
+    //
+    // 바로 앞 한 줄만 보면 안 된다: 중첩 문장처럼 **다이제스트가 다른 행이 쌍둥이
+    // 사이에 끼면** 그 쌍은 영원히 만나지 못한다(자체 발견). 창 안의 후보를 모두 본다 —
+    // 한 스레드의 2초 안이므로 후보는 몇 개뿐이다.
+    let mut group: Vec<usize> = Vec::new();
+    let mut group_key: Option<(String, u64)> = None;
+
     for view in views {
-        let same_run = out.last().is_some_and(|prev| {
-            prev.instance_id == view.instance_id
-                && prev.thread_id == view.thread_id
-                && same_digest(&prev.app_digest, &view.app_digest)
-                && view.started_at_ms.saturating_sub(anchor_ms) <= WINDOW_MS
-                // **구간이 겹쳐야 같은 실행이다.** 입력이 시간 오름차순이므로
-                // "뒤 행의 시작 < 앞 행의 끝" 이면 겹친다.
-                && view.started_at_ms < prev.started_at_ms.saturating_add(prev.duration_ms)
-        });
-        if !same_run {
-            anchor_ms = view.started_at_ms;
-            out.push(view);
-            continue;
-        }
-        let prev = out.pop().expect("same_run 이면 마지막이 있다");
-        let (winner, loser) = if rank(&prev) >= rank(&view) {
-            (prev, view)
+        let key = (view.instance_id.clone(), view.thread_id);
+        if group_key.as_ref() == Some(&key) {
+            group.retain(|&i| {
+                out[i].as_ref().is_some_and(|kept| {
+                    view.started_at_ms.saturating_sub(kept.started_at_ms) <= WINDOW_MS
+                })
+            });
         } else {
-            (view, prev)
-        };
-        out.push(absorb(winner, &loser));
+            group.clear();
+            group_key = Some(key);
+        }
+
+        // **도메인 규칙으로 판정한다** — 저장소·페이크와 같은 함수다
+        // (`ExecutionSpan`). 조회는 거기에 **시작 시각 차이 상한**을 더한다:
+        // 종료를 관측하지 못한 레코드의 끝은 "사라진 것을 알아챈 폴링" 까지 늘어나므로
+        // 겹침만 보면 곧바로 다시 돈 같은 쿼리와 붙을 수 있다(9라운드 지적).
+        let incoming = span_of(&view);
+        let hit = group.iter().copied().find(|&i| {
+            out[i].as_ref().is_some_and(|kept| {
+                span_of(kept).is_same_execution_within(&incoming, START_SPREAD_MS)
+            })
+        });
+
+        match hit {
+            Some(i) => {
+                let kept = out[i].take().expect("후보 슬롯에는 값이 있다");
+                let (winner, loser) = if rank(&kept) >= rank(&view) {
+                    (kept, view)
+                } else {
+                    (view, kept)
+                };
+                out[i] = Some(absorb(winner, &loser));
+            }
+            None => {
+                out.push(Some(view));
+                group.push(out.len() - 1);
+            }
+        }
     }
-    out
+    out.into_iter().flatten().collect()
 }
 
-/// 다이제스트가 같은가. **자리표(`unknown-…`)는 "없음" 으로 본다.**
-fn same_digest(a: &str, b: &str) -> bool {
-    const UNKNOWN: &str = dbmon_core::slow_query::UNKNOWN_DIGEST_PREFIX;
-    a == b || a.starts_with(UNKNOWN) || b.starts_with(UNKNOWN)
+/// 뷰를 도메인의 실행 구간으로. 판정 규칙은 [`dbmon_core::slow_query::ExecutionSpan`] 이다.
+fn span_of(v: &SlowQueryView) -> dbmon_core::slow_query::ExecutionSpan<'_> {
+    dbmon_core::slow_query::ExecutionSpan {
+        digest: &v.app_digest,
+        started_at_ms: v.started_at_ms,
+        duration_ms: v.duration_ms,
+    }
 }
 
 /// 진 행에만 있는 정보를 이긴 행으로 옮긴다.
@@ -729,24 +757,57 @@ mod tests {
         assert_eq!(collapsed, 1);
         assert_eq!(out.len(), 2, "다른 실행을 접었다 — 실행이 사라진다");
 
-        // **사슬처럼 이어 붙지 않는다.** 2초씩 이어진 행들이 한 줄로 접히면
-        // 실제로는 창이 무한히 늘어난다 — 기준은 묶음의 첫 행이다.
-        let chain = |ms: i64, state: &str| {
+        // **창 안에 여러 줄이 있어도 겹치지 않으면 접지 않는다.** 창은 후보를 좁히는
+        // 사전 조건일 뿐이고 판정은 겹침이다 — 한 커넥션에서 겹치는 실행은 있을 수 없다.
+        let short = |ms: i64| {
             view(move |v| {
                 v.record_id = format!("i:9:{ms}");
                 v.thread_id = 9;
                 v.started_at_ms = ms;
-                v.state = state.into();
+                v.duration_ms = 400; // 짧아서 서로 안 겹친다
             })
         };
-        let (out, collapsed) = dedupe_executions(vec![
-            chain(0, "inflight"),
-            chain(1_900, "finalized"),
-            chain(3_500, "inflight"),
-        ]);
-        // 0 과 1,900 은 접히고(1,900 ≤ 2,000), 3,500 은 첫 행 기준 3.5초라 남는다.
-        assert_eq!(collapsed, 1);
-        assert_eq!(out.len(), 2, "사슬 접기가 일어나 실행이 사라졌다");
+        let (out, collapsed) = dedupe_executions(vec![short(0), short(600), short(1_400)]);
+        assert_eq!(collapsed, 0, "겹치지 않는 세 실행을 접었다");
+        assert_eq!(out.len(), 3);
+
+        // **다이제스트가 다른 행이 쌍둥이 사이에 끼어도 접힌다** (자체 발견).
+        // 중첩 문장이 그 사이에 기록되면 앞줄 하나만 보던 판에서는 쌍이 영원히
+        // 만나지 못했다.
+        let twin_a = view(|v| {
+            v.record_id = "i:13:0".into();
+            v.thread_id = 13;
+            v.started_at_ms = 0;
+            v.duration_ms = 3_000;
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+        });
+        let nested = view(|v| {
+            v.record_id = "i:13:x".into();
+            v.thread_id = 13;
+            v.started_at_ms = 100;
+            v.duration_ms = 200;
+            v.app_digest = "d-nested".into();
+        });
+        let twin_b = view(|v| {
+            v.record_id = "i:13:1".into();
+            v.thread_id = 13;
+            v.started_at_ms = 300;
+            v.duration_ms = 3_100;
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+        let (out, collapsed) = dedupe_executions(vec![twin_a, nested, twin_b]);
+        assert_eq!(
+            collapsed, 1,
+            "사이에 다른 다이제스트가 끼어 쌍둥이를 못 접었다"
+        );
+        assert_eq!(out.len(), 2, "중첩 문장은 남아야 한다");
+        assert!(out.iter().any(|v| v.app_digest == "d-nested"));
+        assert!(
+            out.iter()
+                .any(|v| v.state == "finalized" && v.app_digest == "d1")
+        );
 
         // 다이제스트가 다르면 같은 스레드·같은 시각이어도 다른 실행이다.
         let other_digest = view(|v| {
@@ -855,6 +916,41 @@ mod tests {
         let (out, collapsed) = dedupe_executions(vec![earlier, later]);
         assert_eq!(collapsed, 0);
         assert_eq!(out.len(), 2, "겹치지 않는 두 실행을 접었다");
+    }
+
+    /// **종료를 관측하지 못한 레코드의 늘어난 끝 때문에 붙어서는 안 된다.**
+    ///
+    /// `Disappeared` 로 확정된 레코드의 끝은 "사라진 것을 알아챈 폴링" 까지 늘어난다.
+    /// 그래서 같은 커넥션이 곧바로 같은 쿼리를 다시 돌리면 **구간이 겹쳐 보인다** —
+    /// 겹침만 보면 그 둘이 한 줄로 접혀 실행 하나가 사라진다(9라운드 지적). 조회는
+    /// 시작 시각 차이 상한(1초, 폴링의 정수 초 절단)까지 함께 본다.
+    #[test]
+    fn a_rerun_right_after_an_unobserved_end_is_not_collapsed() {
+        // 앞 실행: 진짜 종료는 5.0초였지만 5.9초 폴링에서 사라진 것을 알아챘다.
+        let stretched = view(|v| {
+            v.record_id = "i:21:0".into();
+            v.thread_id = 21;
+            v.started_at_ms = 0;
+            v.duration_ms = 5_900; // 관측 한계까지 늘어난 값
+            v.state = "finalized".into();
+            v.capture_source = "processlist".into();
+        });
+        // 곧바로 다시 돈 같은 쿼리 (5.2초에 시작) → 구간은 겹쳐 보인다.
+        let rerun = view(|v| {
+            v.record_id = "i:21:5".into();
+            v.thread_id = 21;
+            v.started_at_ms = 5_200;
+            v.duration_ms = 3_000;
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+
+        let (out, collapsed) = dedupe_executions(vec![stretched, rerun]);
+        assert_eq!(
+            collapsed, 0,
+            "다시 돈 실행을 앞 실행에 접었다 — 하나가 사라진다"
+        );
+        assert_eq!(out.len(), 2);
     }
 
     /// 추적 끊김은 **진행 중보다는 낫고 확정보다는 못하다.** 순서가 뒤집히면

@@ -319,6 +319,66 @@ impl SlowQuery {
 /// 슬로우로그의 진짜 다이제스트를 이겨 그 실행이 영구히 어느 그룹에도 속하지 않는다.
 pub const UNKNOWN_DIGEST_PREFIX: &str = "unknown-";
 
+/// 두 레코드가 **같은 실행인가** 판정할 때 쓰는 구간.
+///
+/// 저장소(±2초 병합)와 조회(중복 접기)가 **같은 규칙을 써야 한다.** 한쪽만 고치면
+/// 저장소가 먼저 두 실행을 합쳐 버려 조회는 볼 기회조차 없거나, 반대로 저장소가
+/// 못 합친 쌍둥이를 조회가 그대로 두 줄로 낸다. 페이크 저장소도 이걸 쓴다 —
+/// 계약이 갈리면 단위 테스트가 통과하면서 실제만 틀린다(이미 한 번 겪었다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionSpan<'a> {
+    pub digest: &'a str,
+    pub started_at_ms: EpochMs,
+    pub duration_ms: i64,
+}
+
+impl<'a> ExecutionSpan<'a> {
+    pub fn of(q: &'a SlowQuery) -> Self {
+        Self {
+            digest: &q.app_digest,
+            started_at_ms: q.started_at_ms,
+            duration_ms: q.duration_ms,
+        }
+    }
+
+    /// 이 둘이 같은 실행인가.
+    ///
+    /// # 두 조건
+    ///
+    /// 1. **다이제스트가 같다.** 단 `unknown-<thread>` 자리표는 "없음" 으로 본다 —
+    ///    심층 조회가 상한에 걸리면 실시간 캡처는 SQL 이 없어 다이제스트를 만들 수
+    ///    없고, 그걸 값으로 취급하면 같은 실행이 영구히 갈린다.
+    /// 2. **구간이 겹친다.** 커넥션 하나는 한 번에 한 문장만 실행하므로, 겹치면 같은
+    ///    실행이다. 시간 창만 보면 `long_query_time` 이 창보다 작을 때 **연속한 두
+    ///    실행**이 합쳐져 하나가 사라진다.
+    ///
+    /// ⚠ **겹침은 완벽한 증거가 아니다.** 종료를 관측하지 못한 레코드
+    /// (`Disappeared`)의 끝은 "사라진 것을 알아챈 폴링" 까지 늘어나므로, 같은 커넥션이
+    /// 곧바로 같은 쿼리를 다시 돌리면 최대 한 폴링 주기만큼 겹쳐 보일 수 있다. 조회
+    /// 경로는 그래서 시작 시각 차이까지 함께 본다([`Self::is_same_execution_within`]).
+    pub fn is_same_execution(&self, other: &Self) -> bool {
+        let placeholder = |d: &str| d.starts_with(UNKNOWN_DIGEST_PREFIX);
+        let digest_ok =
+            self.digest == other.digest || placeholder(self.digest) || placeholder(other.digest);
+        if !digest_ok {
+            return false;
+        }
+        let a_end = self.started_at_ms.saturating_add(self.duration_ms);
+        let b_end = other.started_at_ms.saturating_add(other.duration_ms);
+        self.started_at_ms < b_end && other.started_at_ms < a_end
+    }
+
+    /// 같은 실행이고 **시작 시각 차이가 `spread_ms` 이내**인가.
+    ///
+    /// 쌍둥이의 시작 시각 차이는 추정 오차(폴링의 정수 초 절단)로 한정된다. 연속한 두
+    /// 실행은 임계값만큼 떨어져 있으므로 이 조건이 둘을 가른다 — 겹침만으로는
+    /// 종료 미관측 레코드의 늘어난 끝 때문에 붙을 수 있다.
+    pub fn is_same_execution_within(&self, other: &Self, spread_ms: i64) -> bool {
+        (self.started_at_ms - other.started_at_ms).abs() <= spread_ms
+            && self.is_same_execution(other)
+    }
+}
+
 /// `duration_source` 별 정확도 순위. 병합 시 큰 쪽이 이긴다.
 pub fn duration_rank(s: DurationSource) -> u8 {
     match s {
@@ -332,6 +392,57 @@ pub fn duration_rank(s: DurationSource) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// **겹침이 판정이다 — 창만 보면 연속한 두 실행이 합쳐진다.**
+    ///
+    /// `long_query_time` 이 병합 창(2초)보다 작으면 같은 스레드에서 같은 쿼리가 창 안에
+    /// 두 번 시작할 수 있다. 그 둘을 합치면 **실행 하나가 영구히 사라진다.**
+    #[test]
+    fn the_same_execution_needs_overlapping_intervals() {
+        use crate::slow_query::ExecutionSpan;
+        let first = ExecutionSpan {
+            digest: "d1",
+            started_at_ms: 1_000_000,
+            duration_ms: 1_200,
+        };
+        // 앞 실행이 끝난 뒤 시작 → 다른 실행이다.
+        let after = ExecutionSpan {
+            digest: "d1",
+            started_at_ms: 1_001_300,
+            duration_ms: 1_100,
+        };
+        assert!(!first.is_same_execution(&after), "연속한 두 실행을 합쳤다");
+        // 도는 중에 관측 → 같은 실행이다.
+        let during = ExecutionSpan {
+            digest: "d1",
+            started_at_ms: 1_000_500,
+            duration_ms: 700,
+        };
+        assert!(first.is_same_execution(&during));
+        assert!(during.is_same_execution(&first), "대칭이어야 한다");
+        // 다이제스트가 다르면 아니다 (중첩 문장).
+        let nested = ExecutionSpan {
+            digest: "d2",
+            started_at_ms: 1_000_500,
+            duration_ms: 700,
+        };
+        assert!(!first.is_same_execution(&nested));
+        // **자리표는 "없음" 이다** — 실시간 캡처가 SQL 을 못 얻은 경우.
+        let placeholder = ExecutionSpan {
+            digest: "unknown-42",
+            started_at_ms: 1_000_500,
+            duration_ms: 700,
+        };
+        assert!(first.is_same_execution(&placeholder));
+        assert!(placeholder.is_same_execution(&first));
+
+        // 시작 시각 차이 상한을 함께 보는 판정(조회 경로가 쓴다).
+        assert!(first.is_same_execution_within(&during, 1_000));
+        assert!(
+            !first.is_same_execution_within(&during, 100),
+            "시작 차이가 상한을 넘으면 같은 실행으로 보지 않는다"
+        );
+    }
     use super::*;
 
     /// **선언 순서에 의존하지 않는다는 것**을 고정한다.

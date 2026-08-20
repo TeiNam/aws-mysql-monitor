@@ -111,13 +111,19 @@ impl SlowQueryStore for FakeSlowQueryStore {
             return Ok(merged);
         }
         // 2) ±2초 보조 조회 — 시작 시각 추정이 1초 어긋난 같은 실행을 찾는다.
+        //
+        // **실제 어댑터와 같은 규칙을 쓴다**(`ExecutionSpan::is_same_execution`).
+        // 계약이 갈리면 단위 테스트가 통과하면서 실제만 틀린다 — 이미 한 번 겪었다
+        // (`find_merge_candidate` 에 프로덕션 호출부가 없던 일).
+        let incoming = crate::slow_query::ExecutionSpan::of(q);
         let candidate_key = items
             .values()
             .find(|e| {
                 e.instance_id == q.instance_id
                     && e.thread_id == q.thread_id
-                    && e.app_digest == q.app_digest
-                    && (e.started_at_ms - q.started_at_ms).abs() <= 2_000
+                    && (e.started_at_ms - q.started_at_ms).abs()
+                        <= crate::clock_offset::BASE_MERGE_WINDOW_MS
+                    && crate::slow_query::ExecutionSpan::of(e).is_same_execution(&incoming)
             })
             .map(|e| e.record_id.as_str().to_string());
         if let Some(ck) = candidate_key {
