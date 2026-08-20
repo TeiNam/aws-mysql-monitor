@@ -69,16 +69,28 @@ const DEFAULT_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_RANGE_DAYS: i64 = 400;
 const MAX_RANGE_MS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60 * 1000;
 
-/// 한 요청이 저장소에 던질 파티션 질의 수 상한 (`인스턴스 수 × 일수`).
+/// 한 요청이 저장소에 던질 파티션 질의 총량 상한 (`인스턴스 수 × 일수 × 읽기 파도`).
 ///
 /// [`MAX_RANGE_DAYS`] 는 **일수만** 막는다. 인스턴스 수가 곱해지는 것은 막지 못해서
 /// 400일 × 500대 = 20만 회가 여전히 가능했다. 예산을 넘으면 일수를 줄이고
 /// `truncated=true` 로 말한다([`clip_to_partition_budget`]).
 ///
+/// **재분배 라운드도 같은 파티션을 다시 읽는다**(4라운드 지적). 그래서 예산은
+/// 파도 수([`READ_WAVES`])로 나눠 잡는다 — 안 그러면 이 상한이 실제로는 3배다.
+///
 /// 값의 근거: 현재 규모(약 100대)에서 **월 단위 통계가 온전히 돌아야 한다**
-/// (31일 × 100대 = 3,100). 500대 목표에서는 월 집계가 이 경로로 성립하지 않고,
-/// 그건 M12 롤업(수집 시점 스냅샷)의 몫이다.
-const MAX_PARTITION_QUERIES: usize = 4_000;
+/// (12,000 ÷ 3 ÷ 100 = 40일 ≥ 31일). 500대 목표에서는 8일까지만 되고, 월 집계는
+/// 이 경로가 아니라 M12 롤업(수집 시점 스냅샷)의 몫이다.
+const MAX_PARTITION_QUERIES: usize = 12_000;
+
+/// 남은 예산을 다시 나눠 주는 최대 라운드 수.
+///
+/// 1회로는 부족하다 — 재분배받은 인스턴스가 덜 채우면 그 몫이 또 남는다. 무한히
+/// 돌리지 않는 이유는 조회 하나가 저장소를 계속 때리지 않아야 하기 때문이다.
+const MAX_REDISTRIBUTE_ROUNDS: usize = 2;
+
+/// 읽기 파도 수 = 1차 + 재분배. 파티션 예산을 이 수로 나눈다.
+const READ_WAVES: usize = 1 + MAX_REDISTRIBUTE_ROUNDS;
 
 /// 인스턴스 조회를 동시에 몇 개까지 던지나. 저장소 조절(throttle)을 부르지 않는 선.
 const READ_CONCURRENCY: usize = 16;
@@ -257,7 +269,7 @@ async fn list_slow_queries(
     // 예전에는 인스턴스를 순회하며 상한에 닿으면 중단했다. 그러면 등록부 순서가
     // 앞선 인스턴스가 상한을 다 먹고, **뒤 인스턴스의 더 새로운 행이 통째로 빠진다** —
     // 정렬은 그 뒤에 하므로 화면은 그 사실을 알 수 없다.
-    let (mut items, truncated) = collect_views(
+    let got = collect_views(
         &state,
         &ctx,
         &allowed_envs,
@@ -269,8 +281,9 @@ async fn list_slow_queries(
         limit + 1,
     )
     .await?;
+    let mut items = got.views;
 
-    let has_more = truncated || items.len() > limit;
+    let has_more = got.truncated || items.len() > limit;
     items.truncate(limit);
     let total = items.len();
     Ok(Json(ListResponse {
@@ -514,15 +527,15 @@ fn aggregate_range(p: &AggregateParams, now_ms: i64) -> Result<TimeRange, ApiErr
 /// `allowed` 는 `사용자 스코프 ∩ 요청 env` 다. 레코드를 사용자 스코프로만 검사하면
 /// `?env=dev` 를 줬는데 prd 레코드가 섞인다(환경이 바뀐 인스턴스의 과거 행).
 ///
-/// # 균등 분배만으로는 표본이 왜곡된다 (그래서 2차 재분배가 있다)
+/// # 균등 분배만으로는 표본이 왜곡된다 (그래서 재분배가 있다)
 ///
 /// 균등 분배는 굶기지는 않지만 **몫이 1까지 줄 수 있다**(500대에 천장 501). 그러면
 /// 바쁜 1대가 만든 최근 50건을 요청했는데 그 중 1건만 보이고, 나머지 자리는 다른
 /// 인스턴스의 오래된 최신값이 채운다 — 표는 "최신순" 이라고 말하면서 가운데가 빈다.
-/// 그래서 **1차에서 몫을 꽉 채운 인스턴스에만 남은 예산을 다시 나눠 준다.** 활동이
-/// 몇 대에 몰린 실제 상황에서는 이 2차로 정확한 답이 나온다.
-///
-/// 반환값의 두 번째는 "천장에 걸렸다" — 저장소가 최신순으로 주므로 잘리는 쪽은 과거다.
+/// 그래서 **몫을 꽉 채운 인스턴스에만 남은 예산을 다시 나눠 준다.** 한 번으로는
+/// 부족하다 — 재분배받은 쪽이 덜 채우면 그 남은 몫이 또 놀기 때문에
+/// [`MAX_REDISTRIBUTE_ROUNDS`] 회까지 반복한다. 무한히 돌리지 않는 이유는
+/// 요청 하나가 저장소를 계속 때리지 않아야 하기 때문이다.
 async fn collect_views(
     state: &ApiState,
     ctx: &AuthContext,
@@ -531,10 +544,14 @@ async fn collect_views(
     range: TimeRange,
     per_instance: usize,
     ceiling: usize,
-) -> Result<(Vec<SlowQueryView>, bool), ApiError> {
+) -> Result<Collected, ApiError> {
     let instances = self_instances(state, instance).await?;
     if instances.is_empty() {
-        return Ok((Vec::new(), false));
+        return Ok(Collected {
+            views: Vec::new(),
+            truncated: false,
+            range,
+        });
     }
     let ids: Vec<_> = instances.iter().map(|i| i.id.clone()).collect();
 
@@ -543,26 +560,34 @@ async fn collect_views(
     let mut truncated = clipped;
 
     // ② 1차: 천장을 균등 분배.
-    let share = even_share(ceiling, ids.len(), per_instance);
+    let mut share = even_share(ceiling, ids.len(), per_instance);
     let mut rows = read_share(state, &ids, range, share).await?;
     let mut asked = vec![share; ids.len()];
 
-    // ③ 2차: 꽉 채운 인스턴스에만 남은 예산을 재분배한다.
-    let used: usize = rows.iter().map(Vec::len).sum();
-    let hungry: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.len() >= share)
-        .map(|(i, _)| i)
-        .collect();
-    if let Some(bigger) = redistributed(ceiling, used, hungry.len(), share, per_instance) {
-        // 최신순이므로 더 큰 limit 의 결과는 1차의 상위집합이다 — 이어 붙이지 않고 갈아낀다.
+    // ③ 꽉 채운 인스턴스에만 남은 예산을 재분배한다. **한 번으로는 부족하다** —
+    //    재분배받은 쪽이 덜 채우면 그 몫이 또 남는다.
+    for _ in 0..MAX_REDISTRIBUTE_ROUNDS {
+        let used: usize = rows.iter().map(Vec::len).sum();
+        // 몫을 꽉 채운 것들. **`asked[i]` 로 본다** — 라운드마다 몫이 달라진다.
+        let hungry: Vec<usize> = (0..rows.len())
+            .filter(|&i| rows[i].len() >= asked[i])
+            .collect();
+        let Some(bigger) = redistributed(ceiling, used, hungry.len(), share, per_instance) else {
+            break;
+        };
+        // 최신순이므로 더 큰 limit 의 결과는 앞 라운드의 상위집합이다 — 이어 붙이지 않고 갈아낀다.
         let hungry_ids: Vec<_> = hungry.iter().map(|&i| ids[i].clone()).collect();
+        // **버릴 앞 라운드 결과를 미리 놓는다.** 안 그러면 새 결과를 받는 동안 두 벌이
+        // 함께 메모리에 있고, 집계 천장(2만 건)에서 그건 그대로 두 배다.
+        for &slot in &hungry {
+            rows[slot] = Vec::new();
+        }
         let refetched = read_share(state, &hungry_ids, range, bigger).await?;
         for (&slot, found) in hungry.iter().zip(refetched) {
             rows[slot] = found;
             asked[slot] = bigger;
         }
+        share = bigger;
     }
 
     let mut views = Vec::new();
@@ -589,13 +614,30 @@ async fn collect_views(
         views.truncate(ceiling);
         truncated = true;
     }
-    Ok((views, truncated))
+    Ok(Collected {
+        views,
+        truncated,
+        range,
+    })
+}
+
+/// 읽기 결과. **좁힌 구간을 함께 돌려준다** — 이게 없으면 8일치 표본을 화면이
+/// "이번 달" 이라고 이름 붙인다(4라운드 지적). 조사 도구에서 구간 표시는 데이터의
+/// 일부가 아니라 데이터의 정의다.
+struct Collected {
+    views: Vec<SlowQueryView>,
+    /// 천장이나 파티션 예산에 걸려 **일부만** 읽었다.
+    truncated: bool,
+    /// 실제로 읽은 구간. 요청 구간과 다를 수 있다.
+    range: TimeRange,
 }
 
 /// 1차 몫. **인스턴스가 많으면 1까지 준다** — 그 자체가 정상이고, 표본 왜곡은
 /// [`redistributed`] 가 되돌린다.
 fn even_share(ceiling: usize, instances: usize, per_instance: usize) -> usize {
-    (ceiling / instances.max(1)).clamp(1, per_instance)
+    // `clamp` 은 min > max 면 패닉한다. 지금 호출부는 둘 다 1 이상이지만, 상한을
+    // 0 으로 넘기는 호출이 생기면 조회 하나가 프로세스를 죽인다.
+    (ceiling / instances.max(1)).clamp(1, per_instance.max(1))
 }
 
 /// 2차 몫. 1차에서 몫을 꽉 채운 인스턴스가 있고 예산이 남았을 때만 값이 있다.
@@ -660,7 +702,8 @@ async fn read_share(
 /// ([`MAX_RANGE_DAYS`])만으로는 인스턴스 수가 곱해지는 것을 막지 못한다.
 fn clip_to_partition_budget(range: TimeRange, instances: usize) -> (TimeRange, bool) {
     const DAY_MS: i64 = 86_400_000;
-    let max_days = (MAX_PARTITION_QUERIES / instances.max(1)).max(1) as i64;
+    // 파도 수로 나눈다 — 재분배 라운드가 같은 파티션을 다시 읽는다.
+    let max_days = (MAX_PARTITION_QUERIES / READ_WAVES / instances.max(1)).max(1) as i64;
     let to_day = range.to_ms().div_euclid(DAY_MS);
     let parts = to_day - range.from_ms().div_euclid(DAY_MS) + 1;
     if parts <= max_days {
@@ -698,7 +741,7 @@ async fn collect_for_aggregate(
     ctx: &AuthContext,
     p: &AggregateParams,
     range: TimeRange,
-) -> Result<(Vec<SlowQueryView>, bool), ApiError> {
+) -> Result<Collected, ApiError> {
     let allowed = allowed_envs_of(ctx, p.env.as_deref())?;
     let ceiling = p.scan.unwrap_or(MAX_AGGREGATE_SCAN).min(MAX_AGGREGATE_SCAN);
     collect_views(
@@ -720,13 +763,16 @@ async fn list_digests(
 ) -> Result<Json<AggregateEnvelope<aggregate::DigestRow>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let (views, truncated) = (got.views, got.truncated);
     Ok(Json(AggregateEnvelope {
         items: aggregate::digest_rows(&views),
         scanned: views.len(),
         truncated,
-        from_ms: range.from_ms(),
-        to_ms: range.to_ms(),
+        // **좁힌 구간을 보고한다.** 요청한 구간을 그대로 돌려주면 8일치 표본이
+        // 화면에서 "이번 달" 이 된다(4라운드 지적).
+        from_ms: got.range.from_ms(),
+        to_ms: got.range.to_ms(),
         month: p.month.clone(),
     }))
 }
@@ -738,13 +784,16 @@ async fn instance_statistics(
 ) -> Result<Json<AggregateEnvelope<aggregate::InstanceStats>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let (views, truncated) = (got.views, got.truncated);
     Ok(Json(AggregateEnvelope {
         items: aggregate::instance_stats(&views),
         scanned: views.len(),
         truncated,
-        from_ms: range.from_ms(),
-        to_ms: range.to_ms(),
+        // **좁힌 구간을 보고한다.** 요청한 구간을 그대로 돌려주면 8일치 표본이
+        // 화면에서 "이번 달" 이 된다(4라운드 지적).
+        from_ms: got.range.from_ms(),
+        to_ms: got.range.to_ms(),
         month: p.month.clone(),
     }))
 }
@@ -756,13 +805,16 @@ async fn user_statistics(
 ) -> Result<Json<AggregateEnvelope<aggregate::UserStats>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let (views, truncated) = (got.views, got.truncated);
     Ok(Json(AggregateEnvelope {
         items: aggregate::user_stats(&views),
         scanned: views.len(),
         truncated,
-        from_ms: range.from_ms(),
-        to_ms: range.to_ms(),
+        // **좁힌 구간을 보고한다.** 요청한 구간을 그대로 돌려주면 8일치 표본이
+        // 화면에서 "이번 달" 이 된다(4라운드 지적).
+        from_ms: got.range.from_ms(),
+        to_ms: got.range.to_ms(),
         month: p.month.clone(),
     }))
 }
@@ -775,7 +827,8 @@ async fn list_plans(
 ) -> Result<Json<ListResponse>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (mut views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
+    let (mut views, truncated) = (got.views, got.truncated);
 
     // **플랜이 있는 것만.** 없는 레코드를 섞으면 "플랜을 눌렀는데 아무것도 없다" 가 된다.
     views.retain(|v| v.has_plan);
@@ -1101,6 +1154,26 @@ mod tests {
         assert_eq!(redistributed(20_000, 0, 1, 5_000, 5_000), None);
         // 인스턴스 하나면 1차부터 인스턴스 상한까지 받는다.
         assert_eq!(even_share(20_000, 1, 5_000), 5_000);
+    }
+
+    /// **재분배 한 번으로는 부족하다.**
+    ///
+    /// 재분배받은 인스턴스가 몫을 덜 채우면 그 남은 몫이 또 놀고, 그 사이 다른
+    /// 바쁜 인스턴스의 더 새로운 행이 빠진 채로 표가 그려진다. 라운드를 반복하면
+    /// 남는 예산이 실제로 줄어든다 — 그 산술을 고정한다.
+    #[test]
+    fn each_round_hands_the_still_unused_budget_to_whoever_filled_it() {
+        // 100대·천장 500 → 1차 몫 5. 2대만 꽉 채웠고(10건) 나머지는 90건뿐이라 치면
+        let share = even_share(500, 100, 500);
+        assert_eq!(share, 5);
+        let round2 = redistributed(500, 100, 2, share, 500).expect("2라운드");
+        assert_eq!(round2, 5 + 200); // 남은 400을 2대가 나눈다
+
+        // 2라운드에서 한 대가 덜 채웠다(합계 300) → 3라운드가 남은 200을 준다.
+        let round3 = redistributed(500, 300, 1, round2, 500).expect("3라운드");
+        assert_eq!(round3, 205 + 200);
+        // 예산을 다 쓰면 멈춘다 — 무의미한 재조회를 하지 않는다.
+        assert_eq!(redistributed(500, 500, 1, round3, 500), None);
     }
 
     /// **일수 상한은 인스턴스 수가 곱해지는 것을 막지 못한다.**

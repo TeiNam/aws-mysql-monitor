@@ -242,7 +242,61 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
 }
 
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
+///
+/// ⚠ **알려진 천장이다.** GSI1 은 워커별로 나뉘어 있지 않고 오래된 순으로 오므로,
+/// 전역 진행 중 레코드가 이 수를 넘으면 그 뒤의 것은 이 스윕에서 보이지 않는다.
+/// 500대 규모에서 동시 진행 중이 500건을 넘는 상황은 이미 비정상이지만, 그때
+/// **조용히 일부만 처리한다**는 사실은 로그로 남긴다(일시정지 확정 경로).
 const ORPHAN_SWEEP_LIMIT: usize = 500;
+
+/// 고아 in_flight 스윕 한 번. **일시정지 중에도 돌아야 한다.**
+///
+/// `drain()` 은 정상 종료만 덮는다. 급사·SIGKILL·리더 교체로 사라진 워커의 레코드는
+/// 이 스윕만 덮는다 — 없으면 TTL(35일)까지 화면에 유령 쿼리로 남는다.
+///
+/// # 왜 함수로 뺐는가
+///
+/// 일시정지 분기는 루프 뒤쪽을 건너뛰므로 **스윕도 함께 건너뛰었다**(4라운드 지적).
+/// 사람이 며칠 멈춰 두면 다른 워커·이전 epoch 의 고아가 그동안 계속 "진행 중" 으로
+/// 남는다 — F4 가 없애려던 그 상태다. 두 경로가 같은 코드를 부르면 다시 어긋나지 않는다.
+async fn sweep_orphans(
+    store: &Arc<dbmon::store::AppSlowQueryStore>,
+    worker_id: &str,
+    epoch: Option<u64>,
+    now_ms: i64,
+    config: &Config,
+) {
+    let threshold = dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
+    // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면 `gate.refresh()`
+    // 가 불리지 않아 리스가 만료되고, 그 사이 수집 태스크는 계속 돌아 두 리더가
+    // 같은 인스턴스를 수집한다. `work_budget()` 의 주석이 설명하는 그 불변식이다.
+    match run_in_budget(dbmon::orphan::sweep(
+        Arc::clone(store),
+        worker_id,
+        // **현재 리스 epoch 를 넘긴다.** 이름만 보면 재시작한 자기 유령을 영구히 건너뛴다.
+        epoch,
+        now_ms,
+        threshold,
+        ORPHAN_SWEEP_LIMIT,
+    ))
+    .await
+    {
+        Err(()) => tracing::warn!("고아 스윕이 예산을 초과했다 — 중단한다"),
+        Ok(Ok(s)) if s.scanned > 0 => tracing::info!(
+            scanned = s.scanned,
+            abandoned = s.abandoned,
+            alive = s.alive,
+            mine = s.mine,
+            errors = s.errors,
+            "고아 스윕"
+        ),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            error = %telemetry::Scrubbed(&e),
+            "고아 스윕 실패 — 다음 주기에 재시도한다"
+        ),
+    }
+}
 
 /// 슬로우로그 소스를 만든다.
 ///
@@ -1203,6 +1257,24 @@ fn spawn_leader_loop(
                         }
                     }
 
+                    // ③ **멈춰 있어도 고아 스윕은 돈다.**
+                    //
+                    // 이 분기는 루프 뒤쪽을 건너뛰므로 예전에는 스윕도 함께 멈췄다
+                    // (4라운드 지적). 사람이 며칠 멈춰 두면 **다른 워커·이전 epoch 의
+                    // 고아가 그동안 계속 "진행 중"** 으로 남는다 — F4 가 없애려던 상태다.
+                    if now_ms - last_sweep_ms >= (config.collector.orphan_sweep_secs as i64) * 1000
+                    {
+                        last_sweep_ms = now_ms;
+                        sweep_orphans(
+                            &stores.slow_query,
+                            &collect_deps.worker_id,
+                            gate.epoch(),
+                            now_ms,
+                            &config,
+                        )
+                        .await;
+                    }
+
                     controls.publish_tick(now_ms, true, 0);
                     // 재개하면 즉시 한 라운드 돌게 한다.
                     last_discovery_ms = 0;
@@ -1331,39 +1403,14 @@ fn spawn_leader_loop(
                 // 화면에 유령 쿼리로 남는다.
                 if now_ms - last_sweep_ms >= (config.collector.orphan_sweep_secs as i64) * 1000 {
                     last_sweep_ms = now_ms;
-                    let threshold =
-                        dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
-                    // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면
-                    // `gate.refresh()` 가 불리지 않아 리스가 만료되고, 그 사이
-                    // 수집 태스크는 계속 돌아 두 리더가 같은 인스턴스를 수집한다.
-                    // `work_budget()` 의 주석이 설명하는 그 불변식이다.
-                    match run_in_budget(dbmon::orphan::sweep(
-                        Arc::clone(&stores.slow_query),
+                    sweep_orphans(
+                        &stores.slow_query,
                         &collect_deps.worker_id,
-                        // **현재 리스 epoch 를 넘긴다.** 이름만 보면 재시작한 자기
-                        // 유령을 영구히 건너뛴다.
                         gate.epoch(),
                         now_ms,
-                        threshold,
-                        ORPHAN_SWEEP_LIMIT,
-                    ))
-                    .await
-                    {
-                        Err(()) => tracing::warn!("고아 스윕이 예산을 초과했다 — 중단한다"),
-                        Ok(Ok(s)) if s.scanned > 0 => tracing::info!(
-                            scanned = s.scanned,
-                            abandoned = s.abandoned,
-                            alive = s.alive,
-                            mine = s.mine,
-                            errors = s.errors,
-                            "고아 스윕"
-                        ),
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => tracing::warn!(
-                            error = %telemetry::Scrubbed(&e),
-                            "고아 스윕 실패 — 다음 주기에 재시도한다"
-                        ),
-                    }
+                        &config,
+                    )
+                    .await;
                 }
 
                 // ── 슬로우로그 백필 ──────────────────────────────────────────
