@@ -148,9 +148,10 @@ describe("재접속", () => {
     expect(FakeSocket.instances.length).toBeGreaterThan(before);
   });
 
-  it("unauthorized 면 다시 붙지 않는다", () => {
+  it("unauthorized 면 다시 붙지 않고 토큰을 버린다", () => {
     // 같은 토큰으로 무한 재접속하면 서버 로그만 더럽히고 화면은 "연결 중" 에서
-    // 멈춘 것처럼 보인다.
+    // 멈춘 것처럼 보인다. 그리고 거부된 토큰을 남겨 두면 새로고침 때 또 보낸다.
+    sessionStorage.setItem("dbmon.token", "dead-token");
     connectedClient();
     latest().accept();
     latest().deliver({ t: "error", code: "unauthorized" });
@@ -158,6 +159,21 @@ describe("재접속", () => {
 
     vi.advanceTimersByTime(60_000);
     expect(FakeSocket.instances).toHaveLength(1);
+    expect(sessionStorage.getItem("dbmon.token")).toBeNull();
+  });
+
+  it("끊긴 동안 요구를 거둔 토픽의 거부 경고를 지운다", () => {
+    // 소켓이 없으면 `unsubscribe` 를 보낼 수 없지만, 요구를 거둔 사실은 지금
+    // 확정됐다 — 배너가 재접속까지 남으면 없는 문제를 말한다.
+    const client = connectedClient();
+    latest().makeReady();
+    const release = client.retain(["slowq:env=prd"]);
+    latest().deliver({ t: "subscribed", topics: [], denied: ["slowq:env=prd"] });
+    expect(client.getSnapshot().denied).toEqual(["slowq:env=prd"]);
+
+    latest().close();
+    release();
+    expect(client.getSnapshot().denied).toEqual([]);
   });
 
   it("다시 연결 버튼은 닫히는 중인 소켓도 처리한다", () => {

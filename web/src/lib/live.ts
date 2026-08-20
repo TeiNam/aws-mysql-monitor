@@ -19,7 +19,7 @@
  * 로 다시 시작한다.
  */
 
-import { currentToken } from "./auth";
+import { clearToken, currentToken } from "./auth";
 import {
   INITIAL_SNAPSHOT,
   applyMessage,
@@ -77,11 +77,19 @@ export class LiveClient {
     this.syncTopics();
 
     return () => {
+      const released: string[] = [];
       for (const topic of topics) {
         const left = (this.wanted.get(topic) ?? 1) - 1;
-        if (left <= 0) this.wanted.delete(topic);
-        else this.wanted.set(topic, left);
+        if (left <= 0) {
+          this.wanted.delete(topic);
+          released.push(topic);
+        } else {
+          this.wanted.set(topic, left);
+        }
       }
+      // **끊겨 있어도 지운다.** 요구를 거둔 토픽의 거부 경고는 의미가 없고,
+      // `syncTopics()` 는 소켓이 없으면 아무 일도 하지 않는다.
+      this.set(forgetDenied(this.snapshot, released));
       this.syncTopics();
     };
   }
@@ -137,6 +145,9 @@ export class LiveClient {
         if (!this.authed) socket.close();
         return;
       }
+      // **거부된 자격증명은 버린다.** 남겨 두면 새로고침 때 그대로 다시 보내고,
+      // HTTP 조회가 없는 화면에서는 아무도 지우지 않는다.
+      if (msg.t === "error" && msg.code === "unauthorized") clearToken();
       this.set(applyMessage(this.snapshot, msg));
       if (msg.t === "ready") {
         // 인증까지 성공한 것이 **연결이 실제로 쓸 만하다**는 증거다.
@@ -160,13 +171,10 @@ export class LiveClient {
     this.socket = null;
     this.authed = false;
     this.sent.clear();
-    // 끊긴 구간을 이력에 남기고 **놓친 것으로 센다.** 끊긴 동안의 슬로우 쿼리
-    // 방송은 다시 오지 않으므로, 화면은 HTTP 로 다시 읽어야 한다.
+    // 끊긴 구간을 이력에 남기고 **놓쳤을 수 있다고 표시**한다. 세는 것은
+    // `ready` 에서 한다 — 끊긴 동안 재조회를 시켜도 실패한다.
     const previous = this.snapshot;
-    const gapped = {
-      ...markStreamGap(previous),
-      missedCount: previous.conn === "open" ? previous.missedCount + 1 : previous.missedCount,
-    };
+    const gapped = previous.conn === "open" ? markStreamGap(previous) : previous;
     // `unauthorized` 를 `closed` 로 덮으면 재접속 금지가 풀린다.
     this.set(
       this.snapshot.conn === "unauthorized"
@@ -221,8 +229,6 @@ export class LiveClient {
     if (drop.length > 0) {
       socket.send(JSON.stringify({ t: "unsubscribe", topics: drop }));
       for (const topic of drop) this.sent.delete(topic);
-      // 요구를 거둔 토픽의 거부 경고는 의미가 없다.
-      this.set(forgetDenied(this.snapshot, drop));
     }
   }
 

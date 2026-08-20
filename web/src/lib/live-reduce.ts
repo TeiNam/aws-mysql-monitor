@@ -54,6 +54,15 @@ export interface LiveSnapshot {
    */
   missedCount: number;
   /**
+   * 끊긴 동안 방송을 놓쳤을 수 있다는 표시. **연결이 돌아올 때** `missedCount` 로
+   * 바뀐다.
+   *
+   * 왜 바로 세지 않는가: 끊긴 순간에 세면 화면이 그 즉시 HTTP 재조회를 하는데,
+   * 그 조회는 **서버가 죽어 있는 동안** 나가서 실패한다. 그리고 재접속에는 신호가
+   * 없으므로 목록이 낡은 채로 남는다.
+   */
+  gapPending: boolean;
+  /**
    * 마지막 프로토콜 오류 코드. **화면에 띄운다** — `malformed`·`auth_timeout` 은
    * 프론트와 백엔드가 어긋났다는 뜻이고, 조용히 삼키면 "데이터가 안 온다" 로만
    * 보인다. 연결이 다시 `ready` 가 되면 지워진다.
@@ -70,6 +79,7 @@ export const INITIAL_SNAPSHOT: LiveSnapshot = {
   status: {},
   qpsHistory: {},
   missedCount: 0,
+  gapPending: false,
   errorCode: null,
 };
 
@@ -82,7 +92,18 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
     case "ready":
       // 새 연결이므로 거부 목록을 비운다 — 앞 연결의 거부를 물고 오면 스코프가
       // 늘어난 뒤에도 경고가 남는다.
-      return { ...prev, conn: "open", user: msg.user, errorCode: null, denied: [] };
+      //
+      // **여기서 놓침을 센다.** 연결이 다시 쓸 수 있게 된 지금이 HTTP 재조회가
+      // 성공할 수 있는 첫 시점이다.
+      return {
+        ...prev,
+        conn: "open",
+        user: msg.user,
+        errorCode: null,
+        denied: [],
+        missedCount: prev.gapPending ? prev.missedCount + 1 : prev.missedCount,
+        gapPending: false,
+      };
 
     case "subscribed": {
       // **거부를 누적한다.** 서버는 매 응답에 그 요청의 거부만 담으므로, 뒤에
@@ -156,8 +177,11 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
  * `null` 하나를 넣어 선을 끊는다 — 스파크라인이 `null` 을 구간 경계로 읽는다.
  */
 export function markStreamGap(prev: LiveSnapshot): LiveSnapshot {
-  const instances = Object.keys(prev.qpsHistory);
-  if (instances.length === 0) return prev;
+  if (Object.keys(prev.qpsHistory).length === 0) {
+    // 이력이 없어도 **놓쳤을 수 있다는 사실은 남긴다** — 슬로우 쿼리 방송은
+    // 지표와 무관하게 흐르고 있었다.
+    return prev.gapPending ? prev : { ...prev, gapPending: true };
+  }
 
   const qpsHistory: Record<string, readonly (number | null)[]> = {};
   for (const [id, history] of Object.entries(prev.qpsHistory)) {
@@ -165,7 +189,7 @@ export function markStreamGap(prev: LiveSnapshot): LiveSnapshot {
     // 이력이 `null` 로만 채워져 데이터를 밀어낸다.
     qpsHistory[id] = history.at(-1) === null ? history : appendBounded(history, null, HISTORY_LEN);
   }
-  return { ...prev, qpsHistory };
+  return { ...prev, qpsHistory, gapPending: true };
 }
 
 /**

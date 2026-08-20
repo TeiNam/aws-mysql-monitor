@@ -137,8 +137,40 @@ describe("실시간 지표", () => {
     expect(s.qpsHistory[inst]).toEqual([10, null, 11]);
   });
 
-  it("이력이 없으면 구멍 표시가 스냅샷을 바꾸지 않는다", () => {
-    expect(markStreamGap(INITIAL_SNAPSHOT)).toBe(INITIAL_SNAPSHOT);
+  it("이력이 없어도 놓쳤을 수 있다는 표시는 남긴다", () => {
+    // 슬로우 쿼리 방송은 지표와 무관하게 흐르고 있었다.
+    const gapped = markStreamGap(INITIAL_SNAPSHOT);
+    expect(gapped.gapPending).toBe(true);
+    // 이미 표시돼 있으면 같은 객체 — 헛된 리렌더를 만들지 않는다.
+    expect(markStreamGap(gapped)).toBe(gapped);
+  });
+
+  it("놓침은 끊긴 시점이 아니라 다시 붙은 시점에 센다", () => {
+    // 끊긴 순간에 세면 화면이 그때 HTTP 재조회를 하고, 그 조회는 서버가 죽어
+    // 있는 동안 나가서 실패한다. 그리고 재접속에는 신호가 없어 목록이 낡는다.
+    const dropped = markStreamGap(
+      apply(INITIAL_SNAPSHOT, {
+        t: "status",
+        instance_id: "i",
+        metrics: metrics({ qps: 10 }),
+      }),
+    );
+    expect(dropped.missedCount).toBe(0);
+    expect(dropped.gapPending).toBe(true);
+
+    const back = applyMessage(dropped, {
+      t: "ready",
+      user: { subject: "u", role: "admin", env_scope: ["dev"], can_see_literals: false },
+    });
+    expect(back.missedCount).toBe(1);
+    expect(back.gapPending).toBe(false);
+
+    // 끊김 없이 다시 `ready` 를 받아도 더 세지 않는다.
+    const again = applyMessage(back, {
+      t: "ready",
+      user: { subject: "u", role: "admin", env_scope: ["dev"], can_see_literals: false },
+    });
+    expect(again.missedCount).toBe(1);
   });
 
   it("이력이 상한을 넘으면 오래된 표본을 버린다", () => {
