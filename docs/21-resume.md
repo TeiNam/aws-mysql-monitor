@@ -1,308 +1,211 @@
 # 21. 이어서 하기 (2026-08-20 중단 지점)
 
-작업 중 이동으로 중단했다. **이 문서만 읽으면 이어서 할 수 있게** 검증된 사실과
-미확인 항목을 구분해 적는다.
+**이 문서만 읽으면 이어서 할 수 있게** 검증된 사실과 미확인 항목을 구분해 적는다.
 
-브랜치: `feat/m0-foundation` · 마지막 커밋 `7454766` (코드 전부 커밋됨, 푸시 안 함)
+브랜치: `feat/m0-foundation` · 코드 전부 커밋됨 (푸시 안 함)
 
 ---
 
 ## 1. 이번 구간에 무엇을 했는가
 
-사용자 요청 두 개가 순서대로 들어왔다.
+두 구간이 이어졌다.
 
-1. "모니터링 도커를 띄워서 **웹유아이로 접속** 가능한가" → 조회 API + 임베드 화면
-2. "프론트는 실시간 메트릭 데이터 출력을 하니까 **React** 로 만드는 게 좋지 않아?"
-   → 맞다. 그런데 그러려면 **백엔드에 실시간 경로가 먼저 있어야** 했고, 없었다.
-   그래서 WebSocket + 실시간 지표 수집을 먼저 만들었다.
+1. **조회 API + WebSocket + 실시간 지표** (M6 일부) — 커밋 `7454766`
+2. **React SPA 4화면 + 정적 서빙 + 9차 2way 리뷰** — 이번 세션
 
-### 새로 만든 것
+`docs/09-frontend.md` 가 규정한 SPA 가 실제로 돌아간다. 그리고 그 프론트가
+**백엔드 결함 하나를 드러냈다**(WS 유휴 종료 — [20 §R9-1](20-review-log.md)).
+
+### 새로 만든 것 (이번 세션)
 
 | 파일 | 내용 |
 |---|---|
-| `crates/dbmon/src/api/{mod,auth,view,cursor}.rs` | 조회 API, T-01 인증, 리터럴 통제, 서명 커서 |
-| `crates/dbmon/src/api/topic.rs` | WS 구독 토픽 파싱·인가 (순수 함수) |
-| `crates/dbmon/src/api/hub.rs` | 방송 허브. `slowq`/`status` 2채널 |
-| `crates/dbmon/src/api/ws.rs` | WebSocket 엔드포인트 `/api/ws` |
-| `crates/dbmon/src/metrics/derive.rs` | `global_status` → QPS 등 유도 (순수 함수) |
-| `crates/dbmon/src/metrics/sampler.rs` | 5초 주기 샘플러 |
-| `crates/dbmon/src/store/broadcast.rs` | 저장소 데코레이터 — **저장되면 반드시 방송된다** |
-| `crates/dbmon/assets/index.html` | 임베드 최소 화면 (SPA 아님) |
-| `web/package.json` | React 19 + Vite 6 + TS + Tailwind 4 스캐폴딩. **의존성 설치까지만 됨** |
+| `web/src/lib/live-reduce.ts` | 실시간 스트림 **판정부**(순수 함수). 테스트가 전부 여기 걸린다 |
+| `web/src/lib/live.ts` | 소켓 **배관**. 연결 하나를 공유하고 토픽은 참조 계수로 센다 |
+| `web/src/lib/{api,format,auth,types}.ts` | HTTP 조회, 표시 포맷, 토큰, 백엔드 뷰 타입 |
+| `web/src/routes/{Fleet,SlowQueries,SlowQueryDetail,Live}.tsx` | 4화면 |
+| `web/src/components/*` | 레이아웃·배지·스파크라인·오류 안내·SQL 블록·ErrorBoundary |
+| `web/src/{App,main}.tsx` | 라우트, 부트스트랩 |
+| `crates/dbmon/src/main.rs` | `web/dist` 정적 서빙(캐시 정책 포함), 없는 `/api/…` 는 404 |
+| `Dockerfile` | 노드 빌더 스테이지 — **런타임 이미지에 노드는 없다** |
 
-전체 테스트 **657개 통과**, `cargo clippy --workspace --all-targets` 경고 0.
+테스트: **Rust 660개 + web 46개**, `cargo clippy --workspace --all-targets` 경고 0.
+
+### 의존성을 줄였다
+
+`uplot`·`date-fns`·`lucide-react` 를 뺐다. SVG 12줄(`Sparkline`)·`Intl`·인라인
+아이콘으로 충분하다. `vitest` 는 vite 6 과 타입이 충돌해 3.x 로 올렸다.
 
 ---
 
 ## 2. 실행으로 검증한 것 (재현 명령 포함)
 
-### 2.1 호스트에서 화면 접속 — 확인됨
+### 2.1 개발 흐름 — 확인됨
 
 ```bash
+# 백엔드 (호스트, 루프백 → 토큰 없이 접속)
 DBMON_TARGET_PASSWORD=dbmon-local-monitor \
   cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
-# → http://127.0.0.1:8080/
+
+# 프론트 개발 서버 (5173 → /api 와 /api/ws 를 8080 으로 프록시)
+npm --prefix web run dev
 ```
 
-브라우저(Playwright)로 12행 렌더 확인. SQL 은 `masked` 정책대로 `?` 로 표시된다.
+프록시를 쓰는 이유는 **CORS 설정을 만들지 않기 위해서**다. 백엔드에 CORS 를 열면
+그 설정이 프로덕션까지 따라간다.
 
-### 2.2 컨테이너에서 화면 접속 — 확인됨
+### 2.2 Rust 가 SPA 를 서빙한다 — 확인됨
 
 ```bash
-docker compose --profile monitor up -d --build dbmon
-docker compose logs dbmon | grep token=      # 접속 URL 이 나온다
-# → http://127.0.0.1:18080/?token=<발급토큰>
+npm --prefix web run build          # → web/dist
+DBMON_TARGET_PASSWORD=dbmon-local-monitor \
+  cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+# 로그: serve_ui=true spa=web/dist
 ```
 
-브라우저로 25행 렌더 확인. 토큰이 URL 에서 즉시 제거되고 `sessionStorage` 로 옮겨진다.
+| 경로 | 응답 |
+|---|---|
+| `/` · `/slow-queries` · `/live` (딥링크) | 200 `text/html` (셸, `cache-control: no-cache`) |
+| `/assets/index-*.js` | 200, `public, max-age=31536000, immutable` |
+| `/assets/없는파일.js` | 404, **캐시 헤더 없음** |
+| `/api` · `/api/없는경로` | 404 `{"error":"not_found"}` |
 
-### 2.3 T-01 인증 게이트 — 음성 대조군까지 확인됨
+산출물 위치는 `DBMON_UI_DIR` (기본 `web/dist`). **없으면 기존 임베드 화면으로
+떨어진다** — `npm run build` 를 안 돌린 체크아웃도 화면을 잃지 않는다.
 
-| 상황 | `/api/slow-queries` | `/healthz` | `/` |
-|---|---|---|---|
-| dev + 루프백 | 200 | 200 | 200 |
-| dev + `0.0.0.0` (토큰 없음) | **401** | 200 | 200(토큰 필요) |
-| dev + `0.0.0.0` (올바른 토큰) | 200 | 200 | 200 |
-| dev + `0.0.0.0` (틀린 토큰) | **401** | 200 | — |
-| prd | **401** | 200 | **404** |
+### 2.3 컨테이너 — 확인됨
 
-### 2.4 WebSocket 프로토콜 — 확인됨
-
-```
-정상 흐름          ready → subscribed → pong
-첫 메시지가 subscribe  error/unauthorized → 연결 종료
-와일드카드          허용=["slowq:env=dev"] 거부=["slowq:*"]
-auth 미전송         auth_timeout → 종료 (정확히 5.0초)
-```
-
-### 2.5 실시간 지표 방송 — 확인됨
-
-```
-status qps=8.98 thr_run=3 lock=0 gap=-
+```bash
+docker compose --profile monitor build dbmon   # 노드 스테이지 + Rust 스테이지
+docker compose --profile monitor up -d dbmon
+docker compose logs dbmon | grep token=
+# → http://127.0.0.1:8080/?token=…   ⚠ 포트는 컨테이너 안 것이다
+# → 호스트에서는 http://127.0.0.1:18080/?token=…
 ```
 
-`global_status()` 는 이번에 처음으로 **호출부가 생겼다**(이전엔 포트·어댑터만 있고
-부르는 곳이 없었다 — 이 프로젝트에서 열 번째 "구현은 있고 호출부가 없다").
+로그: `serve_ui=true spa=/app/web/dist`. 브라우저로 접속해 토큰이 URL 에서 즉시
+제거되고 `sessionStorage` 로 옮겨지는 것, HTTP·WS 양쪽이 그 토큰으로 인증되는 것을
+확인했다.
+
+### 2.4 4화면 전부 브라우저에서 확인됨
+
+| 화면 | 확인한 것 |
+|---|---|
+| `/` 플릿 | QPS 13.6 / 실행 중 2 / 접속 9, 스파크라인, 갱신 시각 |
+| `/live` | `docker exec -d … SLEEP(8)` → 8.7초 확정 행이 실시간으로 나타남 |
+| `/slow-queries` | 필터가 URL 에 담긴다(`?limit=37&env=dev` → select 에 37 표시) |
+| `/slow-queries/:id` | `record_id` 가 슬래시를 담아 `%2F` 인코딩 — 상세 200 |
+
+### 2.5 실패 경로도 확인됨 (이게 리뷰의 절반이었다)
+
+```bash
+# ① 백엔드를 10초 죽였다 → 배지 "연결 끊김" → 자동 재접속 → 스파크라인 구간 2개
+#    (관측이 없던 구간에 선을 그리지 않는다)
+# ② 실시간 화면: "스트림이 1번 끊기거나 밀렸다 — 그 사이의 쿼리는 이 표에 없다"
+# ③ 토큰 무효화(서버 재기동): 배지 "인증 실패" + 표 0행 + DOM 에 SELECT 없음
+# ④ WS 유휴 종료: 인증만 하고 침묵 → 서버가 60.0초에 닫는다
+```
+
+④ 는 **수정 전에 75초를 침묵해도 열려 있었다** — [20 §R9-1](20-review-log.md).
 
 ---
 
-## 3. ⚠ 다음에 가장 먼저 할 일
+## 3. ⚠ 다음에 할 일
 
-### 3.1 `slowq` 방송 도착 확인 (최우선, 단 결함 아님)
+### 3.1 푸시와 PR
 
-> 이 절의 초판은 "제품 결함일 수 있다" 는 톤이었다. **틀렸다.** 원인은 테스트
-> 하네스였고, 아래에 정정해 뒀다. 초판을 믿고 없는 결함을 쫓지 말 것.
+이 브랜치는 아직 **푸시되지 않았다.** 커밋은 전부 로컬에 있다.
 
-**남은 일은 하나다**: 수집기가 잡은 슬로우 쿼리가 WS `slowq` 메시지로 도착하는지
-한 번 보는 것. 그 앞 단계는 전부 확인됐다.
+### 3.2 M6 의 남은 것 (백엔드)
 
-| 단계 | 상태 |
-|---|---|
-| 수집기가 느린 쿼리를 탐지하는가 | ✅ `candidates=1` 관측 (23:20:27~30) |
-| `BroadcastingStore` 가 방송하는가 | ✅ 단위 테스트 (`a_stored_record_is_broadcast`) |
-| WS 가 구독자에게 전달하는가 | ✅ `status` 로 같은 경로 관측됨 |
-| **`slowq` 메시지 실제 도착** | ❓ 마지막 테스트가 중단돼 미확인 |
+- `next_cursor` 발급 — `list_by_instance` 가 `LastEvaluatedKey` 를 노출하지 않아
+  **페이지네이션이 없다.** 화면은 이 사실을 배너로 말한다(상한에 걸리면)
+- 커서 서명 키가 프로세스마다 다르다 — 다중 워커에서 커서 공유 불가
+- 콜드 티어(Athena) 조회 경로
+- `POST /api/queries`(샘플 실행), 실행계획 본문 조회 API
 
-재현 절차 — **두 함정을 피해야 한다**:
+**화면은 이것들을 만들지 않았다.** 없는 데이터를 위한 빈 화면은 "데이터가 없다"
+로 오해되기 때문이다([09 §3.2] 판단 유지).
 
-```bash
-# 1. 격리 테이블로 리더를 잡는다 (아래 3.3 참고 — dbmon-data-local 은 다른
-#    컨테이너가 리스를 쥐고 있다)
-#
-#    ⚠ 로그 필터는 `RUST_LOG` 이 아니라 `DBMON_LOG` 다 (telemetry.rs:257).
-#      RUST_LOG 로 주면 조용히 무시되고 info 레벨만 나온다.
-DBMON_TARGET_PASSWORD=dbmon-local-monitor \
-DBMON__STORAGE__DATA_TABLE=dbmon-data-wstest \
-AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \
-DBMON_LOG=dbmon=trace \
-  ./target/release/dbmon --config local/dbmon.toml --log-pretty serve
+### 3.3 M5 Cognito
 
-# 2. WS 를 붙인다 (스크립트 전문은 부록 A)
-node ws-live.mjs
+배포 환경(prd·stg)은 지금 **접속 자체가 불가능**하다(fail closed). 화면은
+`/api/auth/config` 의 `mode` 를 읽어 "이 환경은 아직 접속할 수 없다" 를 말한다.
+Cognito 가 배선되면 SPA 서빙 게이트(`serves_local_ui()`)도 함께 열어야 한다.
 
-# 3. 느린 쿼리를 만든다.
-#    ⚠ `docker exec` 에 **`-d` 가 필요하다.** 없으면 셸이 완료를 기다려
-#      WS 관측 창과 겹치지 않는다 — 이 세션에서 두 번 이것 때문에
-#      "방송이 안 온다" 고 오진했다.
-docker exec -d dbmon-dev-mysql84-1 mysql -uloadgen -pdbmon-local-loadgen -D shop \
-  -e "SELECT /* ws-demo */ SLEEP(7);"
-```
-
-`slowq` 가 그래도 안 오면 좁힐 순서:
-
-1. `dbmon-data-wstest` 에 새 `SQ#` 레코드가 들어왔는가 (저장 자체를 확인)
-2. `Hub::publish_slow_query` 의 키와 구독 키가 맞는가 (`slowq:env=dev`)
-3. `ws.rs` 의 `subscribed.contains(&key)` 비교가 맞는가
-
-> ⚠ **함정**: `SELECT ... FROM orders o JOIN order_items i ... WHERE SLEEP(4)=0`
-> 형태로 테스트하지 말 것. `SLEEP` 이 **조인 행마다** 평가돼 12만 행 × 4초 =
-> 며칠이 걸린다. 이 세션에서 두 번 걸렸고, 한 번은 `KILL` 로 정리했다.
-> `SELECT SLEEP(7);` 처럼 스칼라로 쓴다.
-
-### 3.2 React SPA — 스캐폴딩만 됐다
-
-`web/` 에 `package.json` 과 `node_modules` 만 있다. 소스 파일이 하나도 없다.
-
-만들 것 (docs/09 규정 기준, 백엔드가 실제로 주는 것만):
-
-| 라우트 | 쓸 수 있는 API |
-|---|---|
-| `/` 플릿 개요 | `GET /api/instances` + WS `status:inst=…` |
-| `/slow-queries` | `GET /api/slow-queries` |
-| `/slow-queries/:id` | `GET /api/queries/{id}` |
-| `/live` | WS `slowq:env=…` |
-
-**백엔드에 없는 것은 화면도 만들지 않는다** — 다이제스트, 알림, 리포트,
-부트스트랩, CloudWatch 메트릭, Athena 콜드 티어. 빈 화면을 만들면 "데이터가 없다"
-로 오해된다(같은 이유로 API 도 라우트를 만들지 않았다).
-
-Dockerfile 에 **노드 빌더 스테이지 추가**가 필요하다. 런타임 이미지에 노드를
-넣지 않는다는 기존 결정을 지키려면 `dist/` 만 `COPY` 해서 Rust 가 정적 서빙한다.
-
-### 3.3 로컬 환경에 남아 있는 것
+### 3.4 로컬 환경에 남아 있는 것
 
 | 대상 | 상태 | 조치 |
 |---|---|---|
-| `dbmon-web` 컨테이너 (`dbmon:round8`) | **실행 중**, `dbmon-data-local` 의 수집 리더 리스를 쥐고 있다 | 이 세션에서 만든 게 아니라 손대지 않았다. 정리 여부는 사용자 판단 |
-| `dbmon-dev-dbmon-1` (컴포즈 `monitor` 프로파일) | 실행 중, `role=api`, HEALTHCHECK `unhealthy` | **원인 미확인** — 컨테이너 안 `dbmon healthcheck` 가 왜 실패하는지 봐야 한다 |
-| `dbmon-data-wstest` 테이블 | 이 세션에서 만든 격리 테이블. 호스트 dbmon 이 이걸로 떠 있을 수 있다 | 필요 없으면 삭제 |
-| `dbmon-dev-mysql84-1` 의 장기 실행 쿼리 | 정리됨 (932초짜리 조인+SLEEP 을 `KILL`) | — |
+| `dbmon-web` 컨테이너 (`dbmon:round8`) | 실행 중, `dbmon-data-local` 의 수집 리더 리스를 쥐고 있다 | 이전 세션에서 만든 것. 정리 여부는 사용자 판단 |
+| `dbmon-dev-dbmon-1` (컴포즈 `monitor`) | 이번 세션에서 새 이미지로 재생성. HEALTHCHECK `unhealthy` | **원인 미확인** — 컨테이너 안 `dbmon healthcheck` 가 왜 실패하는지 봐야 한다 |
+| `dbmon-data-wstest` · `dbmon-data-uitest` | 세션들이 만든 격리 테이블 | 필요 없으면 삭제 |
+| 호스트 `target/debug/dbmon` | 8081 에 떠 있을 수 있다(`DBMON__HTTP__BIND=0.0.0.0`, uitest 테이블) | `pkill -f "target/debug/dbmon"` |
 
-`just` 가 이 머신에 **설치돼 있지 않다.** 그래서 justfile 타깃(`docker-up`,
-`docker-down` 포함)은 **실행으로 검증되지 않았다.** 컴포즈 명령은 직접 실행해 확인했다.
-
----
-
-## 4. 이번에 고친 결함 (재발 방지용 기록)
-
-`docs/20-review-log.md` 에 옮겨 넣을 것.
-
-### 4.1 커서 구분자 충돌 (테스트가 잡음)
-
-`Cursor` 페이로드를 `sub|filters|position|exp` 로 만들고 주석에 "`|` 는 나타날 수
-없다" 고 적었다. **DynamoDB 키 직렬화가 `PK|SK` 라서 항상 나타났다.** 정당한 커서
-전부가 `Malformed` 로 거부 → 페이지네이션이 첫 페이지에서 멈춘다.
-→ `position` 을 맨 뒤로 옮기고 `splitn(4, '|')`. 회귀 테스트 추가.
-
-### 4.2 `mysql_common` 패닉 — IAM 토큰 + 평문 접속 (실행이 잡음)
-
-`caching_sha2_password` 전체 인증은 비밀을 서버 공개키로 **RSA 암호화**한다.
-IAM DB Auth 토큰은 ~1000바이트라 RSA-2048 블록에 안 들어가고
-`mysql_common/crypto/rsa.rs` 가 `assert!` 로 **패닉**한다("message too long").
-tokio 워커 스레드가 죽는다.
-
-발생 조건: `deployment_env=dev` 인데 `DBMON_TARGET_PASSWORD` 가 없으면 IAM
-폴백을 타고, 로컬 MySQL 에 붙는 순간 패닉.
-→ `plaintext_secret_is_sendable(len)` 가드로 **패닉을 오류로 바꿨다**. 오류
-메시지가 `DBMON_TARGET_PASSWORD` 를 알려 준다.
-
-### 4.3 `DBMON_TARGET_PASSWORD` 가 어디에도 배선돼 있지 않았다
-
-dev 폴백 코드는 있는데 justfile·local/dbmon.toml·docker-compose 어디에도
-없었다. 그래서 문서대로 따라 하면 4.2 의 패닉을 만난다.
-→ 세 곳에 모두 넣고 이유를 주석으로 남겼다.
-
-### 4.4 진단을 두 번 틀리게 만든 하네스 문제 (결함 아님, 기록용)
-
-제품 결함이 아니라 **내 테스트 방법**이 틀려서 없는 결함을 쫓았다. 같은 함정에
-다시 빠지지 않도록 남긴다.
-
-- **로그 필터 환경변수가 `DBMON_LOG` 다** (`telemetry.rs:257`). `RUST_LOG` 로
-  주면 조용히 무시된다. 그래서 "수집 tick 로그가 하나도 없다 → 수집기가 안
-  돈다" 로 오진했다. 실제로는 1초마다 정상 tick 중이었다.
-- **`docker exec` 에 `-d` 가 없으면** 셸이 쿼리 완료를 기다려 WS 관측 창과
-  겹치지 않는다. "느린 쿼리를 쐈는데 방송이 안 온다" 의 진짜 이유였다.
-
-이 프로젝트에서 반복되는 유형이다 — 앞서 `kill` 이 래퍼 서브셸을 때린 일,
-포트를 쥔 좀비 프로세스, 열려 있는 슬로우로그 파일을 `rm` 한 일과 같은 계열.
-**"관측되지 않음" 을 "동작하지 않음" 으로 읽기 전에 관측 경로를 먼저 의심한다.**
-
-### 4.5 `0` 을 센티널로 쓴 것 (테스트가 잡음)
-
-`MetricsSampler.last_sampled_at_ms: EpochMs = 0` 이 "아직 샘플링 안 함" 을
-의미하게 했는데 `0` 은 유효한 `EpochMs` 다. `now_ms = 0` 인 테스트가 잡았다.
-→ `Option<EpochMs>`.
-
-### 4.6 임베드 화면이 prd 에서도 서빙됐다
-
-정적 HTML 이라 데이터는 안 새지만 T-01 의 인증 예외가 하나 늘고, prd 에서는
-인증을 통과할 수 없으니 **깨진 화면**이다.
-→ `policy.serves_local_ui()` 일 때만 라우트를 붙인다. prd 는 404.
+`just` 가 이 머신에 **설치돼 있지 않다.** justfile 타깃은 실행으로 검증되지 않았다.
 
 ---
 
-## 5. 이번에 내린 설계 결정
+## 4. 이번 구간의 설계 결정 (프론트)
 
-### 5.1 컨테이너 접속: 우회를 넓히지 않고 토큰을 발급한다
+### 4.1 판정과 배관을 나눴다
 
-인증 우회는 `deployment_env == dev` **AND** 루프백 바인드다. 그런데 컨테이너는
-포트 퍼블리시를 위해 `0.0.0.0` 에 바인드해야 하므로 **우회가 꺼지고 화면을 쓸 수
-없다.** 컨테이너 안에서는 호스트가 포트를 루프백에만 공개했는지 알 수 없다 —
-네임스페이스 밖의 사실이다.
+백엔드가 `ws.rs`(배관)와 `topic.rs`(판정)를 나눈 것과 같은 이유다. `live-reduce.ts`
+는 순수 함수라 테스트가 전부 여기 걸리고, 소켓 쪽에 남는 것은 순서와 수명뿐이다.
+그쪽도 가짜 WebSocket 으로 12개 테스트를 붙였다 — **구독을 안 보내는 버그는 화면이
+조용히 비는 것**으로 나타나고, 그게 이 프로젝트에서 열 번 재발한 유형이다.
 
-우회 조건을 넓히는 대신 **실제 자격증명을 하나 발급**한다:
+### 4.2 연결은 하나, 토픽은 참조 계수
 
-```
-토큰 발급 = (deployment_env == dev) AND (bind 이 루프백 아님) AND (ECS 아님)
-```
+화면마다 소켓을 열면 서버의 재인증·구독 상한이 화면 수만큼 늘고 같은 방송을 N배로
+받는다. 모듈 싱글턴 하나를 공유하고 화면은 "이 토픽이 필요하다" 만 말한다. 두
+화면이 같은 토픽을 요구할 수 있으므로 **계수를 센다** — 계수가 없으면 한 화면이
+언마운트될 때 다른 화면의 스트림이 끊긴다.
 
-우회가 아니라 인증이므로 바인드 주소가 무엇이든 구멍이 없다. ECS 를 배제하는
-이유: dev ECS 배포가 공개 ALB 뒤에 있으면 토큰이 CloudWatch Logs 에 남는다.
-ECS 는 태스크마다 `ECS_CONTAINER_METADATA_URI_V4` 를 주입하므로 **그 부재**로
-판정한다 — 위험한 방향(프로덕션에서 켜짐)을 막으려면 부재가 조건이어야 한다.
+### 4.3 `null` 을 `0` 으로 만들지 않는다
 
-### 5.2 `endpoint_url` 루프백 규칙을 컨테이너까지 넓혔다
+백엔드는 "아직 비율을 낼 수 없다" 를 `null` 로 준다. `?? 0` 으로 채우면 화면이
+"쿼리가 없다" 로 읽힌다. 포맷터가 전부 `—` 를 내고, 스파크라인은 없는 구간을 잇지
+않으며, 합계 타일도 표본이 없으면 `—` 다. **이 규칙을 두 번 어겼고 둘 다 리뷰가
+잡았다**([20 §R9-4], [20 §R9-9]).
 
-컨테이너 안의 `127.0.0.1` 은 컨테이너 자신이라 호스트 DynamoDB Local 에 닿지
-못한다. 컴포즈 서비스 이름(`http://dynamodb:8000`)이 필요한데 그건 루프백이 아니다.
+### 4.4 조용히 삼키는 것을 만들지 않는다
 
-→ `endpoint_override_allowed(env, url, in_local_container)` **순수 함수**로 빼고
-`deployment_env == dev` 는 그대로 필수로 뒀다. prd·stg·unknown 은 URL 이
-무엇이든, 컨테이너 안이든 밖이든 거부된다(전수 테스트 있음).
+- 거부된 구독(`denied`) → 배너. "데이터 없음" 과 구분돼야 한다
+- 프로토콜 오류(`malformed`·`auth_timeout`) → 배너. 프론트·백엔드 불일치 신호다
+- 방송 밀림·연결 끊김(`missedCount`) → 목록 재조회 + 실시간 화면에 구멍 표시
+- 렌더 예외 → `ErrorBoundary`. 하얀 화면은 모니터링 도구에서 "서버가 죽었나" 로
+  오해된다
+- 구독 상한(50)에 걸려 자른 인스턴스 → 표 아래에 몇 개를 못 받는지 적는다
 
-### 5.3 방송은 저장소를 감싸서 한다
+### 4.5 SPA 는 로컬 개발에서만 서빙한다
 
-수집기는 세 곳에서 저장한다(선행 저장·확정·고아 정리). 호출부마다 `publish` 를
-넣으면 빠뜨릴 기회가 셋 생긴다 — 이 프로젝트에서 아홉 번 재발한 실패 유형이다.
-→ `BroadcastingStore` 데코레이터 + `AppSlowQueryStore` 별칭. **감싸는 것을 잊을
-수 없다.**
-
-### 5.4 방송 페이로드는 `AuthContext` 를 받지 않는다 (T-22)
-
-방송은 여러 사용자에게 같은 바이트를 보내므로 사용자별 권한으로 가릴 수 없다.
-`SlowQueryBroadcast::from_record(q)` 는 **문맥을 인자로 받지 않는다** — 그래서
-실수로 관대하게 만들 수 없다. `sql_preview` 는 정책이 `masked` 일 때만 담고,
-원문 정책이면 비운다(클라이언트가 HTTP 상세로 조회 → 그 경로에 권한·감사가 있다).
-
-### 5.5 백프레셔: 채널을 둘로 나눴다
-
-규정이 "`status` 는 버리고 `slowq`·`alert` 는 버리지 않는다" 인데 한 채널로는
-구분이 불가능하다. `slowq`(1000)는 밀리면 `stream_lagged` 로 **알려서 재조회**를
-유발하고, `status`(64)는 조용히 버린다 — 게이지는 최신값만 의미가 있고 5초 뒤
-갱신된다.
+`serves_local_ui()` 게이트를 그대로 유지했다(prd 404). Cognito 검증이 없으므로
+prd 에서 서빙하면 **인증을 통과할 수 없는 깨진 화면**이다. 없는 `/api/…` 경로가
+SPA 폴백에 삼켜지지 않도록 404 라우트를 명시했다 — 200 에 HTML 을 주면 "아직
+구현되지 않았다" 가 "응답이 이상하다" 로 바뀐다.
 
 ---
 
-## 6. 미해결 (이전부터)
+## 5. 미해결 (이전부터)
 
-- **OPEN-Q-15 컴플라이언스 절반**: 운영 데이터 리터럴 저장 허용 여부는 사용자
-  판단 대기. 엔지니어링 절반은 결정·문서화됨(기본 `masked`, `collector.literal_policy`
-  한 줄로 전환, prd+masked 는 기동 경고).
-- M5 Cognito JWT 검증(JWKS·kid 캐시·`AuthContext::intersect`) — 지금은 **fail closed**
+- **OPEN-Q-15 컴플라이언스 절반**: 운영 데이터 리터럴 저장 허용 여부는 사용자 판단
+  대기. 엔지니어링 절반은 결정·문서화됨(기본 `masked`)
+- M5 Cognito JWT 검증(JWKS·kid 캐시·`AuthContext::intersect`)
 - 콜드 티어(Athena) 페이지네이션, `next_cursor` 발급
-- `POST /api/queries`(샘플 실행), M3 부트스트랩, M7 아카이브
+- M3 부트스트랩, M7 아카이브
 - `docs/20-review-log.md` 의 이연 항목: 쓰기 증폭(M4), 다이제스트 스냅샷 배선
   (M12/M11/M13-15), M24-26, `is_collectible()` 수집 시점 재검사(R6-24),
   STS 계정 검증(R6-25)
-- **9차 2way 리뷰 미실시** — 이번 구간(API·WS·지표·방송)이 리뷰를 안 받았다.
-  Stop 훅의 종료 조건이 이것이다.
+- 첫 `finalized` 가 실제보다 짧게 보고되는 건(span 추정) — 화면은 최종값을 쓰므로
+  표시 문제는 없다. 정확 지표는 백필된 값을 봐야 한다
 
 ---
 
 ## 부록 A. WS 확인 스크립트
 
-`web/` 밖에 두면 잃어버리므로 여기 남긴다. `node ws-live.mjs` 로 돌리고,
-느린 쿼리는 **`docker exec -d`** 로 쏜다(§3.1 함정 참고).
+`web/` 밖에 두면 잃어버리므로 여기 남긴다. 느린 쿼리는 **`docker exec -d`** 로
+쏜다(`-d` 가 없으면 셸이 완료를 기다려 관측 창과 겹치지 않는다).
 
 ```js
 const ws = new WebSocket("ws://127.0.0.1:8080/api/ws");
@@ -316,12 +219,17 @@ ws.onopen = () => {
 };
 ws.onmessage = (e) => {
   const m = JSON.parse(e.data);
-  if (m.t === "slowq")  got.push(`slowq ${m.data.state} ${m.data.duration_ms}ms ${m.data.sql_preview ?? "(없음)"}`);
-  if (m.t === "status") got.push(`status qps=${m.metrics.qps ?? "—"} thr_run=${m.metrics.threads_running}`);
+  if (m.t === "slowq")  got.push(`slowq ${m.data.state} ${m.data.duration_ms}ms`);
+  if (m.t === "status") got.push(`status qps=${m.metrics.qps ?? "—"}`);
   if (m.t === "subscribed") got.push(`subscribed=${JSON.stringify(m.topics)} denied=${JSON.stringify(m.denied)}`);
 };
 setTimeout(() => { console.log(got.join("\n") || "(아무것도 오지 않았다)"); process.exit(0); }, 20000);
 ```
+
+유휴 종료를 확인하려면 **auth 만 보내고 아무것도 하지 않는다.** 60초에 닫혀야 한다.
+
+⚠ 느린 쿼리를 만들 때 `WHERE SLEEP(4)=0` 형태를 쓰지 말 것 — 조인 행마다 평가돼
+며칠이 걸린다. `SELECT SLEEP(7);` 처럼 스칼라로 쓴다.
 
 ## 부록 B. 커밋 전에 돌릴 것
 
@@ -329,5 +237,7 @@ setTimeout(() => { console.log(got.join("\n") || "(아무것도 오지 않았다
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-./scripts/check-docs.py          # 이 문서의 링크도 검사된다
+npm --prefix web run build      # tsc --noEmit 포함
+npm --prefix web test
+./scripts/check-docs.py         # 이 문서의 링크도 검사된다
 ```

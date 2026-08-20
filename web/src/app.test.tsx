@@ -10,7 +10,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeSocket } from "./lib/fake-socket";
@@ -109,6 +109,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // ⚠ **자동 정리에 기대지 않는다.** RTL 의 auto-cleanup 은 `afterEach` 가
+  // 전역일 때만 붙는데 이 프로젝트는 `globals: false` 다 — 정리하지 않으면 앞
+  // 테스트의 DOM 이 남아 `findAllByText` 개수가 조용히 어긋난다.
+  cleanup();
   globalThis.WebSocket = realWebSocket;
   globalThis.fetch = realFetch;
   sessionStorage.clear();

@@ -199,11 +199,12 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(n)) => {
-                    // **슬로우 쿼리를 구독한 클라이언트에게만 알린다.** 구독하지
-                    // 않았으면 놓친 것이 없고, 그런 경고는 화면에 거짓 구멍을
-                    // 표시하게 만든다.
+                    // **로그는 항상 남긴다.** 방송이 밀린 것은 운영 신호이고,
+                    // 이 클라이언트가 구독했는지와 무관한 사실이다.
+                    tracing::warn!(dropped = n, "slowq 방송이 밀렸다");
+                    // **알림은 구독자에게만.** 구독하지 않았으면 놓친 것이 없고,
+                    // 그런 경고는 화면에 거짓 구멍을 표시하게 만든다.
                     if subscribed.iter().any(|k| k.starts_with("slowq:")) {
-                        tracing::warn!(dropped = n, "slowq 방송이 밀렸다 — 클라이언트에 재조회를 알린다");
                         send(&mut socket, ServerMsg::Error { code: "stream_lagged" }).await;
                     }
                 }
@@ -442,6 +443,31 @@ mod tests {
         let prd = Topic::SlowQueries(Env::Prd);
         assert!(still_allowed(&prd, &ctx(&[Env::Prd, Env::Dev])));
         assert!(!still_allowed(&prd, &ctx(&[Env::Dev])));
+    }
+
+    /// **유휴 종료를 `select!` 안의 `timeout` 으로 되돌리지 않는다.**
+    ///
+    /// 그 형태는 다른 분기(5초마다 오는 `status` 방송)가 이길 때마다 기한을 새로
+    /// 시작해 유휴 종료를 **무력화한다.** 9차 리뷰에서 실측으로 확인했다:
+    /// 수정 전에는 75초를 침묵해도 연결이 열려 있었고, 수정 후 60.0초에 닫혔다.
+    ///
+    /// 이 프로젝트의 관용대로 소스를 훑는다 — 동작을 테스트하려면 WS 하네스가
+    /// 필요하고, 그건 이 배관보다 크다.
+    #[test]
+    fn the_idle_timeout_uses_an_absolute_deadline() {
+        let src = include_str!("ws.rs");
+        // 테스트 모듈 앞부분만 본다 (이 테스트 자신의 문자열을 세지 않도록).
+        let code = src.split("#[cfg(test)]").next().expect("본문");
+        assert!(
+            code.contains("sleep_until(idle_deadline)"),
+            "유휴 종료가 절대 기한을 쓰지 않는다"
+        );
+        // 금지 패턴을 조립한다 — 그대로 적으면 이 파일이 그 패턴을 갖게 된다.
+        let forbidden = format!("timeout(IDLE_{}, socket.recv())", "TIMEOUT");
+        assert!(
+            !code.contains(&forbidden),
+            "유휴 타임아웃이 select! 안에서 매번 재생성된다 — 방송이 기한을 영원히 밀어낸다"
+        );
     }
 
     /// 기한·주기 값이 규정과 맞는지 고정한다 — 조용히 바뀌면 T-33 이 무의미해진다.

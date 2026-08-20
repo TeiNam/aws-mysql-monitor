@@ -127,6 +127,8 @@ export function fetchSlowQuery(recordId: string, signal: AbortSignal | null): Pr
 export const queryKeys = {
   authConfig: ["auth-config"] as const,
   instances: ["instances"] as const,
+  /** 필터 조합 전체. 놓친 방송을 복구할 때 이 접두로 무효화한다. */
+  slowQueriesAll: ["slow-queries"] as const,
   slowQueries: (q: ListQuery) => ["slow-queries", q] as const,
   slowQuery: (id: string) => ["slow-query", id] as const,
 };

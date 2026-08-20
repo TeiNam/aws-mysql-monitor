@@ -103,7 +103,9 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
       const history = prev.qpsHistory[msg.instance_id] ?? [];
       // 앞 표본과의 간격이 너무 크거나 순서가 뒤집혔으면 이력에 구멍을 넣는다.
       const elapsed = previous === undefined ? 0 : msg.metrics.at_ms - previous.at_ms;
-      const contiguous = previous === undefined || (elapsed > 0 && elapsed <= MAX_SAMPLE_GAP_MS);
+      // `elapsed === 0` 은 같은 표본이 두 번 온 것이다 — 시간이 흐르지 않았으니
+      // 구멍이 아니다. 음수(순서 뒤집힘)는 구멍으로 본다.
+      const contiguous = previous === undefined || (elapsed >= 0 && elapsed <= MAX_SAMPLE_GAP_MS);
       const base =
         contiguous || history.at(-1) === null
           ? history

@@ -74,7 +74,7 @@ export function SlowQueries() {
   const queryClient = useQueryClient();
   useEffect(() => {
     if (missedCount === 0) return;
-    void queryClient.invalidateQueries({ queryKey: ["slow-queries"] });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.slowQueriesAll });
   }, [missedCount, queryClient]);
 
   const envOptions = useMemo(
