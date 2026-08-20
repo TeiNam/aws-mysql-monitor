@@ -1571,6 +1571,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 // 조용한 오동작이 아니라 명시적 `invalid_cursor` 로 나타난다.
                 cursor_key: Arc::new(random_cursor_key()),
                 hub: hub.clone(),
+                // 화면 머리말이 "지금 어느 계정·리전을 보고 있나" 를 말한다. 참조
+                // 대시보드도 이걸 상단에 띄웠다 — 계정을 착각한 채로 조사하는 것이
+                // 이런 도구에서 가장 비싼 실수다.
+                aws_account_id: config.aws.account_id.clone(),
+                aws_region: config.aws.region.clone(),
             });
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.

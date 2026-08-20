@@ -146,6 +146,61 @@ pub struct ListResponse {
     pub items: Vec<SlowQueryView>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+    /// 이 응답에 담긴 건수. 화면이 클라이언트 페이지네이션을 하려면 필요하다.
+    ///
+    /// **저장소 전체의 건수가 아니다.** 조회 상한 안에서 실제로 읽은 수다 —
+    /// 전체 건수를 세려면 구간 전체를 훑어야 하고, 그건 목록 화면이 낼 비용이
+    /// 아니다. `has_more` 가 상한에 걸렸는지 말해 준다.
+    pub total: usize,
+}
+
+/// 실행계획 응답.
+///
+/// # 리터럴이 없다
+///
+/// 저장된 플랜 JSON 은 **정규화·마스킹된 것**이다(FR-PLN-09). 그래서 이 응답에는
+/// 사용자별 리터럴 통제가 걸리지 않는다 — 대신 환경 스코프는 호출부가 검사한다.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PlanView {
+    pub record_id: String,
+    pub instance_id: String,
+    pub started_at_ms: i64,
+    pub duration_ms: i64,
+    pub statement_type: String,
+    /// 플랜 JSON 원문(마스킹됨). 없으면 `s3_key` 나 `error` 를 본다.
+    pub normalized_json: Option<String>,
+    pub tree_text: Option<String>,
+    pub format_version: Option<String>,
+    /// 300KB 초과로 S3 에 오프로드된 경우의 키. **본문은 여기 없다** —
+    /// 조회 경로가 아직 없으므로 화면이 그 사실을 말해야 한다.
+    pub s3_key: Option<String>,
+    pub fingerprint: Option<String>,
+    pub referenced_tables: Vec<String>,
+    /// 어떻게 얻은 플랜인가 (`current` 실행 중 캡처, `rerun` 사후 재실행 등).
+    pub source: String,
+    /// 수집 실패 사유. **있으면 화면에 그대로 보여준다** — 빈 화면으로 두면
+    /// "플랜이 없다" 와 "플랜 수집이 실패했다" 가 구분되지 않는다.
+    pub error: Option<String>,
+}
+
+impl PlanView {
+    pub fn from_record(q: &SlowQuery) -> Self {
+        Self {
+            record_id: q.record_id.as_str().to_string(),
+            instance_id: q.instance_id.as_str().to_string(),
+            started_at_ms: q.started_at_ms,
+            duration_ms: q.duration_ms,
+            statement_type: format!("{:?}", q.statement_type).to_lowercase(),
+            normalized_json: q.plan.normalized_json.clone(),
+            tree_text: q.plan.tree_text.clone(),
+            format_version: q.plan.format_version.clone(),
+            s3_key: q.plan.s3_key.clone(),
+            fingerprint: q.plan.fingerprint.clone(),
+            referenced_tables: q.plan.referenced_tables.clone(),
+            source: format!("{:?}", q.plan.source).to_lowercase(),
+            error: q.plan.error.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
