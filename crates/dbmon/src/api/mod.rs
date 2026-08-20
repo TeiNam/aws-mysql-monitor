@@ -69,6 +69,20 @@ const DEFAULT_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_RANGE_DAYS: i64 = 400;
 const MAX_RANGE_MS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60 * 1000;
 
+/// 한 요청이 저장소에 던질 파티션 질의 수 상한 (`인스턴스 수 × 일수`).
+///
+/// [`MAX_RANGE_DAYS`] 는 **일수만** 막는다. 인스턴스 수가 곱해지는 것은 막지 못해서
+/// 400일 × 500대 = 20만 회가 여전히 가능했다. 예산을 넘으면 일수를 줄이고
+/// `truncated=true` 로 말한다([`clip_to_partition_budget`]).
+///
+/// 값의 근거: 현재 규모(약 100대)에서 **월 단위 통계가 온전히 돌아야 한다**
+/// (31일 × 100대 = 3,100). 500대 목표에서는 월 집계가 이 경로로 성립하지 않고,
+/// 그건 M12 롤업(수집 시점 스냅샷)의 몫이다.
+const MAX_PARTITION_QUERIES: usize = 4_000;
+
+/// 인스턴스 조회를 동시에 몇 개까지 던지나. 저장소 조절(throttle)을 부르지 않는 선.
+const READ_CONCURRENCY: usize = 16;
+
 /// 구간을 만들고 상한을 검사한다. 모든 조회 경로가 이걸 쓴다.
 fn checked_range(from_ms: i64, to_ms: i64) -> Result<TimeRange, ApiError> {
     let range = TimeRange::new(from_ms, to_ms)
@@ -500,6 +514,14 @@ fn aggregate_range(p: &AggregateParams, now_ms: i64) -> Result<TimeRange, ApiErr
 /// `allowed` 는 `사용자 스코프 ∩ 요청 env` 다. 레코드를 사용자 스코프로만 검사하면
 /// `?env=dev` 를 줬는데 prd 레코드가 섞인다(환경이 바뀐 인스턴스의 과거 행).
 ///
+/// # 균등 분배만으로는 표본이 왜곡된다 (그래서 2차 재분배가 있다)
+///
+/// 균등 분배는 굶기지는 않지만 **몫이 1까지 줄 수 있다**(500대에 천장 501). 그러면
+/// 바쁜 1대가 만든 최근 50건을 요청했는데 그 중 1건만 보이고, 나머지 자리는 다른
+/// 인스턴스의 오래된 최신값이 채운다 — 표는 "최신순" 이라고 말하면서 가운데가 빈다.
+/// 그래서 **1차에서 몫을 꽉 채운 인스턴스에만 남은 예산을 다시 나눠 준다.** 활동이
+/// 몇 대에 몰린 실제 상황에서는 이 2차로 정확한 답이 나온다.
+///
 /// 반환값의 두 번째는 "천장에 걸렸다" — 저장소가 최신순으로 주므로 잘리는 쪽은 과거다.
 async fn collect_views(
     state: &ApiState,
@@ -511,25 +533,43 @@ async fn collect_views(
     ceiling: usize,
 ) -> Result<(Vec<SlowQueryView>, bool), ApiError> {
     let instances = self_instances(state, instance).await?;
+    if instances.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let ids: Vec<_> = instances.iter().map(|i| i.id.clone()).collect();
 
-    // 몫을 나눈다. 인스턴스가 여럿이면 천장을 나눠 갖는다 — 하나가 다 먹지 못한다.
-    let share = if instances.len() > 1 {
-        (ceiling / instances.len()).clamp(1, per_instance)
-    } else {
-        per_instance.min(ceiling).max(1)
-    };
+    // ① 파티션 예산에 맞춰 구간을 좁힌다.
+    let (range, clipped) = clip_to_partition_budget(range, ids.len());
+    let mut truncated = clipped;
+
+    // ② 1차: 천장을 균등 분배.
+    let share = even_share(ceiling, ids.len(), per_instance);
+    let mut rows = read_share(state, &ids, range, share).await?;
+    let mut asked = vec![share; ids.len()];
+
+    // ③ 2차: 꽉 채운 인스턴스에만 남은 예산을 재분배한다.
+    let used: usize = rows.iter().map(Vec::len).sum();
+    let hungry: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.len() >= share)
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(bigger) = redistributed(ceiling, used, hungry.len(), share, per_instance) {
+        // 최신순이므로 더 큰 limit 의 결과는 1차의 상위집합이다 — 이어 붙이지 않고 갈아낀다.
+        let hungry_ids: Vec<_> = hungry.iter().map(|&i| ids[i].clone()).collect();
+        let refetched = read_share(state, &hungry_ids, range, bigger).await?;
+        for (&slot, found) in hungry.iter().zip(refetched) {
+            rows[slot] = found;
+            asked[slot] = bigger;
+        }
+    }
 
     let mut views = Vec::new();
-    let mut truncated = false;
-    for inst in &instances {
-        let found = state
-            .store
-            .list_by_instance(&inst.id, range, share)
-            .await
-            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+    for (found, want) in rows.iter().zip(&asked) {
         // 몫을 꽉 채웠다는 것은 더 있다는 뜻이다. 저장소가 1MB 페이지를 따라가므로
         // (`list_by_instance`) 이 판정이 성립한다.
-        if found.len() == share {
+        if found.len() >= *want {
             truncated = true;
         }
         views.extend(
@@ -550,6 +590,88 @@ async fn collect_views(
         truncated = true;
     }
     Ok((views, truncated))
+}
+
+/// 1차 몫. **인스턴스가 많으면 1까지 준다** — 그 자체가 정상이고, 표본 왜곡은
+/// [`redistributed`] 가 되돌린다.
+fn even_share(ceiling: usize, instances: usize, per_instance: usize) -> usize {
+    (ceiling / instances.max(1)).clamp(1, per_instance)
+}
+
+/// 2차 몫. 1차에서 몫을 꽉 채운 인스턴스가 있고 예산이 남았을 때만 값이 있다.
+///
+/// 이 산술이 바로 왜곡의 원인이었다 — 500대에 천장 501이면 1차 몫이 **1** 이라
+/// 바쁜 1대가 만든 최근 50건 중 1건만 표에 오른다. 남은 500을 바쁜 쪽에 몰아주면
+/// 활동이 몇 대에 몰린 실제 상황에서 정확한 답이 나온다.
+fn redistributed(
+    ceiling: usize,
+    used: usize,
+    hungry: usize,
+    share: usize,
+    per_instance: usize,
+) -> Option<usize> {
+    if hungry == 0 || used >= ceiling {
+        return None;
+    }
+    let bigger = (share + (ceiling - used) / hungry).min(per_instance);
+    (bigger > share).then_some(bigger)
+}
+
+/// 인스턴스별 조회를 **동시에** 던진다. 순차로 돌면 왕복 지연이 그대로 곱해진다 —
+/// 500대 × 5ms 면 응답 하나가 2.5초다. 상한을 두는 이유는 저장소 조절(throttle)이다.
+async fn read_share(
+    state: &ApiState,
+    ids: &[dbmon_core::ids::InstanceId],
+    range: TimeRange,
+    limit: usize,
+) -> Result<Vec<Vec<dbmon_core::slow_query::SlowQuery>>, ApiError> {
+    use futures::stream::{StreamExt, TryStreamExt};
+
+    // **`id` 와 저장소를 각 future 로 옮긴다.** 참조를 빌리는 클로저로 쓰면 상위
+    // 랭크 수명(HRTB)이 맞지 않아 핸들러가 `Send` 를 잃는다 — 컴파일러가 route 등록
+    // 지점에서 그걸 알려준다.
+    let tasks: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let store = Arc::clone(&state.store);
+            let id = id.clone();
+            async move {
+                store
+                    .list_by_instance(&id, range, limit)
+                    .await
+                    .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))
+            }
+        })
+        .collect();
+
+    futures::stream::iter(tasks)
+        // **순서를 유지한다.** 호출부가 인덱스로 인스턴스를 되찾으므로 `buffer_unordered`
+        // 를 쓰면 결과가 다른 인스턴스에 붙는다.
+        .buffered(READ_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// 파티션 예산에 맞춰 구간을 좁힌다. **최신 쪽을 남긴다** — 조사 도구에서 과거를
+/// 남기고 현재를 버리는 것은 거의 항상 틀린 선택이다.
+///
+/// 파티션은 `인스턴스 × 날짜` 다. 400일 구간을 500대에 물으면 20만 회 질의가 되고,
+/// 그건 **인증된 사용자 한 명이 저장소를 마비시킬 수 있다는 뜻이다.** 구간 상한
+/// ([`MAX_RANGE_DAYS`])만으로는 인스턴스 수가 곱해지는 것을 막지 못한다.
+fn clip_to_partition_budget(range: TimeRange, instances: usize) -> (TimeRange, bool) {
+    const DAY_MS: i64 = 86_400_000;
+    let max_days = (MAX_PARTITION_QUERIES / instances.max(1)).max(1) as i64;
+    let to_day = range.to_ms().div_euclid(DAY_MS);
+    let parts = to_day - range.from_ms().div_euclid(DAY_MS) + 1;
+    if parts <= max_days {
+        return (range, false);
+    }
+    let from_ms = (to_day - (max_days - 1)) * DAY_MS;
+    match TimeRange::new(from_ms, range.to_ms()) {
+        Some(clipped) => (clipped, true),
+        // 좁히기가 실패하면(있을 수 없다) 원본을 쓴다 — 조용히 빈 결과를 주지 않는다.
+        None => (range, false),
+    }
 }
 
 /// 집계 파라미터에서 `사용자 스코프 ∩ 요청 env` 를 구한다.
@@ -957,6 +1079,59 @@ async fn backfill_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **균등 분배만 쓰면 바쁜 인스턴스의 최근 데이터가 표본에서 사라진다.**
+    ///
+    /// 500대 등록부에 천장 501이면 1차 몫이 1이다. 그 상태로 끝내면 "최근 50건" 을
+    /// 요청한 사람은 바쁜 1대의 1건 + 다른 499대의 오래된 최신값을 본다 — 표는
+    /// 최신순이라고 말하면서 가운데가 비어 있고, 화면은 그 사실을 알 수 없다.
+    #[test]
+    fn a_busy_instance_gets_the_leftover_budget_back() {
+        // 1차: 500대에 501을 나누면 1건씩이다.
+        assert_eq!(even_share(501, 500, 501), 1);
+        // 3대만 데이터가 있었다(각 1건). 남은 498을 그 3대에 몰아준다.
+        let bigger = redistributed(501, 3, 3, 1, 501).expect("재분배가 있어야 한다");
+        assert_eq!(bigger, 1 + 498 / 3);
+
+        // 전부 꽉 찼으면 남는 예산이 없다 — 2차를 돌리지 않는다(무의미한 재조회 금지).
+        assert_eq!(redistributed(501, 501, 500, 1, 501), None);
+        // 꽉 채운 인스턴스가 없으면(=다 읽었다) 2차가 없다.
+        assert_eq!(redistributed(501, 20, 0, 1, 501), None);
+        // 인스턴스별 상한을 넘지 않는다.
+        assert_eq!(redistributed(20_000, 0, 1, 5_000, 5_000), None);
+        // 인스턴스 하나면 1차부터 인스턴스 상한까지 받는다.
+        assert_eq!(even_share(20_000, 1, 5_000), 5_000);
+    }
+
+    /// **일수 상한은 인스턴스 수가 곱해지는 것을 막지 못한다.**
+    ///
+    /// 400일 × 500대 = 20만 회 질의. 예산을 넘으면 **최신 쪽을 남기고** 자른다 —
+    /// 조사 도구에서 과거를 남기고 현재를 버리면 쓸 수 없다.
+    #[test]
+    fn a_wide_fan_out_clips_the_range_to_the_newest_days() {
+        const DAY: i64 = 86_400_000;
+        let to = 1_760_000_000_000;
+        let long = TimeRange::new(to - 399 * DAY, to).expect("구간");
+
+        // 인스턴스 하나면 예산(4000)이 일수 상한(400)보다 크므로 손대지 않는다.
+        let (kept, clipped) = clip_to_partition_budget(long, 1);
+        assert!(!clipped);
+        assert_eq!(kept.from_ms(), long.from_ms());
+
+        // 500대면 예산이 8일이다. 끝은 그대로, 시작만 당긴다.
+        let (cut, clipped) = clip_to_partition_budget(long, 500);
+        assert!(clipped, "잘랐으면 잘랐다고 말해야 한다");
+        assert_eq!(cut.to_ms(), to);
+        let parts = cut.date_parts().len();
+        assert_eq!(parts, 8, "파티션 수가 예산 몫과 같아야 한다");
+        assert!(cut.from_ms() > long.from_ms());
+
+        // 짧은 구간은 인스턴스가 많아도 그대로다 — 기본 24시간 조회가 잘리면 안 된다.
+        let day = TimeRange::new(to - DAY, to).expect("구간");
+        let (kept, clipped) = clip_to_partition_budget(day, 500);
+        assert!(!clipped);
+        assert_eq!(kept.from_ms(), day.from_ms());
+    }
 
     #[test]
     fn limit_is_clamped_to_a_sane_range() {

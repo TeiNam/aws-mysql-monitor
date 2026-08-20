@@ -25,6 +25,8 @@ const realFetch = globalThis.fetch;
 
 /** 401 로 뒤집을 수 있는 가짜 백엔드. */
 let unauthorized = false;
+/** 서버가 조회 상한에 걸려 **0건**을 준 상황. */
+let emptyButTruncated = false;
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -103,6 +105,9 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
     );
   }
   if (url.startsWith("/api/slow-queries") || url.startsWith("/api/plans")) {
+    if (emptyButTruncated) {
+      return Promise.resolve(json({ items: [], next_cursor: null, has_more: true, total: 0 }));
+    }
     return Promise.resolve(json({ items: [RECORD], next_cursor: null, has_more: false, total: 1 }));
   }
   if (url.includes("/plan")) {
@@ -239,6 +244,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
 
 beforeEach(() => {
   unauthorized = false;
+  emptyButTruncated = false;
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
   // `unauthorized` 가 되면 다음 테스트에서 아예 접속하지 않는다(그게 프로덕션
@@ -314,6 +320,21 @@ describe("MySQL Monitor", () => {
     });
 
     expect(await screen.findByText("13.4")).toBeDefined();
+  });
+
+  /**
+   * **0건이 "없다" 로 읽히면 안 된다.**
+   *
+   * 서버는 인스턴스가 많거나 구간이 길면 표본을 잘라 읽고 `has_more=true` 로
+   * 말한다. 그 표본이 환경 필터에서 전부 빠지면 0건이 온다. 상한 표시는
+   * `Pagination` 이 하는데 그건 0건에서 렌더되지 않으므로, 표 안에서 말해야 한다 —
+   * 안 그러면 조사하던 사람이 "문제 없음" 으로 결론 낸다.
+   */
+  it("서버가 상한에 걸려 0건을 주면 '기록이 없다' 로 말하지 않는다", async () => {
+    emptyButTruncated = true;
+    await renderApp("/mysql");
+    expect(await screen.findByText(/조회 상한에 걸려/)).toBeDefined();
+    expect(screen.queryByText(/조회 구간\(최근 24시간\)에 기록이 없다/)).toBeNull();
   });
 });
 

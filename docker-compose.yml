@@ -159,6 +159,14 @@ services:
       - ./local/dbmon.toml:/etc/dbmon.toml:ro
       - ./local/logs/mysql84:/local/logs/mysql84:ro
     command: ["--config", "/etc/dbmon.toml", "serve"]
+    # **종료 유예를 셧다운 예산보다 길게 준다.**
+    #
+    # docker 의 기본 유예는 10초인데 셧다운 단계는 `shutdown_grace_secs`(45초)까지
+    # 쓴다. 짧으면 SIGKILL 이 먼저 와서 **리스 반납 단계가 돌지 않고**, 다음 프로세스가
+    # TTL(60초)이 지나야 리더가 된다 — `DBMON__ROLE=all` 로 수집을 시험할 때 컨테이너를
+    # 멈춘 뒤 호스트 바이너리가 1분간 아무것도 수집하지 않는다. 실제로 겪었다.
+    # 운영(ECS)에서는 `stopTimeout` 이 같은 일을 하고, 그 값은 Terraform 이 검증한다.
+    stop_grace_period: 60s
 
 volumes:
   mysql84-logs:

@@ -549,24 +549,44 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     /// AP-18 — 희소 GSI1 로 진행 중 레코드를 조회한다 (고아 정리, F4).
     ///
     /// 오래된 것부터 본다. `GSI1SK` 가 `last_seen_at_ms` 이므로 오름차순이 곧 오래된 순이다.
+    ///
+    /// # 페이지를 따라간다
+    ///
+    /// DynamoDB 는 `Limit` 에 닿기 전에 **1MB 에서 페이지를 끊는다.** 진행 중
+    /// 레코드는 SQL 원문을 들고 있어 몇 KB 씩 되므로 `limit=200` 을 줘도 한 페이지가
+    /// 그보다 적게 돌아올 수 있다. 그 결과를 "진행 중인 것이 이게 전부" 로 읽으면
+    /// 고아 정리와 일시정지 확정이 **조용히 일부만 처리한다.**
     async fn list_in_flight(&self, limit: usize) -> Result<Vec<SlowQuery>> {
-        let out = self
-            .client
-            .query()
-            .table_name(&self.table)
-            .index_name("GSI1")
-            .key_condition_expression("GSI1PK = :pk")
-            .expression_attribute_values(":pk", AttributeValue::S(keys::IN_FLIGHT_PK.to_string()))
-            .scan_index_forward(true)
-            .limit(limit as i32)
-            .send()
-            .await
-            .map_err(map_sdk_err)?;
-        out.items
-            .unwrap_or_default()
-            .into_iter()
-            .map(Self::from_item)
-            .collect()
+        let mut out: Vec<SlowQuery> = Vec::new();
+        let mut start_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+        loop {
+            let remaining = limit.saturating_sub(out.len());
+            let res = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :pk")
+                .expression_attribute_values(
+                    ":pk",
+                    AttributeValue::S(keys::IN_FLIGHT_PK.to_string()),
+                )
+                .scan_index_forward(true)
+                .limit(remaining as i32)
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(map_sdk_err)?;
+            for item in res.items.unwrap_or_default() {
+                out.push(Self::from_item(item)?);
+            }
+            start_key = res.last_evaluated_key;
+            if start_key.is_none() || out.len() >= limit {
+                break;
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
     }
 }
 

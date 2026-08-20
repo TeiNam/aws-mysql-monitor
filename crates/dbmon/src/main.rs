@@ -721,12 +721,15 @@ impl CollectTasks {
         let count = handles.len();
         let deadline = tokio::time::Instant::now() + budget;
         let mut aborted = 0usize;
-        for (id, h) in handles {
-            match tokio::time::timeout_at(deadline, h).await {
+        for (id, mut h) in handles {
+            // **`&mut h` 로 기다린다.** `h` 를 그대로 넘기면 소유권이 `timeout_at` 으로
+            // 옮겨가고, 만료 시 그 future 가 드롭되면서 `JoinHandle` 도 함께 사라진다.
+            // `JoinHandle` 드롭은 **취소가 아니라 분리(detach)** 다 — 태스크는 계속
+            // 돈다. 그래서 예산을 넘긴 뒤 abort 할 대상이 남아 있지 않았다.
+            match tokio::time::timeout_at(deadline, &mut h).await {
                 Ok(_) => {}
                 Err(_) => {
-                    // `timeout_at` 이 만료되면 future 를 드롭한다 — 태스크는 계속
-                    // 돌므로 명시적으로 abort 해야 한다.
+                    h.abort();
                     tracing::warn!(
                         instance = %id,
                         "수집 태스크가 정리 예산을 넘겼다 — 중단한다 (in_flight 가 남을 수 있다)"
@@ -1165,10 +1168,21 @@ fn spawn_leader_loop(
                     // `Mine` 으로 보고 매번 건너뛴다** — 리더가 바뀌거나 TTL 이 지날
                     // 때까지 영구히 "진행 중" 이다(F4 가 막으려던 유령 상태).
                     // `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
+                    //
+                    // **전역 목록에서 내 것을 골라낸다.** GSI1 은 워커로 나뉘어 있지
+                    // 않으므로 다른 워커의 진행 중 레코드가 앞자리를 차지할 수 있다
+                    // (오래된 순). 상한을 스윕과 같게 두고, **꽉 찼으면 말한다** —
+                    // 그 뒤에 내 레코드가 남았을 수 있다는 뜻이다.
                     use dbmon_core::ports::SlowQueryStore as _;
                     if let Ok(Ok(in_flight)) =
-                        run_in_budget(stores.slow_query.list_in_flight(200)).await
+                        run_in_budget(stores.slow_query.list_in_flight(ORPHAN_SWEEP_LIMIT)).await
                     {
+                        if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
+                            tracing::warn!(
+                                limit = ORPHAN_SWEEP_LIMIT,
+                                "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
+                            );
+                        }
                         let mut closed = 0usize;
                         for q in &in_flight {
                             if q.owner_worker.as_deref() != Some(gate.worker_id())
@@ -1843,4 +1857,48 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **예산을 넘긴 태스크가 실제로 멈춰야 한다.**
+    ///
+    /// `timeout_at(deadline, h)` 로 쓰면 만료 시 `JoinHandle` 이 드롭되고, 드롭은
+    /// **취소가 아니라 분리**다 — 태스크는 계속 돈다. 일시정지를 눌렀는데 수집이
+    /// 계속되고(상태는 `collecting: 0`), 재개하면 같은 인스턴스에 태스크가 둘
+    /// 생긴다. 눈으로는 보이지 않는 종류의 결함이므로 카운터로 확인한다.
+    #[tokio::test]
+    async fn draining_past_the_budget_actually_stops_the_task() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let mut tasks = CollectTasks::new();
+        let counter = Arc::clone(&ticks);
+        tasks.handles.insert(
+            "never-ends".to_string(),
+            tokio::spawn(async move {
+                loop {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }),
+        );
+
+        tasks.drain_all(Duration::from_millis(30)).await;
+        assert!(tasks.running().is_empty(), "정리 후 목록은 비어야 한다");
+
+        // 정리 직후 값을 재고, 태스크가 살아 있다면 늘어날 만큼 기다린다.
+        let after_drain = ticks.load(Ordering::SeqCst);
+        assert!(
+            after_drain > 0,
+            "태스크가 한 번은 돌았어야 테스트가 성립한다"
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            after_drain,
+            "예산을 넘긴 태스크가 계속 돌고 있다 — abort 되지 않았다"
+        );
+    }
 }
