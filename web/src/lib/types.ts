@@ -7,8 +7,8 @@
  * OpenAPI 문서를 내보내지 않는다.** 생성기를 먼저 넣으면 빈 스펙에서 빈 타입이
  * 나오고, 그건 `any` 와 같다.
  *
- * 그래서 지금은 Rust 쪽 뷰 타입(`crates/dbmon/src/api/view.rs`)을 그대로 옮겨
- * 적는다. OpenAPI 가 생기면 이 파일을 생성물로 교체한다.
+ * 그래서 지금은 Rust 쪽 뷰 타입(`crates/dbmon/src/api/{view,aggregate,mod}.rs`)을
+ * 그대로 옮겨 적는다. OpenAPI 가 생기면 이 파일을 생성물로 교체한다.
  *
  * ⚠ **필드를 추측해서 넣지 않는다.** Rust 뷰에 없는 필드를 여기 적으면
  * 화면이 `undefined` 를 그리고, 그게 "데이터가 없다" 로 보인다.
@@ -24,6 +24,37 @@ export interface AuthConfig {
   mode: AuthMode;
   cognito_configured: boolean;
   deployment_env: Env;
+}
+
+/** `GET /api/aws/info`. 화면 머리말이 "어느 계정을 보고 있나" 를 말한다. */
+export interface AwsInfo {
+  account_id: string;
+  region: string;
+  deployment_env: Env;
+}
+
+/**
+ * 수집기 상태. `crates/dbmon/src/control.rs` 의 `ControlSnapshot` + 워커 사실.
+ *
+ * ⚠ `scope` 가 `"process"` 다 — 이 플래그는 **요청을 받은 워커에만** 적용된다.
+ * 여러 워커를 띄운 배포에서 전체를 멈추려면 설정 저장소가 필요하다.
+ */
+export interface CollectorStatus {
+  paused: boolean;
+  paused_since_ms: number | null;
+  /** 이 워커가 수집 리더인가. 아니면 멈추고 있는 것이 정상이다. */
+  is_leader: boolean;
+  collecting: number;
+  last_tick_ms: number | null;
+  last_discovery_ms: number | null;
+  last_backfill_ms: number | null;
+  discovery_requested: boolean;
+  backfill_requested: boolean;
+  worker_id: string;
+  scope: string;
+  /** 조작할 수 있는 역할인가. 버튼 비활성의 근거. */
+  can_control: boolean;
+  role: string;
 }
 
 /**
@@ -64,17 +95,117 @@ export interface ListResponse {
   items: SlowQueryView[];
   next_cursor: string | null;
   has_more: boolean;
+  /** 이 응답에 담긴 건수. **저장소 전체 건수가 아니다.** */
+  total: number;
+}
+
+/** `crates/dbmon/src/api/view.rs` 의 `PlanView`. 플랜 JSON 은 마스킹돼 있다. */
+export interface PlanView {
+  record_id: string;
+  instance_id: string;
+  started_at_ms: number;
+  duration_ms: number;
+  statement_type: string;
+  normalized_json: string | null;
+  tree_text: string | null;
+  format_version: string | null;
+  /** 300KB 초과로 S3 에 오프로드된 키. **본문 조회 경로는 아직 없다.** */
+  s3_key: string | null;
+  fingerprint: string | null;
+  referenced_tables: string[];
+  source: string;
+  /** 수집 실패 사유. 있으면 그대로 보여준다. */
+  error: string | null;
 }
 
 /** `crates/dbmon/src/api/mod.rs` 의 `InstanceView`. */
 export interface InstanceView {
   id: string;
+  name: string;
   env: Env;
+  env_from_tags: Env;
+  env_override: Env | null;
   state: string;
   engine: string;
   engine_version: string;
   endpoint: string | null;
+  port: number;
+  instance_class: string | null;
+  cluster_id: string | null;
+  is_cluster_writer: boolean;
+  iam_auth_enabled: boolean;
+  vpc_id: string | null;
+  availability_zone: string | null;
+  /** 수집 대상인가. 참조 대시보드의 `REAL-TIME` 열과 같은 뜻. */
   collectible: boolean;
+  tags: Record<string, string>;
+  first_seen_ms: number;
+  last_seen_ms: number;
+  deleted_at_ms: number | null;
+  cert_valid_till_ms: number | null;
+}
+
+/** 집계 응답 공통 머리. **천장에 걸렸는지 말한다.** */
+export interface AggregateEnvelope<T> {
+  items: T[];
+  scanned: number;
+  truncated: boolean;
+  from_ms: number;
+  to_ms: number;
+  month: string | null;
+}
+
+/** `aggregate.rs` 의 `DigestRow`. */
+export interface DigestRow {
+  instance_id: string;
+  app_digest: string;
+  digest_query: string | null;
+  users: string[];
+  statement_type: string;
+  schema_name: string | null;
+  exec_count: number;
+  total_time_ms: number;
+  avg_time_ms: number;
+  max_time_ms: number;
+  /** 행 정보가 하나도 없으면 `null`. **0 이 아니다.** */
+  avg_rows_examined: number | null;
+  first_seen_ms: number;
+  last_seen_ms: number;
+}
+
+/** `aggregate.rs` 의 `InstanceStats`. */
+export interface InstanceStats {
+  instance_id: string;
+  unique_digest_count: number;
+  total_slow_query_count: number;
+  total_execution_count: number;
+  total_execution_time_ms: number;
+  avg_execution_time_ms: number;
+  max_execution_time_ms: number;
+  total_rows_examined: number;
+  read_query_count: number;
+  write_query_count: number;
+  ddl_query_count: number;
+  commit_query_count: number;
+  other_query_count: number;
+  first_seen_ms: number;
+  last_seen_ms: number;
+}
+
+/** `aggregate.rs` 의 `UserStats`. */
+export interface UserStats {
+  instance_id: string;
+  user: string;
+  total_queries: number;
+  unique_digest_count: number;
+  total_exec_time_ms: number;
+  avg_execution_time_ms: number;
+  max_execution_time_ms: number;
+  read_query_count: number;
+  write_query_count: number;
+  ddl_query_count: number;
+  commit_query_count: number;
+  other_query_count: number;
 }
 
 /**
@@ -99,7 +230,6 @@ export interface LiveMetrics {
  *
  * `SlowQueryView` 보다 **필드가 적다.** 방송은 여러 사용자에게 같은 바이트를
  * 보내므로 권한으로 가릴 수 없고, 그래서 원문 리터럴을 절대 담지 않는다(T-22).
- * 리터럴이 필요하면 상세 화면이 HTTP 로 조회한다.
  */
 export interface SlowQueryBroadcast {
   record_id: string;
@@ -111,7 +241,6 @@ export interface SlowQueryBroadcast {
   app_digest: string;
   statement_type: string;
   schema_name: string | null;
-  /** 마스킹된 텍스트만. 원문 정책이면 `null`. */
   sql_preview: string | null;
 }
 

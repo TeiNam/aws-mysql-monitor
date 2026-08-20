@@ -1,0 +1,110 @@
+import { describe, expect, it } from "vitest";
+import { layoutPlan, parsePlan } from "./plan-graph";
+
+/**
+ * 참조 대시보드는 노드 좌표를 **라벨 문자열로** 정했다(`case 'Nested_Loop#2'`).
+ * 그래서 테이블이 셋 이상이거나 `grouping_operation` 이 끼면 노드가 같은 자리에
+ * 겹치거나 아예 사라졌다. 여기서는 구조를 따라가므로 그 모양들을 테스트한다.
+ */
+describe("실행계획 파싱", () => {
+  it("테이블을 쓰지 않는 계획의 message 를 버리지 않는다", () => {
+    // 로컬 `SELECT SLEEP(7)` 이 실제로 이 형태로 저장된다.
+    const graph = parsePlan('{"query_block":{"select_id":1,"message":"No tables used"}}');
+    expect(graph).not.toBeNull();
+    expect(graph!.nodes.map((n) => n.label)).toEqual(["Select", "No tables used"]);
+  });
+
+  it("nested_loop 의 테이블을 전부 노드로 만든다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        select_id: 1,
+        cost_info: { query_cost: "353891.58" },
+        ordering_operation: {
+          using_filesort: true,
+          nested_loop: [
+            { table: { table_name: "sg", access_type: "ref", rows_examined_per_scan: 2, filtered: "100.00" } },
+            { table: { table_name: "g", access_type: "ALL", rows_examined_per_scan: 3113305, filtered: "0.01" } },
+            { table: { table_name: "t3", access_type: "eq_ref", rows_examined_per_scan: 1 } },
+          ],
+        },
+      },
+    });
+    const graph = parsePlan(json)!;
+    const tables = graph.nodes.filter((n) => n.kind === "table");
+    // **셋 다 나와야 한다.** 참조 구현은 두 개까지만 그렸다.
+    expect(tables.map((t) => t.label)).toEqual(["sg (ref)", "g (ALL)", "t3 (eq_ref)"]);
+    expect(graph.nodes.find((n) => n.kind === "operation")?.details).toContain("using filesort");
+    expect(graph.nodes[0]?.details).toContain("Cost: 353,891.58");
+  });
+
+  it("grouping·union·서브쿼리도 노드로 잇는다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        select_id: 1,
+        grouping_operation: {
+          using_temporary_table: true,
+          table: {
+            table_name: "derived",
+            access_type: "ALL",
+            materialized_from_subquery: { query_block: { select_id: 2, message: "Impossible WHERE" } },
+          },
+        },
+        union_result: {
+          query_specifications: [{ query_block: { select_id: 3, message: "No tables used" } }],
+        },
+      },
+    });
+    const graph = parsePlan(json)!;
+    const kinds = graph.nodes.map((n) => n.kind);
+    expect(kinds).toContain("operation");
+    expect(kinds).toContain("table");
+    expect(kinds).toContain("subquery");
+    // 서브쿼리 안의 블록도 살아 있어야 한다.
+    expect(graph.nodes.filter((n) => n.kind === "select")).toHaveLength(3);
+  });
+
+  it("깨진 JSON 은 null 이다 — 빈 그래프와 구분된다", () => {
+    expect(parsePlan("not json")).toBeNull();
+    expect(parsePlan("[]")).toBeNull();
+    // 빈 객체는 "읽었지만 내용이 없다" 이므로 Select 노드 하나가 나온다.
+    expect(parsePlan("{}")?.nodes).toHaveLength(1);
+  });
+
+  it("모르는 키는 무시하고 아는 것만 그린다", () => {
+    const graph = parsePlan(
+      '{"query_block":{"select_id":1,"future_operation":{"x":1},"table":{"table_name":"t"}}}',
+    )!;
+    expect(graph.nodes).toHaveLength(2);
+  });
+});
+
+describe("배치", () => {
+  it("깊이가 x, 형제가 y — 노드가 겹치지 않는다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        nested_loop: [
+          { table: { table_name: "a" } },
+          { table: { table_name: "b" } },
+          { table: { table_name: "c" } },
+        ],
+      },
+    });
+    const layout = layoutPlan(parsePlan(json)!);
+    const tables = layout.nodes.filter((n) => n.kind === "table");
+    // 같은 깊이면 x 가 같고 y 는 달라야 한다.
+    expect(new Set(tables.map((t) => t.x)).size).toBe(1);
+    expect(new Set(tables.map((t) => t.y)).size).toBe(3);
+    // 캔버스는 노드를 담을 만큼 커야 한다.
+    expect(layout.height).toBeGreaterThan(tables[2]!.y);
+  });
+
+  it("부모는 자식들의 가운데에 온다", () => {
+    const json = JSON.stringify({
+      query_block: { nested_loop: [{ table: { table_name: "a" } }, { table: { table_name: "b" } }] },
+    });
+    const layout = layoutPlan(parsePlan(json)!);
+    const loop = layout.nodes.find((n) => n.kind === "loop")!;
+    const tables = layout.nodes.filter((n) => n.kind === "table");
+    expect(loop.y).toBeCloseTo((tables[0]!.y + tables[1]!.y) / 2);
+  });
+});

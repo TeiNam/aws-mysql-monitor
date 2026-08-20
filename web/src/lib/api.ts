@@ -15,7 +15,19 @@
  */
 
 import { authHeaders, clearToken } from "./auth";
-import type { AuthConfig, InstanceView, ListResponse, SlowQueryView } from "./types";
+import type {
+  AggregateEnvelope,
+  AuthConfig,
+  AwsInfo,
+  CollectorStatus,
+  DigestRow,
+  InstanceStats,
+  InstanceView,
+  ListResponse,
+  PlanView,
+  SlowQueryView,
+  UserStats,
+} from "./types";
 
 /** 백엔드가 답한 오류. `code` 는 `{"error": …}` 의 값이다. */
 export class ApiError extends Error {
@@ -48,7 +60,7 @@ async function errorCodeOf(res: Response): Promise<string> {
   return `http_${res.status}`;
 }
 
-async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
+async function request(path: string, signal: AbortSignal | null): Promise<Response> {
   const res = await fetch(path, {
     headers: { accept: "application/json", ...authHeaders() },
     // 백엔드가 캐시 헤더를 주지 않는다. 브라우저 휴리스틱 캐시가 낡은 목록을
@@ -56,13 +68,16 @@ async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
     cache: "no-store",
     signal,
   });
-
   if (res.status === 401) {
     clearToken();
     throw new ApiError(401, await errorCodeOf(res));
   }
   if (!res.ok) throw new ApiError(res.status, await errorCodeOf(res));
+  return res;
+}
 
+async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
+  const res = await request(path, signal);
   let body: unknown;
   try {
     body = await res.json();
@@ -79,27 +94,25 @@ async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
   return body as T;
 }
 
-/** 목록 조회 파라미터. 값이 `undefined` 인 항목은 보내지 않는다. */
-export interface ListQuery {
-  instance?: string;
-  env?: string;
-  limit?: number;
-  from_ms?: number;
-  to_ms?: number;
-}
+/** 조회 파라미터. 값이 `undefined`·빈 문자열인 항목은 **보내지 않는다.** */
+export type QueryParams = Record<string, string | number | undefined>;
 
-export function listQueryString(q: ListQuery): string {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(q)) {
+export function queryString(params: QueryParams): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === "") continue;
-    params.set(key, String(value));
+    search.set(key, String(value));
   }
-  const s = params.toString();
-  return s ? `?${s}` : "";
+  const s = search.toString();
+  return s === "" ? "" : `?${s}`;
 }
 
 export function fetchAuthConfig(signal: AbortSignal | null): Promise<AuthConfig> {
   return apiGet<AuthConfig>("/api/auth/config", signal);
+}
+
+export function fetchAwsInfo(signal: AbortSignal | null): Promise<AwsInfo> {
+  return apiGet<AwsInfo>("/api/aws/info", signal);
 }
 
 export async function fetchInstances(signal: AbortSignal | null): Promise<InstanceView[]> {
@@ -109,26 +122,108 @@ export async function fetchInstances(signal: AbortSignal | null): Promise<Instan
 }
 
 export async function fetchSlowQueries(
-  q: ListQuery,
+  params: QueryParams,
   signal: AbortSignal | null,
 ): Promise<ListResponse> {
-  const body = await apiGet<ListResponse>(`/api/slow-queries${listQueryString(q)}`, signal);
+  const body = await apiGet<ListResponse>(`/api/slow-queries${queryString(params)}`, signal);
   if (!Array.isArray(body.items)) throw new ApiError(200, "malformed_response");
   return body;
 }
 
-export function fetchSlowQuery(recordId: string, signal: AbortSignal | null): Promise<SlowQueryView> {
-  // `record_id` 는 `계정/리전/이름:스레드:초` 라서 **슬래시를 담는다.** 인코딩하지
-  // 않으면 라우트가 `/api/queries/{id}` 한 세그먼트에 걸리지 않아 404 가 된다.
+export async function fetchPlans(
+  params: QueryParams,
+  signal: AbortSignal | null,
+): Promise<ListResponse> {
+  const body = await apiGet<ListResponse>(`/api/plans${queryString(params)}`, signal);
+  if (!Array.isArray(body.items)) throw new ApiError(200, "malformed_response");
+  return body;
+}
+
+/**
+ * `record_id` 는 `계정/리전/이름:스레드:초` 라서 **슬래시를 담는다.** 인코딩하지
+ * 않으면 라우트가 한 세그먼트에 걸리지 않아 404 가 된다.
+ */
+export function fetchSlowQuery(
+  recordId: string,
+  signal: AbortSignal | null,
+): Promise<SlowQueryView> {
   return apiGet<SlowQueryView>(`/api/queries/${encodeURIComponent(recordId)}`, signal);
+}
+
+export function fetchPlan(recordId: string, signal: AbortSignal | null): Promise<PlanView> {
+  return apiGet<PlanView>(`/api/queries/${encodeURIComponent(recordId)}/plan`, signal);
+}
+
+export function fetchCollectorStatus(signal: AbortSignal | null): Promise<CollectorStatus> {
+  return apiGet<CollectorStatus>("/api/collector/status", signal);
+}
+
+/**
+ * 수집 제어. **쓰기 경로이므로 `operator` 이상만 통과한다** — 403 이면 화면이
+ * "권한이 없다" 를 말해야 한다(버튼을 숨기지 않는다: 왜 못 누르는지 알려야 한다).
+ */
+async function post<T>(path: string): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { accept: "application/json", ...authHeaders() },
+    cache: "no-store",
+  });
+  if (res.status === 401) {
+    clearToken();
+    throw new ApiError(401, await errorCodeOf(res));
+  }
+  if (!res.ok) throw new ApiError(res.status, await errorCodeOf(res));
+  return (await res.json()) as T;
+}
+
+export const pauseCollector = () => post<CollectorStatus>("/api/collector/pause");
+export const resumeCollector = () => post<CollectorStatus>("/api/collector/resume");
+export const runDiscovery = () => post<CollectorStatus>("/api/discovery/run");
+export const runBackfill = () => post<CollectorStatus>("/api/backfill/run");
+
+/** 마크다운은 JSON 이 아니다 — 텍스트로 받아 브라우저 다운로드로 넘긴다. */
+export async function fetchMarkdown(recordId: string): Promise<string> {
+  const res = await request(`/api/queries/${encodeURIComponent(recordId)}/markdown`, null);
+  return res.text();
+}
+
+export function fetchDigests(
+  params: QueryParams,
+  signal: AbortSignal | null,
+): Promise<AggregateEnvelope<DigestRow>> {
+  return apiGet<AggregateEnvelope<DigestRow>>(`/api/digests${queryString(params)}`, signal);
+}
+
+export function fetchInstanceStatistics(
+  params: QueryParams,
+  signal: AbortSignal | null,
+): Promise<AggregateEnvelope<InstanceStats>> {
+  return apiGet<AggregateEnvelope<InstanceStats>>(`/api/statistics${queryString(params)}`, signal);
+}
+
+export function fetchUserStatistics(
+  params: QueryParams,
+  signal: AbortSignal | null,
+): Promise<AggregateEnvelope<UserStats>> {
+  return apiGet<AggregateEnvelope<UserStats>>(
+    `/api/statistics/users${queryString(params)}`,
+    signal,
+  );
 }
 
 /** react-query 캐시 키. 문자열을 손으로 적으면 무효화가 조용히 빗나간다. */
 export const queryKeys = {
   authConfig: ["auth-config"] as const,
+  awsInfo: ["aws-info"] as const,
+  collectorStatus: ["collector-status"] as const,
   instances: ["instances"] as const,
   /** 필터 조합 전체. 놓친 방송을 복구할 때 이 접두로 무효화한다. */
   slowQueriesAll: ["slow-queries"] as const,
-  slowQueries: (q: ListQuery) => ["slow-queries", q] as const,
+  slowQueries: (p: QueryParams) => ["slow-queries", p] as const,
   slowQuery: (id: string) => ["slow-query", id] as const,
+  plans: (p: QueryParams) => ["plans", p] as const,
+  plan: (id: string) => ["plan", id] as const,
+  digests: (p: QueryParams) => ["digests", p] as const,
+  statistics: (p: QueryParams) => ["statistics", p] as const,
+  userStatistics: (p: QueryParams) => ["user-statistics", p] as const,
 };

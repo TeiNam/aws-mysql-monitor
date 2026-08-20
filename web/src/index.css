@@ -1,11 +1,17 @@
 @import "tailwindcss";
 
 /*
- * 다크 고정.
+ * 라이트 테마.
  *
- * 테마 전환은 요구되지 않았고, 스크롤바·기본 위젯 색까지 맞추려면 `color-scheme`
- * 하나가 CSS 변수 한 벌보다 확실하다.
+ * 참조 대시보드(`my_slow_query_dashboard`)가 흰 배경·회색 캔버스였고, 이 화면을
+ * 쓰는 사람이 그 화면에 익숙하다. `docs/09-frontend.md §9` 는 "다크 모드 기본" 을
+ * 적어 뒀지만 **기존 도구와 같은 모습**이 우선이다 — 같은 일을 하는 두 화면이
+ * 서로 다르게 보이면 그게 곧 오조작이다.
  */
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+}
+
+body {
+  background-color: var(--color-gray-100);
 }

@@ -11,6 +11,7 @@ pub mod aws;
 pub mod collect_loop;
 pub mod collector;
 pub mod config;
+pub mod control;
 pub mod discovery;
 pub mod health;
 pub mod metrics;

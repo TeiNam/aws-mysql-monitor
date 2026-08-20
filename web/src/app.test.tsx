@@ -1,12 +1,14 @@
 /**
- * 화면 통합 테스트 — **인증이 거부되면 화면에서 데이터가 사라져야 한다.**
+ * 화면 통합 테스트.
  *
  * # 왜 DOM 까지 내려와서 보는가
  *
- * 단위 테스트로는 이 결함을 못 잡는다. 스냅샷은 비워졌고 캐시도 지웠는데
- * **이미 마운트된 화면이 마지막 결과를 계속 그리고 있었다** (`queryClient.clear()`
- * 는 관찰자를 되돌리지 않는다). 실제로 브라우저에서 토큰을 무효화하고 확인한
- * 결함이고, 표에 34행의 SQL 이 그대로 남아 있었다.
+ * 단위 테스트로는 두 부류의 결함을 못 잡는다.
+ *
+ * 1. **인증이 거부됐는데 표에 데이터가 남는다.** 스냅샷과 캐시를 비웠는데도 이미
+ *    마운트된 화면이 마지막 결과를 계속 그렸다(`queryClient.clear()` 는 관찰자를
+ *    되돌리지 않는다). 브라우저에서 토큰을 무효화해 확인한 실제 결함이다.
+ * 2. **표가 백엔드 응답의 필드를 실제로 읽는지.** 타입만 맞으면 컴파일은 통과한다.
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -16,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeSocket } from "./lib/fake-socket";
 
 const INSTANCE = "000000000000/ap-northeast-2/mysql84-local";
-const SQL = "SELECT sleep ( ? )";
+const SQL = "SELECT count ( * ) FROM orders WHERE id = ?";
 
 const realWebSocket = globalThis.WebSocket;
 const realFetch = globalThis.fetch;
@@ -24,12 +26,36 @@ const realFetch = globalThis.fetch;
 /** 401 로 뒤집을 수 있는 가짜 백엔드. */
 let unauthorized = false;
 
-function jsonResponse(body: unknown): Response {
+function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" },
   });
 }
+
+const RECORD = {
+  record_id: `${INSTANCE}:12:1700000000`,
+  instance_id: INSTANCE,
+  env: "dev",
+  state: "finalized",
+  thread_id: 12,
+  started_at_ms: Date.now(),
+  duration_ms: 7002,
+  duration_source: "slowlog",
+  capture_source: "merged",
+  app_digest: "d1",
+  statement_type: "select",
+  schema_name: "shop",
+  db_user: "loadgen",
+  sql_text: SQL,
+  sql_redacted_reason: null,
+  sql_text_truncated: false,
+  rows_examined: 20001,
+  rows_sent: 1,
+  lock_time_ms: 0,
+  has_plan: true,
+  abandoned_reason: null,
+};
 
 function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
@@ -41,57 +67,151 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
       }),
     );
   }
+  if (url.startsWith("/api/aws/info")) {
+    return Promise.resolve(
+      json({ account_id: "000000000000", region: "ap-northeast-2", deployment_env: "dev" }),
+    );
+  }
   if (url.startsWith("/api/instances")) {
     return Promise.resolve(
-      jsonResponse([
+      json([
         {
           id: INSTANCE,
+          name: "mysql84-local",
           env: "dev",
+          env_from_tags: "dev",
+          env_override: null,
           state: "collecting",
           engine: "mysql",
           engine_version: "8.4.6",
           endpoint: "127.0.0.1",
+          port: 3306,
+          instance_class: "db.t4g.micro",
+          cluster_id: null,
+          is_cluster_writer: false,
+          iam_auth_enabled: false,
+          vpc_id: "vpc-local",
+          availability_zone: "ap-northeast-2a",
           collectible: true,
+          tags: { env: "dev", team: "dba" },
+          first_seen_ms: Date.now() - 86_400_000,
+          last_seen_ms: Date.now(),
+          deleted_at_ms: null,
+          cert_valid_till_ms: null,
         },
       ]),
     );
   }
-  if (url.startsWith("/api/slow-queries")) {
+  if (url.startsWith("/api/slow-queries") || url.startsWith("/api/plans")) {
+    return Promise.resolve(json({ items: [RECORD], next_cursor: null, has_more: false, total: 1 }));
+  }
+  if (url.includes("/plan")) {
     return Promise.resolve(
-      jsonResponse({
+      json({
+        record_id: RECORD.record_id,
+        instance_id: INSTANCE,
+        started_at_ms: RECORD.started_at_ms,
+        duration_ms: RECORD.duration_ms,
+        statement_type: "select",
+        normalized_json: '{"query_block":{"select_id":1,"message":"No tables used"}}',
+        tree_text: null,
+        format_version: "json_v1",
+        s3_key: null,
+        fingerprint: "e3b0c44298fc1c14",
+        referenced_tables: [],
+        source: "rerun",
+        error: null,
+      }),
+    );
+  }
+  if (url.startsWith("/api/digests")) {
+    return Promise.resolve(
+      json({
         items: [
           {
-            record_id: `${INSTANCE}:12:1700000000`,
             instance_id: INSTANCE,
-            env: "dev",
-            state: "finalized",
-            thread_id: 12,
-            started_at_ms: Date.now(),
-            duration_ms: 7002,
-            duration_source: "slowlog",
-            capture_source: "merged",
             app_digest: "d1",
+            digest_query: SQL,
+            users: ["loadgen"],
             statement_type: "select",
             schema_name: "shop",
-            db_user: "loadgen",
-            sql_text: SQL,
-            sql_redacted_reason: null,
-            sql_text_truncated: false,
-            rows_examined: 1,
-            rows_sent: 1,
-            lock_time_ms: 0,
-            has_plan: false,
-            abandoned_reason: null,
+            exec_count: 21,
+            total_time_ms: 186_774,
+            avg_time_ms: 8_894,
+            max_time_ms: 11_002,
+            avg_rows_examined: 1_234,
+            first_seen_ms: Date.now() - 1000,
+            last_seen_ms: Date.now(),
           },
         ],
-        next_cursor: null,
-        has_more: false,
+        scanned: 83,
+        truncated: false,
+        from_ms: Date.now() - 86_400_000,
+        to_ms: Date.now(),
+        month: "2026-08",
+      }),
+    );
+  }
+  if (url.startsWith("/api/statistics/users")) {
+    return Promise.resolve(
+      json({
+        items: [
+          {
+            instance_id: INSTANCE,
+            user: "loadgen",
+            total_queries: 51,
+            unique_digest_count: 6,
+            total_exec_time_ms: 1_580_312,
+            avg_execution_time_ms: 30_987,
+            max_execution_time_ms: 1_287_986,
+            read_query_count: 47,
+            write_query_count: 4,
+            ddl_query_count: 0,
+            commit_query_count: 0,
+            other_query_count: 0,
+          },
+        ],
+        scanned: 83,
+        truncated: false,
+        from_ms: 0,
+        to_ms: 1,
+        month: "2026-08",
+      }),
+    );
+  }
+  if (url.startsWith("/api/statistics")) {
+    return Promise.resolve(
+      json({
+        items: [
+          {
+            instance_id: INSTANCE,
+            unique_digest_count: 8,
+            total_slow_query_count: 83,
+            total_execution_count: 83,
+            total_execution_time_ms: 1_687_477,
+            avg_execution_time_ms: 20_331,
+            max_execution_time_ms: 1_287_986,
+            total_rows_examined: 85_574,
+            read_query_count: 58,
+            write_query_count: 4,
+            ddl_query_count: 0,
+            commit_query_count: 0,
+            other_query_count: 21,
+            first_seen_ms: 0,
+            last_seen_ms: 1,
+          },
+        ],
+        scanned: 83,
+        truncated: true,
+        from_ms: 0,
+        to_ms: 1,
+        month: "2026-08",
       }),
     );
   }
   if (url.startsWith("/api/auth/config")) {
     return Promise.resolve(
-      jsonResponse({ mode: "local-token", cognito_configured: false, deployment_env: "dev" }),
+      json({ mode: "local-token", cognito_configured: false, deployment_env: "dev" }),
     );
   }
   return Promise.resolve(new Response("not found", { status: 404 }));
@@ -111,7 +231,7 @@ beforeEach(() => {
 afterEach(() => {
   // ⚠ **자동 정리에 기대지 않는다.** RTL 의 auto-cleanup 은 `afterEach` 가
   // 전역일 때만 붙는데 이 프로젝트는 `globals: false` 다 — 정리하지 않으면 앞
-  // 테스트의 DOM 이 남아 `findAllByText` 개수가 조용히 어긋난다.
+  // 테스트의 DOM 이 남아 조회 결과가 조용히 어긋난다.
   cleanup();
   globalThis.WebSocket = realWebSocket;
   globalThis.fetch = realFetch;
@@ -133,29 +253,21 @@ async function renderApp(path: string) {
   );
 }
 
-describe("인증 거부", () => {
-  it("스트림이 거부되면 표에 남아 있던 SQL 이 사라지고 토큰 안내가 나온다", async () => {
-    await renderApp("/slow-queries");
+describe("MySQL Monitor", () => {
+  it("슬로우 쿼리 표와 AWS 계정을 보여준다", async () => {
+    await renderApp("/mysql");
     expect(await screen.findByText(SQL)).toBeDefined();
-
-    // 서버가 재인증에서 거부한다(T-33: 권한이 줄었거나 토큰이 만료됐다).
-    unauthorized = true;
-    FakeSocket.latest().accept();
-    FakeSocket.latest().deliver({ t: "error", code: "unauthorized" });
-
-    await waitFor(() => {
-      expect(screen.queryByText(SQL)).toBeNull();
-    });
-    expect(screen.getByText("접속 토큰이 필요하다")).toBeDefined();
-    // 거부된 토큰은 버려야 한다 — 남겨 두면 계속 401 을 만든다.
-    expect(sessionStorage.getItem("dbmon.token")).toBeNull();
+    // 계정 착각을 막는 머리말. `<strong>Account:</strong>` 와 값이 형제라서
+    // 머리말 전체(`role=banner`)를 본다.
+    expect(screen.getByRole("banner").textContent).toContain("000000000000");
+    expect(screen.getByRole("banner").textContent).toContain("ap-northeast-2");
+    // 조사 행이 표에 실제로 들어간다.
+    expect(screen.getByText(/20,001/)).toBeDefined();
   });
-});
 
-describe("플릿 개요", () => {
-  it("실시간 지표가 오면 표에 채운다", async () => {
-    await renderApp("/");
-    expect(await screen.findByText("mysql84-local")).toBeDefined();
+  it("실시간 지표가 오면 상태 표에 채운다", async () => {
+    await renderApp("/mysql");
+    expect(await screen.findByText(SQL)).toBeDefined();
 
     const socket = FakeSocket.latest();
     socket.makeReady();
@@ -173,19 +285,56 @@ describe("플릿 개요", () => {
       },
     });
 
-    // 두 곳에 나타난다 — 합계 타일과 인스턴스 행. 하나만 찾으면 어느 쪽이
-    // 비었는지 모른다.
-    expect(await screen.findAllByText("13.4")).toHaveLength(2);
+    expect(await screen.findByText("13.4")).toBeDefined();
+  });
+});
+
+describe("인증 거부", () => {
+  it("스트림이 거부되면 표에 남아 있던 SQL 이 사라지고 토큰 안내가 나온다", async () => {
+    await renderApp("/mysql");
+    expect(await screen.findByText(SQL)).toBeDefined();
+
+    // 서버가 재인증에서 거부한다(T-33: 권한이 줄었거나 토큰이 만료됐다).
+    unauthorized = true;
+    FakeSocket.latest().accept();
+    FakeSocket.latest().deliver({ t: "error", code: "unauthorized" });
+
+    await waitFor(() => {
+      expect(screen.queryByText(SQL)).toBeNull();
+    });
+    expect(screen.getByText("접속 토큰이 필요하다")).toBeDefined();
+    // 거부된 토큰은 버려야 한다 — 남겨 두면 계속 401 을 만든다.
+    expect(sessionStorage.getItem("dbmon.token")).toBeNull();
+  });
+});
+
+describe("다이제스트·통계·플랜·인스턴스 화면", () => {
+  it("다이제스트 표가 집계 값을 읽는다", async () => {
+    await renderApp("/cloudwatch");
+    expect(await screen.findByText("21")).toBeDefined(); // exec count
+    expect(screen.getByText("186.77")).toBeDefined(); // total time (s)
+    expect(screen.getByText("loadgen")).toBeDefined();
   });
 
-  it("구독이 거부되면 배너로 알린다", async () => {
-    await renderApp("/");
-    expect(await screen.findByText("mysql84-local")).toBeDefined();
+  it("천장에 걸리면 통계 화면이 그 사실을 말한다", async () => {
+    await renderApp("/statistics");
+    // 조용히 자르지 않는다 — 이 문구가 없으면 "그만큼만 실행됐다" 로 읽힌다.
+    expect(await screen.findByText(/조회 상한에 걸려/)).toBeDefined();
+    expect(screen.getByText(/읽기 58/)).toBeDefined();
+  });
 
-    const socket = FakeSocket.latest();
-    socket.makeReady();
-    socket.deliver({ t: "subscribed", topics: [], denied: [`status:inst=${INSTANCE}`] });
+  it("플랜 화면이 계획 그래프를 그린다", async () => {
+    await renderApp("/plan");
+    // `message` 만 있는 계획도 노드로 나온다. SVG 는 `<text>` 와 툴팁 `<title>`
+    // 둘에 같은 문자열을 담으므로 둘 다 세어 준다.
+    expect(await screen.findAllByText("No tables used")).toHaveLength(2);
+    expect(screen.getByRole("img", { name: /실행계획 노드/ })).toBeDefined();
+  });
 
-    expect(await screen.findByText(/구독이 거부된 토픽/)).toBeDefined();
+  it("RDS 화면이 태그와 수집 여부를 보여준다", async () => {
+    await renderApp("/rds");
+    expect(await screen.findByText("env=dev")).toBeDefined();
+    expect(screen.getByText("team=dba")).toBeDefined();
+    expect(screen.getByText("수집")).toBeDefined();
   });
 });

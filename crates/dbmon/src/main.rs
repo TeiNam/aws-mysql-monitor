@@ -1012,15 +1012,28 @@ fn spawn_instance_collector(
 /// F1 의 산술("합계가 64 또는 0")은 그 상태에서도 **성립한다** — `shards_owned()` 이
 /// `is_leader()` 하나에서 파생되기 때문이다. 불변식을 코드로 강제해도 이 실패는
 /// 잡히지 않는다. 그래서 역할 검사를 리스 획득보다 **앞에** 둔다.
+/// 리더 루프가 쓰는 런타임 배선. **인자를 여덟 개 넘기지 않기 위해 묶는다.**
+struct LoopWiring {
+    readiness: Arc<Readiness>,
+    shutdown: Arc<Shutdown>,
+    hub: dbmon::api::hub::Hub,
+    /// 화면에서 온 조작(멈춤·즉시 탐색·즉시 백필). 조회 API 와 공유한다.
+    controls: Arc<dbmon::control::Controls>,
+}
+
 fn spawn_leader_loop(
     config: &Config,
     worker_id: String,
     stores: Stores,
     auth: TargetAuth,
-    readiness: Arc<Readiness>,
-    shutdown: Arc<Shutdown>,
-    hub: dbmon::api::hub::Hub,
+    wiring: LoopWiring,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    let LoopWiring {
+        readiness,
+        shutdown,
+        hub,
+        controls,
+    } = wiring;
     use dbmon::worker::{LeaderGate, tick_interval};
     use dbmon_core::time::{Clock, SystemClock};
 
@@ -1117,12 +1130,48 @@ fn spawn_leader_loop(
                 // 그 사이 **수집 태스크가 0개인데 `/readyz` 는 리더라고 보고한다.**
                 // 리스 다툼이 5분보다 잦으면 수집이 한 번도 돌지 않는다.
                 last_discovery_ms = 0;
+                // **standby 도 게시한다.** 화면이 "리더가 아니라서 안 돈다" 와
+                // "멈춰 있다" 를 구분해야 한다.
+                controls.publish_tick(SystemClock.now_ms(), false, 0);
             } else {
                 let now_ms = SystemClock.now_ms();
+
+                // ── 화면에서 멈춤을 눌렀다 ────────────────────────────────────
+                //
+                // **리스는 그대로 쥔다.** 반납하면 다른 워커가 즉시 리더가 되어
+                // 수집을 계속하고, 그건 멈춘 것이 아니다. 태스크만 멈춘다.
+                if controls.is_paused() {
+                    if !tasks.running().is_empty() {
+                        tracing::warn!(
+                            stopped = tasks.running().len(),
+                            "수집이 일시정지됐다 (화면 조작) — 이 구간은 기록되지 않는다"
+                        );
+                        // `drain_all` 이 아니라 `abort_all` 이다: 재개할 때 다시
+                        // 훑으므로 진행 중 레코드를 확정할 필요가 없고, 드레인은
+                        // 예산을 먹는다.
+                        tasks.abort_all();
+                    }
+                    controls.publish_tick(now_ms, true, 0);
+                    // 재개하면 즉시 한 라운드 돌게 한다.
+                    last_discovery_ms = 0;
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+                controls.publish_tick(now_ms, true, tasks.running().len());
+
+                // 화면에서 "지금 훑어" 를 눌렀으면 주기를 기다리지 않는다.
+                if controls.take_discovery_request() {
+                    last_discovery_ms = 0;
+                }
+                if controls.take_backfill_request() {
+                    last_backfill_ms = 0;
+                }
+
                 if now_ms - last_discovery_ms >= discovery_interval.as_millis() as i64 {
                     // **실행 전에 시각을 찍는다.** 실패해도 다음 주기까지 기다린다 —
                     // 실패 시 즉시 재시도하면 AWS 장애 중에 핫 루프가 된다.
                     last_discovery_ms = now_ms;
+                    controls.publish_discovery(now_ms);
                     if sources.is_none() {
                         sources = Some(Arc::new(build_discovery(&config).await));
                     }
@@ -1271,6 +1320,7 @@ fn spawn_leader_loop(
                 // `rows_examined` 를 줄 수 없다 — 실행 중에는 0 이기 때문이다.
                 if now_ms - last_backfill_ms >= (config.collector.backfill_secs as i64) * 1000 {
                     last_backfill_ms = now_ms;
+                    controls.publish_backfill(now_ms);
                     if fetcher.is_none() {
                         fetcher = Some(build_slowlog_fetcher(&config).await);
                     }
@@ -1556,6 +1606,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             let worker_id = worker_id(&config);
             tracing::info!(%worker_id, "워커 식별자");
 
+            // 화면 조작과 리더 루프가 공유하는 제어 플래그.
+            let controls = Arc::new(dbmon::control::Controls::new());
+
             // 조회 API 상태. **역할과 무관하게 만든다** — `role=collector` 도 저장소를
             // 갖고 있고, 로컬 개발에서는 한 프로세스가 둘을 겸한다.
             let bind_is_loopback = dbmon::api::auth::is_loopback_bind(&config.http.bind);
@@ -1576,6 +1629,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 // 이런 도구에서 가장 비싼 실수다.
                 aws_account_id: config.aws.account_id.clone(),
                 aws_region: config.aws.region.clone(),
+                controls: Arc::clone(&controls),
+                worker_id: worker_id.clone(),
             });
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
@@ -1585,9 +1640,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 worker_id,
                 stores,
                 auth,
-                readiness.clone(),
-                shutdown.clone(),
-                hub.clone(),
+                LoopWiring {
+                    readiness: readiness.clone(),
+                    shutdown: shutdown.clone(),
+                    hub: hub.clone(),
+                    controls: Arc::clone(&controls),
+                },
             )
         }
         Err(e) => {

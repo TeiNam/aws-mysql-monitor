@@ -40,8 +40,12 @@ pub struct DigestRow {
     pub total_time_ms: i64,
     pub avg_time_ms: f64,
     pub max_time_ms: i64,
-    /// 평균 조사 행. **행 정보가 있는 실행만 분모에 넣는다** — 실시간 캡처는 행
-    /// 카운터를 얻지 못하므로 `None` 이 섞인다([19 §G2]).
+    /// 평균 조사 행.
+    ///
+    /// **실시간 캡처만으로 만든 실행은 분모에서 뺀다.** `PROCESSLIST` 는 실행 *중*
+    /// 문장의 행 카운터를 주지 못해 `0` 이 들어오고([19 §G2]), 그 `0` 을 평균에
+    /// 넣으면 값이 깎여 "인덱스가 잘 타고 있다" 로 오독된다. 슬로우로그가 붙은
+    /// 실행(`slowlog`·`merged`·`backfill`)의 `0` 은 **진짜 0** 이므로 센다.
     pub avg_rows_examined: Option<f64>,
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
@@ -153,9 +157,12 @@ impl Counters {
         self.count += 1;
         self.total_time_ms += view.duration_ms;
         self.max_time_ms = self.max_time_ms.max(view.duration_ms);
+        // 실시간 캡처만으로 만든 레코드의 행 수는 **측정값이 아니다.**
         if let Some(rows) = view.rows_examined {
-            self.rows_examined_sum += rows;
-            self.rows_examined_n += 1;
+            if view.capture_source != "processlist" {
+                self.rows_examined_sum += rows;
+                self.rows_examined_n += 1;
+            }
         }
         match classify(&view.statement_type, view.sql_text.as_deref()) {
             Kind::Read => self.read += 1,
@@ -173,7 +180,7 @@ impl Counters {
         self.total_time_ms as f64 / self.count as f64
     }
 
-    /// 행 정보가 하나도 없으면 **`None`** 이다. `0` 으로 내면 "행을 안 읽었다" 가 된다.
+    /// 측정된 실행이 하나도 없으면 **`None`** 이다. `0` 으로 내면 "행을 안 읽었다" 가 된다.
     fn avg_rows_examined(&self) -> Option<f64> {
         if self.rows_examined_n == 0 {
             return None;
@@ -377,22 +384,38 @@ mod tests {
         assert_eq!(rows[0].users, vec!["app", "batch"]);
     }
 
-    /// **행 정보가 없는 실행을 분모에 넣지 않는다.**
+    /// **측정되지 않은 행 수를 분모에 넣지 않는다.**
     ///
-    /// 실시간 캡처는 실행 중 문장의 행 카운터를 얻을 수 없다. `None` 을 0 으로
-    /// 세면 평균이 절반으로 깎이고, 그건 "인덱스가 잘 타고 있다" 로 오독된다.
+    /// 실시간 캡처는 실행 중 문장의 행 카운터를 얻을 수 없어 `0` 이 들어온다.
+    /// 그 `0` 을 평균에 넣으면 값이 깎이고, 그건 "인덱스가 잘 타고 있다" 로 오독된다.
+    /// 실측: 로컬 83건 중 처리목록 전용 7건이 전부 `rows_examined=0` 이었다.
     #[test]
-    fn rows_examined_average_ignores_records_without_row_counters() {
+    fn rows_examined_average_ignores_unmeasured_captures() {
         let rows = digest_rows(&[
-            view(|v| v.rows_examined = Some(100)),
+            view(|v| {
+                v.capture_source = "slowlog".into();
+                v.rows_examined = Some(100);
+            }),
+            view(|v| {
+                // 실시간 캡처의 0 은 측정값이 아니다.
+                v.capture_source = "processlist".into();
+                v.rows_examined = Some(0);
+            }),
             view(|v| v.rows_examined = None),
         ]);
         assert_eq!(rows[0].avg_rows_examined, Some(100.0));
 
+        // 슬로우로그가 붙은 0 은 **진짜 0** 이므로 센다.
+        let real_zero = digest_rows(&[view(|v| {
+            v.capture_source = "merged".into();
+            v.rows_examined = Some(0);
+        })]);
+        assert_eq!(real_zero[0].avg_rows_examined, Some(0.0));
+
         let none_at_all = digest_rows(&[view(|v| v.rows_examined = None)]);
         assert_eq!(
             none_at_all[0].avg_rows_examined, None,
-            "행 정보가 하나도 없으면 0 이 아니라 없음이다"
+            "측정된 실행이 하나도 없으면 0 이 아니라 없음이다"
         );
     }
 

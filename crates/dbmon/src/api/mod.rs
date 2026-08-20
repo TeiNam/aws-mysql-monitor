@@ -77,6 +77,10 @@ pub struct ApiState {
     /// 운영자가 "지금 어느 계정을 보고 있나" 를 화면에서 확인해야 한다.
     pub aws_account_id: String,
     pub aws_region: String,
+    /// 수집 제어. 리더 루프와 공유한다 (`crate::control`).
+    pub controls: Arc<crate::control::Controls>,
+    /// 이 워커의 식별자. **어느 워커를 멈췄는지** 화면이 알아야 한다.
+    pub worker_id: String,
 }
 
 pub fn router(state: ApiState) -> axum::Router {
@@ -92,6 +96,14 @@ pub fn router(state: ApiState) -> axum::Router {
         .route("/api/statistics", get(instance_statistics))
         .route("/api/statistics/users", get(user_statistics))
         .route("/api/instances", get(list_instances))
+        .route("/api/collector/status", get(collector_status))
+        .route("/api/collector/pause", axum::routing::post(collector_pause))
+        .route(
+            "/api/collector/resume",
+            axum::routing::post(collector_resume),
+        )
+        .route("/api/discovery/run", axum::routing::post(discovery_run))
+        .route("/api/backfill/run", axum::routing::post(backfill_run))
         .route("/api/ws", get(ws::handler))
         .with_state(state)
 }
@@ -711,6 +723,104 @@ async fn get_query_markdown(
         .into_response())
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 수집 제어 (참조 구현의 `POST /mysql/start|stop`, `POST /collectors/rds-instances`)
+//
+// **쓰기 경로다.** 조회는 `viewer` 도 하지만, 수집을 멈추는 것은 관측을 멈추는 것이고
+// 그 사이의 슬로우 쿼리는 영구히 없다. `operator` 이상만 허용한다.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 조작 권한. `viewer` 는 볼 수만 있다.
+fn require_operator(ctx: &AuthContext) -> Result<(), ApiError> {
+    match ctx.role {
+        dbmon_core::rbac::Role::Operator | dbmon_core::rbac::Role::Admin => Ok(()),
+        dbmon_core::rbac::Role::Viewer => {
+            Err(ApiError::new(StatusCode::FORBIDDEN, "role_required"))
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CollectorStatus {
+    #[serde(flatten)]
+    snapshot: crate::control::ControlSnapshot,
+    worker_id: String,
+    /// 이 플래그가 어디까지 적용되는가. 여러 워커를 띄웠으면 **이 프로세스뿐**이다.
+    scope: &'static str,
+    /// 조작할 수 있는 역할인가. 화면이 버튼을 비활성화하는 근거.
+    can_control: bool,
+    role: String,
+}
+
+async fn collector_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorStatus>, ApiError> {
+    let ctx = context_of(&state, &headers)?;
+    Ok(Json(CollectorStatus {
+        snapshot: state.controls.snapshot(),
+        worker_id: state.worker_id.clone(),
+        scope: "process",
+        can_control: require_operator(&ctx).is_ok(),
+        role: ctx.role.as_str().to_string(),
+    }))
+}
+
+async fn collector_pause(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorStatus>, ApiError> {
+    let ctx = context_of(&state, &headers)?;
+    require_operator(&ctx)?;
+    state.controls.set_paused(true, SystemClock.now_ms());
+    // **감사 로그를 남긴다.** 관측이 멈춘 구간은 나중에 반드시 질문거리가 된다.
+    tracing::warn!(
+        subject = %ctx.subject,
+        worker = %state.worker_id,
+        "수집을 멈췄다 (화면 조작) — 이 구간의 슬로우 쿼리는 기록되지 않는다"
+    );
+    collector_status(State(state), headers).await
+}
+
+async fn collector_resume(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorStatus>, ApiError> {
+    let ctx = context_of(&state, &headers)?;
+    require_operator(&ctx)?;
+    state.controls.set_paused(false, SystemClock.now_ms());
+    tracing::warn!(subject = %ctx.subject, worker = %state.worker_id, "수집을 재개했다 (화면 조작)");
+    collector_status(State(state), headers).await
+}
+
+/// 탐색을 즉시 돌린다. 참조 구현의 "인스턴스 수집" 버튼.
+async fn discovery_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorStatus>, ApiError> {
+    let ctx = context_of(&state, &headers)?;
+    require_operator(&ctx)?;
+    state.controls.request_discovery();
+    tracing::info!(subject = %ctx.subject, "탐색을 요청했다 (화면 조작)");
+    collector_status(State(state), headers).await
+}
+
+/// 슬로우로그 백필을 즉시 돌린다. 참조 구현의 "데이터 수집" 버튼.
+///
+/// ⚠ **임의 구간을 지정할 수는 없다.** 백필은 체크포인트부터 현재까지를 읽는
+/// 구조이고, 지난달을 다시 훑으려면 별도 작업(잡 큐)이 필요하다. 지금 할 수 있는
+/// 것은 "다음 주기를 기다리지 말고 지금 돌려라" 다.
+async fn backfill_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorStatus>, ApiError> {
+    let ctx = context_of(&state, &headers)?;
+    require_operator(&ctx)?;
+    state.controls.request_backfill();
+    tracing::info!(subject = %ctx.subject, "백필을 요청했다 (화면 조작)");
+    collector_status(State(state), headers).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +830,37 @@ mod tests {
         // 상한을 넘겨도 잘린다 — 클라이언트가 1만 건을 요구할 수 없다.
         assert_eq!(usize::MAX.clamp(1, MAX_LIMIT), MAX_LIMIT);
         assert_eq!(0usize.clamp(1, MAX_LIMIT), 1);
+    }
+
+    /// **`viewer` 는 수집을 멈출 수 없다.** 관측을 멈추는 것은 그 구간의 슬로우
+    /// 쿼리를 영구히 잃는 것이고, 조회 권한과 같은 급이 아니다.
+    #[test]
+    fn only_operators_may_control_collection() {
+        use dbmon_core::rbac::Role;
+        let ctx = |role| AuthContext {
+            subject: "u".into(),
+            role,
+            env_scope: vec![Env::Dev],
+            can_see_literals: false,
+            claims_version: 0,
+        };
+        assert!(require_operator(&ctx(Role::Admin)).is_ok());
+        assert!(require_operator(&ctx(Role::Operator)).is_ok());
+        assert!(require_operator(&ctx(Role::Viewer)).is_err());
+    }
+
+    /// 월 경계는 **KST** 다. UTC 로 자르면 매월 초 9시간이 이전 달로 간다.
+    #[test]
+    fn month_boundaries_are_kst() {
+        let r = month_range("2026-08").expect("유효한 월");
+        // 2026-08-01 00:00 KST = 2026-07-31 15:00 UTC
+        assert_eq!(r.from_ms(), 1_785_510_000_000);
+        // 2026-09-01 00:00 KST
+        assert_eq!(r.to_ms(), 1_788_188_400_000);
+        assert!(month_range("2026-13").is_none());
+        assert!(month_range("2026-00").is_none());
+        assert!(month_range("nope").is_none());
+        assert!(month_range("2026").is_none());
     }
 
     #[test]
