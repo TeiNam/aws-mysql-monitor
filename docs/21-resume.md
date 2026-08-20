@@ -33,9 +33,10 @@
 2. **React SPA + 정적 서빙 + 9차 2way 리뷰** — 다크 4화면. **참조 구현을 보지 않아
    전부 다시 만들었다**(§0)
 3. **참조 대시보드 이식** — 조회 경로 8개 추가 + 5화면 재구성 + 수집 제어
-4. **2way 리뷰 2·3라운드** — 커밋 `39ccddb`, `8b218b0`. 읽기 경로를 하나로 합치고
-   (`collect_views`), 일시정지가 **태스크를 정말 멈추게** 고쳤다
-   ([20 §2way 리뷰 2라운드·3라운드](20-review-log.md))
+4. **2way 리뷰 2·3·4라운드** — 커밋 `39ccddb`, `8b218b0`, `55e8086`. 읽기 경로를
+   하나로 합치고(`collect_views`), 일시정지가 **태스크를 정말 멈추게** 고쳤고,
+   **읽은 구간을 화면에 정직하게 말하게** 했다
+   ([20 §2way 리뷰 2~4라운드](20-review-log.md))
 
 `docs/09-frontend.md` 가 규정한 SPA 가 실제로 돌아간다. 그리고 그 프론트가
 **백엔드 결함 하나를 드러냈다**(WS 유휴 종료 — [20 §R9-1](20-review-log.md)).
@@ -63,7 +64,7 @@
 | `lib/live{,-reduce}.ts` | WS 배관과 판정부(순수). 실시간 지표·방송 |
 | `components/{Shell,Card,Pagination,SqlModal,ui}.tsx` | 껍데기·카드·페이지네이션·SQL 팝업·클래스 상수 |
 
-테스트: **Rust 681개 + web 67개**, `cargo clippy --workspace --all-targets` 경고 0.
+테스트: **Rust 682개 + web 67개**, `cargo clippy --workspace --all-targets` 경고 0.
 
 ### 의존성
 
