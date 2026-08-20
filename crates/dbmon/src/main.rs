@@ -1216,63 +1216,82 @@ fn spawn_leader_loop(
                         // `gate.refresh()` 가 안 돌아 리스를 잃는다.
                         tasks.drain_all(PAUSE_DRAIN_BUDGET).await;
                     }
-                    // ② 그래도 남은 **진행 중 레코드를 사유와 함께 확정한다.**
+                    // ② 정리 작업은 **전체가 하나의 예산 안에서** 돈다.
                     //
-                    // 남겨 두면 그 레코드는 이 워커의 epoch 소유이므로 **고아 스윕이
-                    // `Mine` 으로 보고 매번 건너뛴다** — 리더가 바뀌거나 TTL 이 지날
-                    // 때까지 영구히 "진행 중" 이다(F4 가 막으려던 유령 상태).
-                    // `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
-                    //
-                    // **전역 목록에서 내 것을 골라낸다.** GSI1 은 워커로 나뉘어 있지
-                    // 않으므로 다른 워커의 진행 중 레코드가 앞자리를 차지할 수 있다
-                    // (오래된 순). 상한을 스윕과 같게 두고, **꽉 찼으면 말한다** —
-                    // 그 뒤에 내 레코드가 남았을 수 있다는 뜻이다.
-                    use dbmon_core::ports::SlowQueryStore as _;
-                    if let Ok(Ok(in_flight)) =
-                        run_in_budget(stores.slow_query.list_in_flight(ORPHAN_SWEEP_LIMIT)).await
-                    {
-                        if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
-                            tracing::warn!(
-                                limit = ORPHAN_SWEEP_LIMIT,
-                                "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
-                            );
-                        }
-                        let mut closed = 0usize;
-                        for q in &in_flight {
-                            if q.owner_worker.as_deref() != Some(gate.worker_id())
-                                || q.owner_epoch != gate.epoch()
-                            {
-                                continue;
-                            }
-                            let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
-                            if stores.slow_query.upsert_merged(&marked).await.is_ok() {
-                                closed += 1;
-                            }
-                        }
-                        if closed > 0 {
-                            tracing::warn!(
-                                closed,
-                                "일시정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
-                            );
-                        }
-                    }
-
-                    // ③ **멈춰 있어도 고아 스윕은 돈다.**
-                    //
-                    // 이 분기는 루프 뒤쪽을 건너뛰므로 예전에는 스윕도 함께 멈췄다
-                    // (4라운드 지적). 사람이 며칠 멈춰 두면 **다른 워커·이전 epoch 의
-                    // 고아가 그동안 계속 "진행 중"** 으로 남는다 — F4 가 없애려던 상태다.
-                    if now_ms - last_sweep_ms >= (config.collector.orphan_sweep_secs as i64) * 1000
-                    {
+                    // 조회 20초 + 쓰기 20초 + 스윕 20초를 각각 재면 합이 리스 TTL(60초)
+                    // 을 넘을 수 있다(5라운드 지적). 그러면 **멈추려다 리더를 잃고**,
+                    // `paused` 플래그가 없는 다른 프로세스가 리더가 되어 수집을 이어간다 —
+                    // 화면에는 "멈춤" 인데 기록은 계속 쌓인다. 하나로 묶으면 그 합이
+                    // 예산을 넘지 않는다. 남은 일은 다음 tick 이 같은 목록을 다시 본다.
+                    let sweep_due = now_ms - last_sweep_ms
+                        >= (config.collector.orphan_sweep_secs as i64) * 1000;
+                    if sweep_due {
                         last_sweep_ms = now_ms;
-                        sweep_orphans(
-                            &stores.slow_query,
-                            &collect_deps.worker_id,
-                            gate.epoch(),
-                            now_ms,
-                            &config,
-                        )
-                        .await;
+                    }
+                    let maintenance = run_in_budget(async {
+                        // 남은 **진행 중 레코드를 사유와 함께 확정한다.**
+                        //
+                        // 남겨 두면 그 레코드는 이 워커의 epoch 소유이므로 **고아 스윕이
+                        // `Mine` 으로 보고 매번 건너뛴다** — 리더가 바뀌거나 TTL 이 지날
+                        // 때까지 영구히 "진행 중" 이다(F4 가 막으려던 유령 상태).
+                        // `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
+                        //
+                        // **전역 목록에서 내 것을 골라낸다.** GSI1 은 워커로 나뉘어 있지
+                        // 않으므로 다른 워커의 진행 중 레코드가 앞자리를 차지할 수 있다
+                        // (오래된 순). 상한을 스윕과 같게 두고, **꽉 찼으면 말한다** —
+                        // 그 뒤에 내 레코드가 남았을 수 있다는 뜻이다.
+                        use dbmon_core::ports::SlowQueryStore as _;
+                        if let Ok(in_flight) =
+                            stores.slow_query.list_in_flight(ORPHAN_SWEEP_LIMIT).await
+                        {
+                            if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
+                                tracing::warn!(
+                                    limit = ORPHAN_SWEEP_LIMIT,
+                                    "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
+                                );
+                            }
+                            let mut closed = 0usize;
+                            for q in &in_flight {
+                                if q.owner_worker.as_deref() != Some(gate.worker_id())
+                                    || q.owner_epoch != gate.epoch()
+                                {
+                                    continue;
+                                }
+                                let marked =
+                                    dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
+                                if stores.slow_query.upsert_merged(&marked).await.is_ok() {
+                                    closed += 1;
+                                }
+                            }
+                            if closed > 0 {
+                                tracing::warn!(
+                                    closed,
+                                    "일시정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
+                                );
+                            }
+                        }
+
+                        // **멈춰 있어도 고아 스윕은 돈다.**
+                        //
+                        // 이 분기는 루프 뒤쪽을 건너뛰므로 예전에는 스윕도 함께 멈췄다
+                        // (4라운드 지적). 사람이 며칠 멈춰 두면 **다른 워커·이전 epoch 의
+                        // 고아가 그동안 계속 "진행 중"** 으로 남는다 — F4 가 없애려던 상태다.
+                        if sweep_due {
+                            sweep_orphans(
+                                &stores.slow_query,
+                                &collect_deps.worker_id,
+                                gate.epoch(),
+                                now_ms,
+                                &config,
+                            )
+                            .await;
+                        }
+                    })
+                    .await;
+                    if maintenance.is_err() {
+                        tracing::warn!(
+                            "일시정지 정리가 예산을 넘겼다 — 리스를 지키려고 끊는다. 남은 일은 다음 tick 이 이어서 한다"
+                        );
                     }
 
                     controls.publish_tick(now_ms, true, 0);

@@ -195,3 +195,35 @@ export function recentMonths(now: Date, count: number): string[] {
   for (let i = 0; i < count; i += 1) out.push(monthKey(now, -i));
   return out;
 }
+
+/**
+ * 카드 제목에 쓸 구간 이름. **요청한 달이 아니라 서버가 실제로 읽은 구간을 말한다.**
+ *
+ * # 왜 필요한가
+ *
+ * 서버는 파티션 예산을 넘으면 구간을 최신 쪽으로 좁혀 읽고, 응답에 그 구간을 담아
+ * 준다. 화면이 `(2026-08)` 이라고만 적으면 **8일치 집계가 "8월 통계" 가 된다** —
+ * 조사하던 사람이 한 달을 봤다고 믿고 결론을 낸다. 좁혀졌으면 좁혀진 구간을 적는다.
+ *
+ * 좁혀졌는지는 응답 구간이 그 달을 덮는지로 판정한다(경계는 KST, 서버와 같다).
+ */
+export function monthRangeLabel(
+  month: string,
+  fromMs: number | null | undefined,
+  toMs: number | null | undefined,
+): string {
+  if (fromMs === null || fromMs === undefined || toMs === null || toMs === undefined) return month;
+  const [y, m] = month.split("-").map(Number);
+  if (y === undefined || m === undefined || Number.isNaN(y) || Number.isNaN(m)) return month;
+  // KST 월 경계를 epoch 로. `Date.UTC(...) - 9h` 가 KST 자정이다.
+  const start = Date.UTC(y, m - 1, 1) - 9 * 3_600_000;
+  const end = Date.UTC(m === 12 ? y + 1 : y, m === 12 ? 0 : m, 1) - 9 * 3_600_000 - 1;
+  if (fromMs <= start && toMs >= end) return month;
+  return `${month} 중 ${fmtDayKst(fromMs)}~${fmtDayKst(toMs)}`;
+}
+
+/** `MM-DD` (KST). 좁혀진 구간을 짧게 적기 위한 것. */
+function fmtDayKst(epochMs: number): string {
+  const kst = new Date(epochMs + 9 * 3_600_000);
+  return `${String(kst.getUTCMonth() + 1).padStart(2, "0")}-${String(kst.getUTCDate()).padStart(2, "0")}`;
+}

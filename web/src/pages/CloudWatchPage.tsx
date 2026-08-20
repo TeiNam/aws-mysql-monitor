@@ -22,7 +22,15 @@ import {
   TR,
 } from "../components/ui";
 import { fetchDigests, fetchInstances, queryKeys } from "../lib/api";
-import { EMPTY, fmtDateTime, fmtInt, fmtSeconds, monthKey, recentMonths } from "../lib/format";
+import {
+  EMPTY,
+  fmtDateTime,
+  fmtInt,
+  fmtSeconds,
+  monthKey,
+  monthRangeLabel,
+  recentMonths,
+} from "../lib/format";
 import type { DigestRow } from "../lib/types";
 
 /**
@@ -98,7 +106,8 @@ export function CloudWatchPage() {
       <Card
         title={
           <>
-            <Search className="h-5 w-5 text-gray-500" /> Slow Query Digest ({month})
+            <Search className="h-5 w-5 text-gray-500" /> Slow Query Digest (
+            {monthRangeLabel(month, digests.data?.from_ms, digests.data?.to_ms)})
           </>
         }
         actions={

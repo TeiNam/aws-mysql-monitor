@@ -193,6 +193,62 @@ impl Counters {
     }
 }
 
+/// 같은 실행이 두 행으로 온 것을 하나로 접는다. **접은 수를 함께 돌려준다.**
+///
+/// # 왜 필요한가 (실측)
+///
+/// `record_id` 는 실행 하나의 신원이다. 그런데 저장소에 **항목이 둘** 생길 수 있다 —
+/// 실시간 캡처와 슬로우로그가 처음 쓰기를 동시에 하면 둘 다 "없다" 를 보고, `SK` 의
+/// 밀리초가 몇 ms 달라 조건부 쓰기가 양쪽 다 통과한다. 로컬 스택에서 200행 중 3건이
+/// 그 상태였다:
+///
+/// ```text
+/// state inflight   capture processlist  dur 1993  rows_examined 0       ← 유령
+/// state finalized  capture merged       dur 2125  rows_examined 21633   ← 진실
+/// ```
+///
+/// 그대로 내보내면 세 가지가 동시에 틀린다: 표에 같은 쿼리가 두 줄(그리고 React 는
+/// 키가 겹친다), 통계가 실행 수를 **두 배**로 세고, 유령 줄은 영원히 "진행 중" 이다.
+///
+/// 저장소 쪽 경합은 별도 결함이다([20 참조](../../../../docs/20-review-log.md)).
+/// 조회는 그것과 무관하게 **실행 하나를 한 줄로** 말해야 한다.
+///
+/// # 무엇을 남기나
+///
+/// 1. **끝을 관측한 쪽** — finalized > abandoned > inflight. 진행 중은 아직 값이 자란다.
+/// 2. **정확 지표가 있는 쪽** — 슬로우로그가 붙은 캡처(`merged`/`slowlog`). 처리목록
+///    캡처의 `rows_examined` 는 0 이다(실행 중에는 얻을 수 없다).
+/// 3. **더 길게 관측한 쪽** — 같은 조건이면 큰 `duration_ms` 가 진실에 가깝다.
+pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usize) {
+    let before = views.len();
+    let mut best: BTreeMap<String, SlowQueryView> = BTreeMap::new();
+    for view in views {
+        match best.get(&view.record_id) {
+            Some(kept) if rank(kept) >= rank(&view) => {}
+            _ => {
+                best.insert(view.record_id.clone(), view);
+            }
+        }
+    }
+    let out: Vec<SlowQueryView> = best.into_values().collect();
+    let collapsed = before - out.len();
+    (out, collapsed)
+}
+
+/// 접을 때의 우선순위. 큰 값이 남는다.
+fn rank(v: &SlowQueryView) -> (u8, u8, i64) {
+    let closed = match v.state.as_str() {
+        "finalized" => 2,
+        "abandoned" => 1,
+        _ => 0,
+    };
+    let exact = match v.capture_source.as_str() {
+        "merged" | "slowlog" => 1,
+        _ => 0,
+    };
+    (closed, exact, v.duration_ms)
+}
+
 /// 다이제스트 하나를 접는 동안의 상태. 튜플로 두면 필드가 뭔지 세어야 한다.
 #[derive(Debug)]
 struct DigestAcc<'a> {
@@ -361,6 +417,88 @@ mod tests {
         };
         overrides(&mut v);
         v
+    }
+
+    /// **같은 실행이 두 행으로 오면 하나만 남고, 남는 쪽은 진실이어야 한다.**
+    ///
+    /// 실측한 상태를 그대로 옮겼다: 유령(진행 중·처리목록·`rows_examined=0`)과
+    /// 진실(확정·병합·정확 지표)이 같은 `record_id` 로 함께 왔다. 유령이 남으면
+    /// 표는 끝난 쿼리를 "진행 중" 으로, 통계는 실행 수를 두 배로 말한다.
+    #[test]
+    fn a_duplicated_execution_collapses_to_the_row_that_saw_the_end() {
+        let ghost = view(|v| {
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 1_993;
+            v.rows_examined = Some(0);
+        });
+        let truth = view(|v| {
+            v.state = "finalized".into();
+            v.capture_source = "merged".into();
+            v.duration_ms = 2_125;
+            v.rows_examined = Some(21_633);
+        });
+
+        // 순서를 바꿔도 같은 결과여야 한다 — 저장소가 어느 쪽을 먼저 주는지는 모른다.
+        for pair in [
+            vec![ghost.clone(), truth.clone()],
+            vec![truth.clone(), ghost.clone()],
+        ] {
+            let (out, collapsed) = dedupe_executions(pair);
+            assert_eq!(collapsed, 1, "접은 수를 말해야 한다 (조용히 접지 않는다)");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].state, "finalized");
+            assert_eq!(out[0].rows_examined, Some(21_633));
+            assert_eq!(out[0].duration_ms, 2_125);
+        }
+
+        // 다른 실행은 접지 않는다.
+        let other = view(|v| {
+            v.record_id = "i:2:1".into();
+            v.thread_id = 2;
+        });
+        let (out, collapsed) = dedupe_executions(vec![ghost.clone(), truth, other]);
+        assert_eq!(collapsed, 1);
+        assert_eq!(out.len(), 2);
+
+        // **진행 중 둘뿐이면 더 오래 관측한 쪽이 남는다** — 실행시간의 하한이 더 크다.
+        let longer = view(|v| {
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 5_000;
+            v.rows_examined = Some(0);
+        });
+        let (out, _) = dedupe_executions(vec![ghost, longer]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].duration_ms, 5_000);
+    }
+
+    /// 추적 끊김은 **진행 중보다는 낫고 확정보다는 못하다.** 순서가 뒤집히면
+    /// "관측이 끊겼다" 가 확정값을 밀어낸다.
+    #[test]
+    fn an_abandoned_row_beats_in_flight_but_loses_to_finalized() {
+        let inflight = view(|v| {
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 9_000;
+        });
+        let abandoned = view(|v| {
+            v.state = "abandoned".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 3_000;
+            v.abandoned_reason = Some("owner_lost".into());
+        });
+        let finalized = view(|v| {
+            v.state = "finalized".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 3_000;
+        });
+
+        let (out, _) = dedupe_executions(vec![inflight.clone(), abandoned.clone()]);
+        assert_eq!(out[0].state, "abandoned", "진행 중이 추적 끊김을 밀어냈다");
+        let (out, _) = dedupe_executions(vec![abandoned, finalized]);
+        assert_eq!(out[0].state, "finalized");
+        let _ = inflight;
     }
 
     #[test]

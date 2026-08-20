@@ -1015,3 +1015,74 @@ async fn a_capped_listing_keeps_the_newest_records() {
         .collect();
     assert_eq!(mine, vec![9002, 9001], "최신순이 아니다");
 }
+
+/// **쌍둥이가 있으면 고아 스윕의 확정이 무효화됐다** (실측으로 발견).
+///
+/// 실시간 캡처와 슬로우로그가 처음 쓰기를 동시에 하면 둘 다 "없다" 를 보고,
+/// `SK` 의 밀리초가 몇 ms 달라 `attribute_not_exists(PK)` 조건이 **양쪽 다 통과**한다.
+/// 그러면 한 실행에 항목이 둘 생긴다 — 하나는 `finalized`, 하나는 `in_flight`.
+///
+/// 이 상태에서 고아 스윕이 진행 중 항목을 확정하려 하면, 초 버킷 조회(`begins_with`)가
+/// **다른 항목**(작은 SK)을 돌려주고 병합 결과가 그쪽에 써진다. 진행 중 항목은 그대로
+/// 남고 스윕은 **성공을 보고한다.** 로컬 스택에서 30초마다 같은 레코드를 영구히 다시
+/// 확정하는 것을 보고 찾았다 — 화면에는 끝난 쿼리가 영원히 "진행 중" 이다.
+#[tokio::test]
+async fn abandoning_an_in_flight_twin_updates_that_very_record() {
+    let Some(s) = store("twin-ghost").await else {
+        return;
+    };
+
+    // 같은 초 버킷·같은 스레드, 밀리초만 3ms 다른 두 항목을 만든다.
+    // **저장소를 통해서는 이 상태를 만들 수 없다**(그게 병합의 목적이다) — 동시
+    // 첫 쓰기 경합의 결과를 재현하려고 원시 클라이언트로 두 번째 항목을 넣는다.
+    let ghost_ms = T0 + 3;
+    let mut ghost = sample(4242, ghost_ms);
+    ghost.state = SlowQueryState::InFlight;
+    ghost.ended_at_ms = None;
+    ghost.owner_worker = Some("worker-gone".into());
+    ghost.owner_epoch = Some(7);
+    s.upsert_merged(&ghost).await.expect("유령 저장");
+
+    // 쌍둥이(먼저 시작한 것으로 기록된 확정 레코드)를 원시로 넣는다. 저장소를 쓰면
+    // 유령과 병합돼 한 항목이 된다.
+    let twin = sample(4242, T0);
+    let raw = client();
+    let item: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
+        serde_dynamo::to_item(&twin).expect("직렬화");
+    let mut item = item;
+    item.insert(
+        "PK".into(),
+        aws_sdk_dynamodb::types::AttributeValue::S(format!(
+            "SQ#{}#2025-08-18",
+            instance().as_str()
+        )),
+    );
+    item.insert(
+        "SK".into(),
+        aws_sdk_dynamodb::types::AttributeValue::S(format!("{T0}#4242")),
+    );
+    raw.put_item()
+        .table_name("dbmon-test-twin-ghost")
+        .set_item(Some(item))
+        .send()
+        .await
+        .expect("쌍둥이 원시 저장");
+
+    // 이제 고아 스윕이 하는 일을 한다: **읽은 그 레코드**를 확정한다.
+    let in_flight = s.list_in_flight(10).await.expect("진행 중 조회");
+    assert_eq!(in_flight.len(), 1, "진행 중은 유령 하나여야 한다");
+    let marked = dbmon::orphan::abandon(&in_flight[0], T0 + 90_000);
+    s.upsert_merged(&marked).await.expect("확정");
+
+    // **핵심 단정**: 진행 중 인덱스가 비어야 한다. 예전에는 쌍둥이만 갱신되고
+    // 유령이 남아 스윕이 매 주기 같은 일을 반복했다.
+    let still = s.list_in_flight(10).await.expect("재조회");
+    assert!(
+        still.is_empty(),
+        "확정했다고 보고했는데 유령이 그대로다 — 스윕이 영구히 같은 레코드를 다시 확정한다: {:?}",
+        still
+            .iter()
+            .map(|q| (q.thread_id, q.started_at_ms))
+            .collect::<Vec<_>>()
+    );
+}

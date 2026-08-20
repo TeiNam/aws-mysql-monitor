@@ -608,6 +608,19 @@ async fn collect_views(
         );
     }
 
+    // **같은 실행이 두 행으로 온 것을 접는다.** 저장소 경합으로 항목이 둘 생길 수
+    // 있고(실측), 그대로 내보내면 표가 두 줄·통계가 두 배·유령 줄이 영원히 진행 중이다.
+    let (deduped, collapsed) = aggregate::dedupe_executions(views);
+    let mut views = deduped;
+    if collapsed > 0 {
+        // **조용히 접지 않는다.** 이 수가 0 이 아니면 저장소에 쌍둥이가 있다는 뜻이고,
+        // 그건 조회가 고칠 수 없는 별도 결함이다.
+        tracing::warn!(
+            collapsed,
+            "같은 record_id 의 행을 접었다 — 저장소에 쌍둥이 항목이 있다"
+        );
+    }
+
     // 전역 최신순. 인스턴스별 결과를 이어 붙였으므로 여기서 한 번 맞춘다.
     views.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
     if views.len() > ceiling {

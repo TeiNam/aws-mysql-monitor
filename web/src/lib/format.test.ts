@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   EMPTY,
   monthKey,
+  monthRangeLabel,
   fmtDateTime,
   fmtDuration,
   fmtInt,
@@ -100,5 +101,40 @@ describe("월 기본값", () => {
   it("이전 달로 물러날 때 연도를 넘긴다", () => {
     expect(monthKey(new Date(Date.UTC(2026, 0, 15)), -1)).toBe("2025-12");
     expect(monthKey(new Date(Date.UTC(2026, 0, 15)), -13)).toBe("2024-12");
+  });
+});
+
+/**
+ * **8일치 집계가 "8월 통계" 로 읽히면 안 된다.**
+ *
+ * 서버는 파티션 예산을 넘으면 구간을 최신 쪽으로 좁혀 읽고 응답에 그 구간을 담는다.
+ * 화면이 요청한 달만 제목에 적으면 조사하던 사람은 한 달을 봤다고 믿는다.
+ */
+describe("월 구간 이름", () => {
+  const AUG_START = Date.UTC(2026, 7, 1) - 9 * 3_600_000; // 2026-08-01 00:00 KST
+  const AUG_END = Date.UTC(2026, 8, 1) - 9 * 3_600_000 - 1; // 08-31 23:59:59.999 KST
+
+  it("달을 온전히 덮으면 달 이름 그대로다", () => {
+    expect(monthRangeLabel("2026-08", AUG_START, AUG_END)).toBe("2026-08");
+    // 서버가 더 넓게 준 경우(있을 수 없지만)도 달 이름이다.
+    expect(monthRangeLabel("2026-08", AUG_START - 1000, AUG_END + 1000)).toBe("2026-08");
+  });
+
+  it("좁혀졌으면 좁혀진 구간을 적는다", () => {
+    const clipped = AUG_END - 7 * 86_400_000; // 마지막 8일
+    expect(monthRangeLabel("2026-08", clipped, AUG_END)).toBe("2026-08 중 08-24~08-31");
+  });
+
+  it("12월은 다음 해로 넘어가는 경계를 쓴다", () => {
+    const decStart = Date.UTC(2026, 11, 1) - 9 * 3_600_000;
+    const decEnd = Date.UTC(2027, 0, 1) - 9 * 3_600_000 - 1;
+    expect(monthRangeLabel("2026-12", decStart, decEnd)).toBe("2026-12");
+    expect(monthRangeLabel("2026-12", decStart + 86_400_000, decEnd)).toBe("2026-12 중 12-02~12-31");
+  });
+
+  it("값이 없으면 달 이름을 그대로 쓴다 — 빈 문자열을 만들지 않는다", () => {
+    expect(monthRangeLabel("2026-08", null, null)).toBe("2026-08");
+    expect(monthRangeLabel("2026-08", undefined, AUG_END)).toBe("2026-08");
+    expect(monthRangeLabel("이상한값", AUG_START, AUG_END)).toBe("이상한값");
   });
 });

@@ -270,6 +270,54 @@ impl DynamoSlowQueryStore {
             .map_err(|e| DomainError::Internal(format!("레코드 역직렬화 실패: {e}")))
     }
 
+    /// **정확히 그 항목**을 읽는다 (`GetItem`).
+    ///
+    /// # 왜 초 버킷 조회로는 부족한가 (실측으로 드러난 결함)
+    ///
+    /// `find_by_record_id` 는 `begins_with(SK, <초 접두>)` 로 찾고 **첫 일치**를 준다.
+    /// 그런데 같은 실행에 항목이 **두 개** 생길 수 있다 — 실시간 캡처와 슬로우로그가
+    /// 처음 쓰기를 동시에 하면 둘 다 "없다" 를 보고, `SK` 의 밀리초가 3ms 달라
+    /// `attribute_not_exists(PK)` 조건이 **양쪽 다 통과**한다. 로컬에서 실제로 그
+    /// 상태를 봤다:
+    ///
+    /// ```text
+    /// SK 1787241482413#10912  state=finalized  capture=merged
+    /// SK 1787241482416#10912  state=in_flight  capture=processlist   ← 유령
+    /// ```
+    ///
+    /// 이때 고아 스윕이 유령(416)을 확정하려고 `upsert_merged` 를 부르면, 초 버킷
+    /// 조회가 **413** 을 돌려주고 병합 결과가 413에 써진다. 유령은 그대로 남고 스윕은
+    /// **성공을 보고한다** — 30초마다 영구히 반복됐다(쓰기 비용도 함께). 화면에는
+    /// 끝난 쿼리가 영원히 "진행 중" 으로 남는다. F4 가 없애려던 바로 그 상태다.
+    ///
+    /// 그래서 갱신 경로는 **자기가 읽은 키를 먼저 본다.** 값이 있으면 그 자리를 고친다.
+    async fn find_exact(
+        &self,
+        instance: &InstanceId,
+        started_at_ms: dbmon_core::time::EpochMs,
+        thread_id: u64,
+    ) -> Result<Option<SlowQuery>> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(
+                "PK",
+                AttributeValue::S(keys::slow_query_pk(instance, started_at_ms)),
+            )
+            .key(
+                "SK",
+                AttributeValue::S(keys::slow_query_sk(started_at_ms, thread_id)),
+            )
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        match out.item {
+            Some(item) => Ok(Some(Self::from_item(item)?)),
+            None => Ok(None),
+        }
+    }
+
     /// `record_id` 로 항목을 찾는다.
     ///
     /// # `GetItem` 을 쓸 수 없다
@@ -277,7 +325,8 @@ impl DynamoSlowQueryStore {
     /// `record_id` 는 `started_at_ms` 를 **초 단위로 절단**해서 담는다(멱등 키가 ±1초
     /// 흔들림을 흡수하도록 의도된 설계다). `SK` 는 밀리초를 담으므로 `record_id` 에서
     /// 복원할 수 없다. 그래서 `begins_with(SK, <초 접두>)` 로 조회하고 `thread_id` 로
-    /// 좁힌다 — 같은 초·같은 스레드는 하나뿐이다.
+    /// 좁힌다 — 같은 초·같은 스레드는 하나뿐이다. **쌍둥이가 있으면 하나뿐이 아니다**
+    /// ([`find_exact`](Self::find_exact) 참고).
     async fn find_by_record_id(&self, id: &RecordId) -> Result<Option<SlowQuery>> {
         let (instance, thread_id, sec) = id.parts().map_err(|e| DomainError::InvalidInput {
             field: "record_id".into(),
@@ -339,8 +388,18 @@ pub(crate) fn is_conditional_failure<E: std::fmt::Debug, R: std::fmt::Debug>(
 impl SlowQueryStore for DynamoSlowQueryStore {
     async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
         for attempt in 0..MAX_UPSERT_RETRIES {
-            // ① `record_id` 직접 조회.
-            let mut existing = self.find_by_record_id(&q.record_id).await?;
+            // ⓪ **자기 키를 먼저 본다.** 초 버킷 조회는 쌍둥이가 있으면 **다른 항목**을
+            //    돌려주고, 그러면 고치려던 레코드는 그대로 남는다(`find_exact` 주석의
+            //    유령 사례). 진행 중 갱신처럼 같은 키를 매 tick 쓰는 경로에서는
+            //    `Query` 대신 `GetItem` 이므로 **더 싸다.**
+            let mut existing = self
+                .find_exact(&q.instance_id, q.started_at_ms, q.thread_id)
+                .await?;
+
+            // ① `record_id` 직접 조회 (밀리초가 어긋난 같은 초 버킷).
+            if existing.is_none() {
+                existing = self.find_by_record_id(&q.record_id).await?;
+            }
 
             // ② **±2초 보조 조회.** 없으면 같은 실행이 두 레코드로 갈린다.
             //

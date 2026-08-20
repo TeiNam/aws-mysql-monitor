@@ -24,7 +24,15 @@ import {
   fetchUserStatistics,
   queryKeys,
 } from "../lib/api";
-import { EMPTY, fmtInt, fmtSeconds, monthKey, recentMonths } from "../lib/format";
+import {
+  EMPTY,
+  fmtDateTime,
+  fmtInt,
+  fmtSeconds,
+  monthKey,
+  monthRangeLabel,
+  recentMonths,
+} from "../lib/format";
 
 /** 참조 대시보드의 `Statistics` 화면 — 월간 SQL 통계 + 사용자별 통계. */
 export function StatisticsPage() {
@@ -106,7 +114,8 @@ export function StatisticsPage() {
       <Card
         title={
           <>
-            <BarChart3 className="h-5 w-5 text-gray-500" /> 인스턴스별 ({month})
+            <BarChart3 className="h-5 w-5 text-gray-500" /> 인스턴스별 (
+            {monthRangeLabel(month, stats.data?.from_ms, stats.data?.to_ms)})
           </>
         }
         actions={filters}
@@ -173,6 +182,11 @@ export function StatisticsPage() {
               </table>
             </div>
             {stats.data.truncated ? <TruncatedNote scanned={stats.data.scanned} /> : null}
+            <Note>
+              실제로 읽은 구간: {fmtDateTime(stats.data.from_ms, "KST")} ~{" "}
+              {fmtDateTime(stats.data.to_ms, "KST")} KST ·{" "}
+              {stats.data.scanned.toLocaleString("ko-KR")}건 실행을 접었다.
+            </Note>
           </>
         )}
       </Card>
@@ -180,7 +194,8 @@ export function StatisticsPage() {
       <Card
         title={
           <>
-            <User className="h-5 w-5 text-gray-500" /> 사용자별 ({month})
+            <User className="h-5 w-5 text-gray-500" /> 사용자별 (
+            {monthRangeLabel(month, users.data?.from_ms, users.data?.to_ms)})
           </>
         }
         note={
@@ -249,6 +264,11 @@ export function StatisticsPage() {
               </table>
             </div>
             {users.data.truncated ? <TruncatedNote scanned={users.data.scanned} /> : null}
+            <Note>
+              실제로 읽은 구간: {fmtDateTime(users.data.from_ms, "KST")} ~{" "}
+              {fmtDateTime(users.data.to_ms, "KST")} KST ·{" "}
+              {users.data.scanned.toLocaleString("ko-KR")}건 실행을 접었다.
+            </Note>
             <Note>
               <span className="font-mono">{EMPTY}</span> 는 0 이 아니라 값이 없다는 뜻이다.
               `commit` 은 SQL 을 볼 수 있을 때만 구분한다 — 가려진 문장을 추측하지 않는다.
