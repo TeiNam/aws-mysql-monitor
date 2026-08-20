@@ -23,6 +23,7 @@ import { currentToken } from "./auth";
 import {
   INITIAL_SNAPSHOT,
   applyMessage,
+  forgetDenied,
   markStreamGap,
   parseServerMessage,
   type LiveSnapshot,
@@ -220,6 +221,8 @@ export class LiveClient {
     if (drop.length > 0) {
       socket.send(JSON.stringify({ t: "unsubscribe", topics: drop }));
       for (const topic of drop) this.sent.delete(topic);
+      // 요구를 거둔 토픽의 거부 경고는 의미가 없다.
+      this.set(forgetDenied(this.snapshot, drop));
     }
   }
 

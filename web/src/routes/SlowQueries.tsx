@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 import { StateBadge } from "../components/Badges";
@@ -67,12 +67,15 @@ export function SlowQueries() {
 
   // 방송이 밀리거나 연결이 끊기면 그 사이 쿼리는 **다시 방송되지 않는다.**
   // HTTP 로 다시 읽는 것이 유일한 복구 경로다.
+  //
+  // **이 필터만 다시 읽지 않는다.** 캐시에 남은 다른 필터 조합도 같은 구멍을
+  // 갖고 있으므로 목록 키 전체를 무효화한다.
   const missedCount = useLiveMissed();
-  const refetch = list.refetch;
+  const queryClient = useQueryClient();
   useEffect(() => {
     if (missedCount === 0) return;
-    void refetch();
-  }, [missedCount, refetch]);
+    void queryClient.invalidateQueries({ queryKey: ["slow-queries"] });
+  }, [missedCount, queryClient]);
 
   const envOptions = useMemo(
     () => [...new Set((instances.data ?? []).map((i) => i.env))].sort(),

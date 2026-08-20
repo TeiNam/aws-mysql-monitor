@@ -161,11 +161,19 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
     let mut reauth = tokio::time::interval(REAUTH_INTERVAL);
     reauth.tick().await; // 첫 tick 은 즉시 오므로 버린다
 
+    // ⚠ **절대 기한으로 관리한다.** `timeout(IDLE_TIMEOUT, recv())` 을 `select!` 안에
+    // 두면 **다른 분기가 이길 때마다 타임아웃이 새로 시작된다.** 5초마다 오는
+    // `status` 방송이 (구독하지 않은 인스턴스의 것까지) 이 분기를 깨우므로 기한이
+    // 영원히 리셋되고, 인증만 하고 침묵하는 소켓이 **무기한 살아 있었다.**
+    // 실측으로 확인했다(75초 침묵 후에도 열려 있음) — 9차 리뷰가 잡았다.
+    let mut idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+
     loop {
         tokio::select! {
             // 클라이언트 메시지. `IDLE_TIMEOUT` 안에 아무것도 없으면 끊는다.
-            incoming = tokio::time::timeout(IDLE_TIMEOUT, socket.recv()) => {
-                let Ok(incoming) = incoming else { return Err("idle_timeout") };
+            incoming = socket.recv() => {
+                // 무엇이든 받았으면 살아 있다. 기한을 뒤로 민다.
+                idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                 match incoming {
                     Some(Ok(Message::Text(raw))) => {
                         handle_client_msg(&raw, &mut socket, &state, &ctx, &mut subscribed).await?;
@@ -180,6 +188,9 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                 }
             }
 
+            // 무응답 종료. 기한이 절대 시각이므로 다른 분기가 이겨도 밀리지 않는다.
+            _ = tokio::time::sleep_until(idle_deadline) => return Err("idle_timeout"),
+
             // 슬로우 쿼리 방송. **밀리면 알린다** — 조용히 버리면 그 쿼리가
             // 화면에 영구히 안 나타난다.
             got = slowq_rx.recv() => match got {
@@ -188,8 +199,13 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "slowq 방송이 밀렸다 — 클라이언트에 재조회를 알린다");
-                    send(&mut socket, ServerMsg::Error { code: "stream_lagged" }).await;
+                    // **슬로우 쿼리를 구독한 클라이언트에게만 알린다.** 구독하지
+                    // 않았으면 놓친 것이 없고, 그런 경고는 화면에 거짓 구멍을
+                    // 표시하게 만든다.
+                    if subscribed.iter().any(|k| k.starts_with("slowq:")) {
+                        tracing::warn!(dropped = n, "slowq 방송이 밀렸다 — 클라이언트에 재조회를 알린다");
+                        send(&mut socket, ServerMsg::Error { code: "stream_lagged" }).await;
+                    }
                 }
                 Err(RecvError::Closed) => return Err("hub_closed"),
             },

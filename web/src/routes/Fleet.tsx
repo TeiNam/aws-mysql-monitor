@@ -21,7 +21,7 @@ import {
 import { useLive, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, queryKeys } from "../lib/api";
 import { EMPTY, fmtClock, fmtInt, fmtRate, shortInstance } from "../lib/format";
-import { MAX_TOPICS } from "../lib/live-reduce";
+import { HISTORY_LEN, MAX_TOPICS } from "../lib/live-reduce";
 import type { InstanceView, LiveMetrics } from "../lib/types";
 
 /** 플릿 개요. `GET /api/instances` + WS `status:inst=…`. */
@@ -63,7 +63,7 @@ export function Fleet() {
               <th className={TH_NUM}>실행 중</th>
               <th className={TH_NUM}>접속</th>
               <th className={TH_NUM}>락 대기</th>
-              <th className={TH}>최근 5분 QPS</th>
+              <th className={TH}>QPS 추이</th>
               <th className={TH_NUM}>갱신</th>
             </tr>
           </thead>
@@ -96,7 +96,8 @@ export function Fleet() {
         </Note>
       ) : null}
       <Note>
-        지표는 5초 주기 샘플이다. <span className="font-mono">{EMPTY}</span> 는 값이 0 이
+        지표는 5초 주기 샘플이고 추이는 최근 {HISTORY_LEN}표본이다(끊긴 구간은 선이
+        끊긴다). <span className="font-mono">{EMPTY}</span> 는 값이 0 이
         아니라 <strong>아직 비율을 낼 수 없다</strong>는 뜻이다(첫 샘플·카운터 초기화).
       </Note>
     </section>

@@ -4,6 +4,7 @@ import {
   INITIAL_SNAPSHOT,
   MAX_LIVE_ROWS,
   applyMessage,
+  forgetDenied,
   markStreamGap,
   parseServerMessage,
   type LiveSnapshot,
@@ -111,6 +112,31 @@ describe("실시간 지표", () => {
     expect(markStreamGap(dropped).qpsHistory[inst]).toEqual([10, null]);
   });
 
+  it("표본이 빈 구간을 시각으로 감지해 구멍을 넣는다", () => {
+    // 서버는 `status` 밀림을 조용히 버린다. 표본이 사라진 것을 이력에서 알 수
+    // 없으면 선이 관측되지 않은 시간을 건너뛴다.
+    const inst = "i";
+    const s = apply(
+      INITIAL_SNAPSHOT,
+      { t: "status", instance_id: inst, metrics: metrics({ at_ms: NOW, qps: 10 }) },
+      // 5초 뒤 — 정상 간격
+      { t: "status", instance_id: inst, metrics: metrics({ at_ms: NOW + 5_000, qps: 11 }) },
+      // 1분 뒤 — 표본 열 개가 사라졌다
+      { t: "status", instance_id: inst, metrics: metrics({ at_ms: NOW + 65_000, qps: 12 }) },
+    );
+    expect(s.qpsHistory[inst]).toEqual([10, 11, null, 12]);
+  });
+
+  it("순서가 뒤집힌 표본도 구멍으로 본다", () => {
+    const inst = "i";
+    const s = apply(
+      INITIAL_SNAPSHOT,
+      { t: "status", instance_id: inst, metrics: metrics({ at_ms: NOW, qps: 10 }) },
+      { t: "status", instance_id: inst, metrics: metrics({ at_ms: NOW - 5_000, qps: 11 }) },
+    );
+    expect(s.qpsHistory[inst]).toEqual([10, null, 11]);
+  });
+
   it("이력이 없으면 구멍 표시가 스냅샷을 바꾸지 않는다", () => {
     expect(markStreamGap(INITIAL_SNAPSHOT)).toBe(INITIAL_SNAPSHOT);
   });
@@ -207,6 +233,20 @@ describe("연결 상태", () => {
       denied: ["slowq:env=prd"],
     });
     expect(s.denied).toEqual(["slowq:env=prd"]);
+  });
+
+  it("요구를 거둔 토픽은 거부 목록에서 빠진다", () => {
+    // 실시간 화면을 떠난 뒤에도 배너가 남으면, 지금 요구하지도 않는 토픽 얘기를
+    // 재접속까지 하고 있게 된다.
+    const s = apply(INITIAL_SNAPSHOT, {
+      t: "subscribed",
+      topics: [],
+      denied: ["slowq:env=prd", "status:inst=x"],
+    });
+    const after = forgetDenied(s, ["slowq:env=prd"]);
+    expect(after.denied).toEqual(["status:inst=x"]);
+    // 바뀔 것이 없으면 같은 객체를 돌려준다(헛된 리렌더 방지).
+    expect(forgetDenied(after, ["없는-토픽"])).toBe(after);
   });
 
   it("pong 은 같은 객체를 돌려준다", () => {

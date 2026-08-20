@@ -60,13 +60,18 @@ function LiveStatus() {
   const live = useLive();
   const queryClient = useQueryClient();
 
-  // **인증이 거부되면 캐시도 버린다.**
+  // **인증이 거부되면 화면의 데이터도 버린다.**
   //
   // 스트림 데이터는 스냅샷이 비우지만(`live-reduce`), HTTP 로 받아 둔 목록·상세는
-  // react-query 캐시에 남는다. 백엔드는 fail closed 인데 화면만 옛 데이터를 계속
+  // react-query 가 들고 있다. 백엔드는 fail closed 인데 화면만 옛 데이터를 계속
   // 보여 주면 강등된 사용자가 그걸 계속 본다.
+  //
+  // ⚠ `clear()` 가 아니라 `resetQueries()` 다. `clear()` 는 캐시에서 지우지만
+  // **이미 마운트된 화면은 마지막 결과를 계속 그린다** — 표가 그대로 남는다.
+  // `resetQueries()` 는 관찰자를 초기 상태로 되돌려 다시 조회하게 하고, 그
+  // 조회가 401 을 받아 토큰 안내로 바뀐다.
   useEffect(() => {
-    if (live.conn === "unauthorized") queryClient.clear();
+    if (live.conn === "unauthorized") void queryClient.resetQueries();
   }, [live.conn, queryClient]);
 
   return (

@@ -16,8 +16,17 @@ export const MAX_LIVE_ROWS = 200;
  * 알리는 편이 낫다.
  */
 export const MAX_TOPICS = 50;
-/** 스파크라인이 쓰는 표본 수. 5초 주기 × 60 = 5분. */
+/** 스파크라인이 쓰는 표본 수. 5초 주기라면 60개 ≈ 5분. */
 export const HISTORY_LEN = 60;
+/**
+ * 표본이 이만큼 벌어지면 **관측이 끊긴 것으로 본다** (샘플러 주기 5초의 3배).
+ *
+ * 서버는 `status` 방송이 밀리면 조용히 버린다([21 §5.5] — 게이지는 최신값만
+ * 의미가 있다는 판단). 그 결정은 숫자 하나에는 맞지만 **이력에는 틀리다**:
+ * 사라진 표본만큼 선이 시간을 건너뛰어도 화면에는 흔적이 없다. 그래서
+ * 클라이언트가 `at_ms` 간격으로 직접 판정한다.
+ */
+export const MAX_SAMPLE_GAP_MS = 15_000;
 
 export type ConnState = "idle" | "connecting" | "open" | "closed" | "unauthorized";
 
@@ -90,13 +99,21 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
       return { ...prev, slowq: upsertSlowQuery(prev.slowq, msg.data) };
 
     case "status": {
+      const previous = prev.status[msg.instance_id];
       const history = prev.qpsHistory[msg.instance_id] ?? [];
+      // 앞 표본과의 간격이 너무 크거나 순서가 뒤집혔으면 이력에 구멍을 넣는다.
+      const elapsed = previous === undefined ? 0 : msg.metrics.at_ms - previous.at_ms;
+      const contiguous = previous === undefined || (elapsed > 0 && elapsed <= MAX_SAMPLE_GAP_MS);
+      const base =
+        contiguous || history.at(-1) === null
+          ? history
+          : appendBounded(history, null, HISTORY_LEN);
       return {
         ...prev,
         status: { ...prev.status, [msg.instance_id]: msg.metrics },
         qpsHistory: {
           ...prev.qpsHistory,
-          [msg.instance_id]: appendBounded(history, msg.metrics.qps, HISTORY_LEN),
+          [msg.instance_id]: appendBounded(base, msg.metrics.qps, HISTORY_LEN),
         },
       };
     }
@@ -147,6 +164,19 @@ export function markStreamGap(prev: LiveSnapshot): LiveSnapshot {
     qpsHistory[id] = history.at(-1) === null ? history : appendBounded(history, null, HISTORY_LEN);
   }
   return { ...prev, qpsHistory };
+}
+
+/**
+ * 더 이상 요구하지 않는 토픽을 거부 목록에서 뺀다.
+ *
+ * 없으면 실시간 화면을 떠난 뒤에도 "구독이 거부됐다" 배너가 재접속까지 남는다 —
+ * 지금은 요구하지도 않는 토픽 얘기다.
+ */
+export function forgetDenied(prev: LiveSnapshot, topics: readonly string[]): LiveSnapshot {
+  if (prev.denied.length === 0) return prev;
+  const dropped = new Set(topics);
+  const denied = prev.denied.filter((t) => !dropped.has(t));
+  return denied.length === prev.denied.length ? prev : { ...prev, denied };
 }
 
 /**
