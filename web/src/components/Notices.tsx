@@ -8,8 +8,9 @@
  * 토큰을 다시 받아야 하는 상황과 DynamoDB 가 죽은 상황은 대응이 다르다.
  */
 
+import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { ApiError, isUnauthorized } from "../lib/api";
+import { ApiError, fetchAuthConfig, isUnauthorized, queryKeys } from "../lib/api";
 import { CARD } from "./styles";
 
 const MESSAGES: Record<string, string> = {
@@ -57,24 +58,51 @@ export function ErrorNotice({ error, onRetry }: ErrorNoticeProps) {
 }
 
 /**
- * 토큰 안내. **이게 유일한 전달 경로다** — 서버는 기동 로그에만 토큰을 찍는다
- * (인증 전에 답하는 `/api/auth/config` 에 토큰을 실으면 인증이 없는 것과 같다).
+ * 토큰 안내.
+ *
+ * **인증 방식을 서버에 묻는다.** `/api/auth/config` 는 인증 전에 답하는 유일한
+ * 엔드포인트이고(그래서 토큰 값은 담지 않는다), 그 `mode` 없이 안내를 쓰면
+ * "컨테이너 로그를 보라" 를 Cognito 환경에서도 말하게 된다.
  */
 function TokenNotice() {
+  const config = useQuery({
+    queryKey: queryKeys.authConfig,
+    queryFn: ({ signal }) => fetchAuthConfig(signal),
+    staleTime: Infinity,
+  });
+  const mode = config.data?.mode;
+
   return (
     <div className={`${CARD} border-amber-500/40 bg-amber-500/10 p-4`} role="alert">
-      <h2 className="text-sm font-medium text-amber-100">접속 토큰이 필요하다</h2>
-      <p className="mt-2 text-sm text-amber-200/90">
-        컨테이너로 띄웠다면 기동 로그에 접속 URL 이 찍혀 있다. 그 URL 로 다시 들어오면
-        토큰이 세션에 저장된다.
-      </p>
-      <pre className="mt-3 overflow-x-auto rounded bg-zinc-950/60 p-3 font-mono text-xs text-amber-100">
-        docker compose logs dbmon | grep token=
-      </pre>
-      <p className="mt-2 text-xs text-amber-200/70">
-        호스트에서 루프백(<span className="font-mono">127.0.0.1</span>)으로 띄웠다면 토큰 없이
-        접속된다. 배포 환경(prd·stg)은 Cognito 검증이 아직 없어 접속할 수 없다.
-      </p>
+      <h2 className="text-sm font-medium text-amber-100">
+        {mode === "cognito" ? "이 환경은 아직 접속할 수 없다" : "접속 토큰이 필요하다"}
+      </h2>
+
+      {mode === "cognito" ? (
+        <p className="mt-2 text-sm text-amber-200/90">
+          배포 환경({config.data?.deployment_env})은 Cognito JWT 검증이 아직 구현되지 않아
+          <strong> fail closed</strong> 다 — 토큰을 만들어도 통과하지 못한다.
+        </p>
+      ) : (
+        <>
+          <p className="mt-2 text-sm text-amber-200/90">
+            컨테이너로 띄웠다면 기동 로그에 접속 URL 이 찍혀 있다. 그 URL 로 다시 들어오면
+            토큰이 세션에 저장된다.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded bg-zinc-950/60 p-3 font-mono text-xs text-amber-100">
+            docker compose logs dbmon | grep token=
+          </pre>
+          <p className="mt-2 text-xs text-amber-200/70">
+            ⚠ 로그의 URL 은 <strong>컨테이너 안의 포트</strong>(8080)를 쓴다. 호스트에서는
+            퍼블리시된 포트로 바꿔야 한다(컴포즈 기본{" "}
+            <span className="font-mono">http://127.0.0.1:18080/?token=…</span>).
+          </p>
+          <p className="mt-1 text-xs text-amber-200/70">
+            호스트에서 루프백(<span className="font-mono">127.0.0.1</span>)으로 띄웠다면 토큰
+            없이 접속된다.
+          </p>
+        </>
+      )}
     </div>
   );
 }

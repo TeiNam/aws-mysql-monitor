@@ -1617,14 +1617,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     use tower_http::set_header::SetResponseHeaderLayer;
 
                     // 해시가 붙은 산출물. 이름이 내용으로 정해지므로 영구 캐시가 안전하다.
+                    //
+                    // ⚠ **성공 응답에만 붙인다.** 404 에 `immutable` 을 붙이면, 배포
+                    // 중에 새 자산을 먼저 요청한 클라이언트가 그 404 를 1년간 캐시해
+                    // **영구히 깨진 화면**을 갖는다.
                     app = app.nest_service(
                         "/assets",
                         axum::routing::any_service(ServeDir::new(dir.join("assets"))).layer(
                             SetResponseHeaderLayer::overriding(
                                 axum::http::header::CACHE_CONTROL,
-                                axum::http::HeaderValue::from_static(
-                                    "public, max-age=31536000, immutable",
-                                ),
+                                |res: &axum::response::Response| {
+                                    res.status().is_success().then(|| {
+                                        axum::http::HeaderValue::from_static(
+                                            "public, max-age=31536000, immutable",
+                                        )
+                                    })
+                                },
                             ),
                         ),
                     );
