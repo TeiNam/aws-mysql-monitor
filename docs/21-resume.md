@@ -2,7 +2,7 @@
 
 **이 문서만 읽으면 이어서 할 수 있게** 검증된 사실과 미확인 항목을 구분해 적는다.
 
-브랜치: `feat/m0-foundation` · 코드 전부 커밋됨 (푸시 안 함)
+브랜치: `feat/m0-foundation` · 코드 전부 커밋됨 (원격 없음 — §3.1)
 
 ---
 
@@ -29,7 +29,7 @@
 | `crates/dbmon/src/main.rs` | `web/dist` 정적 서빙(캐시 정책 포함), 없는 `/api/…` 는 404 |
 | `Dockerfile` | 노드 빌더 스테이지 — **런타임 이미지에 노드는 없다** |
 
-테스트: **Rust 660개 + web 46개**, `cargo clippy --workspace --all-targets` 경고 0.
+테스트: **Rust 661개 + web 48개**, `cargo clippy --workspace --all-targets` 경고 0.
 
 ### 의존성을 줄였다
 
@@ -85,7 +85,11 @@ docker compose logs dbmon | grep token=
 
 로그: `serve_ui=true spa=/app/web/dist`. 브라우저로 접속해 토큰이 URL 에서 즉시
 제거되고 `sessionStorage` 로 옮겨지는 것, HTTP·WS 양쪽이 그 토큰으로 인증되는 것을
-확인했다.
+확인했다. 컨테이너 상태는 **`healthy`** 다.
+
+이 컨테이너는 `DBMON__ROLE=api` 라 지표를 수집하지 않는다. 그래서 플릿 타일이
+`0/1 인스턴스 기준` 이라고 적는다 — **정상이다**(합계가 몇 개 기준인지 말하는
+장치가 동작하는 것이다). 실시간 지표를 컨테이너에서 보려면 `DBMON__ROLE=all`.
 
 ### 2.4 4화면 전부 브라우저에서 확인됨
 
@@ -112,9 +116,10 @@ docker compose logs dbmon | grep token=
 
 ## 3. ⚠ 다음에 할 일
 
-### 3.1 푸시와 PR
+### 3.1 원격이 없다
 
-이 브랜치는 아직 **푸시되지 않았다.** 커밋은 전부 로컬에 있다.
+`git remote -v` 가 비어 있고 `main` 브랜치도 없다 — **로컬 전용 레포**다. 커밋은
+전부 `feat/m0-foundation` 에 있고, 원격을 붙이면 그때 푸시·PR 을 한다.
 
 ### 3.2 M6 의 남은 것 (백엔드)
 
@@ -138,9 +143,23 @@ Cognito 가 배선되면 SPA 서빙 게이트(`serves_local_ui()`)도 함께 열
 | 대상 | 상태 | 조치 |
 |---|---|---|
 | `dbmon-web` 컨테이너 (`dbmon:round8`) | 실행 중, `dbmon-data-local` 의 수집 리더 리스를 쥐고 있다 | 이전 세션에서 만든 것. 정리 여부는 사용자 판단 |
-| `dbmon-dev-dbmon-1` (컴포즈 `monitor`) | 이번 세션에서 새 이미지로 재생성. HEALTHCHECK `unhealthy` | **원인 미확인** — 컨테이너 안 `dbmon healthcheck` 가 왜 실패하는지 봐야 한다 |
+| `dbmon-dev-dbmon-1` (컴포즈 `monitor`) | 이번 세션에서 새 이미지로 재생성. **`healthy`** | 해결됨 — 아래 |
 | `dbmon-data-wstest` · `dbmon-data-uitest` | 세션들이 만든 격리 테이블 | 필요 없으면 삭제 |
 | 호스트 `target/debug/dbmon` | 8081 에 떠 있을 수 있다(`DBMON__HTTP__BIND=0.0.0.0`, uitest 테이블) | `pkill -f "target/debug/dbmon"` |
+
+### 3.5 컨테이너 `unhealthy` 의 원인 — 해결됨
+
+`command:` 의 `--config /etc/dbmon.toml` 은 엔트리포인트에만 붙는다. Dockerfile 의
+HEALTHCHECK(`dbmon healthcheck`)는 그 인자를 못 받으므로 설정을 **환경변수만으로**
+읽었고, `aws.account_id` 가 없어 검증에서 실패했다.
+
+```text
+$ docker exec dbmon-dev-dbmon-1 dbmon healthcheck
+Error: 설정을 읽을 수 없다 … [aws.account_id]: 필수다     ← 헬스가 아니라 설정 문제
+```
+
+→ 컴포즈에 `DBMON_CONFIG: /etc/dbmon.toml` 을 넣었다(clap 이 이미 이 환경변수를
+읽는다). 지금은 `Up (healthy)` 다.
 
 `just` 가 이 머신에 **설치돼 있지 않다.** justfile 타깃은 실행으로 검증되지 않았다.
 

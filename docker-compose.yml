@@ -146,6 +146,13 @@ services:
       # `DBMON__ROLE=all` 로 바꿔 수집까지 시험할 때 필요하다. 없으면 IAM DB Auth
       # 폴백을 타고 로컬 MySQL 접속이 실패한다.
       DBMON_TARGET_PASSWORD: dbmon-local-monitor
+      # **HEALTHCHECK 도 같은 설정을 봐야 한다.**
+      #
+      # `command:` 의 `--config` 는 엔트리포인트에만 붙는다. Dockerfile 의
+      # HEALTHCHECK(`dbmon healthcheck`)는 그 인자를 못 받으므로 설정을 환경변수만
+      # 으로 읽고, `aws.account_id` 가 없어 **검증에서 실패**했다 — 컨테이너가
+      # 계속 `unhealthy` 로 보이던 이유다(9차 리뷰에서 실측으로 확인).
+      DBMON_CONFIG: /etc/dbmon.toml
     volumes:
       # 워킹 디렉터리가 `/` 이므로 설정의 상대 경로(`local/logs/…`)가 여기 맞는다.
       # `DBMON__ROLE=all` 로 바꿔 수집까지 시험할 때 쓴다.
