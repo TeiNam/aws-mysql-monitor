@@ -392,9 +392,15 @@ impl DynamoSlowQueryStore {
                         started_at_ms: around_ms,
                         duration_ms,
                     };
+                    // **창은 긁어오는 범위, 판정은 추정 오차 폭이다.** 창을 그대로
+                    // 판정에 쓰면 `long_query_time` 이 창보다 작을 때 연속한 두 실행이
+                    // 합쳐지고, 그건 되돌릴 수 없다(10라운드 지적).
                     if cand.record.thread_id != thread_id
                         || !dbmon_core::slow_query::ExecutionSpan::of(&cand.record)
-                            .is_same_execution(&incoming)
+                            .is_same_execution_within(
+                                &incoming,
+                                dbmon_core::clock_offset::LIVE_ESTIMATE_SPREAD_MS,
+                            )
                     {
                         continue;
                     }

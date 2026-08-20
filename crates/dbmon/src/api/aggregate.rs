@@ -273,13 +273,9 @@ pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usiz
 /// 남는다**(8라운드 지적). 저장소의 병합 규칙과 같게 "없음" 으로 본다.
 fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
     const WINDOW_MS: i64 = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
-    /// 쌍둥이의 시작 시각 차이 상한 (1초).
-    ///
-    /// 실시간 추정은 `now − PROCESSLIST.TIME × 1000` 이라 **정수 초로 절단**되므로
-    /// 슬로우로그의 밀리초 값과 최대 1초 어긋난다. 그보다 더 떨어진 두 행은 같은
-    /// 실행의 두 관측이 아니다 — 시계 편차가 더 큰 경우는 저장소가 더 넓은 창으로
-    /// 이미 하나로 합쳐 준다(`BASE_MERGE_WINDOW_MS` + 편차).
-    const START_SPREAD_MS: i64 = 1_000;
+    /// 쌍둥이의 시작 시각 차이 상한. **저장소와 같은 상수를 쓴다** — 한쪽만 바뀌면
+    /// 저장소가 합친 것을 조회가 두 줄로 내거나 그 반대가 된다.
+    const START_SPREAD_MS: i64 = dbmon_core::clock_offset::LIVE_ESTIMATE_SPREAD_MS;
 
     // (인스턴스, 스레드)로 묶고 시간순으로 본다. **다이제스트는 정렬 키가 아니다** —
     // 자리표와 진짜 값은 문자열이 달라 정렬하면 서로 떨어진다.

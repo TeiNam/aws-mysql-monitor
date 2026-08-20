@@ -1192,3 +1192,65 @@ async fn a_concurrent_update_retries_instead_of_overwriting() {
         "동시 쓰기가 정확 지표를 덮어썼다"
     );
 }
+
+/// **저장소가 연속한 두 실행을 합치지 않는다** (10라운드 지적).
+///
+/// 종료를 관측하지 못한 레코드의 끝은 "사라진 것을 알아챈 폴링" 까지 늘어난다. 그
+/// 늘어난 구간이 다음 실행과 겹쳐 보이고, ±2초 창 안이면 **두 실행이 한 레코드로
+/// 합쳐진다 — 되돌릴 수 없다.** 판정은 창이 아니라 추정 오차 폭(1초)이어야 한다.
+#[tokio::test]
+async fn the_store_does_not_merge_a_rerun_into_the_previous_execution() {
+    let Some(s) = store("rerun-merge").await else {
+        return;
+    };
+
+    // ① 앞 실행: 1.2초에 끝났지만 폴링이 1.9초에 사라진 것을 알아챘다.
+    let mut first = sample(5150, T0);
+    first.duration_ms = 1_900;
+    first.capture_source = CaptureSource::Processlist;
+    first.stats.rows_examined = None;
+    s.upsert_merged(&first).await.expect("앞 실행 저장");
+
+    // ② 곧바로 다시 돈 같은 쿼리 (1.3초 뒤 시작, 슬로우로그가 정확히 안다).
+    //    창(2초) 안이고 구간도 겹쳐 보이지만 **다른 실행이다.**
+    let mut rerun = sample(5150, T0 + 1_300);
+    rerun.duration_ms = 1_100;
+    rerun.capture_source = CaptureSource::Slowlog;
+    rerun.stats.rows_examined = Some(77);
+    s.upsert_merged(&rerun).await.expect("재실행 저장");
+
+    let range = TimeRange::new(T0 - 10_000, T0 + 20_000).expect("구간");
+    let all = s
+        .list_by_instance(&instance(), range, 50)
+        .await
+        .expect("조회");
+    let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 5150).collect();
+    assert_eq!(
+        mine.len(),
+        2,
+        "연속한 두 실행이 한 레코드로 합쳐졌다 — 실행 하나가 영구히 사라진다"
+    );
+
+    // ③ 반면 **같은 실행의 두 관측**(시작 3ms 차이)은 하나로 합쳐져야 한다.
+    let mut live = sample(5151, T0 + 3);
+    live.state = SlowQueryState::InFlight;
+    live.ended_at_ms = None;
+    live.capture_source = CaptureSource::Processlist;
+    s.upsert_merged(&live).await.expect("실시간 저장");
+    let mut log = sample(5151, T0);
+    log.capture_source = CaptureSource::Slowlog;
+    // 병합은 `max` 를 취하므로 샘플 기본값보다 큰 값을 쓴다.
+    log.stats.rows_examined = Some(999_999);
+    s.upsert_merged(&log).await.expect("슬로우로그 병합");
+    let all = s
+        .list_by_instance(&instance(), range, 50)
+        .await
+        .expect("조회");
+    let twins: Vec<_> = all.iter().filter(|q| q.thread_id == 5151).collect();
+    assert_eq!(twins.len(), 1, "같은 실행의 두 관측을 합치지 못했다 (F5)");
+    assert_eq!(
+        twins[0].stats.rows_examined,
+        Some(999_999),
+        "합쳤지만 슬로우로그의 정확 지표가 반영되지 않았다"
+    );
+}

@@ -123,7 +123,10 @@ impl SlowQueryStore for FakeSlowQueryStore {
                     && e.thread_id == q.thread_id
                     && (e.started_at_ms - q.started_at_ms).abs()
                         <= crate::clock_offset::BASE_MERGE_WINDOW_MS
-                    && crate::slow_query::ExecutionSpan::of(e).is_same_execution(&incoming)
+                    && crate::slow_query::ExecutionSpan::of(e).is_same_execution_within(
+                        &incoming,
+                        crate::clock_offset::LIVE_ESTIMATE_SPREAD_MS,
+                    )
             })
             .map(|e| e.record_id.as_str().to_string());
         if let Some(ck) = candidate_key {

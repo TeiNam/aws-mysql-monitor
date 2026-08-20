@@ -31,6 +31,24 @@ pub const ALERT_THRESHOLD_MS: i64 = 5_000;
 /// 기본 병합 창 ([05 §8.2](../../../docs/05-collector.md)).
 pub const BASE_MERGE_WINDOW_MS: i64 = 2_000;
 
+/// **같은 실행의 두 시작 추정이 어긋날 수 있는 최대 폭 (1초).**
+///
+/// 실시간 캡처의 시작은 `now − PROCESSLIST.TIME × 1000` 이고 `TIME` 은 **정수 초**라
+/// 오차가 1초 미만이다. 슬로우로그는 밀리초다. 그래서 같은 실행의 두 관측은 1초
+/// 안에 들어온다.
+///
+/// # 왜 병합 창과 따로 두는가
+///
+/// 창([`BASE_MERGE_WINDOW_MS`])은 **후보를 긁어오는 범위**이고 여유가 섞여 있다.
+/// 그 창을 동일성 판정에 그대로 쓰면 `long_query_time` 이 창보다 작을 때 **연속한 두
+/// 실행**이 합쳐진다 — 종료를 관측하지 못한 레코드의 끝은 "사라진 것을 알아챈
+/// 폴링" 까지 늘어나므로 다음 실행과 겹쳐 보이기 때문이다(10라운드 지적).
+///
+/// ⚠ **남은 위험**: `long_query_time` 이 1초 미만이면 이 폭 안에 연속한 두 실행이
+/// 들어올 수 있다. 근본 해결은 실행마다 고유한 식별자
+/// (`performance_schema` 의 `EVENT_ID`)를 레코드에 담는 것이다 — 지금은 없다.
+pub const LIVE_ESTIMATE_SPREAD_MS: i64 = 1_000;
+
 /// 대상 DB 와 우리 시계의 차이. **인스턴스별로 유지한다.**
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ClockOffset {

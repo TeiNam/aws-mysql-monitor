@@ -228,7 +228,7 @@ export function CloudWatchPage() {
               {digests.data.items.length.toLocaleString("ko-KR")}개 다이제스트 ·{" "}
               {digests.data.scanned.toLocaleString("ko-KR")}건 실행을 접었다 (
               {fmtDateTime(digests.data.from_ms, "KST")} ~ {fmtDateTime(digests.data.to_ms, "KST")}{" "}
-              KST). 행을 누르면 그 다이제스트의 <strong>대표</strong> SQL 을 본다 — 리터럴은 마스킹돼 있다.
+              KST). 행을 누르면 그 다이제스트의 <strong>대표</strong> SQL 을 본다 — 리터럴은 환경의 저장 정책에 따라 남아 있을 수도, 마스킹돼 있을 수도 있다.
             </Note>
           </>
         )}
