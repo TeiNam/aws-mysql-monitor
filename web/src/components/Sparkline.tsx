@@ -22,7 +22,7 @@ export function Sparkline({ values, label, width = 96, height = 24 }: SparklineP
   const present: number[] = [];
   for (const v of values) if (v !== null) present.push(v);
   if (present.length < 2) {
-    return <span className="text-zinc-600">{EMPTY}</span>;
+    return <span className="text-zinc-400">{EMPTY}</span>;
   }
 
   let min = present[0] as number;

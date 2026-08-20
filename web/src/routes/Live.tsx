@@ -3,7 +3,19 @@ import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router";
 import { StateBadge } from "../components/Badges";
 import { ErrorNotice, Note } from "../components/Notices";
-import { CARD, LINK, MONO, ROW, TABLE, TD, TD_NUM, TH, TH_NUM } from "../components/styles";
+import {
+  LINK,
+  MONO,
+  MUTED,
+  ROW,
+  SCROLL_BOX,
+  SELECT,
+  TABLE,
+  TD,
+  TD_NUM,
+  TH,
+  TH_NUM,
+} from "../components/styles";
 import { useLive, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, queryKeys } from "../lib/api";
 import { EMPTY, fmtClock, fmtDuration, shortInstance } from "../lib/format";
@@ -48,14 +60,14 @@ export function Live() {
       <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
         <h1 className="text-lg font-semibold tracking-tight">
           실시간
-          <span className="ml-2 text-sm font-normal text-zinc-500">
+          <span className="ml-2 text-sm font-normal text-zinc-400">
             {rows.length}건 수신
           </span>
         </h1>
-        <label className="flex flex-col gap-1 text-xs text-zinc-500">
+        <label className="flex flex-col gap-1 text-xs text-zinc-400">
           환경
           <select
-            className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-sky-500 focus:outline-none"
+            className={SELECT}
             value={env}
             onChange={(e) => {
               const next = new URLSearchParams(params);
@@ -81,7 +93,7 @@ export function Live() {
         </div>
       )}
 
-      <div className={`${CARD} overflow-x-auto`}>
+      <div className={SCROLL_BOX}>
         <table className={TABLE}>
           <thead>
             <tr>
@@ -97,7 +109,7 @@ export function Live() {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td className={`${TD} text-zinc-500`} colSpan={7}>
+                <td className={`${TD} ${MUTED}`} colSpan={7}>
                   {/*
                     **구독하고 있지 않은데 "구독 중" 이라고 말하지 않는다.**
                     구독할 환경은 등록부에서 얻으므로, 등록부 조회가 실패하면
@@ -146,11 +158,13 @@ function LiveRow({ row }: { row: SlowQueryBroadcast }) {
       <td className={TD_NUM}>{fmtDuration(row.duration_ms)}</td>
       <td className={TD}>{row.statement_type}</td>
       <td className={TD}>{row.schema_name ?? EMPTY}</td>
-      <td className={`${TD} ${MONO} max-w-lg truncate text-zinc-400`}>
-        {row.sql_preview ?? (
-          // 방송은 원문을 절대 담지 않는다(T-22). 정책이 원문이면 여기가 빈다.
-          <span className="text-zinc-600">원문 정책 — 상세에서 조회</span>
-        )}
+      <td className={`${TD} ${MONO} ${MUTED}`}>
+        <div className="max-w-lg truncate">
+          {row.sql_preview ?? (
+            // 방송은 원문을 절대 담지 않는다(T-22). 정책이 원문이면 여기가 빈다.
+            <span className={MUTED}>원문 정책 — 상세에서 조회</span>
+          )}
+        </div>
       </td>
     </tr>
   );

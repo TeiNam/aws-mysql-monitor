@@ -82,7 +82,7 @@ function TokenNotice() {
 /** 로딩. 스켈레톤을 만들지 않는다 — 표 한 줄이면 위치가 충분히 전달된다. */
 export function Pending({ label }: { label: string }) {
   return (
-    <p className="px-3 py-6 text-sm text-zinc-500" aria-live="polite">
+    <p className="px-3 py-6 text-sm text-zinc-400" aria-live="polite">
       {label}
     </p>
   );
@@ -90,5 +90,5 @@ export function Pending({ label }: { label: string }) {
 
 /** 정보 배너. 상한·미구현 같은 **알아야 하는 제약**을 숨기지 않기 위해 쓴다. */
 export function Note({ children }: { children: ReactNode }) {
-  return <p className="px-1 py-2 text-xs text-zinc-500">{children}</p>;
+  return <p className="px-1 py-2 text-xs text-zinc-400">{children}</p>;
 }

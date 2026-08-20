@@ -57,7 +57,7 @@ export function SlowQueryDetail() {
           <Item label="시작">{fmtDateTime(q.started_at_ms)}</Item>
           <Item label="실행시간">
             {fmtDuration(q.duration_ms)}
-            <span className="ml-1 text-xs text-zinc-500">({q.duration_source})</span>
+            <span className="ml-1 text-xs text-zinc-400">({q.duration_source})</span>
           </Item>
           <Item label="캡처 소스">{q.capture_source}</Item>
           {/* 스레드 id 는 수량이 아니라 식별자다 — 자리수 구분 기호를 넣지 않는다. */}

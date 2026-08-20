@@ -3,7 +3,19 @@ import { useEffect, useMemo, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 import { StateBadge } from "../components/Badges";
 import { ErrorNotice, Note, Pending } from "../components/Notices";
-import { CARD, LINK, MONO, ROW, TABLE, TD, TD_NUM, TH, TH_NUM } from "../components/styles";
+import {
+  LINK,
+  MONO,
+  MUTED,
+  ROW,
+  SCROLL_BOX,
+  SELECT,
+  TABLE,
+  TD,
+  TD_NUM,
+  TH,
+  TH_NUM,
+} from "../components/styles";
 import { useLiveLagged } from "../hooks/useLive";
 import { fetchInstances, fetchSlowQueries, queryKeys, type ListQuery } from "../lib/api";
 import { EMPTY, fmtDuration, fmtInt, fmtClock, shortInstance } from "../lib/format";
@@ -144,7 +156,7 @@ export function SlowQueries() {
         <Pending label="조회 중…" />
       ) : (
         <>
-          <div className={`${CARD} overflow-x-auto`}>
+          <div className={SCROLL_BOX}>
             <table className={TABLE}>
               <thead>
                 <tr>
@@ -162,7 +174,7 @@ export function SlowQueries() {
               <tbody>
                 {list.data.items.length === 0 ? (
                   <tr>
-                    <td className={`${TD} text-zinc-500`} colSpan={9}>
+                    <td className={`${TD} ${MUTED}`} colSpan={9}>
                       조회 구간(최근 24시간)에 기록이 없다.
                     </td>
                   </tr>
@@ -186,12 +198,9 @@ export function SlowQueries() {
   );
 }
 
-const SELECT =
-  "rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-sky-500 focus:outline-none";
-
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <label className="flex flex-col gap-1 text-xs text-zinc-500">
+    <label className="flex flex-col gap-1 text-xs text-zinc-400">
       {label}
       {children}
     </label>
@@ -219,8 +228,15 @@ function QueryRow({ item }: { item: SlowQueryView }) {
       <td className={TD}>{item.schema_name ?? EMPTY}</td>
       <td className={TD_NUM}>{fmtInt(item.rows_examined)}</td>
       <td className={TD_NUM}>{fmtInt(item.rows_sent)}</td>
-      <td className={`${TD} ${MONO} max-w-md truncate text-zinc-400`}>
-        {item.sql_text ?? redactionLabel(item.sql_redacted_reason)}
+      {/*
+        `max-width` 를 `td` 에 직접 주면 표 자동 레이아웃이 무시할 수 있다.
+        안쪽 블록에 줘야 실제로 잘린다 — 안 그러면 긴 SQL 하나가 표를 몇 천
+        픽셀로 늘린다.
+      */}
+      <td className={`${TD} ${MONO} ${MUTED}`}>
+        <div className="max-w-md truncate">
+          {item.sql_text ?? redactionLabel(item.sql_redacted_reason)}
+        </div>
       </td>
     </tr>
   );

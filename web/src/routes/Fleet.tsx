@@ -4,7 +4,20 @@ import { Link } from "react-router";
 import { StateBadge } from "../components/Badges";
 import { ErrorNotice, Note, Pending } from "../components/Notices";
 import { Sparkline } from "../components/Sparkline";
-import { CARD, LABEL, LINK, MONO, ROW, TABLE, TD, TD_NUM, TH, TH_NUM } from "../components/styles";
+import {
+  CARD,
+  LABEL,
+  LINK,
+  MONO,
+  MUTED,
+  ROW,
+  SCROLL_BOX,
+  TABLE,
+  TD,
+  TD_NUM,
+  TH,
+  TH_NUM,
+} from "../components/styles";
 import { useLive, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, queryKeys } from "../lib/api";
 import { EMPTY, fmtClock, fmtInt, fmtRate, shortInstance } from "../lib/format";
@@ -37,7 +50,7 @@ export function Fleet() {
       <h1 className="mb-4 text-lg font-semibold tracking-tight">플릿 개요</h1>
       <Summary instances={rows} status={live.status} />
 
-      <div className={`${CARD} mt-4 overflow-x-auto`}>
+      <div className={`${SCROLL_BOX} mt-4`}>
         <table className={TABLE}>
           <thead>
             <tr>
@@ -57,7 +70,7 @@ export function Fleet() {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td className={`${TD} text-zinc-500`} colSpan={11}>
+                <td className={`${TD} ${MUTED}`} colSpan={11}>
                   등록된 인스턴스가 없다. 탐색(discovery)이 아직 돌지 않았거나 필터가 전부
                   제외했다.
                 </td>
@@ -113,7 +126,7 @@ function InstanceRow({ instance, metrics, history }: InstanceRowProps) {
           {shortInstance(instance.id)}
         </Link>
         {instance.collectible ? null : (
-          <span className="ml-2 text-xs text-zinc-500">수집 대상 아님</span>
+          <span className="ml-2 text-xs text-zinc-400">수집 대상 아님</span>
         )}
       </td>
       <td className={TD}>{instance.env}</td>
@@ -136,7 +149,7 @@ function InstanceRow({ instance, metrics, history }: InstanceRowProps) {
           label={`${shortInstance(instance.id)} 최근 QPS 추이`}
         />
       </td>
-      <td className={`${TD_NUM} text-zinc-500`}>{fmtClock(metrics?.at_ms)}</td>
+      <td className={`${TD_NUM} ${MUTED}`}>{fmtClock(metrics?.at_ms)}</td>
     </tr>
   );
 }
