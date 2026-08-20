@@ -40,7 +40,7 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
-import { useLive, useLiveMissed, useLiveTopics } from "../hooks/useLive";
+import { useLive, useLiveMissed, useLiveSlowqSeen, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, fetchSlowQueries, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, fmtRate, shortInstance, type Timezone } from "../lib/format";
 import { MAX_TOPICS } from "../lib/live-reduce";
@@ -103,9 +103,11 @@ export function MySQLMonitorPage() {
   }, [autoRefresh, interval, queryClient]);
 
   // 방송이 오면 **기다리지 않고** 다시 읽는다. 참조 구현은 고정 주기 폴링만 했다.
+  //
+  // ⚠ `slowq.length` 가 아니라 **누적 수**를 본다. 길이는 상한(200)에서 멈추므로
+  // 그 뒤로는 방송이 와도 신호가 바뀌지 않는다.
   const missedCount = useLiveMissed();
-  const live = useLive();
-  const slowqSeen = live.slowq.length;
+  const slowqSeen = useLiveSlowqSeen();
   useEffect(() => {
     if (slowqSeen === 0 && missedCount === 0) return;
     void queryClient.invalidateQueries({ queryKey: queryKeys.slowQueriesAll });

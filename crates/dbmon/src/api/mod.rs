@@ -407,7 +407,11 @@ pub struct AggregateParams {
     to_ms: Option<i64>,
     instance: Option<String>,
     env: Option<String>,
-    limit: Option<usize>,
+    /// **접을 레코드 수의 상한이다** — 반환 행 수가 아니다.
+    ///
+    /// `/api/slow-queries` 의 `limit` 은 페이지 크기라서 이름이 겹치면 `?limit=10` 이
+    /// "10건만 집계" 로 읽히고, 그러면 통계가 조용히 틀린다. 그래서 `scan` 이다.
+    scan: Option<usize>,
 }
 
 /// 집계 응답 공통 머리. **천장에 걸렸는지 말한다.**
@@ -465,7 +469,8 @@ fn aggregate_range(p: &AggregateParams, now_ms: i64) -> Result<TimeRange, ApiErr
 
 /// 집계용 레코드 수집. **뷰를 거친다** — 리터럴 통제가 그 안에 있다.
 ///
-/// 반환값의 두 번째는 "천장에 걸렸다" 다.
+/// 반환값의 두 번째는 "천장에 걸렸다" 다. 저장소가 **최신 순으로** 돌려주므로
+/// (`scan_index_forward(false)`) 잘리는 쪽은 항상 과거다 — 통계가 최근을 놓치지 않는다.
 async fn collect_views(
     state: &ApiState,
     ctx: &AuthContext,
@@ -484,10 +489,7 @@ async fn collect_views(
     }
 
     let instances = self_instances(state, p.instance.as_deref()).await?;
-    let ceiling = p
-        .limit
-        .unwrap_or(MAX_AGGREGATE_SCAN)
-        .min(MAX_AGGREGATE_SCAN);
+    let ceiling = p.scan.unwrap_or(MAX_AGGREGATE_SCAN).min(MAX_AGGREGATE_SCAN);
 
     let mut views = Vec::new();
     let mut truncated = false;

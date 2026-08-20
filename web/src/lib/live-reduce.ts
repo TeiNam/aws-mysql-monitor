@@ -46,6 +46,14 @@ export interface LiveSnapshot {
   denied: readonly string[];
   /** 최신순 슬로우 쿼리. `record_id` 로 upsert 된다. */
   slowq: readonly SlowQueryBroadcast[];
+  /**
+   * 받은 `slowq` 방송의 **누적 수**.
+   *
+   * 화면이 "새 쿼리가 왔다" 를 감지하는 신호다. `slowq.length` 를 쓰면 상한
+   * (`MAX_LIVE_ROWS`)에 닿는 순간 길이가 고정되고, 그 뒤로는 방송이 와도
+   * **아무 일도 일어나지 않는다.** 실제로 그렇게 만들었다가 잡았다.
+   */
+  slowqSeen: number;
   /** 인스턴스별 최신 지표. */
   status: Readonly<Record<string, LiveMetrics>>;
   /** 인스턴스별 QPS 이력. `null` 은 "비율을 못 냈다" 이고 0 과 다르다. */
@@ -84,6 +92,7 @@ export const INITIAL_SNAPSHOT: LiveSnapshot = {
   subscribed: [],
   denied: [],
   slowq: [],
+  slowqSeen: 0,
   status: {},
   qpsHistory: {},
   missedCount: 0,
@@ -125,7 +134,11 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
     }
 
     case "slowq":
-      return { ...prev, slowq: upsertSlowQuery(prev.slowq, msg.data) };
+      return {
+        ...prev,
+        slowq: upsertSlowQuery(prev.slowq, msg.data),
+        slowqSeen: prev.slowqSeen + 1,
+      };
 
     case "status": {
       const previous = prev.status[msg.instance_id];

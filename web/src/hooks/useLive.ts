@@ -25,6 +25,16 @@ export function useLiveMissed(): number {
 }
 
 /**
+ * 받은 슬로우 쿼리 방송의 누적 수. **배열 길이가 아니다** — 길이는 상한에서
+ * 멈추고, 그러면 "새 쿼리가 왔다" 신호가 조용히 죽는다.
+ */
+const selectSlowqSeen = () => liveClient.getSnapshot().slowqSeen;
+
+export function useLiveSlowqSeen(): number {
+  return useSyncExternalStore(liveClient.subscribe, selectSlowqSeen, selectSlowqSeen);
+}
+
+/**
  * 이 화면이 필요한 토픽을 요구한다. 언마운트되면 해제된다.
  *
  * 의존성을 **문자열 하나**로 만드는 이유: 호출부가 `useMemo` 를 빠뜨려 매 렌더

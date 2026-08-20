@@ -68,6 +68,22 @@ describe("슬로우 쿼리 upsert", () => {
     expect(s.slowq[1]?.state).toBe("finalized");
   });
 
+  it("누적 수신 수는 상한에서 멈추지 않는다", () => {
+    // 화면은 이 값으로 "새 쿼리가 왔다" 를 감지한다. 배열 길이를 쓰면 상한에
+    // 닿는 순간 신호가 죽어 재조회가 영구히 멈춘다.
+    const messages: ServerMessage[] = Array.from({ length: MAX_LIVE_ROWS + 10 }, (_, i) => ({
+      t: "slowq",
+      data: broadcast({ record_id: `r:${i}:0` }),
+    }));
+    const s = apply(INITIAL_SNAPSHOT, ...messages);
+    expect(s.slowq).toHaveLength(MAX_LIVE_ROWS);
+    expect(s.slowqSeen).toBe(MAX_LIVE_ROWS + 10);
+
+    // 같은 레코드의 갱신도 "받았다" 로 센다 — 상태 전이(진행 중 → 확정)도 새 정보다.
+    const again = applyMessage(s, { t: "slowq", data: broadcast({ record_id: "r:0:0" }) });
+    expect(again.slowqSeen).toBe(MAX_LIVE_ROWS + 11);
+  });
+
   it("상한을 넘으면 오래된 것부터 버린다", () => {
     const messages: ServerMessage[] = Array.from({ length: MAX_LIVE_ROWS + 10 }, (_, i) => ({
       t: "slowq",
