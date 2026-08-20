@@ -151,12 +151,18 @@ docker compose logs dbmon | grep token=
 ```bash
 bash local/loadgen.sh longsql            # 6초짜리 쿼리를 만든다
 curl -XPOST -H 'x-dbmon-control: 1' :8080/api/collector/pause
+sleep 6                                  # ⚠ 아래 설명 — 즉시 멈추지 않는다
 bash local/loadgen.sh longsql            # 정지 구간에 다시 부하
 # → 정지 시각 이후에 시작된 기록: 0건   (유령 태스크 없음)
 curl -XPOST -H 'x-dbmon-control: 1' :8080/api/collector/resume
 bash local/loadgen.sh longsql
 # → 재개 후 기록 1건, "수집 태스크 시작" 로그는 인스턴스당 1회 (중복 없음)
 ```
+
+⚠ **정지는 즉시가 아니다.** API 는 플래그만 세우고, 리더 루프가 다음 tick(≤1초)에
+그걸 보고 드레인(≤3초)한다. 그래서 **정지 직후 약 4초 안에 시작된 쿼리는 여전히
+기록된다** — `sleep 6` 없이 측정하면 "정지했는데 기록이 남는다" 로 보인다(실제로 그렇게
+한 번 놀랐다). 이건 결함이 아니라 드레인의 정의다: 이미 관측 중인 쿼리는 확정한다.
 
 ### 2.5 실패 경로도 확인됨 (이게 리뷰의 절반이었다)
 
