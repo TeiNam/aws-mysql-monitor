@@ -1086,3 +1086,62 @@ async fn abandoning_an_in_flight_twin_updates_that_very_record() {
             .collect::<Vec<_>>()
     );
 }
+
+/// **병합이 시작 시각을 앞당긴 레코드는 그 뒤로도 계속 갱신돼야 한다.**
+///
+/// `SK` 는 `started_at_ms` 에서 파생된다. 그래서 병합이 시각을 앞당기면 **항목의
+/// 필드와 물리 키가 어긋난다** — 항목은 처음 자리에 머물고 필드만 바뀐다(의도된 설계).
+///
+/// 예전에는 다음 갱신이 **필드로 키를 다시 만들었다.** 그러면 없는 자리를 겨냥해
+/// 조건부 쓰기가 실패하고, 재시도 5회를 넘겨 `낙관적 잠금 재시도 5회 초과` 로 죽는다.
+/// 로컬 스택에서 그 오류가 30초마다 반복되는 것을 보고 찾았다 — 그 레코드는 그 시점부터
+/// **영구히 갱신 불가**였고, 진행 중이던 것은 영원히 진행 중으로 남았다.
+#[tokio::test]
+async fn a_record_stays_writable_after_a_merge_moves_its_start_time() {
+    let Some(s) = store("key-drift").await else {
+        return;
+    };
+
+    // ① 실시간 캡처: 시작 시각 추정이 500ms 늦다.
+    let mut live = sample(7777, T0 + 500);
+    live.state = SlowQueryState::InFlight;
+    live.ended_at_ms = None;
+    live.capture_source = CaptureSource::Processlist;
+    live.stats.rows_examined = None;
+    s.upsert_merged(&live).await.expect("실시간 저장");
+
+    // ② 슬로우로그: 같은 실행을 더 이른 시각으로 안다 → 병합이 시각을 앞당긴다.
+    let mut log = sample(7777, T0);
+    log.capture_source = CaptureSource::Slowlog;
+    log.stats.rows_examined = Some(4242);
+    let merged = s.upsert_merged(&log).await.expect("슬로우로그 병합");
+    assert_eq!(merged.started_at_ms, T0, "병합은 더 이른 시각을 채택한다");
+
+    // ③ **그 다음 갱신이 성공해야 한다.** 여기서 예전 코드가 죽었다.
+    let mut again = merged.clone();
+    again.stats.rows_sent = Some(7);
+    let third = s.upsert_merged(&again).await.expect(
+        "병합된 레코드를 다시 갱신할 수 있어야 한다 — 여기서 '낙관적 잠금 재시도 5회 초과' 가 났다",
+    );
+    assert_eq!(third.stats.rows_sent, Some(7));
+    assert_eq!(
+        third.stats.rows_examined,
+        Some(4242),
+        "정확 지표가 남아야 한다"
+    );
+
+    // ④ **항목이 하나여야 한다.** 키를 다시 만들면 쌍둥이가 생긴다.
+    let range = TimeRange::new(T0 - 10_000, T0 + 10_000).expect("구간");
+    let all = s
+        .list_by_instance(&instance(), range, 50)
+        .await
+        .expect("조회");
+    let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 7777).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "한 실행에 항목이 {}개다 — 표에 두 줄, 통계는 두 배가 된다",
+        mine.len()
+    );
+    assert_eq!(mine[0].stats.rows_sent, Some(7));
+}

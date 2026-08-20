@@ -149,7 +149,12 @@ export function StatisticsPage() {
                 </thead>
                 <tbody className={TBODY}>
                   {stats.data.items.length === 0 ? (
-                    <EmptyRow colSpan={8}>이 달에 기록된 슬로우 쿼리가 없다.</EmptyRow>
+                    <EmptyRow colSpan={8}>
+                      {/* 좁혀진 구간을 "이 달" 로 말하지 않는다(6라운드 지적). */}
+                      {monthRangeLabel(month, stats.data.from_ms, stats.data.to_ms) === month
+                        ? "이 달에 기록된 슬로우 쿼리가 없다."
+                        : `조회한 구간(${monthRangeLabel(month, stats.data.from_ms, stats.data.to_ms)})에는 기록이 없다 — 이 달 전체를 본 것이 아니다.`}
+                    </EmptyRow>
                   ) : (
                     stats.data.items.map((s) => (
                       <tr key={s.instance_id} className={TR}>
@@ -230,6 +235,9 @@ export function StatisticsPage() {
                     <EmptyRow colSpan={8}>
                       사용자 정보가 있는 실행이 없다. 실시간 캡처는 계정을 함께 기록하지만,
                       슬로우로그만으로 만든 레코드는 계정이 비어 있을 수 있다.
+                      {monthRangeLabel(month, users.data.from_ms, users.data.to_ms) === month
+                        ? ""
+                        : ` (조회한 구간: ${monthRangeLabel(month, users.data.from_ms, users.data.to_ms)} — 이 달 전체가 아니다)`}
                     </EmptyRow>
                   ) : (
                     users.data.items.map((u) => (

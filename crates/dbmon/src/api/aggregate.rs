@@ -221,11 +221,20 @@ impl Counters {
 /// 3. **더 길게 관측한 쪽** — 같은 조건이면 큰 `duration_ms` 가 진실에 가깝다.
 pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usize) {
     let before = views.len();
+    let views = collapse_same_second(views);
     let mut best: BTreeMap<String, SlowQueryView> = BTreeMap::new();
     for view in views {
-        match best.get(&view.record_id) {
-            Some(kept) if rank(kept) >= rank(&view) => {}
-            _ => {
+        match best.remove(&view.record_id) {
+            // 둘 다 있으면 이긴 쪽을 남기고 **진 쪽의 정보를 채운다.**
+            Some(kept) => {
+                let (winner, loser) = if rank(&kept) >= rank(&view) {
+                    (kept, view)
+                } else {
+                    (view, kept)
+                };
+                best.insert(winner.record_id.clone(), absorb(winner, &loser));
+            }
+            None => {
                 best.insert(view.record_id.clone(), view);
             }
         }
@@ -233,6 +242,106 @@ pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usiz
     let out: Vec<SlowQueryView> = best.into_values().collect();
     let collapsed = before - out.len();
     (out, collapsed)
+}
+
+/// **초 경계를 걸친 쌍둥이**도 접는다 — `record_id` 가 다르므로 위 단계가 못 잡는다.
+///
+/// 실시간 캡처의 시작 시각은 `now − PROCESSLIST.TIME × 1000` 이라 **정수 초**이고
+/// 슬로우로그는 밀리초다. 두 추정이 초 경계를 사이에 두면 `record_id` 가 갈린다 —
+/// 저장소가 `find_merge_candidate` 로 흡수하려는 그 상황이고, 첫 쓰기가 정확히
+/// 동시면 흡수에 실패해 항목이 둘 남는다.
+///
+/// # 왜 이 창이 안전한가
+///
+/// 같은 스레드(= 커넥션)에서 **같은 다이제스트**가 창 안에 두 번 시작할 수 없다.
+/// 커넥션은 한 번에 한 문장을 실행하고, 슬로우 쿼리로 기록되려면 임계값(`long_query_time`)
+/// 을 넘어야 하므로 연속한 두 실행의 시작 간격은 최소 그 임계값이다. 그래서 임계값이
+/// 창(2초)보다 크면 오접기가 **불가능**하다.
+///
+/// ⚠ 임계값을 2초 아래로 내리면 오접기가 가능해진다. 그때는 저장소의 병합
+/// (`find_merge_candidate`, 같은 창)이 **먼저** 두 실행을 하나로 합치므로 조회가
+/// 더 나빠지는 것은 아니다 — 두 곳이 같은 규칙을 쓴다는 사실이 중요하다.
+fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
+    const WINDOW_MS: i64 = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
+
+    // (인스턴스, 스레드, 다이제스트)로 묶고 시간순으로 본다.
+    views.sort_by(|a, b| {
+        (
+            a.instance_id.as_str(),
+            a.thread_id,
+            a.app_digest.as_str(),
+            a.started_at_ms,
+        )
+            .cmp(&(
+                b.instance_id.as_str(),
+                b.thread_id,
+                b.app_digest.as_str(),
+                b.started_at_ms,
+            ))
+    });
+
+    let mut out: Vec<SlowQueryView> = Vec::with_capacity(views.len());
+    for view in views {
+        let same_run = out.last().is_some_and(|prev| {
+            prev.instance_id == view.instance_id
+                && prev.thread_id == view.thread_id
+                && prev.app_digest == view.app_digest
+                // **남긴 행 기준**으로 창을 잰다. 사슬처럼 이어 붙지 않게 한다.
+                && (view.started_at_ms - prev.started_at_ms).abs() <= WINDOW_MS
+        });
+        if !same_run {
+            out.push(view);
+            continue;
+        }
+        let prev = out.pop().expect("same_run 이면 마지막이 있다");
+        let (winner, loser) = if rank(&prev) >= rank(&view) {
+            (prev, view)
+        } else {
+            (view, prev)
+        };
+        out.push(absorb(winner, &loser));
+    }
+    out
+}
+
+/// 진 행에만 있는 정보를 이긴 행으로 옮긴다.
+///
+/// **버리는 쪽이 유일한 출처인 값이 있다.** 두 항목은 병합되지 않은 쌍둥이이므로
+/// 각자 다른 것을 들고 있다 — 실행계획이 진행 중 레코드에만 수집돼 있으면, 이긴 행만
+/// 남기면 **계획이 화면에서 사라진다.** 없는 값만 채우고, 있는 값은 건드리지 않는다.
+fn absorb(mut winner: SlowQueryView, loser: &SlowQueryView) -> SlowQueryView {
+    // 계획은 한쪽에만 있을 수 있다. 있으면 있다.
+    winner.has_plan = winner.has_plan || loser.has_plan;
+    if winner.sql_text.is_none() && loser.sql_text.is_some() {
+        winner.sql_text = loser.sql_text.clone();
+        winner.sql_redacted_reason = loser.sql_redacted_reason;
+        winner.sql_text_truncated = loser.sql_text_truncated;
+    }
+    if winner.schema_name.is_none() {
+        winner.schema_name = loser.schema_name.clone();
+    }
+    if winner.db_user.is_none() {
+        winner.db_user = loser.db_user.clone();
+    }
+    // **처리목록 캡처의 행 수는 채우지 않는다.** 실행 중에는 얻을 수 없어 0 이 오고,
+    // 그 0 을 "측정된 0" 으로 채우면 평균이 깎여 "인덱스가 잘 탄다" 로 오독된다.
+    if loser.capture_source != "processlist" {
+        if winner.rows_examined.is_none() {
+            winner.rows_examined = loser.rows_examined;
+        }
+        if winner.rows_sent.is_none() {
+            winner.rows_sent = loser.rows_sent;
+        }
+        if winner.lock_time_ms.is_none() {
+            winner.lock_time_ms = loser.lock_time_ms;
+        }
+    }
+    // 한쪽이 "관측이 끊겼다" 를 기록했으면 그 사실을 지우지 않는다 — 정확 지표를
+    // 의심할 근거이고, 화면이 배지에 함께 보여준다.
+    if winner.abandoned_reason.is_none() {
+        winner.abandoned_reason = loser.abandoned_reason.clone();
+    }
+    winner
 }
 
 /// 접을 때의 우선순위. 큰 값이 남는다.
@@ -471,6 +580,115 @@ mod tests {
         let (out, _) = dedupe_executions(vec![ghost, longer]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].duration_ms, 5_000);
+    }
+
+    /// **버리는 행이 유일한 출처인 값은 옮겨야 한다.**
+    ///
+    /// 쌍둥이는 병합되지 않았으므로 각자 다른 것을 들고 있다. 실행계획이 진행 중
+    /// 레코드에만 수집돼 있으면, 이긴 행만 남기면 계획이 화면에서 사라진다.
+    #[test]
+    fn collapsing_carries_over_what_only_the_discarded_row_had() {
+        let ghost = view(|v| {
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 1_000;
+            v.has_plan = true; // 계획은 여기에만 있다
+            v.rows_examined = Some(0); // 처리목록의 0 — 의미 없는 값이다
+            v.rows_sent = Some(0);
+            v.schema_name = Some("shop".into());
+            v.abandoned_reason = Some("owner_lost".into());
+        });
+        let truth = view(|v| {
+            v.state = "finalized".into();
+            v.capture_source = "merged".into();
+            v.duration_ms = 2_000;
+            v.has_plan = false;
+            v.rows_examined = None; // 아직 모른다
+            v.rows_sent = None;
+            v.schema_name = None;
+            v.db_user = None;
+            v.sql_text = None;
+            v.abandoned_reason = None;
+        });
+
+        let (out, _) = dedupe_executions(vec![ghost.clone(), truth.clone()]);
+        let kept = &out[0];
+        assert_eq!(kept.state, "finalized");
+        assert!(kept.has_plan, "계획이 진행 중 행에만 있었는데 사라졌다");
+        assert_eq!(kept.schema_name.as_deref(), Some("shop"));
+        assert_eq!(kept.sql_text.as_deref(), Some("SELECT ?"));
+        assert_eq!(
+            kept.abandoned_reason.as_deref(),
+            Some("owner_lost"),
+            "한쪽이 기록한 '관측이 끊겼다' 를 지웠다"
+        );
+        // **처리목록의 0 은 채우지 않는다** — 측정값이 아니다.
+        assert_eq!(
+            kept.rows_examined, None,
+            "실행 중 캡처의 0 을 측정값으로 채웠다 — 평균이 깎인다"
+        );
+        assert_eq!(kept.rows_sent, None);
+
+        // 반대 순서도 같아야 한다.
+        let (out2, _) = dedupe_executions(vec![truth, ghost]);
+        assert_eq!(out2[0].has_plan, out[0].has_plan);
+        assert_eq!(out2[0].rows_examined, out[0].rows_examined);
+    }
+
+    /// **초 경계를 걸친 쌍둥이는 `record_id` 가 다르다.** 그래도 한 실행이다.
+    ///
+    /// 실시간 캡처의 시작 시각은 정수 초, 슬로우로그는 밀리초다. 두 추정이 초 경계를
+    /// 사이에 두면 멱등 키가 갈린다 — 저장소가 ±2초 창으로 흡수하려는 그 상황이고,
+    /// 첫 쓰기가 정확히 동시면 흡수에 실패한다.
+    #[test]
+    fn twins_that_straddle_a_second_boundary_also_collapse() {
+        // 같은 실행: 실시간은 ...999, 슬로우로그는 ...002 로 안다.
+        let live = view(|v| {
+            v.record_id = "i:5:1755500399".into();
+            v.thread_id = 5;
+            v.started_at_ms = 1_755_500_399_999;
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.duration_ms = 2_100;
+            v.rows_examined = Some(0);
+        });
+        let log = view(|v| {
+            v.record_id = "i:5:1755500400".into(); // ← 초가 다르다
+            v.thread_id = 5;
+            v.started_at_ms = 1_755_500_400_002;
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+            v.duration_ms = 2_240;
+            v.rows_examined = Some(900);
+        });
+
+        let (out, collapsed) = dedupe_executions(vec![live.clone(), log.clone()]);
+        assert_eq!(collapsed, 1, "초 경계를 걸친 쌍둥이를 접지 못했다");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, "finalized");
+        assert_eq!(out[0].rows_examined, Some(900));
+
+        // **창을 넘으면 접지 않는다** — 같은 스레드에서 나중에 다시 돈 실행이다.
+        let later = view(|v| {
+            v.record_id = "i:5:1755500410".into();
+            v.thread_id = 5;
+            v.started_at_ms = 1_755_500_410_000; // 10초 뒤
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+        let (out, collapsed) = dedupe_executions(vec![live.clone(), log, later]);
+        assert_eq!(collapsed, 1);
+        assert_eq!(out.len(), 2, "다른 실행을 접었다 — 실행이 사라진다");
+
+        // 다이제스트가 다르면 같은 스레드·같은 시각이어도 다른 실행이다.
+        let other_digest = view(|v| {
+            v.record_id = "i:5:1755500400".into();
+            v.thread_id = 5;
+            v.started_at_ms = 1_755_500_400_002;
+            v.app_digest = "d2".into();
+        });
+        let (out, _) = dedupe_executions(vec![live, other_digest]);
+        assert_eq!(out.len(), 2);
     }
 
     /// 추적 끊김은 **진행 중보다는 낫고 확정보다는 못하다.** 순서가 뒤집히면

@@ -1110,7 +1110,17 @@ fn spawn_leader_loop(
         return None;
     }
 
-    let interval = tick_interval(config.collector.detect_interval_ms);
+    // **리스 갱신 주기보다 오래 자지 않는다.**
+    //
+    // 이 루프는 자는 동안 `gate.refresh()` 를 부르지 않는다. `detect_interval_ms` 는
+    // 설정 상한이 60초이므로 그대로 자면 (작업 시간 + 60초) 동안 갱신이 없고, 리스
+    // TTL 이 60초라 **잠든 사이에 리더를 잃는다** — 그러면 다른 워커가 리더가 되어
+    // 같은 인스턴스를 수집하거나(F1), 멈춤을 눌러 둔 워커가 있으면 그 멈춤이 무의미해진다
+    // (6라운드 지적). 수집 자체는 인스턴스별 태스크가 하므로 이 루프를 자주 깨워도
+    // 비용은 tick 게시뿐이다.
+    let interval = tick_interval(config.collector.detect_interval_ms).min(Duration::from_millis(
+        dbmon_core::ports::LEASE_RENEW_INTERVAL_MS as u64,
+    ));
     let discovery_interval = Duration::from_secs(config.discovery.interval_secs);
     // **`Arc` 로 든다.** `select!` 팔에 참조를 넘기면 `implementation of Send is not
     // general enough` 로 컴파일이 깨진다 — 참조 인자에 대해 `for<'a>` Send 를
@@ -1225,9 +1235,11 @@ fn spawn_leader_loop(
                     // 예산을 넘지 않는다. 남은 일은 다음 tick 이 같은 목록을 다시 본다.
                     let sweep_due = now_ms - last_sweep_ms
                         >= (config.collector.orphan_sweep_secs as i64) * 1000;
-                    if sweep_due {
-                        last_sweep_ms = now_ms;
-                    }
+                    // **스윕이 실제로 돌았을 때만 시각을 찍는다.** 앞의 확정 작업이
+                    // 예산을 다 쓰면 스윕은 시작조차 못 하는데, 미리 찍어 두면
+                    // "돌았다" 로 기록돼 다음 주기까지 건너뛴다 — 예산 초과가 반복되면
+                    // **영구히 굶는다**(6라운드 지적).
+                    let mut swept = false;
                     let maintenance = run_in_budget(async {
                         // 남은 **진행 중 레코드를 사유와 함께 확정한다.**
                         //
@@ -1285,9 +1297,13 @@ fn spawn_leader_loop(
                                 &config,
                             )
                             .await;
+                            swept = true;
                         }
                     })
                     .await;
+                    if swept {
+                        last_sweep_ms = now_ms;
+                    }
                     if maintenance.is_err() {
                         tracing::warn!(
                             "일시정지 정리가 예산을 넘겼다 — 리스를 지키려고 끊는다. 남은 일은 다음 tick 이 이어서 한다"

@@ -41,6 +41,17 @@ use dbmon_core::time::{DatePart, TimeRange, sort_key_ms};
 /// 병합이 교환법칙을 만족하므로 재시도는 안전하다. 상한은 무한 루프 방지용이다.
 const MAX_UPSERT_RETRIES: u32 = 5;
 
+/// 저장소에서 읽은 항목. **물리 키를 함께 들고 온다.**
+///
+/// 레코드의 `started_at_ms` 필드로 키를 다시 만들 수 없기 때문이다
+/// ([`DynamoSlowQueryStore::to_item_at`] 의 주석 참고) — 병합이 시작 시각을 앞당기면
+/// 필드와 키가 어긋나고, 그때부터 그 레코드는 **영구히 갱신 불가**가 된다.
+struct Stored {
+    record: SlowQuery,
+    pk: String,
+    sk: String,
+}
+
 pub struct DynamoSlowQueryStore {
     client: Client,
     table: String,
@@ -213,10 +224,14 @@ impl DynamoSlowQueryStore {
     /// 레코드를 항목으로. **키는 [`keys`] 가 만든다** — 쓰기·읽기가 각자 만들면
     /// 한쪽만 바뀔 때 조회가 조용히 0건이 된다.
     fn to_item(&self, q: &SlowQuery) -> Result<HashMap<String, AttributeValue>> {
-        self.to_item_keyed(q, q)
+        self.to_item_at(
+            q,
+            &keys::slow_query_pk(&q.instance_id, q.started_at_ms),
+            &keys::slow_query_sk(q.started_at_ms, q.thread_id),
+        )
     }
 
-    /// 레코드를 항목으로 만들되 **키는 `key_source` 에서** 가져온다.
+    /// 레코드를 항목으로 만들되 **키는 주어진 물리 키를 그대로** 쓴다.
     ///
     /// # 왜 키를 분리해야 하는가
     ///
@@ -231,10 +246,23 @@ impl DynamoSlowQueryStore {
     ///
     /// 대가: `SK` 가 실제 시작 시각과 최대 1초 어긋날 수 있어 시간 범위 조회의
     /// 경계가 그만큼 부정확해진다. 한 실행이 두 레코드로 갈리는 것보다 훨씬 낫다.
-    fn to_item_keyed(
+    ///
+    /// # ⚠ 왜 `key_source: &SlowQuery` 로는 안 되는가 (6라운드 지적, 실측 확인)
+    ///
+    /// 예전에는 읽어온 레코드의 `started_at_ms` **필드**로 키를 다시 만들었다. 그런데
+    /// 위 규칙 때문에 **필드와 물리 키는 첫 병합 이후 어긋난다** — 항목은 416에 있고
+    /// 필드는 413이다. 그 다음 갱신이 필드로 키를 만들면 413을 겨냥하고,
+    ///
+    /// - 413에 아무것도 없으면 조건(`SK = 413`)이 실패해 **재시도 5회 초과로 죽는다**
+    ///   (로컬에서 그 오류를 실제로 봤다),
+    /// - 413에 쌍둥이가 있으면 **그쪽을 고치고 416의 유령은 그대로 남는다.**
+    ///
+    /// 즉 "자리에 머문다" 는 첫 병합까지만 성립했다. 물리 키를 들고 다녀야 한다.
+    fn to_item_at(
         &self,
         q: &SlowQuery,
-        key_source: &SlowQuery,
+        pk: &str,
+        sk: &str,
     ) -> Result<HashMap<String, AttributeValue>> {
         let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(q)
             .map_err(|e| DomainError::Internal(format!("레코드 직렬화 실패: {e}")))?;
@@ -243,14 +271,8 @@ impl DynamoSlowQueryStore {
         let (g2pk, g2sk) = keys::gsi2(q.env, q.duration_ms, q.started_at_ms);
 
         for (k, v) in [
-            (
-                "PK",
-                keys::slow_query_pk(&key_source.instance_id, key_source.started_at_ms),
-            ),
-            (
-                "SK",
-                keys::slow_query_sk(key_source.started_at_ms, key_source.thread_id),
-            ),
+            ("PK", pk.to_string()),
+            ("SK", sk.to_string()),
             ("GSI1PK", g1pk),
             ("GSI1SK", g1sk),
             ("GSI2PK", g2pk),
@@ -268,6 +290,81 @@ impl DynamoSlowQueryStore {
     fn from_item(item: HashMap<String, AttributeValue>) -> Result<SlowQuery> {
         serde_dynamo::from_item(item)
             .map_err(|e| DomainError::Internal(format!("레코드 역직렬화 실패: {e}")))
+    }
+
+    /// 항목을 **물리 키와 함께** 읽는다. 갱신 경로가 쓴다.
+    fn stored_from_item(item: HashMap<String, AttributeValue>) -> Result<Stored> {
+        let key = |name: &str| -> Result<String> {
+            item.get(name)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .ok_or_else(|| DomainError::Internal(format!("항목에 {name} 가 없다")))
+        };
+        let pk = key("PK")?;
+        let sk = key("SK")?;
+        Ok(Stored {
+            record: Self::from_item(item)?,
+            pk,
+            sk,
+        })
+    }
+
+    /// `(instance, thread_id, ±window, app_digest)` 보조 조회.
+    ///
+    /// `record_id` 가 1초 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../../docs/05-collector.md)).
+    /// 시작 시각이 날짜 경계를 걸칠 수 있으므로 **양쪽 날짜 파티션을 본다.**
+    async fn find_merge_candidate_stored(
+        &self,
+        instance: &InstanceId,
+        thread_id: u64,
+        app_digest: &str,
+        around_ms: dbmon_core::time::EpochMs,
+        window_ms: i64,
+    ) -> Result<Option<Stored>> {
+        let (lo, hi) = (around_ms - window_ms, around_ms + window_ms);
+        let mut best: Option<Stored> = None;
+
+        // 창이 자정을 걸치면 파티션이 둘이다. 중복은 아래에서 걸러진다.
+        let mut dates = vec![DatePart::from_epoch_ms(lo)];
+        let hi_date = DatePart::from_epoch_ms(hi);
+        if hi_date != dates[0] {
+            dates.push(hi_date);
+        }
+
+        for date in dates {
+            let pk = format!("SQ#{}#{}", instance.as_str(), date.as_str());
+            let out = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
+                .expression_attribute_values(":pk", AttributeValue::S(pk))
+                .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(lo)))
+                // `#` 를 붙여 같은 밀리초의 모든 스레드를 포함한다.
+                .expression_attribute_values(
+                    ":hi",
+                    AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(hi))),
+                )
+                .send()
+                .await
+                .map_err(map_sdk_err)?;
+
+            for item in out.items.unwrap_or_default() {
+                let cand = Self::stored_from_item(item)?;
+                if cand.record.thread_id != thread_id || cand.record.app_digest != app_digest {
+                    continue;
+                }
+                // 가장 가까운 것을 고른다 — 창 안에 둘 이상이면 결정론적이어야 한다.
+                let closer = best.as_ref().is_none_or(|b| {
+                    (cand.record.started_at_ms - around_ms).abs()
+                        < (b.record.started_at_ms - around_ms).abs()
+                });
+                if closer {
+                    best = Some(cand);
+                }
+            }
+        }
+        Ok(best)
     }
 
     /// **정확히 그 항목**을 읽는다 (`GetItem`).
@@ -296,7 +393,7 @@ impl DynamoSlowQueryStore {
         instance: &InstanceId,
         started_at_ms: dbmon_core::time::EpochMs,
         thread_id: u64,
-    ) -> Result<Option<SlowQuery>> {
+    ) -> Result<Option<Stored>> {
         let out = self
             .client
             .get_item()
@@ -313,7 +410,7 @@ impl DynamoSlowQueryStore {
             .await
             .map_err(map_sdk_err)?;
         match out.item {
-            Some(item) => Ok(Some(Self::from_item(item)?)),
+            Some(item) => Ok(Some(Self::stored_from_item(item)?)),
             None => Ok(None),
         }
     }
@@ -327,7 +424,7 @@ impl DynamoSlowQueryStore {
     /// 복원할 수 없다. 그래서 `begins_with(SK, <초 접두>)` 로 조회하고 `thread_id` 로
     /// 좁힌다 — 같은 초·같은 스레드는 하나뿐이다. **쌍둥이가 있으면 하나뿐이 아니다**
     /// ([`find_exact`](Self::find_exact) 참고).
-    async fn find_by_record_id(&self, id: &RecordId) -> Result<Option<SlowQuery>> {
+    async fn find_by_record_id(&self, id: &RecordId) -> Result<Option<Stored>> {
         let (instance, thread_id, sec) = id.parts().map_err(|e| DomainError::InvalidInput {
             field: "record_id".into(),
             reason: e.to_string(),
@@ -352,9 +449,9 @@ impl DynamoSlowQueryStore {
             .map_err(map_sdk_err)?;
 
         for item in out.items.unwrap_or_default() {
-            let q = Self::from_item(item)?;
-            if q.thread_id == thread_id {
-                return Ok(Some(q));
+            let found = Self::stored_from_item(item)?;
+            if found.record.thread_id == thread_id {
+                return Ok(Some(found));
             }
         }
         Ok(None)
@@ -422,7 +519,7 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             // 모든 단위 테스트가 통과했다 — 페이크와 실제의 계약이 갈린 상태였다.
             if existing.is_none() {
                 existing = self
-                    .find_merge_candidate(
+                    .find_merge_candidate_stored(
                         &q.instance_id,
                         q.thread_id,
                         &q.app_digest,
@@ -434,13 +531,15 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             let merged = match &existing {
                 // **`merge(existing, incoming)`** 순서를 지킨다. `record_id`·`literal_policy`
                 // 는 "먼저 저장된 쪽 유지" 가 문서화된 의도다.
-                Some(prev) => merge(prev, q),
+                Some(prev) => merge(&prev.record, q),
                 None => q.clone(),
             };
             // **키는 기존 항목 자리를 유지한다.** 병합이 시작 시각을 앞당기면
             // 키가 이동해 조건부 쓰기가 깨진다(위 `to_item_keyed` 참고).
             let item = match &existing {
-                Some(prev) => self.to_item_keyed(&merged, prev)?,
+                // **읽어온 물리 키를 그대로 쓴다.** 필드로 다시 만들면 첫 병합 이후
+                // 어긋나 조건부 쓰기가 영구히 실패한다(`to_item_at` 주석).
+                Some(prev) => self.to_item_at(&merged, &prev.pk, &prev.sk)?,
                 None => self.to_item(&merged)?,
             };
 
@@ -456,10 +555,7 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                 // 같은 `record_id` 라도 다른 밀리초면 다른 항목이다.
                 Some(prev) => put
                     .condition_expression("SK = :sk")
-                    .expression_attribute_values(
-                        ":sk",
-                        AttributeValue::S(keys::slow_query_sk(prev.started_at_ms, prev.thread_id)),
-                    ),
+                    .expression_attribute_values(":sk", AttributeValue::S(prev.sk.clone())),
             };
 
             match put.send().await {
@@ -480,13 +576,13 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     }
 
     async fn get(&self, id: &RecordId) -> Result<Option<SlowQuery>> {
-        self.find_by_record_id(id).await
+        Ok(self.find_by_record_id(id).await?.map(|s| s.record))
     }
 
-    /// `(instance, thread_id, ±window, app_digest)` 보조 조회.
+    /// `(instance, thread_id, ±window, app_digest)` 보조 조회 (포트 계약).
     ///
-    /// `record_id` 가 1초 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../../docs/05-collector.md)).
-    /// 시작 시각이 날짜 경계를 걸칠 수 있으므로 **양쪽 날짜 파티션을 본다.**
+    /// 내부 갱신 경로는 물리 키가 필요하므로 [`Self::find_merge_candidate_stored`] 를
+    /// 쓴다. 포트는 레코드만 약속하므로 여기서 벗겨 준다.
     async fn find_merge_candidate(
         &self,
         instance: &InstanceId,
@@ -495,49 +591,10 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         around_ms: dbmon_core::time::EpochMs,
         window_ms: i64,
     ) -> Result<Option<SlowQuery>> {
-        let (lo, hi) = (around_ms - window_ms, around_ms + window_ms);
-        let mut best: Option<SlowQuery> = None;
-
-        // 창이 자정을 걸치면 파티션이 둘이다. 중복은 아래에서 걸러진다.
-        let mut dates = vec![DatePart::from_epoch_ms(lo)];
-        let hi_date = DatePart::from_epoch_ms(hi);
-        if hi_date != dates[0] {
-            dates.push(hi_date);
-        }
-
-        for date in dates {
-            let pk = format!("SQ#{}#{}", instance.as_str(), date.as_str());
-            let out = self
-                .client
-                .query()
-                .table_name(&self.table)
-                .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
-                .expression_attribute_values(":pk", AttributeValue::S(pk))
-                .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(lo)))
-                // `#` 를 붙여 같은 밀리초의 모든 스레드를 포함한다.
-                .expression_attribute_values(
-                    ":hi",
-                    AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(hi))),
-                )
-                .send()
-                .await
-                .map_err(map_sdk_err)?;
-
-            for item in out.items.unwrap_or_default() {
-                let cand = Self::from_item(item)?;
-                if cand.thread_id != thread_id || cand.app_digest != app_digest {
-                    continue;
-                }
-                // 가장 가까운 것을 고른다 — 창 안에 둘 이상이면 결정론적이어야 한다.
-                let closer = best.as_ref().is_none_or(|b| {
-                    (cand.started_at_ms - around_ms).abs() < (b.started_at_ms - around_ms).abs()
-                });
-                if closer {
-                    best = Some(cand);
-                }
-            }
-        }
-        Ok(best)
+        Ok(self
+            .find_merge_candidate_stored(instance, thread_id, app_digest, around_ms, window_ms)
+            .await?
+            .map(|s| s.record))
     }
 
     /// 구간 안의 레코드를 **최신순으로** 돌려준다.

@@ -171,8 +171,11 @@ export function CloudWatchPage() {
                 <tbody className={TBODY}>
                   {digests.data.items.length === 0 ? (
                     <EmptyRow colSpan={9}>
-                      이 달에 기록된 슬로우 쿼리가 없다. 월을 바꿔 보거나, 수집이 도는지
-                      MySQL Monitor 화면에서 확인한다.
+                      {/* **"이 달에 없다" 라고 말하지 않는다.** 서버가 구간을 좁혀 읽었으면
+                          달의 일부만 본 것이고, 그걸 "없다" 로 읽으면 조사가 끝나 버린다. */}
+                      {monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms) === month
+                        ? "이 달에 기록된 슬로우 쿼리가 없다. 월을 바꿔 보거나, 수집이 도는지 MySQL Monitor 화면에서 확인한다."
+                        : `조회한 구간(${monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms)})에는 기록이 없다 — 이 달 전체를 본 것이 아니다. 인스턴스를 지정하면 더 거슬러 볼 수 있다.`}
                     </EmptyRow>
                   ) : (
                     digests.data.items.map((row) => (
