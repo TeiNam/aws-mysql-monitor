@@ -148,15 +148,18 @@ interface SummaryProps {
 
 function Summary({ instances, status }: SummaryProps) {
   // 한 번만 훑는다. 인스턴스 수는 작지만 필터를 세 번 도는 습관이 표를 키운다.
+  //
+  // **표본이 없으면 합계도 `null`** 이다. `0` 으로 초기화하면 "지표가 아직
+  // 안 왔다" 가 "스레드가 0개다" 로 보인다 — 옆 칸의 `—` 와도 모순된다.
   let collecting = 0;
   let qpsTotal: number | null = null;
-  let running = 0;
+  let running: number | null = null;
   for (const instance of instances) {
     if (instance.state === "collecting") collecting += 1;
     const metrics = status[instance.id];
     if (metrics === undefined) continue;
     if (metrics.qps !== null) qpsTotal = (qpsTotal ?? 0) + metrics.qps;
-    running += metrics.threads_running ?? 0;
+    if (metrics.threads_running !== null) running = (running ?? 0) + metrics.threads_running;
   }
 
   return (

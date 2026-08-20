@@ -4,6 +4,7 @@ import {
   INITIAL_SNAPSHOT,
   MAX_LIVE_ROWS,
   applyMessage,
+  markStreamGap,
   parseServerMessage,
   type LiveSnapshot,
 } from "./live-reduce";
@@ -41,7 +42,7 @@ function metrics(overrides: Partial<LiveMetrics> = {}): LiveMetrics {
 }
 
 function apply(snapshot: LiveSnapshot, ...msgs: ServerMessage[]): LiveSnapshot {
-  return msgs.reduce((acc, msg) => applyMessage(acc, msg, NOW), snapshot);
+  return msgs.reduce((acc, msg) => applyMessage(acc, msg), snapshot);
 }
 
 describe("슬로우 쿼리 upsert", () => {
@@ -94,6 +95,26 @@ describe("실시간 지표", () => {
     expect(s.qpsHistory[inst]).toEqual([null, 13.4]);
   });
 
+  it("연결이 끊기면 이력에 구멍을 남긴다", () => {
+    // 이게 없으면 10분 뒤 재연결한 첫 표본이 끊기기 전 표본과 선으로 이어져
+    // **관측이 없던 구간에 선이 그려진다.**
+    const inst = "i";
+    const connected = apply(INITIAL_SNAPSHOT, {
+      t: "status",
+      instance_id: inst,
+      metrics: metrics({ qps: 10 }),
+    });
+    const dropped = markStreamGap(connected);
+    expect(dropped.qpsHistory[inst]).toEqual([10, null]);
+
+    // 재접속을 여러 번 실패해도 `null` 로만 채워 데이터를 밀어내지 않는다.
+    expect(markStreamGap(dropped).qpsHistory[inst]).toEqual([10, null]);
+  });
+
+  it("이력이 없으면 구멍 표시가 스냅샷을 바꾸지 않는다", () => {
+    expect(markStreamGap(INITIAL_SNAPSHOT)).toBe(INITIAL_SNAPSHOT);
+  });
+
   it("이력이 상한을 넘으면 오래된 표본을 버린다", () => {
     const inst = "i";
     const messages: ServerMessage[] = Array.from({ length: HISTORY_LEN + 5 }, (_, i) => ({
@@ -115,10 +136,22 @@ describe("연결 상태", () => {
     expect(s.user).toBeNull();
   });
 
-  it("stream_lagged 는 재조회 신호를 남긴다", () => {
+  it("stream_lagged 는 재조회 신호를 셈으로 남긴다", () => {
     // 유실된 방송은 다시 오지 않는다. 화면이 HTTP 로 다시 읽어야 한다.
-    const s = apply(INITIAL_SNAPSHOT, { t: "error", code: "stream_lagged" });
-    expect(s.laggedAt).toBe(NOW);
+    // 같은 밀리초에 두 번 밀려도 두 번으로 세져야 재조회가 빠지지 않는다.
+    const s = apply(
+      INITIAL_SNAPSHOT,
+      { t: "error", code: "stream_lagged" },
+      { t: "error", code: "stream_lagged" },
+    );
+    expect(s.laggedCount).toBe(2);
+    // 스스로 복구되는 상황이므로 오류 배너를 띄우지 않는다.
+    expect(s.errorCode).toBeNull();
+  });
+
+  it("프로토콜 오류 코드를 삼키지 않는다", () => {
+    const s = apply(INITIAL_SNAPSHOT, { t: "error", code: "malformed" });
+    expect(s.errorCode).toBe("malformed");
   });
 
   it("거부된 토픽을 버리지 않는다", () => {
@@ -132,7 +165,7 @@ describe("연결 상태", () => {
 
   it("pong 은 같은 객체를 돌려준다", () => {
     // 참조가 바뀌면 `useSyncExternalStore` 가 30초마다 전체를 리렌더한다.
-    const s = applyMessage(INITIAL_SNAPSHOT, { t: "pong" }, NOW);
+    const s = applyMessage(INITIAL_SNAPSHOT, { t: "pong" });
     expect(s).toBe(INITIAL_SNAPSHOT);
   });
 });
@@ -158,10 +191,50 @@ describe("프레임 파싱", () => {
       '{"t":"slowq"}',
       '{"t":"slowq","data":{"record_id":"a"}}', // duration_ms 없음
       '{"t":"status","instance_id":"i"}', // metrics 없음
+      '{"t":"status","instance_id":"i","metrics":{}}', // at_ms 없음 → 1970년을 그리지 않는다
       '{"t":"subscribed","topics":"dev","denied":[]}',
       '{"t":"error"}',
     ]) {
       expect(parseServerMessage(raw), raw).toBeNull();
     }
+  });
+
+  /**
+   * **화면이 읽는 필드가 없으면 프레임을 버린다.** `env_scope` 가 없으면 헤더가
+   * `undefined.join()` 으로 죽고, 그러면 프레임 하나가 화면 전체를 날린다.
+   */
+  it("ready 에 화면이 읽는 필드가 빠지면 버린다", () => {
+    const full = {
+      t: "ready",
+      user: { subject: "u", role: "viewer", env_scope: ["dev"], can_see_literals: false },
+    };
+    expect(parseServerMessage(JSON.stringify(full))).not.toBeNull();
+
+    for (const missing of ["subject", "role", "env_scope", "can_see_literals"]) {
+      const user: Record<string, unknown> = { ...full.user };
+      delete user[missing];
+      expect(parseServerMessage(JSON.stringify({ t: "ready", user })), missing).toBeNull();
+    }
+  });
+
+  it("지표의 숫자가 아닌 값은 null 로 정규화한다", () => {
+    // `undefined` 가 산술에 들어가면 `NaN` 이 되고, 차트에 구멍이 아니라
+    // 쓰레기가 그려진다.
+    const msg = parseServerMessage(
+      '{"t":"status","instance_id":"i","metrics":{"at_ms":1,"qps":"9","threads_running":3}}',
+    );
+    expect(msg).toEqual({
+      t: "status",
+      instance_id: "i",
+      metrics: {
+        at_ms: 1,
+        qps: null,
+        slow_per_sec: null,
+        threads_running: 3,
+        threads_connected: null,
+        lock_waits: null,
+        rate_gap_reason: null,
+      },
+    });
   });
 });

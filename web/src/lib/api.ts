@@ -51,6 +51,9 @@ async function errorCodeOf(res: Response): Promise<string> {
 async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
   const res = await fetch(path, {
     headers: { accept: "application/json", ...authHeaders() },
+    // 백엔드가 캐시 헤더를 주지 않는다. 브라우저 휴리스틱 캐시가 낡은 목록을
+    // 돌려주면 "왜 새 쿼리가 안 보이나" 를 코드에서 찾게 된다.
+    cache: "no-store",
     signal,
   });
 

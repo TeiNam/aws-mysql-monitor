@@ -13,6 +13,18 @@ export function useLive(): LiveSnapshot {
 }
 
 /**
+ * 방송 유실 횟수만 관찰한다.
+ *
+ * 전체 스냅샷을 구독하면 5초마다 오는 `status` 하나에 **표 전체가 리렌더**된다.
+ * 목록 화면은 유실 신호 말고는 실시간 값을 쓰지 않으므로 원시값 하나만 본다.
+ */
+const selectLaggedCount = () => liveClient.getSnapshot().laggedCount;
+
+export function useLiveLagged(): number {
+  return useSyncExternalStore(liveClient.subscribe, selectLaggedCount, selectLaggedCount);
+}
+
+/**
  * 이 화면이 필요한 토픽을 요구한다. 언마운트되면 해제된다.
  *
  * 의존성을 **문자열 하나**로 만드는 이유: 호출부가 `useMemo` 를 빠뜨려 매 렌더

@@ -9,9 +9,14 @@ const NAV = [
   { to: "/live", label: "실시간" },
 ] as const;
 
+/**
+ * 껍데기.
+ *
+ * **여기서 실시간 스냅샷을 구독하지 않는다.** 구독하면 5초마다 오는 지표 하나에
+ * `<Outlet />` 아래 화면 전체가 리렌더된다. 실시간 값이 필요한 조각([`LiveStatus`],
+ * [`LiveBanners`])만 잎에서 구독한다.
+ */
 export function Layout() {
-  const live = useLive();
-
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <header className="border-b border-zinc-800 bg-zinc-900/80 backdrop-blur">
@@ -35,17 +40,38 @@ export function Layout() {
             ))}
           </nav>
           <div className="ml-auto flex items-center gap-3">
-            <UserBadge user={live.user} />
-            <ConnBadge conn={live.conn} />
+            <LiveStatus />
           </div>
         </div>
-        <DeniedBanner denied={live.denied} />
+        <LiveBanners />
       </header>
 
       <main className="mx-auto max-w-7xl px-4 py-6">
         <Outlet />
       </main>
     </div>
+  );
+}
+
+/** 사용자·연결 상태. 실시간 메시지마다 리렌더되는 것은 이 조각뿐이다. */
+function LiveStatus() {
+  const live = useLive();
+  return (
+    <>
+      <UserBadge user={live.user} />
+      <ConnBadge conn={live.conn} />
+    </>
+  );
+}
+
+/** 알림 배너. 같은 이유로 잎에서 구독한다. */
+function LiveBanners() {
+  const live = useLive();
+  return (
+    <>
+      <DeniedBanner denied={live.denied} />
+      <StreamErrorBanner code={live.errorCode} />
+    </>
   );
 }
 
@@ -100,6 +126,33 @@ function UserBadge({ user }: { user: LiveSnapshot["user"] }) {
         </span>
       ) : null}
     </span>
+  );
+}
+
+/**
+ * 스트림 프로토콜 오류.
+ *
+ * `unauthorized` 는 연결 배지가 이미 말하고 있으므로 중복해서 띄우지 않는다.
+ * 나머지는 **프론트와 백엔드가 어긋났다는 신호**다 — 조용히 삼키면 "데이터가
+ * 안 온다" 로만 보이고, 그게 이 프로젝트에서 반복된 오진의 출발점이었다.
+ */
+const STREAM_ERRORS: Record<string, string> = {
+  malformed: "서버가 우리 메시지를 이해하지 못했다. 프로토콜 버전이 어긋났다.",
+  auth_timeout: "인증 메시지가 5초 안에 닿지 않았다.",
+  binary_not_supported: "이진 프레임을 보냈다 — 클라이언트 버그다.",
+  already_authenticated: "인증이 중복 전송됐다 — 클라이언트 버그다.",
+};
+
+function StreamErrorBanner({ code }: { code: string | null }) {
+  if (code === null || code === "unauthorized") return null;
+  return (
+    <p
+      className="border-t border-rose-500/30 bg-rose-500/10 px-4 py-2 text-xs text-rose-200"
+      role="alert"
+    >
+      실시간 스트림 오류: <span className="font-mono">{code}</span>
+      {STREAM_ERRORS[code] === undefined ? null : ` — ${STREAM_ERRORS[code]}`}
+    </p>
   );
 }
 

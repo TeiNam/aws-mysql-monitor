@@ -4,7 +4,7 @@ import { Link, useSearchParams } from "react-router";
 import { StateBadge } from "../components/Badges";
 import { ErrorNotice, Note, Pending } from "../components/Notices";
 import { CARD, LINK, MONO, ROW, TABLE, TD, TD_NUM, TH, TH_NUM } from "../components/styles";
-import { useLive } from "../hooks/useLive";
+import { useLiveLagged } from "../hooks/useLive";
 import { fetchInstances, fetchSlowQueries, queryKeys, type ListQuery } from "../lib/api";
 import { EMPTY, fmtDuration, fmtInt, fmtClock, shortInstance } from "../lib/format";
 import type { SlowQueryView } from "../lib/types";
@@ -54,12 +54,12 @@ export function SlowQueries() {
   });
 
   // 방송이 밀리면 유실된 쿼리는 **다시 방송되지 않는다.** HTTP 로 다시 읽는다.
-  const { laggedAt } = useLive();
+  const laggedCount = useLiveLagged();
   const refetch = list.refetch;
   useEffect(() => {
-    if (laggedAt === null) return;
+    if (laggedCount === 0) return;
     void refetch();
-  }, [laggedAt, refetch]);
+  }, [laggedCount, refetch]);
 
   const envOptions = useMemo(
     () => [...new Set((instances.data ?? []).map((i) => i.env))].sort(),
@@ -112,7 +112,15 @@ export function SlowQueries() {
               value={String(limit)}
               onChange={(e) => update("limit", e.target.value)}
             >
-              {LIMIT_OPTIONS.map((n) => (
+              {/*
+                URL 이 `?limit=37` 처럼 목록에 없는 값을 줄 수 있다. 그 값은
+                유효하므로(서버가 1..200 을 받는다) **버리지 않고 항목으로
+                보여 준다** — 안 그러면 select 가 다른 숫자를 표시해 거짓말한다.
+              */}
+              {(LIMIT_OPTIONS.includes(limit as (typeof LIMIT_OPTIONS)[number])
+                ? LIMIT_OPTIONS
+                : [...LIMIT_OPTIONS, limit].sort((a, b) => a - b)
+              ).map((n) => (
                 <option key={n} value={n}>
                   {n}
                 </option>

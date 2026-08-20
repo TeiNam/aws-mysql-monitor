@@ -1620,6 +1620,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     // 나머지 경로는 `index.html` 이 받는다. 단 `/api/…` 는 위의
                     // 명시 라우트에 걸리지 않았다면 **404 로 답한다.**
                     app = app
+                        .route("/api", axum::routing::any(api_route_not_found))
                         .route("/api/{*rest}", axum::routing::any(api_route_not_found))
                         .fallback_service(ServeFile::new(dir.join("index.html")));
                 }

@@ -36,11 +36,18 @@ export interface LiveSnapshot {
   /** 인스턴스별 QPS 이력. `null` 은 "비율을 못 냈다" 이고 0 과 다르다. */
   qpsHistory: Readonly<Record<string, readonly (number | null)[]>>;
   /**
-   * 방송이 밀려 유실된 시각(`stream_lagged`). 값이 바뀌면 화면은 **HTTP 로
+   * 방송이 밀려 유실된 횟수(`stream_lagged`). 값이 늘면 화면은 **HTTP 로
    * 재조회**해야 한다 — 유실된 쿼리는 다시 방송되지 않는다.
+   *
+   * 시각이 아니라 횟수인 이유: 같은 밀리초에 두 번 밀리면 시각은 같은 값이 되어
+   * 재조회가 한 번 빠진다.
    */
-  laggedAt: number | null;
-  /** 마지막 서버 오류 코드. 표시 후에도 남겨 둔다(연결 성공 시 지워진다). */
+  laggedCount: number;
+  /**
+   * 마지막 프로토콜 오류 코드. **화면에 띄운다** — `malformed`·`auth_timeout` 은
+   * 프론트와 백엔드가 어긋났다는 뜻이고, 조용히 삼키면 "데이터가 안 온다" 로만
+   * 보인다. 연결이 다시 `ready` 가 되면 지워진다.
+   */
   errorCode: string | null;
 }
 
@@ -52,21 +59,15 @@ export const INITIAL_SNAPSHOT: LiveSnapshot = {
   slowq: [],
   status: {},
   qpsHistory: {},
-  laggedAt: null,
+  laggedCount: 0,
   errorCode: null,
 };
 
 /**
  * 서버 메시지 하나를 반영한다. **새 객체를 돌려준다** — 변경이 없으면 같은
  * 객체를 그대로 돌려주어 `useSyncExternalStore` 가 헛되게 리렌더하지 않게 한다.
- *
- * `nowMs` 는 `laggedAt` 표시에만 쓴다. 인자로 받는 이유는 테스트다.
  */
-export function applyMessage(
-  prev: LiveSnapshot,
-  msg: ServerMessage,
-  nowMs: number,
-): LiveSnapshot {
+export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapshot {
   switch (msg.t) {
     case "ready":
       return { ...prev, conn: "open", user: msg.user, errorCode: null };
@@ -99,11 +100,33 @@ export function applyMessage(
       if (msg.code === "unauthorized") {
         return { ...prev, conn: "unauthorized", user: null, errorCode: msg.code };
       }
+      // 밀린 것은 **오류가 아니라 재조회 신호**다. `errorCode` 로 배너를 띄우면
+      // 스스로 복구되는 상황에 사용자가 할 일이 없는 경고가 남는다.
       if (msg.code === "stream_lagged") {
-        return { ...prev, laggedAt: nowMs, errorCode: msg.code };
+        return { ...prev, laggedCount: prev.laggedCount + 1 };
       }
       return { ...prev, errorCode: msg.code };
   }
+}
+
+/**
+ * 연결이 끊겼음을 이력에 남긴다.
+ *
+ * 끊긴 동안의 표본은 **존재하지 않는다.** 이력을 그대로 두면 10분 뒤 재연결한
+ * 첫 표본이 끊기기 전 표본과 선으로 이어져, 관측이 없던 구간에 선이 그려진다.
+ * `null` 하나를 넣어 선을 끊는다 — 스파크라인이 `null` 을 구간 경계로 읽는다.
+ */
+export function markStreamGap(prev: LiveSnapshot): LiveSnapshot {
+  const instances = Object.keys(prev.qpsHistory);
+  if (instances.length === 0) return prev;
+
+  const qpsHistory: Record<string, readonly (number | null)[]> = {};
+  for (const [id, history] of Object.entries(prev.qpsHistory)) {
+    // 이미 끊긴 표시가 있으면 또 넣지 않는다 — 재접속을 여러 번 실패하면
+    // 이력이 `null` 로만 채워져 데이터를 밀어낸다.
+    qpsHistory[id] = history.at(-1) === null ? history : appendBounded(history, null, HISTORY_LEN);
+  }
+  return { ...prev, qpsHistory };
 }
 
 /**
@@ -152,10 +175,21 @@ export function parseServerMessage(raw: string): ServerMessage | null {
   if (!isRecord(parsed) || typeof parsed.t !== "string") return null;
 
   switch (parsed.t) {
-    case "ready":
-      return isRecord(parsed.user) && typeof parsed.user.subject === "string"
-        ? (parsed as unknown as ServerMessage)
-        : null;
+    case "ready": {
+      // **화면이 읽는 필드를 전부 확인한다.** `env_scope` 가 없으면 헤더에서
+      // `undefined.join()` 으로 죽는다 — 프레임 하나가 화면 전체를 날린다.
+      const user = parsed.user;
+      if (
+        !isRecord(user) ||
+        typeof user.subject !== "string" ||
+        typeof user.role !== "string" ||
+        typeof user.can_see_literals !== "boolean" ||
+        !isStringArray(user.env_scope)
+      ) {
+        return null;
+      }
+      return parsed as unknown as ServerMessage;
+    }
     case "subscribed":
       return isStringArray(parsed.topics) && isStringArray(parsed.denied)
         ? (parsed as unknown as ServerMessage)
@@ -163,13 +197,20 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     case "slowq":
       return isRecord(parsed.data) &&
         typeof parsed.data.record_id === "string" &&
-        typeof parsed.data.duration_ms === "number"
+        typeof parsed.data.duration_ms === "number" &&
+        typeof parsed.data.instance_id === "string" &&
+        typeof parsed.data.state === "string"
         ? (parsed as unknown as ServerMessage)
         : null;
-    case "status":
-      return typeof parsed.instance_id === "string" && isRecord(parsed.metrics)
-        ? (parsed as unknown as ServerMessage)
-        : null;
+    case "status": {
+      if (typeof parsed.instance_id !== "string" || !isRecord(parsed.metrics)) return null;
+      // 지표는 **정규화**한다. 없는 필드를 그대로 두면 `undefined` 가 산술에
+      // 들어가 `NaN` 이 되고, 그건 `0` 보다 나쁘다(차트에 구멍이 아니라 쓰레기).
+      const metrics = normalizeMetrics(parsed.metrics);
+      return metrics === null
+        ? null
+        : { t: "status", instance_id: parsed.instance_id, metrics };
+    }
     case "pong":
       return { t: "pong" };
     case "error":
@@ -177,6 +218,29 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     default:
       return null;
   }
+}
+
+/** 숫자가 아니면 `null`. "값이 없다" 로 흘려보내면 화면이 `—` 를 그린다. */
+function numberOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * 지표 프레임 정규화. **표본 시각이 없으면 프레임 자체를 버린다** — `0` 으로
+ * 채우면 화면이 1970년을 "마지막 갱신" 으로 표시한다.
+ */
+function normalizeMetrics(raw: Record<string, unknown>): LiveMetrics | null {
+  const at_ms = numberOrNull(raw.at_ms);
+  if (at_ms === null) return null;
+  return {
+    at_ms,
+    qps: numberOrNull(raw.qps),
+    slow_per_sec: numberOrNull(raw.slow_per_sec),
+    threads_running: numberOrNull(raw.threads_running),
+    threads_connected: numberOrNull(raw.threads_connected),
+    lock_waits: numberOrNull(raw.lock_waits),
+    rate_gap_reason: typeof raw.rate_gap_reason === "string" ? raw.rate_gap_reason : null,
+  };
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

@@ -23,6 +23,7 @@ import { currentToken } from "./auth";
 import {
   INITIAL_SNAPSHOT,
   applyMessage,
+  markStreamGap,
   parseServerMessage,
   type LiveSnapshot,
 } from "./live-reduce";
@@ -46,10 +47,7 @@ export class LiveClient {
   private pingTimer: number | null = null;
   private reconnectTimer: number | null = null;
 
-  constructor(
-    private readonly url: string,
-    private readonly now: () => number = Date.now,
-  ) {}
+  constructor(private readonly url: string) {}
 
   /** `useSyncExternalStore` 용. **참조가 안정적이어야** 하므로 화살표 필드다. */
   readonly getSnapshot = (): LiveSnapshot => this.snapshot;
@@ -94,10 +92,19 @@ export class LiveClient {
     if (this.snapshot.conn === "unauthorized") {
       this.set({ ...this.snapshot, conn: "idle", errorCode: null });
     }
+    // 서버가 `unauthorized` 를 보낸 **직후**에는 소켓이 아직 닫히는 중일 수 있다.
+    // 그 상태로 `connect()` 를 부르면 아래 가드에 걸려 **버튼이 아무 일도 하지
+    // 않는다.** 닫아 주면 `onclose` 가 teardown 과 재접속을 잇는다.
+    if (this.socket !== null) {
+      this.socket.close();
+      return;
+    }
     this.connect();
   }
 
   private connect(): void {
+    // **소켓은 항상 최대 하나다.** `teardown()` 이 `null` 로 만든 뒤에만 새로
+    // 만들므로, 핸들러가 "내가 현재 소켓인가" 를 확인할 필요가 없다.
     if (this.socket !== null || this.snapshot.conn === "unauthorized") return;
 
     this.set({ ...this.snapshot, conn: "connecting" });
@@ -107,7 +114,9 @@ export class LiveClient {
     this.sent.clear();
 
     socket.onopen = () => {
-      this.attempt = 0;
+      // **여기서 백오프를 초기화하지 않는다.** 업그레이드는 성공했는데 서버가
+      // 곧바로 끊는 경우(인증 실패·허브 종료)가 있고, 그때 초기화하면 최소
+      // 지연으로 무한히 재접속한다. 초기화는 `ready` 를 받은 뒤에 한다.
       const token = currentToken();
       // 로컬 우회 모드에는 토큰이 없다. 서버가 `{"t":"auth"}` 를 허용한다.
       socket.send(JSON.stringify(token === null ? { t: "auth" } : { t: "auth", token }));
@@ -119,8 +128,10 @@ export class LiveClient {
       if (typeof event.data !== "string") return;
       const msg = parseServerMessage(event.data);
       if (msg === null) return;
-      this.set(applyMessage(this.snapshot, msg, this.now()));
+      this.set(applyMessage(this.snapshot, msg));
       if (msg.t === "ready") {
+        // 인증까지 성공한 것이 **연결이 실제로 쓸 만하다**는 증거다.
+        this.attempt = 0;
         this.authed = true;
         this.syncTopics();
       }
@@ -140,10 +151,14 @@ export class LiveClient {
     this.socket = null;
     this.authed = false;
     this.sent.clear();
+    // 끊긴 구간을 이력에 남긴다 — 없으면 재연결 후 첫 표본이 옛 표본과 이어진다.
+    const gapped = markStreamGap(this.snapshot);
     // `unauthorized` 를 `closed` 로 덮으면 재접속 금지가 풀린다.
-    if (this.snapshot.conn !== "unauthorized") {
-      this.set({ ...this.snapshot, conn: "closed", user: null });
-    }
+    this.set(
+      this.snapshot.conn === "unauthorized"
+        ? gapped
+        : { ...gapped, conn: "closed", user: null },
+    );
   }
 
   private scheduleReconnect(): void {

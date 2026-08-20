@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router";
 import { StateBadge } from "../components/Badges";
-import { Note } from "../components/Notices";
+import { ErrorNotice, Note } from "../components/Notices";
 import { CARD, LINK, MONO, ROW, TABLE, TD, TD_NUM, TH, TH_NUM } from "../components/styles";
 import { useLive, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, queryKeys } from "../lib/api";
@@ -74,6 +74,13 @@ export function Live() {
         </label>
       </div>
 
+      {/* 등록부 조회가 실패하면 구독할 환경을 모른다 — 조용히 빈 표를 두지 않는다. */}
+      {instances.error === null ? null : (
+        <div className="mb-4">
+          <ErrorNotice error={instances.error} onRetry={() => void instances.refetch()} />
+        </div>
+      )}
+
       <div className={`${CARD} overflow-x-auto`}>
         <table className={TABLE}>
           <thead>
@@ -91,9 +98,18 @@ export function Live() {
             {rows.length === 0 ? (
               <tr>
                 <td className={`${TD} text-zinc-500`} colSpan={7}>
-                  {live.conn === "open"
-                    ? "구독 중이다. 임계값을 넘는 쿼리가 실행되면 여기 나타난다."
-                    : "연결되면 여기에 실시간으로 쌓인다."}
+                  {/*
+                    **구독하고 있지 않은데 "구독 중" 이라고 말하지 않는다.**
+                    구독할 환경은 등록부에서 얻으므로, 등록부 조회가 실패하면
+                    토픽이 하나도 없고 스트림은 영구히 비어 있다.
+                  */}
+                  {topics.length === 0
+                    ? instances.isPending
+                      ? "구독할 환경을 확인하는 중…"
+                      : "구독한 토픽이 없다 — 등록부에서 환경을 얻지 못했다."
+                    : live.conn === "open"
+                      ? "구독 중이다. 임계값을 넘는 쿼리가 실행되면 여기 나타난다."
+                      : "연결되면 여기에 실시간으로 쌓인다."}
                 </td>
               </tr>
             ) : (
@@ -105,7 +121,8 @@ export function Live() {
 
       <Note>
         같은 쿼리가 <strong>진행 중 → 확정</strong> 으로 갱신된다(같은{" "}
-        <span className="font-mono">record_id</span> 를 덮어쓴다). 화면은 최근{" "}
+        <span className="font-mono">record_id</span> 를 덮어쓴다). 정렬은 시작 시각이 아니라{" "}
+        <strong>수신 순서</strong>다 — 갱신 때마다 행이 튀지 않게 자리를 지킨다. 화면은 최근{" "}
         {MAX_LIVE_ROWS}건만 유지하고, 그 이전 것은 목록 화면에서 조회한다.
       </Note>
     </section>
