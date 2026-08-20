@@ -173,9 +173,12 @@ export function CloudWatchPage() {
                     <EmptyRow colSpan={9}>
                       {/* **"이 달에 없다" 라고 말하지 않는다.** 서버가 구간을 좁혀 읽었으면
                           달의 일부만 본 것이고, 그걸 "없다" 로 읽으면 조사가 끝나 버린다. */}
-                      {monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms) === month
+                      {/* 상한(`truncated`)에 걸렸을 때도 "없다" 로 말하면 안 된다 —
+                          구간은 그대로여도 **일부만 읽은 것**이다(7라운드 지적). */}
+                      {monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms) === month &&
+                      !digests.data.truncated
                         ? "이 달에 기록된 슬로우 쿼리가 없다. 월을 바꿔 보거나, 수집이 도는지 MySQL Monitor 화면에서 확인한다."
-                        : `조회한 구간(${monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms)})에는 기록이 없다 — 이 달 전체를 본 것이 아니다. 인스턴스를 지정하면 더 거슬러 볼 수 있다.`}
+                        : `조회한 범위(${monthRangeLabel(month, digests.data.from_ms, digests.data.to_ms)}${digests.data.truncated ? ", 조회 상한에 걸림" : ""})에서는 기록을 찾지 못했다 — 이 달 전체를 본 것이 아니다. 인스턴스를 지정하면 더 좁혀 볼 수 있다.`}
                     </EmptyRow>
                   ) : (
                     digests.data.items.map((row) => (

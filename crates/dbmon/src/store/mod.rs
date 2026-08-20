@@ -41,15 +41,32 @@ use dbmon_core::time::{DatePart, TimeRange, sort_key_ms};
 /// 병합이 교환법칙을 만족하므로 재시도는 안전하다. 상한은 무한 루프 방지용이다.
 const MAX_UPSERT_RETRIES: u32 = 5;
 
+/// 낙관적 잠금 카운터 속성 이름.
+///
+/// # 왜 `SK = <읽은 SK>` 만으로는 부족했나 (7라운드 지적)
+///
+/// `PutItem` 은 이미 그 `PK`/`SK` 를 겨냥하므로 `SK = :sk` 조건은 **"그 자리에 항목이
+/// 있다" 만 확인한다** — 항진명제에 가깝다. 그래서 두 워커가 같은 항목을 동시에
+/// 읽고 각자 병합해 쓰면 **둘 다 성공하고 나중 것이 앞의 것을 덮는다.** 재시도
+/// 경로가 아예 돌지 않으므로 병합의 교환법칙도 소용이 없다 — 실행계획이나 정확
+/// 지표가 **조용히 사라질 수 있다.**
+///
+/// 이 카운터를 조건에 넣으면 하나만 통과하고, 진 쪽은 다시 읽어 병합한다(그 재시도
+/// 루프는 이미 있었다).
+const REV_ATTR: &str = "rev";
+
 /// 저장소에서 읽은 항목. **물리 키를 함께 들고 온다.**
 ///
 /// 레코드의 `started_at_ms` 필드로 키를 다시 만들 수 없기 때문이다
 /// ([`DynamoSlowQueryStore::to_item_at`] 의 주석 참고) — 병합이 시작 시각을 앞당기면
 /// 필드와 키가 어긋나고, 그때부터 그 레코드는 **영구히 갱신 불가**가 된다.
+#[derive(Clone)]
 struct Stored {
     record: SlowQuery,
     pk: String,
     sk: String,
+    /// 낙관적 잠금 카운터. **옛 항목에는 없다**(`None`).
+    rev: Option<u64>,
 }
 
 pub struct DynamoSlowQueryStore {
@@ -228,6 +245,7 @@ impl DynamoSlowQueryStore {
             q,
             &keys::slow_query_pk(&q.instance_id, q.started_at_ms),
             &keys::slow_query_sk(q.started_at_ms, q.thread_id),
+            1,
         )
     }
 
@@ -263,6 +281,7 @@ impl DynamoSlowQueryStore {
         q: &SlowQuery,
         pk: &str,
         sk: &str,
+        next_rev: u64,
     ) -> Result<HashMap<String, AttributeValue>> {
         let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(q)
             .map_err(|e| DomainError::Internal(format!("레코드 직렬화 실패: {e}")))?;
@@ -284,6 +303,11 @@ impl DynamoSlowQueryStore {
             "ttl".to_string(),
             AttributeValue::N(keys::ttl_secs(q.started_at_ms).to_string()),
         );
+        // **낙관적 잠금 카운터.** 조건이 이 값을 보므로 동시 쓰기 중 하나만 통과한다.
+        item.insert(
+            REV_ATTR.to_string(),
+            AttributeValue::N(next_rev.to_string()),
+        );
         Ok(item)
     }
 
@@ -302,10 +326,15 @@ impl DynamoSlowQueryStore {
         };
         let pk = key("PK")?;
         let sk = key("SK")?;
+        let rev = item
+            .get(REV_ATTR)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok());
         Ok(Stored {
             record: Self::from_item(item)?,
             pk,
             sk,
+            rev,
         })
     }
 
@@ -367,64 +396,22 @@ impl DynamoSlowQueryStore {
         Ok(best)
     }
 
-    /// **정확히 그 항목**을 읽는다 (`GetItem`).
+    /// 같은 초 버킷의 **모든** 후보를 모은다.
     ///
-    /// # 왜 초 버킷 조회로는 부족한가 (실측으로 드러난 결함)
+    /// # 왜 첫 일치로는 안 되는가 (실측으로 드러난 결함)
     ///
-    /// `find_by_record_id` 는 `begins_with(SK, <초 접두>)` 로 찾고 **첫 일치**를 준다.
-    /// 그런데 같은 실행에 항목이 **두 개** 생길 수 있다 — 실시간 캡처와 슬로우로그가
-    /// 처음 쓰기를 동시에 하면 둘 다 "없다" 를 보고, `SK` 의 밀리초가 3ms 달라
-    /// `attribute_not_exists(PK)` 조건이 **양쪽 다 통과**한다. 로컬에서 실제로 그
-    /// 상태를 봤다:
+    /// 같은 실행에 항목이 **두 개** 생길 수 있다 — 실시간 캡처와 슬로우로그가 처음
+    /// 쓰기를 동시에 하면 둘 다 "없다" 를 보고, `SK` 의 밀리초가 3ms 달라
+    /// `attribute_not_exists(PK)` 조건이 **양쪽 다 통과**한다. 로컬에서 그 상태를 봤다:
     ///
     /// ```text
     /// SK 1787241482413#10912  state=finalized  capture=merged
     /// SK 1787241482416#10912  state=in_flight  capture=processlist   ← 유령
     /// ```
     ///
-    /// 이때 고아 스윕이 유령(416)을 확정하려고 `upsert_merged` 를 부르면, 초 버킷
-    /// 조회가 **413** 을 돌려주고 병합 결과가 413에 써진다. 유령은 그대로 남고 스윕은
-    /// **성공을 보고한다** — 30초마다 영구히 반복됐다(쓰기 비용도 함께). 화면에는
-    /// 끝난 쿼리가 영원히 "진행 중" 으로 남는다. F4 가 없애려던 바로 그 상태다.
-    ///
-    /// 그래서 갱신 경로는 **자기가 읽은 키를 먼저 본다.** 값이 있으면 그 자리를 고친다.
-    async fn find_exact(
-        &self,
-        instance: &InstanceId,
-        started_at_ms: dbmon_core::time::EpochMs,
-        thread_id: u64,
-    ) -> Result<Option<Stored>> {
-        let out = self
-            .client
-            .get_item()
-            .table_name(&self.table)
-            .key(
-                "PK",
-                AttributeValue::S(keys::slow_query_pk(instance, started_at_ms)),
-            )
-            .key(
-                "SK",
-                AttributeValue::S(keys::slow_query_sk(started_at_ms, thread_id)),
-            )
-            .send()
-            .await
-            .map_err(map_sdk_err)?;
-        match out.item {
-            Some(item) => Ok(Some(Self::stored_from_item(item)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// `record_id` 로 항목을 찾는다.
-    ///
-    /// # `GetItem` 을 쓸 수 없다
-    ///
-    /// `record_id` 는 `started_at_ms` 를 **초 단위로 절단**해서 담는다(멱등 키가 ±1초
-    /// 흔들림을 흡수하도록 의도된 설계다). `SK` 는 밀리초를 담으므로 `record_id` 에서
-    /// 복원할 수 없다. 그래서 `begins_with(SK, <초 접두>)` 로 조회하고 `thread_id` 로
-    /// 좁힌다 — 같은 초·같은 스레드는 하나뿐이다. **쌍둥이가 있으면 하나뿐이 아니다**
-    /// ([`find_exact`](Self::find_exact) 참고).
-    async fn find_by_record_id(&self, id: &RecordId) -> Result<Option<Stored>> {
+    /// 첫 일치(작은 SK)를 고치면 유령은 그대로 남고 스윕은 **성공을 보고한다** —
+    /// 30초마다 영구히 반복됐다. 그래서 후보를 다 모아 [`pick_target`] 이 고른다.
+    async fn candidates_by_record_id(&self, id: &RecordId) -> Result<Vec<Stored>> {
         let (instance, thread_id, sec) = id.parts().map_err(|e| DomainError::InvalidInput {
             field: "record_id".into(),
             reason: e.to_string(),
@@ -448,14 +435,94 @@ impl DynamoSlowQueryStore {
             .await
             .map_err(map_sdk_err)?;
 
+        let mut found = Vec::new();
         for item in out.items.unwrap_or_default() {
-            let found = Self::stored_from_item(item)?;
-            if found.record.thread_id == thread_id {
-                return Ok(Some(found));
+            let cand = Self::stored_from_item(item)?;
+            if cand.record.thread_id == thread_id {
+                found.push(cand);
             }
         }
-        Ok(None)
+        Ok(found)
     }
+
+    /// `record_id` 로 항목 하나를 찾는다 (`get()` 이 쓴다).
+    ///
+    /// # `GetItem` 을 쓸 수 없다
+    ///
+    /// `record_id` 는 `started_at_ms` 를 **초 단위로 절단**해서 담는다(멱등 키가 ±1초
+    /// 흔들림을 흡수하도록 의도된 설계다). `SK` 는 밀리초를 담으므로 `record_id` 에서
+    /// 복원할 수 없다. 그래서 초 버킷을 조회한다.
+    ///
+    /// 쌍둥이가 있으면 후보가 둘 이상이다. 조회는 **가장 정보가 많은 쪽**(확정·정확
+    /// 지표)을 주는 것이 옳다 — 상세 화면이 "진행 중" 을 보여 주고 끝나면 안 된다.
+    async fn find_by_record_id(&self, id: &RecordId) -> Result<Option<Stored>> {
+        let mut found = self.candidates_by_record_id(id).await?;
+        found.sort_by_key(|s| std::cmp::Reverse(read_rank(&s.record)));
+        Ok(found.into_iter().next())
+    }
+}
+
+/// 여러 후보 중 **고칠 항목**을 고른다. 순수 함수 — 규칙을 테스트로 고정한다.
+///
+/// 쌍둥이(같은 실행의 항목 둘)가 있을 때 아무거나 고치면 나머지가 유령으로 남는다.
+/// 순서대로 본다:
+///
+/// 1. 들어온 레코드가 **닫는 쓰기**(진행 중이 아니다)면 **저장된 진행 중 항목** —
+///    고아 스윕·일시정지 확정·정상 확정이 이 경로다. **닫으려는 대상은 열려 있는
+///    쪽이다.** 이 규칙이 물리 키 일치보다 앞서야 한다: 병합이 시각을 앞당긴
+///    레코드는 필드로 계산한 키가 **쌍둥이를 가리킬 수 있고**, 그러면 유령이 남는다
+///    (7라운드 지적 — 테스트가 이 순서를 고정한다).
+/// 2. **물리 `SK` 가 들어온 레코드의 시작 시각과 일치** — 정상 경로다. 진행 중 갱신은
+///    매 tick 같은 자리를 쓴다.
+/// 3. 필드 시작 시각이 일치 — 읽어서 고치는 경로(병합이 시각을 앞당긴 항목).
+/// 4. 시작 시각이 가장 가까운 것 — 남은 경우를 결정론적으로 만든다.
+fn pick_target<'a>(candidates: &'a [Stored], incoming: &SlowQuery) -> Option<&'a Stored> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if incoming.state != dbmon_core::slow_query::SlowQueryState::InFlight {
+        if let Some(open) = candidates
+            .iter()
+            .find(|c| c.record.state == dbmon_core::slow_query::SlowQueryState::InFlight)
+        {
+            return Some(open);
+        }
+    }
+    let want_sk = keys::slow_query_sk(incoming.started_at_ms, incoming.thread_id);
+    if let Some(hit) = candidates.iter().find(|c| c.sk == want_sk) {
+        return Some(hit);
+    }
+    if let Some(same) = candidates
+        .iter()
+        .find(|c| c.record.started_at_ms == incoming.started_at_ms)
+    {
+        return Some(same);
+    }
+    candidates.iter().min_by_key(|c| {
+        (
+            (c.record.started_at_ms - incoming.started_at_ms).abs(),
+            // 동거리면 SK 로 확정한다 — 순서가 응답마다 달라지면 안 된다.
+            c.sk.clone(),
+        )
+    })
+}
+
+/// 조회가 여러 후보 중 하나를 보여줄 때의 우선순위. 큰 값이 이긴다.
+///
+/// 화면이 **정보가 더 많은 쪽**을 봐야 한다 — 확정된 값이 있는데 "진행 중" 을
+/// 보여주면 실행시간을 하한으로 읽게 된다.
+fn read_rank(q: &SlowQuery) -> (u8, u8, i64) {
+    use dbmon_core::slow_query::{CaptureSource, SlowQueryState};
+    let closed = match q.state {
+        SlowQueryState::Finalized => 2,
+        SlowQueryState::Abandoned => 1,
+        SlowQueryState::InFlight => 0,
+    };
+    let exact = match q.capture_source {
+        CaptureSource::Merged | CaptureSource::Slowlog => 1,
+        _ => 0,
+    };
+    (closed, exact, q.duration_ms)
 }
 
 /// SDK 오류를 도메인 오류로.
@@ -485,18 +552,11 @@ pub(crate) fn is_conditional_failure<E: std::fmt::Debug, R: std::fmt::Debug>(
 impl SlowQueryStore for DynamoSlowQueryStore {
     async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
         for attempt in 0..MAX_UPSERT_RETRIES {
-            // ⓪ **자기 키를 먼저 본다.** 초 버킷 조회는 쌍둥이가 있으면 **다른 항목**을
-            //    돌려주고, 그러면 고치려던 레코드는 그대로 남는다(`find_exact` 주석의
-            //    유령 사례). 진행 중 갱신처럼 같은 키를 매 tick 쓰는 경로에서는
-            //    `Query` 대신 `GetItem` 이므로 **더 싸다.**
-            let mut existing = self
-                .find_exact(&q.instance_id, q.started_at_ms, q.thread_id)
-                .await?;
-
-            // ① `record_id` 직접 조회 (밀리초가 어긋난 같은 초 버킷).
-            if existing.is_none() {
-                existing = self.find_by_record_id(&q.record_id).await?;
-            }
+            // ① 같은 초 버킷의 **후보를 다 모아** 고칠 항목을 고른다.
+            //    첫 일치를 쓰면 쌍둥이가 있을 때 **다른 항목**을 고치고, 고치려던
+            //    레코드는 그대로 남는다(`candidates_by_record_id` 주석의 유령 사례).
+            let candidates = self.candidates_by_record_id(&q.record_id).await?;
+            let mut existing = pick_target(&candidates, q).cloned();
 
             // ② **±2초 보조 조회.** 없으면 같은 실행이 두 레코드로 갈린다.
             //
@@ -539,7 +599,9 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             let item = match &existing {
                 // **읽어온 물리 키를 그대로 쓴다.** 필드로 다시 만들면 첫 병합 이후
                 // 어긋나 조건부 쓰기가 영구히 실패한다(`to_item_at` 주석).
-                Some(prev) => self.to_item_at(&merged, &prev.pk, &prev.sk)?,
+                Some(prev) => {
+                    self.to_item_at(&merged, &prev.pk, &prev.sk, prev.rev.unwrap_or(0) + 1)?
+                }
                 None => self.to_item(&merged)?,
             };
 
@@ -551,11 +613,16 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             put = match &existing {
                 // 신규: 아직 없어야 한다.
                 None => put.condition_expression("attribute_not_exists(PK)"),
-                // 갱신: 우리가 읽은 그 항목이어야 한다. `SK` 는 밀리초를 담으므로
-                // 같은 `record_id` 라도 다른 밀리초면 다른 항목이다.
-                Some(prev) => put
-                    .condition_expression("SK = :sk")
-                    .expression_attribute_values(":sk", AttributeValue::S(prev.sk.clone())),
+                // 갱신: **우리가 읽은 그 판(rev)이어야 한다.** `SK = :sk` 만으로는
+                // 항진명제에 가까워 동시 쓰기가 서로를 덮었다(`REV_ATTR` 주석).
+                // 옛 항목에는 `rev` 가 없으므로 그 경우는 "없음" 을 조건으로 한다 —
+                // 한 번 쓰이면 그 뒤로는 카운터 경로를 탄다.
+                Some(prev) => match prev.rev {
+                    Some(rev) => put
+                        .condition_expression("rev = :rev")
+                        .expression_attribute_values(":rev", AttributeValue::N(rev.to_string())),
+                    None => put.condition_expression("attribute_not_exists(rev)"),
+                },
             };
 
             match put.send().await {
@@ -765,6 +832,81 @@ pub(crate) mod tests {
             abandoned_reason: None,
             long_running: false,
         }
+    }
+
+    /// **쌍둥이가 있을 때 "닫는 쓰기" 는 열려 있는 쪽을 고쳐야 한다.**
+    ///
+    /// 실측한 상태를 그대로 옮겼다: 같은 실행의 항목이 둘이고 하나는 확정, 하나는
+    /// 진행 중이다. 고아 스윕이 진행 중인 쪽을 닫으려 하는데 확정된 쪽을 고치면
+    /// 유령은 그대로 남고 스윕은 성공을 보고한다 — 30초마다 영구히 반복됐다.
+    #[test]
+    fn a_closing_write_targets_the_item_that_is_still_open() {
+        let base = sample();
+        let twin = super::Stored {
+            record: {
+                let mut q = base.clone();
+                q.started_at_ms = 1_755_500_400_413;
+                q.state = SlowQueryState::Finalized;
+                q
+            },
+            pk: "SQ#i#2025-08-18".into(),
+            sk: "1755500400413#8842119".into(),
+            rev: Some(3),
+        };
+        let ghost = super::Stored {
+            record: {
+                let mut q = base.clone();
+                q.started_at_ms = 1_755_500_400_416;
+                q.state = SlowQueryState::InFlight;
+                q
+            },
+            pk: "SQ#i#2025-08-18".into(),
+            sk: "1755500400416#8842119".into(),
+            rev: None, // 옛 항목처럼 카운터가 없는 경우도 섞는다
+        };
+        let candidates = vec![twin.clone(), ghost.clone()]; // 작은 SK 가 먼저 온다
+
+        // ① 유령을 닫는 쓰기: 시작 시각이 유령과 같다 → 물리 SK 일치로 유령을 고른다.
+        let mut closing = ghost.record.clone();
+        closing.state = SlowQueryState::Abandoned;
+        let picked = super::pick_target(&candidates, &closing).expect("후보가 있다");
+        assert_eq!(
+            picked.sk, ghost.sk,
+            "확정된 쌍둥이를 고쳤다 — 유령이 남는다"
+        );
+
+        // ② 시작 시각이 병합으로 앞당겨져 물리 SK 와 어긋난 경우에도 열린 쪽을 고른다.
+        let mut drifted = ghost.record.clone();
+        drifted.started_at_ms = 1_755_500_400_413; // 필드만 앞당겨졌다
+        drifted.state = SlowQueryState::Abandoned;
+        let picked = super::pick_target(&candidates, &drifted).expect("후보가 있다");
+        assert_eq!(
+            picked.sk, ghost.sk,
+            "닫는 쓰기가 이미 확정된 항목으로 갔다 — 유령이 영구히 남는다"
+        );
+
+        // ③ 진행 중 갱신은 자기 자리를 고친다(닫는 쓰기가 아니다).
+        let live = ghost.record.clone();
+        let picked = super::pick_target(&candidates, &live).expect("후보가 있다");
+        assert_eq!(picked.sk, ghost.sk);
+
+        // ④ 후보가 없으면 None — 신규 생성 경로로 간다.
+        assert!(super::pick_target(&[], &live).is_none());
+    }
+
+    /// 조회는 **정보가 더 많은 쪽**을 보여줘야 한다. 확정값이 있는데 진행 중을
+    /// 보여주면 실행시간을 하한으로 읽는다.
+    #[test]
+    fn a_read_prefers_the_row_that_saw_the_end() {
+        let mut open = sample();
+        open.state = SlowQueryState::InFlight;
+        open.capture_source = CaptureSource::Processlist;
+        open.duration_ms = 9_000;
+        let mut closed = sample();
+        closed.state = SlowQueryState::Finalized;
+        closed.capture_source = CaptureSource::Merged;
+        closed.duration_ms = 2_000;
+        assert!(super::read_rank(&closed) > super::read_rank(&open));
     }
 
     /// **이 파일에 `scan` 이 없어야 한다.** IAM 이 `Deny dynamodb:Scan` 으로 막지만,

@@ -251,16 +251,20 @@ pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usiz
 /// 저장소가 `find_merge_candidate` 로 흡수하려는 그 상황이고, 첫 쓰기가 정확히
 /// 동시면 흡수에 실패해 항목이 둘 남는다.
 ///
-/// # 왜 이 창이 안전한가
+/// # 왜 오접기가 불가능한가 — **구간이 겹쳐야 한다**
 ///
-/// 같은 스레드(= 커넥션)에서 **같은 다이제스트**가 창 안에 두 번 시작할 수 없다.
-/// 커넥션은 한 번에 한 문장을 실행하고, 슬로우 쿼리로 기록되려면 임계값(`long_query_time`)
-/// 을 넘어야 하므로 연속한 두 실행의 시작 간격은 최소 그 임계값이다. 그래서 임계값이
-/// 창(2초)보다 크면 오접기가 **불가능**하다.
+/// 창(2초)만 보면 임계값(`long_query_time`)이 2초보다 작을 때 **연속한 두 실행**이
+/// 접힌다(7라운드 지적). 그래서 시간 창에 더해 **실행 구간이 겹칠 것**을 요구한다:
 ///
-/// ⚠ 임계값을 2초 아래로 내리면 오접기가 가능해진다. 그때는 저장소의 병합
-/// (`find_merge_candidate`, 같은 창)이 **먼저** 두 실행을 하나로 합치므로 조회가
-/// 더 나빠지는 것은 아니다 — 두 곳이 같은 규칙을 쓴다는 사실이 중요하다.
+/// ```text
+/// 같은 실행의 쌍둥이 :  [====실행====]        시작 3ms 차이 → 완전히 겹친다
+///                       [====실행====]
+/// 연속한 두 실행     :  [==1==]  [==2==]      1이 끝난 뒤 2가 시작한다 → 안 겹친다
+/// ```
+///
+/// 커넥션 하나는 **한 번에 한 문장**만 실행한다. 그래서 구간이 겹치면 그 둘은 같은
+/// 실행이다 — 임계값 설정과 무관하게 성립한다. 중첩 문장(`is_nested`)은 겹칠 수
+/// 있지만 다이제스트가 다르므로 여기서 걸러진다.
 fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
     const WINDOW_MS: i64 = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
 
@@ -281,15 +285,23 @@ fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
     });
 
     let mut out: Vec<SlowQueryView> = Vec::with_capacity(views.len());
+    // **묶음의 첫(가장 이른) 행을 기준으로 창을 잰다.** 남긴 행 기준으로 재면 이긴 행이
+    // 더 늦은 쪽일 때 기준이 밀려 **사슬처럼 이어 붙는다** — 2초 창이 실제로는
+    // 무한히 늘어날 수 있다. 입력이 시간 오름차순이므로 첫 행 기준이면 한 묶음은
+    // 최대 2초 폭이다.
+    let mut anchor_ms = i64::MIN;
     for view in views {
         let same_run = out.last().is_some_and(|prev| {
             prev.instance_id == view.instance_id
                 && prev.thread_id == view.thread_id
                 && prev.app_digest == view.app_digest
-                // **남긴 행 기준**으로 창을 잰다. 사슬처럼 이어 붙지 않게 한다.
-                && (view.started_at_ms - prev.started_at_ms).abs() <= WINDOW_MS
+                && view.started_at_ms.saturating_sub(anchor_ms) <= WINDOW_MS
+                // **구간이 겹쳐야 같은 실행이다.** 입력이 시간 오름차순이므로
+                // "뒤 행의 시작 < 앞 행의 끝" 이면 겹친다.
+                && view.started_at_ms < prev.started_at_ms.saturating_add(prev.duration_ms)
         });
         if !same_run {
+            anchor_ms = view.started_at_ms;
             out.push(view);
             continue;
         }
@@ -310,8 +322,10 @@ fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
 /// 각자 다른 것을 들고 있다 — 실행계획이 진행 중 레코드에만 수집돼 있으면, 이긴 행만
 /// 남기면 **계획이 화면에서 사라진다.** 없는 값만 채우고, 있는 값은 건드리지 않는다.
 fn absorb(mut winner: SlowQueryView, loser: &SlowQueryView) -> SlowQueryView {
-    // 계획은 한쪽에만 있을 수 있다. 있으면 있다.
-    winner.has_plan = winner.has_plan || loser.has_plan;
+    // ⚠ **`has_plan` 은 옮기지 않는다.** 계획은 항목에 붙어 있고 화면은 **남긴 행의
+    // `record_id`** 로 계획을 가져온다. 진 행의 계획을 "있다" 고 표시하면 눌렀을 때
+    // 비어 있는 상세로 간다 — 없는 것보다 나쁜 거짓말이다(7라운드 지적). 대신
+    // 동순위일 때 계획이 있는 쪽을 이기게 해서([`rank`]) 계획을 잃지 않는다.
     if winner.sql_text.is_none() && loser.sql_text.is_some() {
         winner.sql_text = loser.sql_text.clone();
         winner.sql_redacted_reason = loser.sql_redacted_reason;
@@ -345,7 +359,7 @@ fn absorb(mut winner: SlowQueryView, loser: &SlowQueryView) -> SlowQueryView {
 }
 
 /// 접을 때의 우선순위. 큰 값이 남는다.
-fn rank(v: &SlowQueryView) -> (u8, u8, i64) {
+fn rank(v: &SlowQueryView) -> (u8, u8, u8, i64) {
     let closed = match v.state.as_str() {
         "finalized" => 2,
         "abandoned" => 1,
@@ -355,7 +369,10 @@ fn rank(v: &SlowQueryView) -> (u8, u8, i64) {
         "merged" | "slowlog" => 1,
         _ => 0,
     };
-    (closed, exact, v.duration_ms)
+    // 동순위면 **계획이 있는 쪽**을 남긴다 — 그 행의 `record_id` 로 계획을 가져올 수
+    // 있어야 하므로, 계획을 옮기는 대신 계획이 붙은 행을 남긴다.
+    let plan = u8::from(v.has_plan);
+    (closed, exact, plan, v.duration_ms)
 }
 
 /// 다이제스트 하나를 접는 동안의 상태. 튜플로 두면 필드가 뭔지 세어야 한다.
@@ -614,7 +631,13 @@ mod tests {
         let (out, _) = dedupe_executions(vec![ghost.clone(), truth.clone()]);
         let kept = &out[0];
         assert_eq!(kept.state, "finalized");
-        assert!(kept.has_plan, "계획이 진행 중 행에만 있었는데 사라졌다");
+        // **`has_plan` 은 옮기지 않는다.** 계획은 항목에 붙어 있고 화면은 남긴 행의
+        // `record_id` 로 가져온다 — "있다" 고 하고 비어 있는 상세로 보내면 없는 것보다
+        // 나쁘다. 계획을 잃지 않는 장치는 동순위 우선순위다(아래 테스트).
+        assert!(
+            !kept.has_plan,
+            "진 행의 계획을 '있다' 로 표시했다 — 누르면 빈 상세가 나온다"
+        );
         assert_eq!(kept.schema_name.as_deref(), Some("shop"));
         assert_eq!(kept.sql_text.as_deref(), Some("SELECT ?"));
         assert_eq!(
@@ -633,6 +656,23 @@ mod tests {
         let (out2, _) = dedupe_executions(vec![truth, ghost]);
         assert_eq!(out2[0].has_plan, out[0].has_plan);
         assert_eq!(out2[0].rows_examined, out[0].rows_examined);
+
+        // **동순위면 계획이 있는 쪽을 남긴다** — 그래야 계획이 화면에서 사라지지 않는다.
+        let plain = view(|v| {
+            v.state = "finalized".into();
+            v.capture_source = "merged".into();
+            v.has_plan = false;
+        });
+        let with_plan = view(|v| {
+            v.state = "finalized".into();
+            v.capture_source = "merged".into();
+            v.has_plan = true;
+        });
+        let (out3, _) = dedupe_executions(vec![plain, with_plan]);
+        assert!(
+            out3[0].has_plan,
+            "계획이 붙은 행을 버렸다 — 계획을 볼 길이 없다"
+        );
     }
 
     /// **초 경계를 걸친 쌍둥이는 `record_id` 가 다르다.** 그래도 한 실행이다.
@@ -680,6 +720,25 @@ mod tests {
         assert_eq!(collapsed, 1);
         assert_eq!(out.len(), 2, "다른 실행을 접었다 — 실행이 사라진다");
 
+        // **사슬처럼 이어 붙지 않는다.** 2초씩 이어진 행들이 한 줄로 접히면
+        // 실제로는 창이 무한히 늘어난다 — 기준은 묶음의 첫 행이다.
+        let chain = |ms: i64, state: &str| {
+            view(move |v| {
+                v.record_id = format!("i:9:{ms}");
+                v.thread_id = 9;
+                v.started_at_ms = ms;
+                v.state = state.into();
+            })
+        };
+        let (out, collapsed) = dedupe_executions(vec![
+            chain(0, "inflight"),
+            chain(1_900, "finalized"),
+            chain(3_500, "inflight"),
+        ]);
+        // 0 과 1,900 은 접히고(1,900 ≤ 2,000), 3,500 은 첫 행 기준 3.5초라 남는다.
+        assert_eq!(collapsed, 1);
+        assert_eq!(out.len(), 2, "사슬 접기가 일어나 실행이 사라졌다");
+
         // 다이제스트가 다르면 같은 스레드·같은 시각이어도 다른 실행이다.
         let other_digest = view(|v| {
             v.record_id = "i:5:1755500400".into();
@@ -689,6 +748,49 @@ mod tests {
         });
         let (out, _) = dedupe_executions(vec![live, other_digest]);
         assert_eq!(out.len(), 2);
+    }
+
+    /// **연속한 두 실행은 접지 않는다 — 구간이 겹치지 않는다.**
+    ///
+    /// 임계값(`long_query_time`)이 2초보다 작으면 같은 스레드·같은 다이제스트가 창
+    /// 안에 두 번 시작할 수 있다. 창만 보면 그 둘이 한 줄로 접혀 **실행이 사라진다**
+    /// (7라운드 지적). 커넥션은 한 번에 한 문장만 실행하므로 **구간 겹침**이 판정이다.
+    #[test]
+    fn two_sequential_executions_on_one_thread_are_not_collapsed() {
+        // 1.2초짜리 실행이 끝난 뒤 0.1초 뒤에 같은 쿼리가 또 돈다 (임계값 1초 설정).
+        let first = view(|v| {
+            v.record_id = "i:7:1000".into();
+            v.thread_id = 7;
+            v.started_at_ms = 1_000_000;
+            v.duration_ms = 1_200;
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+        let second = view(|v| {
+            v.record_id = "i:7:1001".into();
+            v.thread_id = 7;
+            v.started_at_ms = 1_001_300; // 첫 실행이 끝난(1,001,200) 뒤에 시작
+            v.duration_ms = 1_100;
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+        let (out, collapsed) = dedupe_executions(vec![first.clone(), second]);
+        assert_eq!(collapsed, 0, "연속한 두 실행을 접었다 — 실행이 사라진다");
+        assert_eq!(out.len(), 2);
+
+        // 반면 **겹치면** 같은 실행이다 — 커넥션은 한 번에 한 문장만 실행한다.
+        let overlapping = view(|v| {
+            v.record_id = "i:7:1000".into();
+            v.thread_id = 7;
+            v.started_at_ms = 1_000_500; // 첫 실행이 도는 중에 관측됐다
+            v.duration_ms = 700;
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+        });
+        let (out, collapsed) = dedupe_executions(vec![first, overlapping]);
+        assert_eq!(collapsed, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, "finalized");
     }
 
     /// 추적 끊김은 **진행 중보다는 낫고 확정보다는 못하다.** 순서가 뒤집히면

@@ -1145,3 +1145,50 @@ async fn a_record_stays_writable_after_a_merge_moves_its_start_time() {
     );
     assert_eq!(mine[0].stats.rows_sent, Some(7));
 }
+
+/// **동시 갱신 중 하나는 반드시 조건에 걸려 다시 읽어야 한다.**
+///
+/// `SK = <읽은 SK>` 조건은 `PutItem` 이 이미 그 키를 겨냥하므로 "그 자리에 항목이
+/// 있다" 만 확인한다 — 두 워커가 같은 항목을 읽고 각자 병합해 쓰면 **둘 다 성공하고
+/// 나중 것이 앞의 것을 덮는다.** 실행계획이나 정확 지표가 조용히 사라질 수 있다.
+///
+/// 여기서는 두 쓰기를 `join!` 으로 **겹쳐서** 던진다. 둘의 읽기가 실제로 겹치면 옛
+/// 코드에서는 한쪽 기여가 사라지고, 낙관적 잠금이 있으면 진 쪽이 다시 읽어 병합한다.
+/// (직렬화되면 이 테스트는 그냥 통과한다 — 약해질 뿐 틀리지는 않는다.)
+#[tokio::test]
+async fn a_concurrent_update_retries_instead_of_overwriting() {
+    let Some(s) = store("rev-lock").await else {
+        return;
+    };
+
+    let base = sample(3131, T0);
+    s.upsert_merged(&base).await.expect("최초 저장");
+
+    // 하나는 플랜을, 하나는 더 큰 정확 지표를 얹는다. 병합은 `max` 이므로 둘 다 남아야 한다.
+    let mut with_plan = base.clone();
+    with_plan.plan.normalized_json = Some(r#"{"query_block":{"select_id":1}}"#.into());
+    with_plan.plan.fingerprint = Some("fp-1".into());
+
+    let mut with_stats = base.clone();
+    with_stats.capture_source = CaptureSource::Slowlog;
+    with_stats.stats.rows_examined = Some(999_999);
+
+    let (a, b) = tokio::join!(s.upsert_merged(&with_plan), s.upsert_merged(&with_stats));
+    a.expect("플랜 쓰기");
+    b.expect("지표 쓰기");
+
+    let got = s
+        .get(&base.record_id)
+        .await
+        .expect("조회")
+        .expect("레코드가 있어야 한다");
+    assert!(
+        got.plan.has_plan(),
+        "동시 쓰기가 플랜을 덮어썼다 — 낙관적 잠금이 동작하지 않는다"
+    );
+    assert_eq!(
+        got.stats.rows_examined,
+        Some(999_999),
+        "동시 쓰기가 정확 지표를 덮어썼다"
+    );
+}
