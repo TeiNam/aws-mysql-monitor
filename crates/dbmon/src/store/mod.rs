@@ -348,6 +348,7 @@ impl DynamoSlowQueryStore {
         thread_id: u64,
         app_digest: &str,
         around_ms: dbmon_core::time::EpochMs,
+        duration_ms: i64,
         window_ms: i64,
     ) -> Result<Option<Stored>> {
         let (lo, hi) = (around_ms - window_ms, around_ms + window_ms);
@@ -362,34 +363,46 @@ impl DynamoSlowQueryStore {
 
         for date in dates {
             let pk = format!("SQ#{}#{}", instance.as_str(), date.as_str());
-            let out = self
-                .client
-                .query()
-                .table_name(&self.table)
-                .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
-                .expression_attribute_values(":pk", AttributeValue::S(pk))
-                .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(lo)))
-                // `#` 를 붙여 같은 밀리초의 모든 스레드를 포함한다.
-                .expression_attribute_values(
-                    ":hi",
-                    AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(hi))),
-                )
-                .send()
-                .await
-                .map_err(map_sdk_err)?;
+            let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let out = self
+                    .client
+                    .query()
+                    .table_name(&self.table)
+                    .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
+                    .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                    .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(lo)))
+                    // `#` 를 붙여 같은 밀리초의 모든 스레드를 포함한다.
+                    .expression_attribute_values(
+                        ":hi",
+                        AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(hi))),
+                    )
+                    // 읽고-병합하고-쓰는 경로다 (위 `candidates_by_record_id` 주석 참고).
+                    .consistent_read(true)
+                    .set_exclusive_start_key(start_key)
+                    .send()
+                    .await
+                    .map_err(map_sdk_err)?;
 
-            for item in out.items.unwrap_or_default() {
-                let cand = Self::stored_from_item(item)?;
-                if cand.record.thread_id != thread_id || cand.record.app_digest != app_digest {
-                    continue;
+                for item in out.items.unwrap_or_default() {
+                    let cand = Self::stored_from_item(item)?;
+                    if cand.record.thread_id != thread_id
+                        || !same_execution(&cand.record, app_digest, around_ms, duration_ms)
+                    {
+                        continue;
+                    }
+                    // 가장 가까운 것을 고른다 — 창 안에 둘 이상이면 결정론적이어야 한다.
+                    let closer = best.as_ref().is_none_or(|b| {
+                        (cand.record.started_at_ms - around_ms).abs()
+                            < (b.record.started_at_ms - around_ms).abs()
+                    });
+                    if closer {
+                        best = Some(cand);
+                    }
                 }
-                // 가장 가까운 것을 고른다 — 창 안에 둘 이상이면 결정론적이어야 한다.
-                let closer = best.as_ref().is_none_or(|b| {
-                    (cand.record.started_at_ms - around_ms).abs()
-                        < (b.record.started_at_ms - around_ms).abs()
-                });
-                if closer {
-                    best = Some(cand);
+                start_key = out.last_evaluated_key;
+                if start_key.is_none() {
+                    break;
                 }
             }
         }
@@ -421,25 +434,38 @@ impl DynamoSlowQueryStore {
         // 13자리 중 앞 10자리가 초까지다. 뒤 3자리(밀리초)는 무엇이든 매칭한다.
         let second_prefix = &padded[..padded.len() - 3];
 
-        let out = self
-            .client
-            .query()
-            .table_name(&self.table)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk)")
-            .expression_attribute_values(
-                ":pk",
-                AttributeValue::S(keys::slow_query_pk(&instance, ms)),
-            )
-            .expression_attribute_values(":sk", AttributeValue::S(second_prefix.to_string()))
-            .send()
-            .await
-            .map_err(map_sdk_err)?;
-
         let mut found = Vec::new();
-        for item in out.items.unwrap_or_default() {
-            let cand = Self::stored_from_item(item)?;
-            if cand.record.thread_id == thread_id {
-                found.push(cand);
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("PK = :pk AND begins_with(SK, :sk)")
+                .expression_attribute_values(
+                    ":pk",
+                    AttributeValue::S(keys::slow_query_pk(&instance, ms)),
+                )
+                .expression_attribute_values(":sk", AttributeValue::S(second_prefix.to_string()))
+                // **강한 일관성으로 읽는다.** 읽고-병합하고-쓰는 경로이므로 결과적
+                // 일관성 읽기는 **직전에 성공한 쓰기를 못 볼 수 있다** — 그러면 조건부
+                // 쓰기가 계속 실패해 재시도 5회를 소진한다(8라운드 지적).
+                .consistent_read(true)
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(map_sdk_err)?;
+            for item in out.items.unwrap_or_default() {
+                let cand = Self::stored_from_item(item)?;
+                if cand.record.thread_id == thread_id {
+                    found.push(cand);
+                }
+            }
+            // **페이지를 따라간다.** 바쁜 1초는 1MB 를 넘길 수 있고, 그러면 "모든
+            // 후보" 가 실제로는 첫 페이지뿐이다 — 대상이 빠지면 쌍둥이를 새로 만든다.
+            start_key = out.last_evaluated_key;
+            if start_key.is_none() {
+                break;
             }
         }
         Ok(found)
@@ -462,6 +488,43 @@ impl DynamoSlowQueryStore {
     }
 }
 
+/// 후보가 **같은 실행인가.** 저장소의 ±2초 병합과 조회의 접기가 같은 규칙을 쓴다.
+///
+/// # 다이제스트 일치만으로는 두 방향으로 틀린다
+///
+/// - **너무 느슨하다**: `long_query_time` 이 창(2초)보다 작으면 같은 스레드에서 같은
+///   쿼리가 창 안에 두 번 시작할 수 있다. 그 둘을 합치면 **실행 하나가 사라진다.**
+///   → 커넥션은 한 번에 한 문장만 실행하므로 **구간이 겹칠 것**을 요구한다.
+/// - **너무 엄하다**: 심층 조회가 상한에 걸리면 실시간 캡처의 다이제스트가
+///   `unknown-<thread>` 자리표다([`UNKNOWN_DIGEST_PREFIX`]). 슬로우로그의 진짜
+///   다이제스트와 다르므로 **같은 실행인데 합쳐지지 않는다** — 표에 두 줄, 통계는
+///   두 배(8라운드 지적). → 자리표는 "없음" 으로 취급한다(병합 규칙과 같다).
+fn same_execution(
+    cand: &SlowQuery,
+    incoming_digest: &str,
+    incoming_started_ms: dbmon_core::time::EpochMs,
+    incoming_duration_ms: i64,
+) -> bool {
+    use dbmon_core::slow_query::UNKNOWN_DIGEST_PREFIX;
+    let placeholder = |d: &str| d.starts_with(UNKNOWN_DIGEST_PREFIX);
+    let digest_ok = cand.app_digest == incoming_digest
+        || placeholder(&cand.app_digest)
+        || placeholder(incoming_digest);
+    if !digest_ok {
+        return false;
+    }
+    // 구간이 겹치는가. 어느 쪽이 먼저 시작했는지 모르므로 양방향으로 본다.
+    let (a_start, a_end) = (
+        cand.started_at_ms,
+        cand.started_at_ms.saturating_add(cand.duration_ms),
+    );
+    let (b_start, b_end) = (
+        incoming_started_ms,
+        incoming_started_ms.saturating_add(incoming_duration_ms),
+    );
+    a_start < b_end && b_start < a_end
+}
+
 /// 여러 후보 중 **고칠 항목**을 고른다. 순수 함수 — 규칙을 테스트로 고정한다.
 ///
 /// 쌍둥이(같은 실행의 항목 둘)가 있을 때 아무거나 고치면 나머지가 유령으로 남는다.
@@ -480,14 +543,24 @@ fn pick_target<'a>(candidates: &'a [Stored], incoming: &SlowQuery) -> Option<&'a
     if candidates.is_empty() {
         return None;
     }
+    // 닫는 쓰기는 **열려 있는 후보 안에서** 고른다. 열린 것이 여럿이면(쌍둥이 둘이
+    // 다 진행 중) 아무거나 고르면 안 된다 — 같은 규칙을 그 부분집합에 적용한다
+    // (8라운드 지적).
     if incoming.state != dbmon_core::slow_query::SlowQueryState::InFlight {
-        if let Some(open) = candidates
+        let open: Vec<&Stored> = candidates
             .iter()
-            .find(|c| c.record.state == dbmon_core::slow_query::SlowQueryState::InFlight)
-        {
-            return Some(open);
+            .filter(|c| c.record.state == dbmon_core::slow_query::SlowQueryState::InFlight)
+            .collect();
+        if !open.is_empty() {
+            return closest_of(&open, incoming);
         }
     }
+    let all: Vec<&Stored> = candidates.iter().collect();
+    closest_of(&all, incoming)
+}
+
+/// 후보 중 하나를 **결정론적으로** 고른다: 물리 키 일치 → 필드 일치 → 가장 가까운 것.
+fn closest_of<'a>(candidates: &[&'a Stored], incoming: &SlowQuery) -> Option<&'a Stored> {
     let want_sk = keys::slow_query_sk(incoming.started_at_ms, incoming.thread_id);
     if let Some(hit) = candidates.iter().find(|c| c.sk == want_sk) {
         return Some(hit);
@@ -498,20 +571,23 @@ fn pick_target<'a>(candidates: &'a [Stored], incoming: &SlowQuery) -> Option<&'a
     {
         return Some(same);
     }
-    candidates.iter().min_by_key(|c| {
-        (
-            (c.record.started_at_ms - incoming.started_at_ms).abs(),
-            // 동거리면 SK 로 확정한다 — 순서가 응답마다 달라지면 안 된다.
-            c.sk.clone(),
-        )
-    })
+    candidates
+        .iter()
+        .min_by_key(|c| {
+            (
+                (c.record.started_at_ms - incoming.started_at_ms).abs(),
+                // 동거리면 SK 로 확정한다 — 순서가 응답마다 달라지면 안 된다.
+                c.sk.clone(),
+            )
+        })
+        .copied()
 }
 
 /// 조회가 여러 후보 중 하나를 보여줄 때의 우선순위. 큰 값이 이긴다.
 ///
 /// 화면이 **정보가 더 많은 쪽**을 봐야 한다 — 확정된 값이 있는데 "진행 중" 을
 /// 보여주면 실행시간을 하한으로 읽게 된다.
-fn read_rank(q: &SlowQuery) -> (u8, u8, i64) {
+fn read_rank(q: &SlowQuery) -> (u8, u8, u8, i64) {
     use dbmon_core::slow_query::{CaptureSource, SlowQueryState};
     let closed = match q.state {
         SlowQueryState::Finalized => 2,
@@ -522,7 +598,10 @@ fn read_rank(q: &SlowQuery) -> (u8, u8, i64) {
         CaptureSource::Merged | CaptureSource::Slowlog => 1,
         _ => 0,
     };
-    (closed, exact, q.duration_ms)
+    // **집계의 `rank` 와 같은 축이어야 한다.** 목록은 계획이 붙은 쌍둥이를 고르고
+    // 상세는 다른 쪽을 고르면, 계획을 눌렀을 때 빈 상세가 나온다(8라운드 지적).
+    let plan = u8::from(q.plan.has_plan());
+    (closed, exact, plan, q.duration_ms)
 }
 
 /// SDK 오류를 도메인 오류로.
@@ -584,6 +663,7 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                         q.thread_id,
                         &q.app_digest,
                         q.started_at_ms,
+                        q.duration_ms,
                         dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS,
                     )
                     .await?;
@@ -659,7 +739,12 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         window_ms: i64,
     ) -> Result<Option<SlowQuery>> {
         Ok(self
-            .find_merge_candidate_stored(instance, thread_id, app_digest, around_ms, window_ms)
+            .find_merge_candidate_stored(
+                instance, thread_id, app_digest, around_ms,
+                // 포트 계약에는 지속시간이 없다. 겹침 판정을 통과시키려면 창만큼을
+                // 준다 — 포트 호출부는 페이크 계약 확인용이고 실제 병합은 위 경로다.
+                window_ms, window_ms,
+            )
             .await?
             .map(|s| s.record))
     }
@@ -892,6 +977,39 @@ pub(crate) mod tests {
 
         // ④ 후보가 없으면 None — 신규 생성 경로로 간다.
         assert!(super::pick_target(&[], &live).is_none());
+    }
+
+    /// **±2초 병합도 구간이 겹칠 때만 같은 실행이다.**
+    ///
+    /// `long_query_time` 이 창(2초)보다 작으면 같은 스레드에서 같은 쿼리가 창 안에 두
+    /// 번 시작할 수 있다. 그 둘을 합치면 **실행 하나가 영구히 사라진다** — 조회 쪽
+    /// 접기는 이미 겹침을 보는데 저장소가 먼저 합쳐 버리면 볼 기회조차 없다(8라운드).
+    #[test]
+    fn the_merge_window_requires_overlapping_intervals() {
+        let mut cand = sample();
+        cand.started_at_ms = 1_000_000;
+        cand.duration_ms = 1_200;
+        cand.app_digest = "d1".into();
+
+        // 앞 실행이 끝난 뒤 시작한 실행 → 같은 실행이 아니다.
+        assert!(
+            !super::same_execution(&cand, "d1", 1_001_300, 1_100),
+            "연속한 두 실행을 같은 실행으로 봤다 — 하나가 사라진다"
+        );
+        // 도는 중에 관측된 것 → 같은 실행이다.
+        assert!(super::same_execution(&cand, "d1", 1_000_500, 700));
+        // 다이제스트가 다르면 아니다 (중첩 문장).
+        assert!(!super::same_execution(&cand, "d2", 1_000_500, 700));
+        // **자리표는 "없음" 이다** — 실시간 캡처가 SQL 을 못 얻은 경우.
+        assert!(super::same_execution(
+            &cand,
+            "unknown-8842119",
+            1_000_500,
+            700
+        ));
+        let mut placeholder = cand.clone();
+        placeholder.app_digest = "unknown-8842119".into();
+        assert!(super::same_execution(&placeholder, "d1", 1_000_500, 700));
     }
 
     /// 조회는 **정보가 더 많은 쪽**을 보여줘야 한다. 확정값이 있는데 진행 중을

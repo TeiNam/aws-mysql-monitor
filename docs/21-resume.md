@@ -33,7 +33,7 @@
 2. **React SPA + 정적 서빙 + 9차 2way 리뷰** — 다크 4화면. **참조 구현을 보지 않아
    전부 다시 만들었다**(§0)
 3. **참조 대시보드 이식** — 조회 경로 8개 추가 + 5화면 재구성 + 수집 제어
-4. **2way 리뷰 2~7라운드** — 읽기 경로를 하나로 합치고(`collect_views`), 일시정지가
+4. **2way 리뷰 2~8라운드** — 읽기 경로를 하나로 합치고(`collect_views`), 일시정지가
    **태스크를 정말 멈추게** 고쳤고, **읽은 구간을 화면에 정직하게 말하게** 했고,
    **유령 레코드의 뿌리**(병합 후 키 표류)를 찾아 고쳤고, 마지막에 **낙관적 잠금이
    항진명제였던 것**을 고쳤다 ([20 §2way 리뷰 2~7라운드](20-review-log.md))
@@ -64,7 +64,7 @@
 | `lib/live{,-reduce}.ts` | WS 배관과 판정부(순수). 실시간 지표·방송 |
 | `components/{Shell,Card,Pagination,SqlModal,ui}.tsx` | 껍데기·카드·페이지네이션·SQL 팝업·클래스 상수 |
 
-테스트: **Rust 692개 + web 71개**, `cargo clippy --workspace --all-targets` 경고 0.
+테스트: **Rust 694개 + web 71개**, `cargo clippy --workspace --all-targets` 경고 0.
 
 ### 의존성
 
@@ -197,6 +197,19 @@ bash local/loadgen.sh longsql
 배포 환경(prd·stg)은 지금 **접속 자체가 불가능**하다(fail closed). 화면은
 `/api/auth/config` 의 `mode` 를 읽어 "이 환경은 아직 접속할 수 없다" 를 말한다.
 Cognito 가 배선되면 SPA 서빙 게이트(`serves_local_ui()`)도 함께 열어야 한다.
+
+### 3.3a 로컬 수집은 `DBMON_TARGET_PASSWORD` 가 있어야 돈다
+
+없이 띄우면 IAM 토큰을 로컬 MySQL 에 보내려 하고, 평문 접속의 RSA 한도에 걸려
+**연결 옵션 구성 실패**로 끝난다. 로그에 그 사실이 정확히 찍히지만(친절한 메시지),
+**슬로우로그 백필은 그대로 돌기 때문에** 화면에는 데이터가 있어 눈치채기 어렵다 —
+실시간 캡처(`processlist`)와 진행 중 상태만 조용히 사라진다. 이 세션에서 실제로
+그렇게 30분을 흘렸다.
+
+```bash
+DBMON_TARGET_PASSWORD=dbmon-local-monitor \
+  ./target/release/dbmon --config local/dbmon.toml --log-pretty serve
+```
 
 ### 3.4 로컬 환경에 남아 있는 것
 

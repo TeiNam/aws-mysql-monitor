@@ -265,23 +265,26 @@ pub fn dedupe_executions(views: Vec<SlowQueryView>) -> (Vec<SlowQueryView>, usiz
 /// 커넥션 하나는 **한 번에 한 문장**만 실행한다. 그래서 구간이 겹치면 그 둘은 같은
 /// 실행이다 — 임계값 설정과 무관하게 성립한다. 중첩 문장(`is_nested`)은 겹칠 수
 /// 있지만 다이제스트가 다르므로 여기서 걸러진다.
+///
+/// # 자리표 다이제스트는 "없음" 이다
+///
+/// 심층 조회가 상한에 걸리면 실시간 캡처의 다이제스트가 `unknown-<thread>` 다. 그걸
+/// 값으로 취급하면 슬로우로그의 진짜 다이제스트와 달라 **같은 실행인데 두 줄로
+/// 남는다**(8라운드 지적). 저장소의 병합 규칙과 같게 "없음" 으로 본다.
 fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
     const WINDOW_MS: i64 = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
 
-    // (인스턴스, 스레드, 다이제스트)로 묶고 시간순으로 본다.
+    // (인스턴스, 스레드)로 묶고 시간순으로 본다.
+    //
+    // **다이제스트를 정렬 키에 넣지 않는다.** 자리표(`unknown-<thread>`)와 진짜
+    // 다이제스트는 문자열이 달라 정렬하면 서로 떨어지고, 그러면 인접 비교가 그 쌍을
+    // 영원히 만나지 못한다. 같은 스레드의 시간순이면 쌍둥이는 반드시 인접한다.
     views.sort_by(|a, b| {
-        (
-            a.instance_id.as_str(),
-            a.thread_id,
-            a.app_digest.as_str(),
-            a.started_at_ms,
-        )
-            .cmp(&(
-                b.instance_id.as_str(),
-                b.thread_id,
-                b.app_digest.as_str(),
-                b.started_at_ms,
-            ))
+        (a.instance_id.as_str(), a.thread_id, a.started_at_ms).cmp(&(
+            b.instance_id.as_str(),
+            b.thread_id,
+            b.started_at_ms,
+        ))
     });
 
     let mut out: Vec<SlowQueryView> = Vec::with_capacity(views.len());
@@ -294,7 +297,7 @@ fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
         let same_run = out.last().is_some_and(|prev| {
             prev.instance_id == view.instance_id
                 && prev.thread_id == view.thread_id
-                && prev.app_digest == view.app_digest
+                && same_digest(&prev.app_digest, &view.app_digest)
                 && view.started_at_ms.saturating_sub(anchor_ms) <= WINDOW_MS
                 // **구간이 겹쳐야 같은 실행이다.** 입력이 시간 오름차순이므로
                 // "뒤 행의 시작 < 앞 행의 끝" 이면 겹친다.
@@ -314,6 +317,12 @@ fn collapse_same_second(mut views: Vec<SlowQueryView>) -> Vec<SlowQueryView> {
         out.push(absorb(winner, &loser));
     }
     out
+}
+
+/// 다이제스트가 같은가. **자리표(`unknown-…`)는 "없음" 으로 본다.**
+fn same_digest(a: &str, b: &str) -> bool {
+    const UNKNOWN: &str = dbmon_core::slow_query::UNKNOWN_DIGEST_PREFIX;
+    a == b || a.starts_with(UNKNOWN) || b.starts_with(UNKNOWN)
 }
 
 /// 진 행에만 있는 정보를 이긴 행으로 옮긴다.
@@ -791,6 +800,61 @@ mod tests {
         assert_eq!(collapsed, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state, "finalized");
+    }
+
+    /// **자리표 다이제스트(`unknown-<thread>`)도 같은 실행으로 본다.**
+    ///
+    /// 심층 조회가 상한에 걸리면 실시간 캡처는 SQL 텍스트가 없어 다이제스트를 만들 수
+    /// 없다. 그걸 값으로 취급하면 슬로우로그의 진짜 다이제스트와 달라 **같은 실행이
+    /// 두 줄로 남고 통계가 두 배**가 된다(8라운드 지적).
+    #[test]
+    fn a_placeholder_digest_still_matches_its_real_twin() {
+        let live = view(|v| {
+            v.record_id = "i:11:1000".into();
+            v.thread_id = 11;
+            v.started_at_ms = 1_000_000;
+            v.duration_ms = 2_500;
+            v.app_digest = "unknown-11".into(); // 심층 조회가 스킵됐다
+            v.state = "inflight".into();
+            v.capture_source = "processlist".into();
+            v.sql_text = None;
+        });
+        let log = view(|v| {
+            v.record_id = "i:11:0999".into(); // 초 경계도 걸쳤다
+            v.thread_id = 11;
+            v.started_at_ms = 999_800;
+            v.duration_ms = 2_700;
+            v.app_digest = "d-real".into();
+            v.state = "finalized".into();
+            v.capture_source = "slowlog".into();
+        });
+
+        let (out, collapsed) = dedupe_executions(vec![live, log]);
+        assert_eq!(
+            collapsed, 1,
+            "자리표 다이제스트라서 접지 못했다 — 통계가 두 배가 된다"
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].app_digest, "d-real", "진짜 다이제스트가 남아야 한다");
+
+        // **자리표라도 구간이 겹치지 않으면 다른 실행이다.**
+        let earlier = view(|v| {
+            v.record_id = "i:12:0".into();
+            v.thread_id = 12;
+            v.started_at_ms = 0;
+            v.duration_ms = 1_000;
+            v.app_digest = "d-real".into();
+        });
+        let later = view(|v| {
+            v.record_id = "i:12:1".into();
+            v.thread_id = 12;
+            v.started_at_ms = 1_500;
+            v.duration_ms = 1_000;
+            v.app_digest = "unknown-12".into();
+        });
+        let (out, collapsed) = dedupe_executions(vec![earlier, later]);
+        assert_eq!(collapsed, 0);
+        assert_eq!(out.len(), 2, "겹치지 않는 두 실행을 접었다");
     }
 
     /// 추적 끊김은 **진행 중보다는 낫고 확정보다는 못하다.** 순서가 뒤집히면
