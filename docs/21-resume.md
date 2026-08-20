@@ -1,4 +1,4 @@
-# 21. 이어서 하기 (2026-08-20 중단 지점)
+# 21. 이어서 하기 (2026-08-21 중단 지점)
 
 **이 문서만 읽으면 이어서 할 수 있게** 검증된 사실과 미확인 항목을 구분해 적는다.
 
@@ -6,35 +6,67 @@
 
 ---
 
+## 0. ⚠ 이 프로젝트가 무엇을 옮기는 것인지 (먼저 읽는다)
+
+부모 폴더에 **이미 동작하는 구현 두 개**가 있다. 이 프로젝트는 그것을 Rust + React
+로 다시 만드는 것이다.
+
+| 경로 | 무엇 |
+|---|---|
+| `../my_slow_query_scraper` | FastAPI + MongoDB 백엔드 (실시간 캡처·CloudWatch 수집·EXPLAIN·통계) |
+| `../my_slow_query_dashboard` | React 대시보드 5화면 + `screenshots/` |
+
+**화면을 만들거나 API 를 정할 때 이 두 레포를 먼저 본다.** `docs/09-frontend.md`
+는 이상적인 설계(24 라우트)를 적어 뒀지만, **사용자가 기대하는 것은 참조 구현의
+모습**이다. 한 세션이 이걸 모르고 만들어서 전혀 다른 화면(다크 4화면)을 냈고,
+전부 다시 만들었다. 두 번 하지 않는다.
+
+참조 API 표면과 이쪽 대응은 [20 §참조 이식](20-review-log.md) 표에 있다.
+
+---
+
 ## 1. 이번 구간에 무엇을 했는가
 
-두 구간이 이어졌다.
+세 구간이 이어졌다.
 
 1. **조회 API + WebSocket + 실시간 지표** (M6 일부) — 커밋 `7454766`
-2. **React SPA 4화면 + 정적 서빙 + 9차 2way 리뷰** — 이번 세션
+2. **React SPA + 정적 서빙 + 9차 2way 리뷰** — 다크 4화면. **참조 구현을 보지 않아
+   전부 다시 만들었다**(§0)
+3. **참조 대시보드 이식** — 조회 경로 8개 추가 + 5화면 재구성 + 수집 제어
 
 `docs/09-frontend.md` 가 규정한 SPA 가 실제로 돌아간다. 그리고 그 프론트가
 **백엔드 결함 하나를 드러냈다**(WS 유휴 종료 — [20 §R9-1](20-review-log.md)).
 
-### 새로 만든 것 (이번 세션)
+### 새로 만든 것
+
+**백엔드 (참조 API 표면에 대응)**
 
 | 파일 | 내용 |
 |---|---|
-| `web/src/lib/live-reduce.ts` | 실시간 스트림 **판정부**(순수 함수). 테스트가 전부 여기 걸린다 |
-| `web/src/lib/live.ts` | 소켓 **배관**. 연결 하나를 공유하고 토픽은 참조 계수로 센다 |
-| `web/src/lib/{api,format,auth,types}.ts` | HTTP 조회, 표시 포맷, 토큰, 백엔드 뷰 타입 |
-| `web/src/routes/{Fleet,SlowQueries,SlowQueryDetail,Live}.tsx` | 4화면 |
-| `web/src/components/*` | 레이아웃·배지·스파크라인·오류 안내·SQL 블록·ErrorBoundary |
-| `web/src/{App,main}.tsx` | 라우트, 부트스트랩 |
-| `crates/dbmon/src/main.rs` | `web/dist` 정적 서빙(캐시 정책 포함), 없는 `/api/…` 는 404 |
+| `api/aggregate.rs` | 다이제스트·월간 통계·사용자 통계를 **조회 시점에** 접는다(순수 함수) |
+| `api/mod.rs` | `/api/{aws/info,digests,statistics,statistics/users,plans,queries/{id}/plan,queries/{id}/markdown}` + 제어 5개 |
+| `control.rs` | 수집 정지·재개·즉시 탐색·즉시 백필. API 와 리더 루프가 원자값으로 공유 |
+| `main.rs` | 리더 루프에 제어 배선, `web/dist` 정적 서빙(캐시 정책), 없는 `/api/…` 는 404 |
 | `Dockerfile` | 노드 빌더 스테이지 — **런타임 이미지에 노드는 없다** |
 
-테스트: **Rust 661개 + web 48개**, `cargo clippy --workspace --all-targets` 경고 0.
+**프론트 (참조 대시보드 5화면)**
 
-### 의존성을 줄였다
+| 파일 | 내용 |
+|---|---|
+| `pages/{MySQLMonitor,PlanVisualization,CloudWatch,Statistics,RDSInstance}Page.tsx` | 5화면. 경로까지 참조와 같다 |
+| `lib/plan-graph.ts` | EXPLAIN JSON → 그래프 (순수 함수). 참조의 canvas 판을 대체 |
+| `components/PlanGraph.tsx` | SVG 렌더 — 확대·검색·스크린리더가 된다 |
+| `components/CollectorControls.tsx` | 수집 정지/재개·인스턴스 수집·지금 수집 |
+| `lib/live{,-reduce}.ts` | WS 배관과 판정부(순수). 실시간 지표·방송 |
+| `components/{Shell,Card,Pagination,SqlModal,ui}.tsx` | 껍데기·카드·페이지네이션·SQL 팝업·클래스 상수 |
 
-`uplot`·`date-fns`·`lucide-react` 를 뺐다. SVG 12줄(`Sparkline`)·`Intl`·인라인
-아이콘으로 충분하다. `vitest` 는 vite 6 과 타입이 충돌해 3.x 로 올렸다.
+테스트: **Rust 670개 + web 62개**, `cargo clippy --workspace --all-targets` 경고 0.
+
+### 의존성
+
+`lucide-react`(참조와 같은 아이콘), `sql-formatter`(SQL 정형화), `@tanstack/react-query`,
+`react-router`. 차트 라이브러리는 쓰지 않는다 — 스파크라인은 SVG 12줄, 실행계획은
+직접 그린다. `vitest` 는 vite 6 과 타입이 충돌해 3.x 로 올렸다.
 
 ---
 
@@ -91,14 +123,18 @@ docker compose logs dbmon | grep token=
 `0/1 인스턴스 기준` 이라고 적는다 — **정상이다**(합계가 몇 개 기준인지 말하는
 장치가 동작하는 것이다). 실시간 지표를 컨테이너에서 보려면 `DBMON__ROLE=all`.
 
-### 2.4 4화면 전부 브라우저에서 확인됨
+### 2.4 5화면 전부 브라우저에서 확인됨
 
 | 화면 | 확인한 것 |
 |---|---|
-| `/` 플릿 | QPS 13.6 / 실행 중 2 / 접속 9, 스파크라인, 갱신 시각 |
-| `/live` | `docker exec -d … SLEEP(8)` → 8.7초 확정 행이 실시간으로 나타남 |
-| `/slow-queries` | 필터가 URL 에 담긴다(`?limit=37&env=dev` → select 에 37 표시) |
-| `/slow-queries/:id` | `record_id` 가 슬래시를 담아 `%2F` 인코딩 — 상세 200 |
+| `/mysql` | 슬로우 쿼리 83건 표(20건씩 5페이지), QPS 13.6·실행 3·접속 10, 스파크라인, 수집 정지/재개 |
+| `/plan` | 플랜 11건 목록 → 선택 → 쿼리 정보 + 실행계획 그래프(Select → No tables used) |
+| `/cloudwatch` | 다이제스트 9행 / 84건 실행, 월 선택(KST 경계), 지금 수집 |
+| `/statistics` | 인스턴스별 1행 + 사용자별 3행(loadgen/dbmon/root), 유형 분포 칩 |
+| `/rds` | 태그·엔드포인트·수집 여부·마지막 관측 |
+
+수집 제어도 화면에서 확인했다: **정지** → 로그에 `일시정지됐다` + 감사 로그
+(subject 포함) → 표시가 `일시정지` 로 바뀜 → **재개** → `collecting=1` 복귀.
 
 ### 2.5 실패 경로도 확인됨 (이게 리뷰의 절반이었다)
 
