@@ -63,7 +63,14 @@ async function apiGet<T>(path: string, signal: AbortSignal | null): Promise<T> {
   }
   if (!res.ok) throw new ApiError(res.status, await errorCodeOf(res));
 
-  const body: unknown = await res.json();
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    // 200 을 받았는데 본문이 JSON 이 아니다(프록시가 HTML 을 끼워 넣는 경우).
+    // 이걸 그냥 던지면 화면이 "서버에 닿지 못했다" 고 말한다 — 닿았는데.
+    throw new ApiError(res.status, "malformed_response");
+  }
   if (body === null || typeof body !== "object") {
     // 스키마 전체를 검증하지는 않는다(백엔드 뷰 타입이 계약이다). 다만 컨테이너
     // 종류가 다르면 화면이 `undefined.map` 으로 깨지므로 여기서 막는다.

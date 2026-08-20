@@ -18,11 +18,15 @@ const RATE = new Intl.NumberFormat("ko-KR", {
   minimumFractionDigits: 1,
   maximumFractionDigits: 1,
 });
-const CLOCK = new Intl.DateTimeFormat("ko-KR", { hour12: false, timeStyle: "medium" });
+// `timeStyle: "medium"` 을 쓰지 않는 이유: ko-KR 에서 시가 한 자리로 나와
+// (`9:30:00`) 표의 열이 들쭉날쭉해진다. 자리수를 고정한다.
+const TIME_PARTS = { hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" } as const;
+const CLOCK = new Intl.DateTimeFormat("ko-KR", TIME_PARTS);
 const DATETIME = new Intl.DateTimeFormat("ko-KR", {
-  hour12: false,
-  dateStyle: "short",
-  timeStyle: "medium",
+  ...TIME_PARTS,
+  year: "2-digit",
+  month: "2-digit",
+  day: "2-digit",
 });
 const RELATIVE = new Intl.RelativeTimeFormat("ko-KR", { numeric: "auto" });
 
@@ -68,6 +72,22 @@ export function fmtClock(epochMs: number | null | undefined): string {
 /** 날짜까지. 상세 화면처럼 하루를 넘길 수 있는 곳에 쓴다. */
 export function fmtDateTime(epochMs: number | null | undefined): string {
   return epochMs === null || epochMs === undefined ? EMPTY : DATETIME.format(epochMs);
+}
+
+/**
+ * 오늘이면 시각만, 아니면 날짜까지.
+ *
+ * 목록의 기본 조회 구간이 **24시간**이라 자정을 넘는다. 시각만 찍으면 어제
+ * 23:50 이 오늘 것으로 읽힌다 — 같은 표에서 두 날짜가 섞이는데 구분이 없다.
+ * `nowMs` 를 받는 이유는 테스트다.
+ */
+export function fmtClockOrDate(
+  epochMs: number | null | undefined,
+  nowMs: number,
+): string {
+  if (epochMs === null || epochMs === undefined) return EMPTY;
+  const sameDay = new Date(epochMs).toDateString() === new Date(nowMs).toDateString();
+  return sameDay ? CLOCK.format(epochMs) : DATETIME.format(epochMs);
 }
 
 /** "3분 전". `nowMs` 를 인자로 받는다 — 시계를 숨기면 테스트할 수 없다. */

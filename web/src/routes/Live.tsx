@@ -18,7 +18,7 @@ import {
 } from "../components/styles";
 import { useLive, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, queryKeys } from "../lib/api";
-import { EMPTY, fmtClock, fmtDuration, shortInstance } from "../lib/format";
+import { EMPTY, fmtClockOrDate, fmtDuration, shortInstance } from "../lib/format";
 import { MAX_LIVE_ROWS } from "../lib/live-reduce";
 import type { SlowQueryBroadcast } from "../lib/types";
 
@@ -125,11 +125,23 @@ export function Live() {
                 </td>
               </tr>
             ) : (
-              rows.map((row) => <LiveRow key={row.record_id} row={row} />)
+              rows.map((row) => <LiveRow key={row.record_id} row={row} nowMs={Date.now()} />)
             )}
           </tbody>
         </table>
       </div>
+
+      {/*
+        **놓친 구간을 표시한다.** 연결이 끊기거나 방송이 밀리면 그 사이 쿼리는
+        이 표에 영구히 없다(재방송되지 않는다). 조용히 두면 "그 시간엔 느린
+        쿼리가 없었다" 로 읽힌다.
+      */}
+      {live.missedCount > 0 ? (
+        <p className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          스트림이 {live.missedCount}번 끊기거나 밀렸다. <strong>그 사이의 쿼리는 이 표에
+          없다</strong> — 목록 화면(HTTP 조회)에서 확인한다.
+        </p>
+      ) : null}
 
       <Note>
         같은 쿼리가 <strong>진행 중 → 확정</strong> 으로 갱신된다(같은{" "}
@@ -141,12 +153,12 @@ export function Live() {
   );
 }
 
-function LiveRow({ row }: { row: SlowQueryBroadcast }) {
+function LiveRow({ row, nowMs }: { row: SlowQueryBroadcast; nowMs: number }) {
   return (
     <tr className={ROW}>
       <td className={`${TD} whitespace-nowrap`}>
         <Link className={LINK} to={`/slow-queries/${encodeURIComponent(row.record_id)}`}>
-          {fmtClock(row.started_at_ms)}
+          {fmtClockOrDate(row.started_at_ms, nowMs)}
         </Link>
       </td>
       <td className={TD} title={row.instance_id}>

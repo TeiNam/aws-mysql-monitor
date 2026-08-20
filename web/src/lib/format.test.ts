@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EMPTY, fmtDuration, fmtInt, fmtRate, shortInstance } from "./format";
+import { EMPTY, fmtClockOrDate, fmtDuration, fmtInt, fmtRate, shortInstance } from "./format";
 
 describe("null 과 0 을 구분한다", () => {
   it("값이 없으면 EMPTY 이고 0 은 0 이다", () => {
@@ -35,5 +35,18 @@ describe("인스턴스 id 축약", () => {
 
   it("구분자가 없으면 그대로 둔다", () => {
     expect(shortInstance("mysql84-local")).toBe("mysql84-local");
+  });
+});
+
+describe("자정을 넘는 목록", () => {
+  it("오늘이 아니면 날짜까지 보여 준다", () => {
+    // 기본 조회 구간이 24시간이라 어제 23:50 이 오늘 것으로 읽히면 안 된다.
+    const now = new Date(2026, 7, 20, 10, 0, 0).getTime();
+    const today = new Date(2026, 7, 20, 9, 30, 0).getTime();
+    const yesterday = new Date(2026, 7, 19, 23, 50, 0).getTime();
+
+    expect(fmtClockOrDate(today, now)).toBe("09:30:00");
+    expect(fmtClockOrDate(yesterday, now)).toContain("19.");
+    expect(fmtClockOrDate(null, now)).toBe(EMPTY);
   });
 });

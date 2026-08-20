@@ -27,8 +27,9 @@ thiserror = "2"
 # dbmon (bin) 전용
 tokio = { version = "1", features = ["full", "test-util"] }
 axum = { version = "0.8", features = ["ws"] }
-# `fs` 는 SPA 산출물(`web/dist`) 정적 서빙에 필요하다.
-tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+# `fs` 는 SPA 산출물(`web/dist`) 정적 서빙, `set-header` 는 그 응답의
+# `Cache-Control`(셸은 no-cache, 해시 자산은 immutable)에 필요하다.
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 mysql_async = { version = "0.36", default-features = false, features = ["default-rustls"] }

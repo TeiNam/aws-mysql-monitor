@@ -6,7 +6,7 @@
  * 그건 배관 버그다.
  */
 
-import type { LiveMetrics, ReadyUser, ServerMessage, SlowQueryBroadcast } from "./types";
+import { ALL_ENVS, type Env, type LiveMetrics, type ReadyUser, type ServerMessage, type SlowQueryBroadcast } from "./types";
 
 /** 실시간 표에 유지하는 행 수 상한. 넘으면 오래된 것부터 버린다. */
 export const MAX_LIVE_ROWS = 200;
@@ -36,13 +36,14 @@ export interface LiveSnapshot {
   /** 인스턴스별 QPS 이력. `null` 은 "비율을 못 냈다" 이고 0 과 다르다. */
   qpsHistory: Readonly<Record<string, readonly (number | null)[]>>;
   /**
-   * 방송이 밀려 유실된 횟수(`stream_lagged`). 값이 늘면 화면은 **HTTP 로
-   * 재조회**해야 한다 — 유실된 쿼리는 다시 방송되지 않는다.
+   * 방송을 놓친 횟수. **밀림(`stream_lagged`)과 연결 끊김을 함께 센다** — 둘 다
+   * "이 사이의 쿼리는 이 화면에 없다" 는 같은 사실이고, 복구 방법도 같다(HTTP
+   * 재조회). 값이 늘면 목록은 다시 읽고, 실시간 화면은 구멍이 있다고 말한다.
    *
-   * 시각이 아니라 횟수인 이유: 같은 밀리초에 두 번 밀리면 시각은 같은 값이 되어
+   * 시각이 아니라 횟수인 이유: 같은 밀리초에 두 번 놓치면 시각은 같은 값이 되어
    * 재조회가 한 번 빠진다.
    */
-  laggedCount: number;
+  missedCount: number;
   /**
    * 마지막 프로토콜 오류 코드. **화면에 띄운다** — `malformed`·`auth_timeout` 은
    * 프론트와 백엔드가 어긋났다는 뜻이고, 조용히 삼키면 "데이터가 안 온다" 로만
@@ -59,7 +60,7 @@ export const INITIAL_SNAPSHOT: LiveSnapshot = {
   slowq: [],
   status: {},
   qpsHistory: {},
-  laggedCount: 0,
+  missedCount: 0,
   errorCode: null,
 };
 
@@ -70,10 +71,20 @@ export const INITIAL_SNAPSHOT: LiveSnapshot = {
 export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapshot {
   switch (msg.t) {
     case "ready":
-      return { ...prev, conn: "open", user: msg.user, errorCode: null };
+      // 새 연결이므로 거부 목록을 비운다 — 앞 연결의 거부를 물고 오면 스코프가
+      // 늘어난 뒤에도 경고가 남는다.
+      return { ...prev, conn: "open", user: msg.user, errorCode: null, denied: [] };
 
-    case "subscribed":
-      return { ...prev, subscribed: msg.topics, denied: msg.denied };
+    case "subscribed": {
+      // **거부를 누적한다.** 서버는 매 응답에 그 요청의 거부만 담으므로, 뒤에
+      // 온 성공 응답이 앞의 거부 경고를 지운다. 지금 구독된 것만 목록에서 뺀다.
+      const stillDenied = prev.denied.filter((t) => !msg.topics.includes(t));
+      return {
+        ...prev,
+        subscribed: msg.topics,
+        denied: [...new Set([...stillDenied, ...msg.denied])],
+      };
+    }
 
     case "slowq":
       return { ...prev, slowq: upsertSlowQuery(prev.slowq, msg.data) };
@@ -98,12 +109,21 @@ export function applyMessage(prev: LiveSnapshot, msg: ServerMessage): LiveSnapsh
       // **`unauthorized` 는 재시도로 풀리지 않는다.** 소켓 쪽이 이 상태를 보고
       // 재접속을 멈춘다(같은 토큰으로 무한 재접속하면 서버 로그만 더럽힌다).
       if (msg.code === "unauthorized") {
-        return { ...prev, conn: "unauthorized", user: null, errorCode: msg.code };
+        // **화면에 남은 데이터도 버린다.** 백엔드는 fail closed 인데 화면이 옛
+        // 데이터를 계속 들고 있으면 강등된 사용자가 그걸 계속 본다(T-33 이
+        // 5분 재인증을 두는 이유가 권한 축소다). `missedCount` 는 유지한다 —
+        // 재조회 신호를 지우면 목록이 갱신되지 않는다.
+        return {
+          ...INITIAL_SNAPSHOT,
+          conn: "unauthorized",
+          errorCode: msg.code,
+          missedCount: prev.missedCount,
+        };
       }
       // 밀린 것은 **오류가 아니라 재조회 신호**다. `errorCode` 로 배너를 띄우면
       // 스스로 복구되는 상황에 사용자가 할 일이 없는 경고가 남는다.
       if (msg.code === "stream_lagged") {
-        return { ...prev, laggedCount: prev.laggedCount + 1 };
+        return { ...prev, missedCount: prev.missedCount + 1 };
       }
       return { ...prev, errorCode: msg.code };
   }
@@ -194,14 +214,11 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       return isStringArray(parsed.topics) && isStringArray(parsed.denied)
         ? (parsed as unknown as ServerMessage)
         : null;
-    case "slowq":
-      return isRecord(parsed.data) &&
-        typeof parsed.data.record_id === "string" &&
-        typeof parsed.data.duration_ms === "number" &&
-        typeof parsed.data.instance_id === "string" &&
-        typeof parsed.data.state === "string"
-        ? (parsed as unknown as ServerMessage)
-        : null;
+    case "slowq": {
+      if (!isRecord(parsed.data)) return null;
+      const data = normalizeBroadcast(parsed.data);
+      return data === null ? null : { t: "slowq", data };
+    }
     case "status": {
       if (typeof parsed.instance_id !== "string" || !isRecord(parsed.metrics)) return null;
       // 지표는 **정규화**한다. 없는 필드를 그대로 두면 `undefined` 가 산술에
@@ -218,6 +235,46 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     default:
       return null;
   }
+}
+
+/**
+ * 방송 프레임 정규화. 화면이 읽는 필드가 **타입까지** 맞아야 한다.
+ *
+ * `sql_preview` 가 문자열이 아니면 React 가 "Objects are not valid as a React
+ * child" 로 죽고, `started_at_ms` 가 없으면 `Intl` 이 **조용히 현재 시각**을
+ * 그린다 — 둘 다 프레임 하나가 화면을 망치는 경로다.
+ */
+function normalizeBroadcast(raw: Record<string, unknown>): SlowQueryBroadcast | null {
+  const record_id = raw.record_id;
+  const instance_id = raw.instance_id;
+  const started_at_ms = numberOrNull(raw.started_at_ms);
+  const duration_ms = numberOrNull(raw.duration_ms);
+  if (
+    typeof record_id !== "string" ||
+    typeof instance_id !== "string" ||
+    started_at_ms === null ||
+    duration_ms === null
+  ) {
+    return null;
+  }
+  return {
+    record_id,
+    instance_id,
+    // `env` 는 실시간 화면의 필터 키다. 모르는 값이면 `unknown` 으로 둔다 —
+    // 버리면 그 쿼리가 화면에서 사라진다.
+    env: isEnv(raw.env) ? raw.env : "unknown",
+    state: typeof raw.state === "string" ? raw.state : "unknown",
+    started_at_ms,
+    duration_ms,
+    app_digest: typeof raw.app_digest === "string" ? raw.app_digest : "",
+    statement_type: typeof raw.statement_type === "string" ? raw.statement_type : "unknown",
+    schema_name: typeof raw.schema_name === "string" ? raw.schema_name : null,
+    sql_preview: typeof raw.sql_preview === "string" ? raw.sql_preview : null,
+  };
+}
+
+function isEnv(v: unknown): v is Env {
+  return typeof v === "string" && (ALL_ENVS as readonly string[]).includes(v);
 }
 
 /** 숫자가 아니면 `null`. "값이 없다" 로 흘려보내면 화면이 `—` 를 그린다. */

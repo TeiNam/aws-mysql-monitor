@@ -16,9 +16,9 @@ import {
   TH,
   TH_NUM,
 } from "../components/styles";
-import { useLiveLagged } from "../hooks/useLive";
+import { useLiveMissed } from "../hooks/useLive";
 import { fetchInstances, fetchSlowQueries, queryKeys, type ListQuery } from "../lib/api";
-import { EMPTY, fmtDuration, fmtInt, fmtClock, shortInstance } from "../lib/format";
+import { EMPTY, fmtClockOrDate, fmtDuration, fmtInt, shortInstance } from "../lib/format";
 import type { SlowQueryView } from "../lib/types";
 
 /** 목록 조회 상한. 백엔드 `MAX_LIMIT` 과 같다 — 더 요구해도 서버가 자른다. */
@@ -65,13 +65,14 @@ export function SlowQueries() {
     queryFn: ({ signal }) => fetchInstances(signal),
   });
 
-  // 방송이 밀리면 유실된 쿼리는 **다시 방송되지 않는다.** HTTP 로 다시 읽는다.
-  const laggedCount = useLiveLagged();
+  // 방송이 밀리거나 연결이 끊기면 그 사이 쿼리는 **다시 방송되지 않는다.**
+  // HTTP 로 다시 읽는 것이 유일한 복구 경로다.
+  const missedCount = useLiveMissed();
   const refetch = list.refetch;
   useEffect(() => {
-    if (laggedCount === 0) return;
+    if (missedCount === 0) return;
     void refetch();
-  }, [laggedCount, refetch]);
+  }, [missedCount, refetch]);
 
   const envOptions = useMemo(
     () => [...new Set((instances.data ?? []).map((i) => i.env))].sort(),
@@ -179,7 +180,10 @@ export function SlowQueries() {
                     </td>
                   </tr>
                 ) : (
-                  list.data.items.map((item) => <QueryRow key={item.record_id} item={item} />)
+                  // 자정을 넘는 구간이므로 오늘이 아닌 행은 날짜까지 보여 준다.
+                  list.data.items.map((item) => (
+                    <QueryRow key={item.record_id} item={item} nowMs={Date.now()} />
+                  ))
                 )}
               </tbody>
             </table>
@@ -207,12 +211,12 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function QueryRow({ item }: { item: SlowQueryView }) {
+function QueryRow({ item, nowMs }: { item: SlowQueryView; nowMs: number }) {
   return (
     <tr className={ROW}>
       <td className={`${TD} whitespace-nowrap`}>
         <Link className={LINK} to={`/slow-queries/${encodeURIComponent(item.record_id)}`}>
-          {fmtClock(item.started_at_ms)}
+          {fmtClockOrDate(item.started_at_ms, nowMs)}
         </Link>
       </td>
       <td className={TD} title={item.instance_id}>

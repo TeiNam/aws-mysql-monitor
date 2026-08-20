@@ -1614,15 +1614,38 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             match &spa {
                 Some(dir) => {
                     use tower_http::services::{ServeDir, ServeFile};
-                    // 해시가 붙은 산출물. 이름이 내용으로 정해지므로 캐시가 안전하다.
-                    app = app.nest_service("/assets", ServeDir::new(dir.join("assets")));
+                    use tower_http::set_header::SetResponseHeaderLayer;
+
+                    // 해시가 붙은 산출물. 이름이 내용으로 정해지므로 영구 캐시가 안전하다.
+                    app = app.nest_service(
+                        "/assets",
+                        axum::routing::any_service(ServeDir::new(dir.join("assets"))).layer(
+                            SetResponseHeaderLayer::overriding(
+                                axum::http::header::CACHE_CONTROL,
+                                axum::http::HeaderValue::from_static(
+                                    "public, max-age=31536000, immutable",
+                                ),
+                            ),
+                        ),
+                    );
+
                     // 클라이언트 라우팅(`/slow-queries/…`)이 새로고침을 견뎌야 하므로
                     // 나머지 경로는 `index.html` 이 받는다. 단 `/api/…` 는 위의
                     // 명시 라우트에 걸리지 않았다면 **404 로 답한다.**
+                    //
+                    // ⚠ **셸은 캐시하지 않는다.** `index.html` 은 해시가 붙은 자산
+                    // 이름을 담으므로, 낡은 셸이 캐시되면 배포 뒤 **삭제된 파일을
+                    // 가리켜 빈 화면**이 된다. `ServeFile` 은 `Last-Modified` 만
+                    // 주므로 브라우저가 휴리스틱으로 캐시할 수 있다.
+                    let shell = axum::routing::any_service(ServeFile::new(dir.join("index.html")))
+                        .layer(SetResponseHeaderLayer::overriding(
+                            axum::http::header::CACHE_CONTROL,
+                            axum::http::HeaderValue::from_static("no-cache"),
+                        ));
                     app = app
                         .route("/api", axum::routing::any(api_route_not_found))
                         .route("/api/{*rest}", axum::routing::any(api_route_not_found))
-                        .fallback_service(ServeFile::new(dir.join("index.html")));
+                        .fallback_service(shell);
                 }
                 None => app = app.route("/", get(index_page)),
             }

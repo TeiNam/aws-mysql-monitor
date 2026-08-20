@@ -130,10 +130,56 @@ describe("실시간 지표", () => {
 });
 
 describe("연결 상태", () => {
-  it("unauthorized 는 재접속을 막는 상태로 남는다", () => {
-    const s = apply(INITIAL_SNAPSHOT, { t: "error", code: "unauthorized" });
+  it("unauthorized 는 재접속을 막고 남은 데이터를 버린다", () => {
+    // 백엔드는 fail closed 다. 화면만 옛 데이터를 들고 있으면 강등된 사용자가
+    // 그걸 계속 본다.
+    const filled = apply(
+      INITIAL_SNAPSHOT,
+      { t: "slowq", data: broadcast() },
+      { t: "status", instance_id: "i", metrics: metrics() },
+      { t: "error", code: "stream_lagged" },
+    );
+    const s = applyMessage(filled, { t: "error", code: "unauthorized" });
+
     expect(s.conn).toBe("unauthorized");
     expect(s.user).toBeNull();
+    expect(s.slowq).toEqual([]);
+    expect(s.status).toEqual({});
+    expect(s.qpsHistory).toEqual({});
+    // 재조회 신호는 유지한다 — 지우면 목록이 갱신되지 않는다.
+    expect(s.missedCount).toBe(1);
+  });
+
+  it("거부된 토픽은 뒤에 온 성공 응답이 지우지 않는다", () => {
+    // 서버는 매 응답에 그 요청의 거부만 담는다. 그대로 덮으면 경고가 사라지고
+    // 사용자는 "왜 이 인스턴스 지표만 없나" 를 코드에서 찾게 된다.
+    const s = apply(
+      INITIAL_SNAPSHOT,
+      { t: "subscribed", topics: ["slowq:env=dev"], denied: ["status:inst=x"] },
+      { t: "subscribed", topics: ["slowq:env=dev", "slowq:env=stg"], denied: [] },
+    );
+    expect(s.denied).toEqual(["status:inst=x"]);
+
+    // 나중에 실제로 구독되면 목록에서 빠진다.
+    const after = applyMessage(s, {
+      t: "subscribed",
+      topics: ["slowq:env=dev", "status:inst=x"],
+      denied: [],
+    });
+    expect(after.denied).toEqual([]);
+  });
+
+  it("새 연결(ready)은 거부 목록을 비운다", () => {
+    const s = apply(INITIAL_SNAPSHOT, {
+      t: "subscribed",
+      topics: [],
+      denied: ["slowq:env=prd"],
+    });
+    const reconnected = applyMessage(s, {
+      t: "ready",
+      user: { subject: "u", role: "admin", env_scope: ["prd"], can_see_literals: true },
+    });
+    expect(reconnected.denied).toEqual([]);
   });
 
   it("stream_lagged 는 재조회 신호를 셈으로 남긴다", () => {
@@ -144,7 +190,7 @@ describe("연결 상태", () => {
       { t: "error", code: "stream_lagged" },
       { t: "error", code: "stream_lagged" },
     );
-    expect(s.laggedCount).toBe(2);
+    expect(s.missedCount).toBe(2);
     // 스스로 복구되는 상황이므로 오류 배너를 띄우지 않는다.
     expect(s.errorCode).toBeNull();
   });
@@ -180,6 +226,37 @@ describe("프레임 파싱", () => {
     expect(
       parseServerMessage('{"t":"subscribed","topics":["slowq:env=dev"],"denied":[]}'),
     ).not.toBeNull();
+  });
+
+  it("slowq 의 화면이 읽는 필드가 타입까지 맞아야 한다", () => {
+    // `sql_preview` 가 객체면 React 가 죽고, `started_at_ms` 가 없으면 `Intl` 이
+    // 조용히 **현재 시각**을 그린다.
+    expect(
+      parseServerMessage(
+        '{"t":"slowq","data":{"record_id":"a","instance_id":"i","duration_ms":1}}',
+      ),
+      "started_at_ms 없음",
+    ).toBeNull();
+
+    const msg = parseServerMessage(
+      '{"t":"slowq","data":{"record_id":"a","instance_id":"i","duration_ms":1,' +
+        '"started_at_ms":2,"env":"nope","sql_preview":{"x":1},"statement_type":null}}',
+    );
+    expect(msg).toEqual({
+      t: "slowq",
+      data: {
+        record_id: "a",
+        instance_id: "i",
+        env: "unknown",
+        state: "unknown",
+        started_at_ms: 2,
+        duration_ms: 1,
+        app_digest: "",
+        statement_type: "unknown",
+        schema_name: null,
+        sql_preview: null,
+      },
+    });
   });
 
   it("모르는 형태와 깨진 프레임을 버린다", () => {

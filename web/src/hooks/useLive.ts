@@ -13,15 +13,15 @@ export function useLive(): LiveSnapshot {
 }
 
 /**
- * 방송 유실 횟수만 관찰한다.
+ * 방송을 놓친 횟수만 관찰한다.
  *
  * 전체 스냅샷을 구독하면 5초마다 오는 `status` 하나에 **표 전체가 리렌더**된다.
- * 목록 화면은 유실 신호 말고는 실시간 값을 쓰지 않으므로 원시값 하나만 본다.
+ * 목록 화면은 이 신호 말고는 실시간 값을 쓰지 않으므로 원시값 하나만 본다.
  */
-const selectLaggedCount = () => liveClient.getSnapshot().laggedCount;
+const selectMissedCount = () => liveClient.getSnapshot().missedCount;
 
-export function useLiveLagged(): number {
-  return useSyncExternalStore(liveClient.subscribe, selectLaggedCount, selectLaggedCount);
+export function useLiveMissed(): number {
+  return useSyncExternalStore(liveClient.subscribe, selectMissedCount, selectMissedCount);
 }
 
 /**

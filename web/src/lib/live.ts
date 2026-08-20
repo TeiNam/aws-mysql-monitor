@@ -127,7 +127,15 @@ export class LiveClient {
       // 이진 프레임은 프로토콜에 없다. 문자열만 읽는다.
       if (typeof event.data !== "string") return;
       const msg = parseServerMessage(event.data);
-      if (msg === null) return;
+      if (msg === null) {
+        // **못 읽은 프레임을 조용히 버리지 않는다.** 특히 `ready` 를 못 읽으면
+        // `authed` 가 영원히 거짓이고, 하트비트는 계속 나가므로 서버도 끊지
+        // 않는다 → 화면이 "연결 중" 에서 영구히 멈춘다. 인증 전이라면 끊어서
+        // 백오프 재접속에 맡긴다.
+        this.set(applyMessage(this.snapshot, { t: "error", code: "malformed_frame" }));
+        if (!this.authed) socket.close();
+        return;
+      }
       this.set(applyMessage(this.snapshot, msg));
       if (msg.t === "ready") {
         // 인증까지 성공한 것이 **연결이 실제로 쓸 만하다**는 증거다.
@@ -151,8 +159,13 @@ export class LiveClient {
     this.socket = null;
     this.authed = false;
     this.sent.clear();
-    // 끊긴 구간을 이력에 남긴다 — 없으면 재연결 후 첫 표본이 옛 표본과 이어진다.
-    const gapped = markStreamGap(this.snapshot);
+    // 끊긴 구간을 이력에 남기고 **놓친 것으로 센다.** 끊긴 동안의 슬로우 쿼리
+    // 방송은 다시 오지 않으므로, 화면은 HTTP 로 다시 읽어야 한다.
+    const previous = this.snapshot;
+    const gapped = {
+      ...markStreamGap(previous),
+      missedCount: previous.conn === "open" ? previous.missedCount + 1 : previous.missedCount,
+    };
     // `unauthorized` 를 `closed` 로 덮으면 재접속 금지가 풀린다.
     this.set(
       this.snapshot.conn === "unauthorized"

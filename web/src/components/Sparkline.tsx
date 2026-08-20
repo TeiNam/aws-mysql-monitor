@@ -19,20 +19,17 @@ interface SparklineProps {
  * 선을 그리게 되고, 그건 없는 데이터를 그린 것이다.
  */
 export function Sparkline({ values, label, width = 96, height = 24 }: SparklineProps) {
-  const present: number[] = [];
-  for (const v of values) if (v !== null) present.push(v);
-  if (present.length < 2) {
-    return <span className="text-zinc-400">{EMPTY}</span>;
-  }
-
-  let min = present[0] as number;
-  let max = min;
-  for (const v of present) {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const v of values) {
+    if (v === null) continue;
     if (v < min) min = v;
     if (v > max) max = v;
   }
-  // 평평한 계열(모두 같은 값)은 0 으로 나누지 않고 가운데 선으로 그린다.
-  const span = max - min || 1;
+  const flat = max === min;
+  // 평평한 계열은 0 으로 나눌 수 없다. 가운데 높이에 그린다 — 바닥에 그리면
+  // "값이 최저" 로 읽힌다.
+  const span = flat ? 1 : max - min;
   const stepX = values.length > 1 ? width / (values.length - 1) : width;
 
   const segments: string[] = [];
@@ -44,10 +41,16 @@ export function Sparkline({ values, label, width = 96, height = 24 }: SparklineP
       return;
     }
     const x = i * stepX;
-    const y = height - ((v - min) / span) * height;
+    const y = flat ? height / 2 : height - ((v - min) / span) * height;
     current.push(`${x.toFixed(1)},${y.toFixed(1)}`);
   });
   if (current.length > 1) segments.push(current.join(" "));
+
+  // **표본이 있어도 이어진 구간이 없으면 선을 그릴 수 없다** (`[1, null, 2]`).
+  // 빈 `<svg>` 를 내면 칸이 비어 "값이 없다" 와 구분되지 않으므로 표시로 낸다.
+  if (segments.length === 0) {
+    return <span className="text-zinc-400">{EMPTY}</span>;
+  }
 
   return (
     <svg

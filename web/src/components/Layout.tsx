@@ -1,3 +1,5 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { NavLink, Outlet } from "react-router";
 import { useLive } from "../hooks/useLive";
 import { liveClient } from "../lib/live";
@@ -56,6 +58,17 @@ export function Layout() {
 /** 사용자·연결 상태. 실시간 메시지마다 리렌더되는 것은 이 조각뿐이다. */
 function LiveStatus() {
   const live = useLive();
+  const queryClient = useQueryClient();
+
+  // **인증이 거부되면 캐시도 버린다.**
+  //
+  // 스트림 데이터는 스냅샷이 비우지만(`live-reduce`), HTTP 로 받아 둔 목록·상세는
+  // react-query 캐시에 남는다. 백엔드는 fail closed 인데 화면만 옛 데이터를 계속
+  // 보여 주면 강등된 사용자가 그걸 계속 본다.
+  useEffect(() => {
+    if (live.conn === "unauthorized") queryClient.clear();
+  }, [live.conn, queryClient]);
+
   return (
     <>
       <UserBadge user={live.user} />
