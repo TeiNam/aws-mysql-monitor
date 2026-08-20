@@ -33,6 +33,9 @@
 2. **React SPA + 정적 서빙 + 9차 2way 리뷰** — 다크 4화면. **참조 구현을 보지 않아
    전부 다시 만들었다**(§0)
 3. **참조 대시보드 이식** — 조회 경로 8개 추가 + 5화면 재구성 + 수집 제어
+4. **2way 리뷰 2·3라운드** — 커밋 `39ccddb`, `8b218b0`. 읽기 경로를 하나로 합치고
+   (`collect_views`), 일시정지가 **태스크를 정말 멈추게** 고쳤다
+   ([20 §2way 리뷰 2라운드·3라운드](20-review-log.md))
 
 `docs/09-frontend.md` 가 규정한 SPA 가 실제로 돌아간다. 그리고 그 프론트가
 **백엔드 결함 하나를 드러냈다**(WS 유휴 종료 — [20 §R9-1](20-review-log.md)).
@@ -60,7 +63,7 @@
 | `lib/live{,-reduce}.ts` | WS 배관과 판정부(순수). 실시간 지표·방송 |
 | `components/{Shell,Card,Pagination,SqlModal,ui}.tsx` | 껍데기·카드·페이지네이션·SQL 팝업·클래스 상수 |
 
-테스트: **Rust 670개 + web 62개**, `cargo clippy --workspace --all-targets` 경고 0.
+테스트: **Rust 681개 + web 67개**, `cargo clippy --workspace --all-targets` 경고 0.
 
 ### 의존성
 
@@ -136,6 +139,19 @@ docker compose logs dbmon | grep token=
 수집 제어도 화면에서 확인했다: **정지** → 로그에 `일시정지됐다` + 감사 로그
 (subject 포함) → 표시가 `일시정지` 로 바뀜 → **재개** → `collecting=1` 복귀.
 
+3라운드에서 **정지가 진짜로 멈추는지**를 부하로 다시 측정했다 — 이게 없으면
+"멈췄다고 표시되는데 계속 수집하는" 상태를 볼 수 없다:
+
+```bash
+bash local/loadgen.sh longsql            # 6초짜리 쿼리를 만든다
+curl -XPOST -H 'x-dbmon-control: 1' :8080/api/collector/pause
+bash local/loadgen.sh longsql            # 정지 구간에 다시 부하
+# → 정지 시각 이후에 시작된 기록: 0건   (유령 태스크 없음)
+curl -XPOST -H 'x-dbmon-control: 1' :8080/api/collector/resume
+bash local/loadgen.sh longsql
+# → 재개 후 기록 1건, "수집 태스크 시작" 로그는 인스턴스당 1회 (중복 없음)
+```
+
 ### 2.5 실패 경로도 확인됨 (이게 리뷰의 절반이었다)
 
 ```bash
@@ -159,8 +175,10 @@ docker compose logs dbmon | grep token=
 
 ### 3.2 M6 의 남은 것 (백엔드)
 
-- `next_cursor` 발급 — `list_by_instance` 가 `LastEvaluatedKey` 를 노출하지 않아
-  **페이지네이션이 없다.** 화면은 이 사실을 배너로 말한다(상한에 걸리면)
+- `next_cursor` 발급 — `list_by_instance` 는 페이지를 **내부에서** 따라가고
+  `LastEvaluatedKey` 를 밖으로 주지 않아 **페이지네이션이 없다.** 화면은 상한에
+  걸리면 그 사실을 말한다(0건일 때도 — 3라운드 자체 발견). 다중 인스턴스에서
+  제대로 된 커서는 인스턴스별 위치를 한 토큰에 담아야 한다(k-way 병합)
 - 커서 서명 키가 프로세스마다 다르다 — 다중 워커에서 커서 공유 불가
 - 콜드 티어(Athena) 조회 경로
 - `POST /api/queries`(샘플 실행), 실행계획 본문 조회 API
@@ -178,7 +196,7 @@ Cognito 가 배선되면 SPA 서빙 게이트(`serves_local_ui()`)도 함께 열
 
 | 대상 | 상태 | 조치 |
 |---|---|---|
-| `dbmon-web` 컨테이너 (`dbmon:round8`) | 실행 중, `dbmon-data-local` 의 수집 리더 리스를 쥐고 있다 | 이전 세션에서 만든 것. 정리 여부는 사용자 판단 |
+| `dbmon-web` 컨테이너 (`dbmon:round8`) | **정지시켰다** (3라운드 검증 중). 낡은 바이너리로 수집 리더 리스를 19시간 쥐고 있어 **호스트 바이너리가 리더가 되지 못했다** — 원인을 찾는 데 5분을 썼다 | 정지 상태로 둔다. 다시 띄우면 리스를 다시 뺏는다 |
 | `dbmon-dev-dbmon-1` (컴포즈 `monitor`) | 이번 세션에서 새 이미지로 재생성. **`healthy`** | 해결됨 — 아래 |
 | `dbmon-data-wstest` · `dbmon-data-uitest` | 세션들이 만든 격리 테이블 | 필요 없으면 삭제 |
 | 호스트 `target/debug/dbmon` | 8081 에 떠 있을 수 있다(`DBMON__HTTP__BIND=0.0.0.0`, uitest 테이블) | `pkill -f "target/debug/dbmon"` |
