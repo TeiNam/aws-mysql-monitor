@@ -69,6 +69,11 @@ impl<L: LeaseStore, C: Clock> LeaderGate<L, C> {
     }
 
     /// 현재 리스의 `epoch`. 저장 레코드의 `owner_epoch` 로 쓴다(펜싱 근거).
+    /// 이 워커의 식별자. 레코드 소유 판정에 쓴다.
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
     pub fn epoch(&self) -> Option<u64> {
         self.held.as_ref().map(|l| l.epoch)
     }

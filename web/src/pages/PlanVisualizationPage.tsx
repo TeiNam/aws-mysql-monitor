@@ -14,6 +14,7 @@ import { useSearchParams } from "react-router";
 import { Card } from "../components/Card";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { PlanGraph } from "../components/PlanGraph";
+import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
 import {
   BTN_GHOST,
@@ -66,7 +67,12 @@ export function PlanVisualizationPage() {
   }
 
   const items = plans.data?.items ?? [];
-  const current = items.find((i) => i.record_id === selected) ?? items[0];
+  // **없는 레코드를 다른 것으로 갈아치우지 않는다.** 오래된 북마크나 필터 변경으로
+  // 목록에서 사라진 경우 **다른 쿼리의 계획**을 보여주게 되고, 그건 조사 도구에서
+  // 가장 위험한 거짓말이다.
+  const picked = selected === "" ? undefined : items.find((i) => i.record_id === selected);
+  const missing = selected !== "" && picked === undefined && !plans.isPending;
+  const current = picked ?? (selected === "" ? items[0] : undefined);
   const nowMs = Date.now();
 
   return (
@@ -176,7 +182,25 @@ export function PlanVisualizationPage() {
         )}
       </Card>
 
+      {missing ? (
+        <Card>
+          <p className="text-sm text-gray-700">
+            주소로 지정한 레코드가 이 목록에 없다 (
+            <span className={MONO}>{selected}</span>). 인스턴스 필터나 조회 구간을 확인한다 —
+            <strong> 다른 쿼리의 계획을 대신 보여주지 않는다.</strong>
+          </p>
+          <button type="button" className={`${BTN_GHOST} mt-3`} onClick={() => update("record", "")}>
+            최근 것부터 보기
+          </button>
+        </Card>
+      ) : null}
       {current === undefined ? null : <PlanDetail query={current} tz={tz} />}
+      {plans.data?.has_more === true ? (
+        <Note>
+          플랜이 조회 상한을 넘었다 — 목록은 최근 것만 보여준다. 인스턴스로 좁히면 더
+          거슬러 볼 수 있다.
+        </Note>
+      ) : null}
     </div>
   );
 }
@@ -221,6 +245,9 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
           </Item>
           <Item label="Env">
             <EnvChip env={query.env} />
+          </Item>
+          <Item label="State">
+            <StateBadge state={query.state} reason={query.abandoned_reason} />
           </Item>
           <Item label="Thread">{query.thread_id}</Item>
           <Item label="Execution Time">{(query.duration_ms / 1000).toFixed(2)}s</Item>

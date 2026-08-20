@@ -60,6 +60,25 @@ const AGGREGATE_PAGE: usize = 5_000;
 /// 기본 조회 구간 (24시간). 시간 범위를 주지 않았을 때.
 const DEFAULT_RANGE_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// 조회 구간 상한 (400일 — 아카이브 티어와 같다).
+///
+/// **없으면 인증된 사용자가 저장소를 때릴 수 있다.** `from_ms=0` 을 주면
+/// `date_parts()` 가 상한(1만)까지 날짜를 만들고, 그건 인스턴스마다 1만 번의
+/// DynamoDB 질의다. 게다가 그 1만 개는 **1970년부터**이므로 최근 데이터가 통째로
+/// 빠진다 — 비싸고 틀린 응답이다. 구간을 넘기면 조용히 좁히지 않고 거부한다.
+const MAX_RANGE_DAYS: i64 = 400;
+const MAX_RANGE_MS: i64 = MAX_RANGE_DAYS * 24 * 60 * 60 * 1000;
+
+/// 구간을 만들고 상한을 검사한다. 모든 조회 경로가 이걸 쓴다.
+fn checked_range(from_ms: i64, to_ms: i64) -> Result<TimeRange, ApiError> {
+    let range = TimeRange::new(from_ms, to_ms)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_range"))?;
+    if range.to_ms().saturating_sub(range.from_ms()) > MAX_RANGE_MS {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "range_too_long"));
+    }
+    Ok(range)
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Arc<AppSlowQueryStore>,
@@ -188,8 +207,7 @@ async fn list_slow_queries(
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let to_ms = p.to_ms.unwrap_or(now_ms);
     let from_ms = p.from_ms.unwrap_or(to_ms - DEFAULT_RANGE_MS);
-    let range = TimeRange::new(from_ms, to_ms)
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_range"))?;
+    let range = checked_range(from_ms, to_ms)?;
 
     // **환경 스코프를 여기서 교집합한다.** 요청이 무엇을 요구하든 사용자의
     // 스코프 밖은 볼 수 없다.
@@ -220,40 +238,26 @@ async fn list_slow_queries(
         // `list_by_instance` 가 `LastEvaluatedKey` 를 아직 노출하지 않는다.
     }
 
-    // 대상 인스턴스를 정한다.
-    let instances = self_instances(&state, p.instance.as_deref()).await?;
+    // **인스턴스마다 같은 몫을 읽고 전역 정렬한다.**
+    //
+    // 예전에는 인스턴스를 순회하며 상한에 닿으면 중단했다. 그러면 등록부 순서가
+    // 앞선 인스턴스가 상한을 다 먹고, **뒤 인스턴스의 더 새로운 행이 통째로 빠진다** —
+    // 정렬은 그 뒤에 하므로 화면은 그 사실을 알 수 없다.
+    let (mut items, truncated) = collect_views(
+        &state,
+        &ctx,
+        &allowed_envs,
+        p.instance.as_deref(),
+        range,
+        // 하나 더 읽어 "더 있다" 를 정확히 판정한다. `>` 만 쓰면 정확히 상한일 때
+        // `has_more=false` 가 되어 마지막 페이지가 끝인 것처럼 보인다.
+        limit + 1,
+        limit + 1,
+    )
+    .await?;
 
-    let mut items = Vec::new();
-    for inst in &instances {
-        if !allowed_envs.contains(&inst.env.effective) {
-            continue;
-        }
-        let found = state
-            .store
-            .list_by_instance(&inst.id, range, limit)
-            .await
-            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
-        for q in &found {
-            // **레코드의 환경으로 다시 검사한다.**
-            //
-            // 인스턴스의 *현재* 환경만 보면, 환경이 바뀐 인스턴스(태그 수정·override)의
-            // **과거 레코드**가 스코프 밖 사용자에게 나간다 — 그 레코드에는 당시 환경의
-            // SQL 이 들어 있다. 상세 조회(`get_query`)는 이미 이렇게 한다.
-            if !ctx.is_env_allowed(q.env) {
-                continue;
-            }
-            // **뷰를 반드시 거친다.** 리터럴 통제가 그 안에 있다.
-            items.push(SlowQueryView::from_record(q, &ctx));
-        }
-        if items.len() >= limit {
-            break;
-        }
-    }
-    // 최신순으로 맞춘다 — 인스턴스별 조회를 이어 붙였으므로 전역 정렬이 필요하다.
-    items.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
-    let has_more = items.len() > limit;
+    let has_more = truncated || items.len() > limit;
     items.truncate(limit);
-
     let total = items.len();
     Ok(Json(ListResponse {
         items,
@@ -463,9 +467,11 @@ fn month_range(month: &str) -> Option<TimeRange> {
         (year, mon + 1)
     };
     let end = NaiveDate::from_ymd_opt(next_year, next_mon, 1)?.and_hms_opt(0, 0, 0)?;
+    // **끝을 1ms 당긴다.** `TimeRange` 와 DynamoDB `BETWEEN` 은 양끝을 포함하므로,
+    // 다음 달 0시를 그대로 두면 정확히 그 시각의 레코드가 **두 달에 모두** 잡힌다.
     TimeRange::new(
         kst.from_local_datetime(&start).single()?.timestamp_millis(),
-        kst.from_local_datetime(&end).single()?.timestamp_millis(),
+        kst.from_local_datetime(&end).single()?.timestamp_millis() - 1,
     )
 }
 
@@ -477,64 +483,112 @@ fn aggregate_range(p: &AggregateParams, now_ms: i64) -> Result<TimeRange, ApiErr
     }
     let to_ms = p.to_ms.unwrap_or(now_ms);
     let from_ms = p.from_ms.unwrap_or(to_ms - DEFAULT_RANGE_MS);
-    TimeRange::new(from_ms, to_ms)
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_range"))
+    checked_range(from_ms, to_ms)
 }
 
-/// 집계용 레코드 수집. **뷰를 거친다** — 리터럴 통제가 그 안에 있다.
+/// 조회·집계가 **공유하는 단 하나의 읽기 경로**. 뷰를 거치므로 리터럴 통제를
+/// 우회할 수 없다.
 ///
-/// 반환값의 두 번째는 "천장에 걸렸다" 다. 저장소가 **최신 순으로** 돌려주므로
-/// (`scan_index_forward(false)`) 잘리는 쪽은 항상 과거다 — 통계가 최근을 놓치지 않는다.
+/// # 왜 인스턴스마다 같은 몫인가
+///
+/// 등록부 순서대로 읽고 천장에서 멈추면 **바쁜 인스턴스 하나가 천장을 다 먹고**
+/// 다른 인스턴스의 더 새로운 데이터가 통째로 빠진다. 그 뒤에 정렬해도 없는 행은
+/// 나타나지 않는다 — 통계가 조용히 한 인스턴스만 반영한다.
+///
+/// # 환경 판정은 **요청 교집합**으로 한다
+///
+/// `allowed` 는 `사용자 스코프 ∩ 요청 env` 다. 레코드를 사용자 스코프로만 검사하면
+/// `?env=dev` 를 줬는데 prd 레코드가 섞인다(환경이 바뀐 인스턴스의 과거 행).
+///
+/// 반환값의 두 번째는 "천장에 걸렸다" — 저장소가 최신순으로 주므로 잘리는 쪽은 과거다.
 async fn collect_views(
+    state: &ApiState,
+    ctx: &AuthContext,
+    allowed: &[Env],
+    instance: Option<&str>,
+    range: TimeRange,
+    per_instance: usize,
+    ceiling: usize,
+) -> Result<(Vec<SlowQueryView>, bool), ApiError> {
+    let instances = self_instances(state, instance).await?;
+
+    // 몫을 나눈다. 인스턴스가 여럿이면 천장을 나눠 갖는다 — 하나가 다 먹지 못한다.
+    let share = if instances.len() > 1 {
+        (ceiling / instances.len()).clamp(1, per_instance)
+    } else {
+        per_instance.min(ceiling).max(1)
+    };
+
+    let mut views = Vec::new();
+    let mut truncated = false;
+    for inst in &instances {
+        let found = state
+            .store
+            .list_by_instance(&inst.id, range, share)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+        // 몫을 꽉 채웠다는 것은 더 있다는 뜻이다. 저장소가 1MB 페이지를 따라가므로
+        // (`list_by_instance`) 이 판정이 성립한다.
+        if found.len() == share {
+            truncated = true;
+        }
+        views.extend(
+            found
+                .iter()
+                // **요청 교집합으로 검사한다.** 사용자 스코프만 보면 `?env=dev` 에
+                // prd 행이 섞이고(환경이 바뀐 인스턴스의 과거 행), 인스턴스의 현재
+                // 환경만 보면 그 반대로 볼 수 있는 행이 빠진다.
+                .filter(|q| allowed.contains(&q.env))
+                .map(|q| SlowQueryView::from_record(q, ctx)),
+        );
+    }
+
+    // 전역 최신순. 인스턴스별 결과를 이어 붙였으므로 여기서 한 번 맞춘다.
+    views.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
+    if views.len() > ceiling {
+        views.truncate(ceiling);
+        truncated = true;
+    }
+    Ok((views, truncated))
+}
+
+/// 집계 파라미터에서 `사용자 스코프 ∩ 요청 env` 를 구한다.
+fn allowed_envs_of(ctx: &AuthContext, env: Option<&str>) -> Result<Vec<Env>, ApiError> {
+    let requested: Vec<Env> = match env {
+        Some(e) => {
+            vec![
+                parse_env(e)
+                    .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_env"))?,
+            ]
+        }
+        None => Env::ALL.to_vec(),
+    };
+    let allowed = ctx.scope_intersection(&requested);
+    if allowed.is_empty() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "env_not_allowed"));
+    }
+    Ok(allowed)
+}
+
+/// 집계 호출부의 공통 준비 — 스코프·몫.
+async fn collect_for_aggregate(
     state: &ApiState,
     ctx: &AuthContext,
     p: &AggregateParams,
     range: TimeRange,
 ) -> Result<(Vec<SlowQueryView>, bool), ApiError> {
-    let requested_envs: Vec<Env> = match p.env.as_deref() {
-        Some(e) => vec![
-            parse_env(e).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_env"))?,
-        ],
-        None => Env::ALL.to_vec(),
-    };
-    let allowed = ctx.scope_intersection(&requested_envs);
-    if allowed.is_empty() {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "env_not_allowed"));
-    }
-
-    let instances = self_instances(state, p.instance.as_deref()).await?;
+    let allowed = allowed_envs_of(ctx, p.env.as_deref())?;
     let ceiling = p.scan.unwrap_or(MAX_AGGREGATE_SCAN).min(MAX_AGGREGATE_SCAN);
-
-    let mut views = Vec::new();
-    let mut truncated = false;
-    for inst in &instances {
-        if !allowed.contains(&inst.env.effective) {
-            continue;
-        }
-        if views.len() >= ceiling {
-            truncated = true;
-            break;
-        }
-        let page = AGGREGATE_PAGE.min(ceiling - views.len());
-        let found = state
-            .store
-            .list_by_instance(&inst.id, range, page)
-            .await
-            .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
-        // 페이지를 꽉 채웠다는 것은 더 있을 수 있다는 뜻이다. 저장소가 1MB 페이지를
-        // 따라가므로(`list_by_instance`) 이 판정이 성립한다.
-        if found.len() == page {
-            truncated = true;
-        }
-        // **레코드의 환경으로 다시 검사한다** — 위 인스턴스 필터는 현재 환경만 본다.
-        views.extend(
-            found
-                .iter()
-                .filter(|q| ctx.is_env_allowed(q.env))
-                .map(|q| SlowQueryView::from_record(q, ctx)),
-        );
-    }
-    Ok((views, truncated))
+    collect_views(
+        state,
+        ctx,
+        &allowed,
+        p.instance.as_deref(),
+        range,
+        AGGREGATE_PAGE,
+        ceiling,
+    )
+    .await
 }
 
 async fn list_digests(
@@ -544,7 +598,7 @@ async fn list_digests(
 ) -> Result<Json<AggregateEnvelope<aggregate::DigestRow>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_views(&state, &ctx, &p, range).await?;
+    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
     Ok(Json(AggregateEnvelope {
         items: aggregate::digest_rows(&views),
         scanned: views.len(),
@@ -562,7 +616,7 @@ async fn instance_statistics(
 ) -> Result<Json<AggregateEnvelope<aggregate::InstanceStats>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_views(&state, &ctx, &p, range).await?;
+    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
     Ok(Json(AggregateEnvelope {
         items: aggregate::instance_stats(&views),
         scanned: views.len(),
@@ -580,7 +634,7 @@ async fn user_statistics(
 ) -> Result<Json<AggregateEnvelope<aggregate::UserStats>>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (views, truncated) = collect_views(&state, &ctx, &p, range).await?;
+    let (views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
     Ok(Json(AggregateEnvelope {
         items: aggregate::user_stats(&views),
         scanned: views.len(),
@@ -599,17 +653,19 @@ async fn list_plans(
 ) -> Result<Json<ListResponse>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
-    let (mut views, truncated) = collect_views(&state, &ctx, &p, range).await?;
+    let (mut views, truncated) = collect_for_aggregate(&state, &ctx, &p, range).await?;
 
     // **플랜이 있는 것만.** 없는 레코드를 섞으면 "플랜을 눌렀는데 아무것도 없다" 가 된다.
     views.retain(|v| v.has_plan);
     views.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
+    // 잘렸으면 **그 사실도 `has_more` 다.** 화면이 "플랜이 이게 전부" 로 읽으면 안 된다.
+    let capped = views.len() > MAX_LIMIT;
     views.truncate(MAX_LIMIT);
     let total = views.len();
     Ok(Json(ListResponse {
         items: views,
         next_cursor: None,
-        has_more: truncated,
+        has_more: truncated || capped,
         total,
     }))
 }
@@ -771,6 +827,28 @@ fn require_global_control(ctx: &AuthContext) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// 제어 요청에 **브라우저가 임의 오리진에서 보낼 수 없는 헤더**를 요구한다.
+///
+/// # 왜 필요한가
+///
+/// 로컬 개발에서는 루프백 바인드면 **토큰 없이 통과**한다(그게 그 모드의 목적이다).
+/// 그러면 개발자가 방문한 아무 웹페이지가 `fetch("http://127.0.0.1:8080/api/collector/pause",
+/// {method:"POST"})` 로 **수집을 멈출 수 있다** — 응답은 CORS 로 못 읽지만 부작용은
+/// 이미 일어난다. 전형적인 CSRF 다.
+///
+/// 커스텀 헤더는 크로스 오리진에서 **preflight 를 통과해야** 보낼 수 있고, 우리는
+/// CORS 를 열지 않으므로 preflight 가 실패한다. 그래서 이 헤더 하나가 방어가 된다.
+fn require_control_header(headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers.get("x-dbmon-control").is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "control_header_required",
+        ))
+    }
+}
+
 /// 이 프로세스가 실제로 수집을 도는가.
 ///
 /// **아니면 조작을 거부한다.** 플래그는 프로세스 원자값이므로 `role=api` 워커에서
@@ -818,6 +896,7 @@ async fn collector_pause(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
+    require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
     state.controls.set_paused(true, SystemClock.now_ms());
@@ -835,6 +914,7 @@ async fn collector_resume(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
+    require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
     state.controls.set_paused(false, SystemClock.now_ms());
@@ -848,6 +928,7 @@ async fn discovery_run(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
+    require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
     state.controls.request_discovery();
@@ -865,6 +946,7 @@ async fn backfill_run(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
+    require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
     state.controls.request_backfill();
@@ -922,8 +1004,12 @@ mod tests {
         let r = month_range("2026-08").expect("유효한 월");
         // 2026-08-01 00:00 KST = 2026-07-31 15:00 UTC
         assert_eq!(r.from_ms(), 1_785_510_000_000);
-        // 2026-09-01 00:00 KST
-        assert_eq!(r.to_ms(), 1_788_188_400_000);
+        // **다음 달 0시의 1ms 전**이다. 그대로 두면 그 시각 레코드가 두 달에 잡힌다.
+        assert_eq!(r.to_ms(), 1_788_188_400_000 - 1);
+
+        // 두 달이 겹치지 않는다 — 경계가 딱 맞물린다.
+        let next = month_range("2026-09").expect("유효한 월");
+        assert_eq!(next.from_ms(), r.to_ms() + 1);
         assert!(month_range("2026-13").is_none());
         assert!(month_range("2026-00").is_none());
         assert!(month_range("nope").is_none());

@@ -26,6 +26,7 @@ import { Pagination } from "../components/Pagination";
 import { EnvChip } from "../components/Shell";
 import { Sparkline } from "../components/Sparkline";
 import { SqlModal } from "../components/SqlModal";
+import { StateBadge } from "../components/StateBadge";
 import {
   BTN_GHOST,
   CELL_ICON,
@@ -124,7 +125,11 @@ export function MySQLMonitorPage() {
 
   const items = list.data?.items ?? [];
   const nowMs = Date.now();
-  const visible = items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  // **결과가 줄면 페이지를 당긴다.** 3페이지를 보다 자동 새로고침으로 건수가 줄면
+  // 빈 표가 나오고, 그건 "기록이 없다" 로 읽힌다.
+  const lastPage = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const safePage = Math.min(page, lastPage);
+  const visible = items.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
     <div className="space-y-6">
@@ -224,6 +229,7 @@ export function MySQLMonitorPage() {
                     <th className={TH}>Instance</th>
                     <th className={TH}>Database</th>
                     <th className={TH}>User</th>
+                    <th className={TH}>State</th>
                     <th className={TH_NUM}>Thread</th>
                     <th className={TH_NUM}>Time</th>
                     <th className={TH_NUM}>Rows</th>
@@ -232,7 +238,7 @@ export function MySQLMonitorPage() {
                 </thead>
                 <tbody className={TBODY}>
                   {visible.length === 0 ? (
-                    <EmptyRow colSpan={8}>
+                    <EmptyRow colSpan={9}>
                       조회 구간(최근 24시간)에 기록이 없다. 임계값을 넘는 쿼리가 실행되면 여기
                       쌓인다.
                     </EmptyRow>
@@ -263,6 +269,9 @@ export function MySQLMonitorPage() {
                             <User className={CELL_ICON} />
                             {q.db_user ?? EMPTY}
                           </span>
+                        </td>
+                        <td className={TD}>
+                          <StateBadge state={q.state} reason={q.abandoned_reason} />
                         </td>
                         <td className={TD_NUM}>
                           <span className="flex items-center justify-end">
@@ -297,14 +306,15 @@ export function MySQLMonitorPage() {
             </div>
 
             <Pagination
-              page={page}
+              page={safePage}
               pageSize={PAGE_SIZE}
               total={items.length}
               truncated={list.data.has_more}
               onChange={(n) => update("page", String(n))}
             />
             <Note>
-              행을 누르면 전체 SQL 을 본다. 시각은 {tz} 기준이고, 자동 새로고침은{" "}
+              <strong>진행 중</strong>은 실행시간이 지금까지의 값이고,{" "}
+              <strong>추적 끊김</strong>은 하한이다(언제 끝났는지 모른다). 행을 누르면 전체 SQL 을 본다. 시각은 {tz} 기준이고, 자동 새로고침은{" "}
               {autoRefresh ? `${interval}초` : "꺼짐"} — 새 슬로우 쿼리가 방송되면 주기를
               기다리지 않고 즉시 다시 읽는다.
             </Note>
@@ -342,9 +352,13 @@ function ScraperStatus({ instances, tz }: { instances: InstanceView[]; tz: Timez
   // 즉시 다시 읽는다" 가 거짓말이 된다. 환경은 등록부에서 얻는다 — 목록을 손으로
   // 적으면 없는 환경을 구독해 `denied` 만 받는다.
   const topics = useMemo(() => {
-    const status = instances.slice(0, MAX_TOPICS).map((i) => `status:inst=${i.id}`);
+    // **슬로우 쿼리 토픽 자리를 먼저 확보한다.** 지표 토픽이 상한(50)을 다 먹으면
+    // 인스턴스가 50개인 순간부터 방송 구독이 전부 거부되고, "즉시 재조회" 가 죽는다.
     const envs = [...new Set(instances.map((i) => i.env))].sort();
-    return [...status, ...envs.map((e) => `slowq:env=${e}`)];
+    const slowq = envs.map((e) => `slowq:env=${e}`);
+    const room = Math.max(0, MAX_TOPICS - slowq.length);
+    const status = instances.slice(0, room).map((i) => `status:inst=${i.id}`);
+    return [...slowq, ...status];
   }, [instances]);
   useLiveTopics(topics);
 

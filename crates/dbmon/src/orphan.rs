@@ -89,10 +89,19 @@ pub fn judge(
 /// 소요 시간으로 남기고 사유를 붙인다 — 그게 "관측이 끊겼다" 는 사실을 정직하게
 /// 표현하는 유일한 방법이다.
 pub fn abandon(q: &SlowQuery, now_ms: EpochMs) -> SlowQuery {
+    abandon_with(q, now_ms, "owner_lost")
+}
+
+/// 사유를 지정해 `abandoned` 로 확정한다.
+///
+/// **사유가 다르면 다른 사실이다.** `owner_lost` 는 워커가 사라진 것이고,
+/// `collector_paused` 는 사람이 관측을 멈춘 것이다 — 화면과 조사자가 그 둘을
+/// 구분할 수 있어야 한다.
+pub fn abandon_with(q: &SlowQuery, now_ms: EpochMs, reason: &str) -> SlowQuery {
     let last_seen = q.last_seen_at_ms.unwrap_or(q.started_at_ms);
     let mut out = q.clone();
     out.state = SlowQueryState::Abandoned;
-    out.abandoned_reason = Some("owner_lost".into());
+    out.abandoned_reason = Some(reason.to_string());
     // 마지막 관측 시점까지의 소요만 안다. 그 이후는 알 수 없다.
     out.duration_ms = (last_seen - q.started_at_ms).max(q.duration_ms);
     // **`ended_at_ms` 를 채우지 않는다.** 채우면 "이때 끝났다" 는 거짓이 된다.
@@ -293,6 +302,11 @@ mod tests {
         let a = abandon(&q, NOW);
 
         assert_eq!(a.state, SlowQueryState::Abandoned);
+        assert_eq!(
+            a.abandoned_reason.as_deref(),
+            Some("owner_lost"),
+            "기본 사유가 바뀌면 조사자가 원인을 구분할 수 없다"
+        );
         assert_eq!(a.abandoned_reason.as_deref(), Some("owner_lost"));
         assert_eq!(a.ended_at_ms, None, "완료 시각을 만들어 냈다");
         // 마지막 관측까지의 소요만 남는다.

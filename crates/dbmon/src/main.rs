@@ -211,6 +211,13 @@ async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> 
 /// 체크포인트가 그 지점을 지나가면 **영구히 백필되지 않는다.**
 const BACKFILL_INITIAL_LOOKBACK_MS: i64 = 5 * 60_000;
 
+/// 일시정지 시 드레인 예산 (3초).
+///
+/// **셧다운 예산보다 훨씬 작다.** 일시정지는 루프를 계속 돌려야 하고, 여기서 오래
+/// 막히면 그 동안 `gate.refresh()` 가 안 돌아 **리스를 잃는다** — 멈추려다 리더를
+/// 놓치면 다른 워커가 수집을 이어받아 "멈춤" 이 되지 않는다.
+const PAUSE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
 /// 백필이 한 번에 거슬러 올라갈 최대 구간 (1시간).
 ///
 /// 며칠 멈춘 워커가 며칠치를 한 번에 읽으면 API 조절과 메모리 폭주가 함께 온다.
@@ -1146,11 +1153,42 @@ fn spawn_leader_loop(
                             stopped = tasks.running().len(),
                             "수집이 일시정지됐다 (화면 조작) — 이 구간은 기록되지 않는다"
                         );
-                        // `drain_all` 이 아니라 `abort_all` 이다: 재개할 때 다시
-                        // 훑으므로 진행 중 레코드를 확정할 필요가 없고, 드레인은
-                        // 예산을 먹는다.
-                        tasks.abort_all();
+                        // ① 짧게 드레인한다 — 끝난 쿼리는 정상 확정된다.
+                        //
+                        // **예산을 작게 쓴다.** 여기서 오래 막히면 그 동안
+                        // `gate.refresh()` 가 안 돌아 리스를 잃는다.
+                        tasks.drain_all(PAUSE_DRAIN_BUDGET).await;
                     }
+                    // ② 그래도 남은 **진행 중 레코드를 사유와 함께 확정한다.**
+                    //
+                    // 남겨 두면 그 레코드는 이 워커의 epoch 소유이므로 **고아 스윕이
+                    // `Mine` 으로 보고 매번 건너뛴다** — 리더가 바뀌거나 TTL 이 지날
+                    // 때까지 영구히 "진행 중" 이다(F4 가 막으려던 유령 상태).
+                    // `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
+                    use dbmon_core::ports::SlowQueryStore as _;
+                    if let Ok(Ok(in_flight)) =
+                        run_in_budget(stores.slow_query.list_in_flight(200)).await
+                    {
+                        let mut closed = 0usize;
+                        for q in &in_flight {
+                            if q.owner_worker.as_deref() != Some(gate.worker_id())
+                                || q.owner_epoch != gate.epoch()
+                            {
+                                continue;
+                            }
+                            let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
+                            if stores.slow_query.upsert_merged(&marked).await.is_ok() {
+                                closed += 1;
+                            }
+                        }
+                        if closed > 0 {
+                            tracing::warn!(
+                                closed,
+                                "일시정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
+                            );
+                        }
+                    }
+
                     controls.publish_tick(now_ms, true, 0);
                     // 재개하면 즉시 한 라운드 돌게 한다.
                     last_discovery_ms = 0;

@@ -165,7 +165,14 @@ export function fetchCollectorStatus(signal: AbortSignal | null): Promise<Collec
 async function post<T>(path: string): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
-    headers: { accept: "application/json", ...authHeaders() },
+    headers: {
+      accept: "application/json",
+      // **CSRF 방어.** 커스텀 헤더는 크로스 오리진에서 preflight 를 통과해야 보낼 수
+      // 있고 서버는 CORS 를 열지 않는다 — 로컬 개발(토큰 없이 통과)에서 아무 웹페이지가
+      // `POST /api/collector/pause` 로 수집을 멈추는 것을 막는다.
+      "x-dbmon-control": "1",
+      ...authHeaders(),
+    },
     cache: "no-store",
   });
   if (res.status === 401) {

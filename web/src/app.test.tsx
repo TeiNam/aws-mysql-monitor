@@ -285,6 +285,9 @@ describe("MySQL Monitor", () => {
     expect(screen.getByText(/20,001/)).toBeDefined();
     // 수집 제어가 상태를 읽어 버튼을 고른다(수집 중이면 "정지").
     expect(await screen.findByText("수집 정지")).toBeDefined();
+    // 상태를 표에 보여준다 — 진행 중·추적 끊김·확정이 같아 보이면 하한을
+    // 확정값으로 읽는다.
+    expect(screen.getByText("확정")).toBeDefined();
     // 워커 식별자는 상태 줄과 사실 표 두 곳에 나온다 — 어느 워커를 멈추는지
     // 헷갈리면 안 되는 값이라 일부러 두 번 적는다.
     expect(screen.getAllByText(/all-local/).length).toBeGreaterThanOrEqual(1);

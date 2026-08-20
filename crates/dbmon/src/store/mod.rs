@@ -533,6 +533,10 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                     out.push(Self::from_item(item)?);
                 }
                 start_key = res.last_evaluated_key;
+                // **끝난다.** `FilterExpression` 이 없으므로 `LastEvaluatedKey` 가
+                // 있으면 그 페이지에 항목이 최소 하나 있었다 — `out` 이 매 회 자라고
+                // `limit` 에 도달한다. 필터를 붙이면 이 보장이 깨지므로 그때는 페이지
+                // 수 상한을 함께 둬야 한다.
                 if start_key.is_none() || out.len() >= limit {
                     break;
                 }
