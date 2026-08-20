@@ -1376,12 +1376,38 @@ fn dev_access_token(config: &dbmon::config::Config, bind_is_loopback: bool) -> O
     Some(token)
 }
 
-/// 임베드된 최소 화면.
+/// SPA 빌드 산출물 디렉터리. 없으면 `None`.
 ///
-/// ⚠ `docs/09-frontend.md` 가 규정한 SPA(React 19 + Vite + TanStack + uPlot)가 **아니다.**
-/// 그건 M0-12 의 작업이고, 노드 툴체인을 런타임 이미지에 넣지 않기 위해 별도 빌드
-/// 산출물로 서빙할 계획이다. 이 페이지는 **API 가 브라우저에서 실제로 동작하는지**
-/// 확인하고 컨테이너 하나로 결과를 볼 수 있게 하는 최소 수단이다.
+/// **런타임 이미지에 노드를 넣지 않는다.** `web/` 은 빌더 스테이지에서 빌드하고
+/// `dist/` 만 이미지에 들어온다(`Dockerfile`). 그래서 여기서는 디렉터리가 있는지
+/// 만 보고, 없으면 임베드 화면으로 떨어진다 — `npm run build` 를 안 돌린
+/// `cargo run` 도 화면을 잃지 않아야 한다.
+fn spa_dir() -> Option<PathBuf> {
+    // 설정(`HttpConfig`)에 두지 않는 이유: 배포 산출물의 경로는 **이미지 레이아웃**
+    // 사실이고 운영자가 튜닝할 값이 아니다. `DBMON_TARGET_PASSWORD`·`DBMON_LOG` 와
+    // 같은 부류로 환경변수 하나에 둔다.
+    let raw = std::env::var("DBMON_UI_DIR").unwrap_or_else(|_| "web/dist".to_string());
+    let dir = PathBuf::from(raw);
+    dir.join("index.html").is_file().then_some(dir)
+}
+
+/// 없는 API 경로. **SPA 폴백이 이걸 삼키면 안 된다.**
+///
+/// 폴백이 `index.html` 을 돌려주면 `GET /api/digests` 가 200 에 HTML 을 받고,
+/// 그건 "아직 구현되지 않았다" 가 아니라 "응답이 이상하다" 로 나타난다.
+async fn api_route_not_found() -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "not_found" })),
+    )
+        .into_response()
+}
+
+/// 임베드된 최소 화면. **SPA 산출물이 없을 때만** 쓰인다.
+///
+/// `npm run build` 를 돌리지 않은 개발 체크아웃에서 `cargo run` 만으로 API 가
+/// 브라우저에서 동작하는지 확인하는 수단이다. SPA 는 `web/` 에 있고 개발 중에는
+/// Vite 개발 서버(`npm run dev`, 5173)가 `/api` 를 여기로 프록시한다.
 async fn index_page() -> axum::response::Response {
     use axum::http::header;
     (
@@ -1583,12 +1609,27 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         // 실제 SPA(M0-12)가 오면 그때 인증을 태워 붙인다.
         let serve_ui = api_state.policy.serves_local_ui();
         app = app.merge(dbmon::api::router(api_state));
+        let spa = if serve_ui { spa_dir() } else { None };
         if serve_ui {
-            app = app.route("/", get(index_page));
+            match &spa {
+                Some(dir) => {
+                    use tower_http::services::{ServeDir, ServeFile};
+                    // 해시가 붙은 산출물. 이름이 내용으로 정해지므로 캐시가 안전하다.
+                    app = app.nest_service("/assets", ServeDir::new(dir.join("assets")));
+                    // 클라이언트 라우팅(`/slow-queries/…`)이 새로고침을 견뎌야 하므로
+                    // 나머지 경로는 `index.html` 이 받는다. 단 `/api/…` 는 위의
+                    // 명시 라우트에 걸리지 않았다면 **404 로 답한다.**
+                    app = app
+                        .route("/api/{*rest}", axum::routing::any(api_route_not_found))
+                        .fallback_service(ServeFile::new(dir.join("index.html")));
+                }
+                None => app = app.route("/", get(index_page)),
+            }
         }
         tracing::info!(
             bind_is_loopback = %dbmon::api::auth::is_loopback_bind(&config.http.bind),
             serve_ui,
+            spa = %spa.as_ref().map_or_else(|| "(임베드 화면)".to_string(), |d| d.display().to_string()),
             "조회 API 를 서비스한다"
         );
     }

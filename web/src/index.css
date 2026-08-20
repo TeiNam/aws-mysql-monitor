@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/*
+ * 다크 고정.
+ *
+ * 테마 전환은 요구되지 않았고, 스크롤바·기본 위젯 색까지 맞추려면 `color-scheme`
+ * 하나가 CSS 변수 한 벌보다 확실하다.
+ */
+:root {
+  color-scheme: dark;
+}

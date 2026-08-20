@@ -14,6 +14,24 @@
 #   docker build --platform linux/arm64 -t dbmon:dev .
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 프론트 빌더. **런타임 이미지에 노드가 들어가지 않는다** — `dist/` 만 넘긴다.
+FROM public.ecr.aws/docker/library/node:22-bookworm-slim AS web
+
+WORKDIR /web
+
+# 잠금 파일만 먼저 넣어 의존성 레이어를 캐시한다. 소스가 바뀌어도 `npm ci` 는
+# 다시 돌지 않는다.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+# `.dockerignore` 가 `web/node_modules` 와 `web/dist` 를 빼므로 호스트의 산출물이
+# 이미지로 새지 않는다.
+COPY web/ ./
+# `npm run build` 는 `tsc --noEmit` 을 먼저 돈다 — 타입 오류가 이미지에 들어가지
+# 않는다.
+RUN npm run build
+
+# ─────────────────────────────────────────────────────────────────────────────
 FROM public.ecr.aws/docker/library/rust:1-slim-bookworm AS builder
 
 # `mysql_async` 의 rustls 백엔드가 aws-lc-rs 를 빌드하므로 cmake·clang 이 필요하다.
@@ -50,6 +68,11 @@ RUN apt-get update \
  && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin dbmon
 
 COPY --from=builder /dbmon /usr/local/bin/dbmon
+
+# SPA 산출물. 정적 파일뿐이므로 쓰기 권한이 필요 없다.
+COPY --from=web /web/dist /app/web/dist
+# 이 경로가 없거나 비어 있으면 바이너리가 임베드 최소 화면으로 떨어진다.
+ENV DBMON_UI_DIR=/app/web/dist
 
 USER 10001:10001
 EXPOSE 8080
