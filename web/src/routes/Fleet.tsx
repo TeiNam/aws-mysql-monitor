@@ -166,31 +166,41 @@ function Summary({ instances, status }: SummaryProps) {
   // **표본이 없으면 합계도 `null`** 이다. `0` 으로 초기화하면 "지표가 아직
   // 안 왔다" 가 "스레드가 0개다" 로 보인다 — 옆 칸의 `—` 와도 모순된다.
   let collecting = 0;
+  let sampled = 0;
   let qpsTotal: number | null = null;
   let running: number | null = null;
   for (const instance of instances) {
     if (instance.state === "collecting") collecting += 1;
     const metrics = status[instance.id];
     if (metrics === undefined) continue;
+    sampled += 1;
     if (metrics.qps !== null) qpsTotal = (qpsTotal ?? 0) + metrics.qps;
     if (metrics.threads_running !== null) running = (running ?? 0) + metrics.threads_running;
   }
+
+  // **합계가 몇 개 기준인지 말한다.** 지표가 안 온 인스턴스는 합계에서 빠지는데
+  // 이름만 "합계" 면 전체를 더한 것으로 읽힌다(구독 상한 50을 넘는 플릿에서는
+  // 영구히 일부만 더해진다).
+  const basis = sampled === instances.length ? null : `${sampled}/${instances.length} 인스턴스`;
 
   return (
     <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
       <Tile label="인스턴스" value={fmtInt(instances.length)} />
       <Tile label="수집 중" value={fmtInt(collecting)} />
-      <Tile label="합계 QPS" value={fmtRate(qpsTotal)} />
-      <Tile label="실행 중 스레드" value={fmtInt(running)} />
+      <Tile label="합계 QPS" value={fmtRate(qpsTotal)} note={basis} />
+      <Tile label="실행 중 스레드" value={fmtInt(running)} note={basis} />
     </dl>
   );
 }
 
-function Tile({ label, value }: { label: string; value: string }) {
+function Tile({ label, value, note }: { label: string; value: string; note?: string | null }) {
   return (
     <div className={`${CARD} p-3`}>
       <dt className={LABEL}>{label}</dt>
       <dd className="mt-1 text-2xl tabular-nums">{value}</dd>
+      {note === null || note === undefined ? null : (
+        <dd className="text-xs text-zinc-400">{note} 기준</dd>
+      )}
     </div>
   );
 }

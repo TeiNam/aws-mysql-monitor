@@ -149,6 +149,12 @@ export class LiveClient {
       // HTTP 조회가 없는 화면에서는 아무도 지우지 않는다.
       if (msg.t === "error" && msg.code === "unauthorized") clearToken();
       this.set(applyMessage(this.snapshot, msg));
+      if (msg.t === "subscribed") {
+        // **요구를 거둔 뒤에 도착한 거부는 되살리지 않는다.** 구독 요청과 해제가
+        // 겹치면 서버 응답이 나중에 오면서 지워진 경고를 다시 넣는다.
+        const stale = this.snapshot.denied.filter((topic) => !this.wanted.has(topic));
+        if (stale.length > 0) this.set(forgetDenied(this.snapshot, stale));
+      }
       if (msg.t === "ready") {
         // 인증까지 성공한 것이 **연결이 실제로 쓸 만하다**는 증거다.
         this.attempt = 0;

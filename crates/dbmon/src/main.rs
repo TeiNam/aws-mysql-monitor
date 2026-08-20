@@ -1650,8 +1650,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                             axum::http::header::CACHE_CONTROL,
                             axum::http::HeaderValue::from_static("no-cache"),
                         ));
+                    // `/api`·`/api/` 를 따로 적는 이유: `{*rest}` 는 **빈 세그먼트를
+                    // 잡지 않는다.** 실측에서 `/api/` 가 HTML 200 을 돌려줬다.
                     app = app
                         .route("/api", axum::routing::any(api_route_not_found))
+                        .route("/api/", axum::routing::any(api_route_not_found))
                         .route("/api/{*rest}", axum::routing::any(api_route_not_found))
                         .fallback_service(shell);
                 }

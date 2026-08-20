@@ -36,7 +36,13 @@ export interface LiveSnapshot {
   user: ReadyUser | null;
   /** 서버가 확인한 구독 목록. */
   subscribed: readonly string[];
-  /** 거부된 토픽. **비우지 않는다** — 화면이 "데이터 없음" 과 구분해야 한다. */
+  /**
+   * 거부된 토픽. **조용히 버리지 않는다** — 화면이 "데이터 없음" 과 구분해야 한다.
+   *
+   * 이번 연결 동안 누적한다. 비워지는 경우는 셋뿐이다: 실제로 구독됐거나
+   * ([`applyMessage`] 의 `subscribed`), 요구를 거뒀거나([`forgetDenied`]),
+   * 새 연결이 됐을 때(`ready` — 스코프가 늘었을 수 있다).
+   */
   denied: readonly string[];
   /** 최신순 슬로우 쿼리. `record_id` 로 upsert 된다. */
   slowq: readonly SlowQueryBroadcast[];
@@ -48,6 +54,8 @@ export interface LiveSnapshot {
    * 방송을 놓친 횟수. **밀림(`stream_lagged`)과 연결 끊김을 함께 센다** — 둘 다
    * "이 사이의 쿼리는 이 화면에 없다" 는 같은 사실이고, 복구 방법도 같다(HTTP
    * 재조회). 값이 늘면 목록은 다시 읽고, 실시간 화면은 구멍이 있다고 말한다.
+   *
+   * 끊김은 **다시 붙었을 때** 세진다([`LiveSnapshot.gapPending`]).
    *
    * 시각이 아니라 횟수인 이유: 같은 밀리초에 두 번 놓치면 시각은 같은 값이 되어
    * 재조회가 한 번 빠진다.
