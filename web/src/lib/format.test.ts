@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EMPTY,
+  monthKey,
   fmtDateTime,
   fmtDuration,
   fmtInt,
@@ -84,5 +85,20 @@ describe("말이 안 되는 시각", () => {
 
     // 2000-01-01 이후는 정상으로 본다.
     expect(fmtDateTime(Date.UTC(2026, 7, 20, 0, 30), "KST")).toContain("2026");
+  });
+});
+
+describe("월 기본값", () => {
+  it("KST 기준으로 자른다", () => {
+    // 백엔드가 월 경계를 KST 로 자르므로 화면 기본값도 KST 여야 한다.
+    // 2026-09-01 00:30 KST = 2026-08-31 15:30 UTC → 9월이다.
+    expect(monthKey(new Date(Date.UTC(2026, 7, 31, 15, 30)))).toBe("2026-09");
+    // 2026-08-31 23:30 KST = 2026-08-31 14:30 UTC → 8월이다.
+    expect(monthKey(new Date(Date.UTC(2026, 7, 31, 14, 30)))).toBe("2026-08");
+  });
+
+  it("이전 달로 물러날 때 연도를 넘긴다", () => {
+    expect(monthKey(new Date(Date.UTC(2026, 0, 15)), -1)).toBe("2025-12");
+    expect(monthKey(new Date(Date.UTC(2026, 0, 15)), -13)).toBe("2024-12");
   });
 });

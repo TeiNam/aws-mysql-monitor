@@ -52,6 +52,8 @@ export interface CollectorStatus {
   backfill_requested: boolean;
   worker_id: string;
   scope: string;
+  /** 이 워커가 수집 루프를 도는가. `false` 면 제어가 409 로 거부된다. */
+  runs_collector: boolean;
   /** 조작할 수 있는 역할인가. 버튼 비활성의 근거. */
   can_control: boolean;
   role: string;

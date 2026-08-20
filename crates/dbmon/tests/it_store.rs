@@ -974,3 +974,44 @@ async fn bucket_split_merge_is_order_independent() {
     assert_eq!(mine[0].stats.rows_examined, Some(180_000));
     assert!(mine[0].plan.has_plan());
 }
+
+/// **상한에 걸릴 때 남는 것은 최근이어야 한다.**
+///
+/// `date_parts()` 는 오래된 순이므로, 파티션을 그 순서로 훑으면 `limit` 이 작을 때
+/// **가장 오래된 날의 레코드만** 돌아온다. 목록·플랜·집계는 전부 최근을 보는
+/// 화면이므로 그건 조용히 틀린 화면이 된다(9차 리뷰 후속 라운드에서 지적됨).
+#[tokio::test]
+async fn a_capped_listing_keeps_the_newest_records() {
+    let Some(s) = store("newest-first").await else {
+        return;
+    };
+    let i = instance();
+
+    // 이틀에 걸쳐 저장한다 — 날짜 파티션이 둘이어야 이 테스트가 의미를 갖는다.
+    const DAY_MS: i64 = 86_400_000;
+    let older_ms = T0 - DAY_MS;
+    let older = sample(9001, older_ms);
+    let newer = sample(9002, T0);
+
+    s.upsert_merged(&older).await.expect("옛 레코드 저장");
+    s.upsert_merged(&newer).await.expect("새 레코드 저장");
+
+    let range = TimeRange::new(older_ms - 10_000, T0 + 10_000).expect("구간");
+
+    // 상한이 1이면 **새 것**이 와야 한다.
+    let capped = s.list_by_instance(&i, range, 1).await.expect("조회");
+    assert_eq!(capped.len(), 1);
+    assert_eq!(
+        capped[0].thread_id, 9002,
+        "상한에 걸렸을 때 오래된 레코드가 남았다 — 화면이 옛 데이터를 최신으로 보여준다"
+    );
+
+    // 상한을 풀면 둘 다, 그리고 최신순이어야 한다.
+    let all = s.list_by_instance(&i, range, 10).await.expect("조회");
+    let mine: Vec<u64> = all
+        .iter()
+        .filter(|q| q.thread_id == 9001 || q.thread_id == 9002)
+        .map(|q| q.thread_id)
+        .collect();
+    assert_eq!(mine, vec![9002, 9001], "최신순이 아니다");
+}

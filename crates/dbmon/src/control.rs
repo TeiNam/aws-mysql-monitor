@@ -24,7 +24,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 /// 수집 제어 플래그와 런타임 사실. API 와 리더 루프가 `Arc` 로 공유한다.
 #[derive(Debug, Default)]
 pub struct Controls {
-    paused: AtomicBool,
+    /// **0 이면 안 멈춤, >0 이면 멈춘 시각.**
+    ///
+    /// `paused: AtomicBool` 과 `paused_since_ms: AtomicI64` 로 나누면 두 요청이
+    /// 겹칠 때 `paused=false` 인데 시각이 남는 모순 상태가 만들어진다. 하나로 합치면
+    /// 그 상태가 **표현 불가능**하다.
+    paused_since_ms: AtomicI64,
     /// 다음 tick 에 탐색을 강제한다. **한 번 소비되면 내려간다.**
     discover_now: AtomicBool,
     /// 다음 tick 에 슬로우로그 백필을 강제한다.
@@ -36,7 +41,6 @@ pub struct Controls {
     last_tick_ms: AtomicI64,
     last_discovery_ms: AtomicI64,
     last_backfill_ms: AtomicI64,
-    paused_since_ms: AtomicI64,
 }
 
 impl Controls {
@@ -46,17 +50,24 @@ impl Controls {
 
     // ── 조작 ────────────────────────────────────────────────────────────────
 
-    /// 수집을 멈춘다/재개한다. 이미 그 상태면 시각을 덮지 않는다.
+    /// 수집을 멈춘다/재개한다. 이미 멈춰 있으면 **시작 시각을 덮지 않는다** —
+    /// 화면이 "3분 전부터 멈춤" 을 말할 수 있어야 한다.
     pub fn set_paused(&self, paused: bool, now_ms: i64) {
-        let was = self.paused.swap(paused, Ordering::SeqCst);
-        if was != paused {
-            self.paused_since_ms
-                .store(if paused { now_ms } else { 0 }, Ordering::SeqCst);
+        if !paused {
+            self.paused_since_ms.store(0, Ordering::SeqCst);
+            return;
         }
+        // 0 → now 로만 바꾼다. 이미 값이 있으면 그대로 둔다.
+        let _ = self.paused_since_ms.compare_exchange(
+            0,
+            now_ms.max(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
+        self.paused_since_ms.load(Ordering::SeqCst) != 0
     }
 
     pub fn request_discovery(&self) {
@@ -95,9 +106,11 @@ impl Controls {
     /// 화면에 그대로 내보내는 스냅샷. **`0` 은 "아직 없다" 이므로 `None` 으로 바꾼다.**
     pub fn snapshot(&self) -> ControlSnapshot {
         let opt = |v: i64| if v == 0 { None } else { Some(v) };
+        // **한 번만 읽는다.** 두 번 읽으면 그 사이에 바뀌어 다시 모순이 생긴다.
+        let paused_since = self.paused_since_ms.load(Ordering::SeqCst);
         ControlSnapshot {
-            paused: self.is_paused(),
-            paused_since_ms: opt(self.paused_since_ms.load(Ordering::SeqCst)),
+            paused: paused_since != 0,
+            paused_since_ms: opt(paused_since),
             is_leader: self.is_leader.load(Ordering::Relaxed),
             collecting: self.collecting.load(Ordering::Relaxed),
             last_tick_ms: opt(self.last_tick_ms.load(Ordering::Relaxed)),
@@ -129,6 +142,26 @@ pub struct ControlSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`paused` 와 시각이 어긋난 상태가 표현 불가능해야 한다.**
+    ///
+    /// 둘을 따로 둔 판에서는 요청이 겹칠 때 `paused=false` + 시각 있음이 나올 수
+    /// 있었다. 하나의 원자값으로 합쳐 그 조합을 없앴다.
+    #[test]
+    fn paused_and_its_timestamp_cannot_disagree() {
+        let c = Controls::new();
+        for (paused, now) in [(true, 5), (true, 9), (false, 11), (true, 20), (false, 30)] {
+            c.set_paused(paused, now);
+            let s = c.snapshot();
+            assert_eq!(
+                s.paused,
+                s.paused_since_ms.is_some(),
+                "paused={} 인데 시각은 {:?} 다",
+                s.paused,
+                s.paused_since_ms
+            );
+        }
+    }
 
     #[test]
     fn pause_records_when_it_started_and_resume_clears_it() {

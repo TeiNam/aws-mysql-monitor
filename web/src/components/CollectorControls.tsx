@@ -51,7 +51,14 @@ export function CollectorControls() {
   const s = status.data;
   const busy = pause.isPending || resume.isPending || discover.isPending;
   const canControl = s?.can_control ?? false;
-  const reason = canControl ? undefined : `권한이 없다 (역할: ${s?.role ?? "?"} — operator 이상 필요)`;
+  // **왜 못 누르는지 구분해 말한다.** "권한이 없다" 와 "이 워커는 수집기가 아니다" 는
+  // 대응이 다르다 — 하나는 역할을 받아야 하고, 하나는 다른 워커에 붙어야 한다.
+  const reason =
+    canControl || s === undefined
+      ? undefined
+      : s.runs_collector
+        ? `권한이 없다 (역할: ${s.role}, 전 환경 스코프 필요)`
+        : `이 워커는 수집기가 아니다 (role=api) — 수집 워커에서 조작한다`;
 
   return (
     <div className="flex flex-wrap items-center gap-3">
@@ -158,7 +165,9 @@ export function BackfillButton() {
         title={
           canControl
             ? "다음 주기를 기다리지 않고 지금 슬로우로그를 읽는다"
-            : `권한이 없다 (역할: ${status.data?.role ?? "?"})`
+            : status.data?.runs_collector === false
+              ? "이 워커는 수집기가 아니다 (role=api)"
+              : `권한이 없다 (역할: ${status.data?.role ?? "?"})`
         }
         onClick={() => run.mutate()}
       >

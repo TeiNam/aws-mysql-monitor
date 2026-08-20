@@ -63,6 +63,48 @@ describe("실행계획 파싱", () => {
     expect(graph.nodes.filter((n) => n.kind === "select")).toHaveLength(3);
   });
 
+  /**
+   * v2(`explain_json_format_version=2`, MySQL 8.3+)는 키 이름이 완전히 다르다.
+   * v1 만 읽으면 노드 하나짜리 그래프가 나와 **그럴싸하게 비어 있다.**
+   */
+  it("v2 (query_plan 루트) 트리도 읽는다", () => {
+    const json = JSON.stringify({
+      query_plan: {
+        operation: "Sort: c DESC",
+        estimated_total_cost: 1234.5,
+        estimated_rows: 5,
+        inputs: [
+          {
+            operation: "Aggregate using temporary table",
+            inputs: [
+              {
+                operation: "Nested loop inner join",
+                inputs: [
+                  { table_name: "o", access_type: "table_scan", estimated_rows: 3113305 },
+                  { table_name: "i", access_type: "index_lookup", covering_index: "idx_order" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const graph = parsePlan(json)!;
+    expect(graph.nodes.map((n) => n.label)).toEqual([
+      "Sort: c DESC",
+      "Aggregate using temporary table",
+      "Nested loop inner join",
+      "o (table_scan)",
+      "i (index_lookup)",
+    ]);
+    // 테이블은 테이블 색으로, 연산은 연산 색으로.
+    expect(graph.nodes.filter((n) => n.kind === "table")).toHaveLength(2);
+    expect(graph.nodes[0]?.details).toContain("Cost: 1,234.5");
+    expect(graph.nodes[4]?.details).toContain("Key: idx_order");
+    // 깊이가 실제 트리를 따라간다 — 배치가 겹치지 않게 하는 근거다.
+    expect(graph.nodes[3]?.depth).toBe(3);
+  });
+
   it("깨진 JSON 은 null 이다 — 빈 그래프와 구분된다", () => {
     expect(parsePlan("not json")).toBeNull();
     expect(parsePlan("[]")).toBeNull();

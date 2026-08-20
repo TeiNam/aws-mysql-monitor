@@ -1631,6 +1631,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 aws_region: config.aws.region.clone(),
                 controls: Arc::clone(&controls),
                 worker_id: worker_id.clone(),
+                // 이 프로세스가 수집 루프를 도는가. `role=api` 워커는 제어를 받지
+                // 않는다 — 플래그가 프로세스 원자값이라 수집 워커가 모른다.
+                runs_collector: config.role.runs_collector(),
             });
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.

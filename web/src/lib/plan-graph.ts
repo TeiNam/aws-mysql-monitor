@@ -206,6 +206,47 @@ export function parsePlan(json: string): PlanGraph | null {
     return id;
   };
 
+  /**
+   * v2 (`explain_json_format_version=2`, MySQL 8.3+) 트리.
+   *
+   * v1 과 **키 이름이 완전히 다르다** — `operation`·`inputs`·`estimated_*`. v1 만
+   * 읽으면 v2 계획이 노드 하나짜리 그래프로 그려져 **그럴싸하게 비어 있다.**
+   * 백엔드가 v2 를 지원하므로(`planparse::PlanFormat::JsonV2`) 여기서도 읽는다.
+   */
+  const walkV2 = (node: Record<string, unknown>, depth: number): string => {
+    const operation = str(node.operation);
+    const table = str(node.table_name);
+    const access = str(node.access_type);
+    const label =
+      operation ??
+      (table === null ? "Operation" : access === null ? table : `${table} (${access})`);
+
+    const details: string[] = [];
+    const rows = num(node.estimated_rows);
+    if (rows !== null) details.push(`Rows: ${INT.format(rows)}`);
+    const cost = num(node.estimated_total_cost);
+    if (cost !== null) details.push(`Cost: ${COST.format(cost)}`);
+    if (table !== null && operation !== null) details.push(`Table: ${table}`);
+    const key = str(node.covering_index) ?? str(node.index_name) ?? str(node.key);
+    if (key !== null) details.push(`Key: ${key}`);
+
+    // 테이블 접근인지 연산인지로 색을 나눈다.
+    const kind: NodeKind = table !== null && operation === null ? "table" : "operation";
+    const id = add(kind, label, details, depth);
+
+    if (Array.isArray(node.inputs)) {
+      for (const child of node.inputs) {
+        if (isRecord(child)) link(id, walkV2(child, depth + 1));
+      }
+    }
+    return id;
+  };
+
+  if (isRecord(root.query_plan)) {
+    walkV2(root.query_plan, 0);
+    return { nodes, edges };
+  }
+
   const start = isRecord(root.query_block) ? root.query_block : root;
   walkBlock(start, 0, "Select");
 

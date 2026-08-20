@@ -209,6 +209,26 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
       }),
     );
   }
+  if (url.startsWith("/api/collector/status")) {
+    return Promise.resolve(
+      json({
+        paused: false,
+        paused_since_ms: null,
+        is_leader: true,
+        collecting: 1,
+        last_tick_ms: Date.now(),
+        last_discovery_ms: Date.now() - 60_000,
+        last_backfill_ms: Date.now() - 30_000,
+        discovery_requested: false,
+        backfill_requested: false,
+        worker_id: "all-local",
+        scope: "process",
+        runs_collector: true,
+        can_control: true,
+        role: "admin",
+      }),
+    );
+  }
   if (url.startsWith("/api/auth/config")) {
     return Promise.resolve(
       json({ mode: "local-token", cognito_configured: false, deployment_env: "dev" }),
@@ -263,6 +283,11 @@ describe("MySQL Monitor", () => {
     expect(screen.getByRole("banner").textContent).toContain("ap-northeast-2");
     // 조사 행이 표에 실제로 들어간다.
     expect(screen.getByText(/20,001/)).toBeDefined();
+    // 수집 제어가 상태를 읽어 버튼을 고른다(수집 중이면 "정지").
+    expect(await screen.findByText("수집 정지")).toBeDefined();
+    // 워커 식별자는 상태 줄과 사실 표 두 곳에 나온다 — 어느 워커를 멈추는지
+    // 헷갈리면 안 되는 값이라 일부러 두 번 적는다.
+    expect(screen.getAllByText(/all-local/).length).toBeGreaterThanOrEqual(1);
   });
 
   it("실시간 지표가 오면 상태 표에 채운다", async () => {

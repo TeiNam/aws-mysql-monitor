@@ -81,6 +81,12 @@ pub struct ApiState {
     pub controls: Arc<crate::control::Controls>,
     /// 이 워커의 식별자. **어느 워커를 멈췄는지** 화면이 알아야 한다.
     pub worker_id: String,
+    /// 이 프로세스가 수집 루프를 도는가 (`role` 이 collector·all).
+    ///
+    /// **`false` 면 제어를 받지 않는다.** 제어 플래그는 프로세스 원자값이라
+    /// `role=api` 워커에서 눌러도 수집 워커는 모른다 — 성공을 돌려주면 화면이
+    /// "멈췄다" 고 거짓말한다.
+    pub runs_collector: bool,
 }
 
 pub fn router(state: ApiState) -> axum::Router {
@@ -228,6 +234,14 @@ async fn list_slow_queries(
             .await
             .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
         for q in &found {
+            // **레코드의 환경으로 다시 검사한다.**
+            //
+            // 인스턴스의 *현재* 환경만 보면, 환경이 바뀐 인스턴스(태그 수정·override)의
+            // **과거 레코드**가 스코프 밖 사용자에게 나간다 — 그 레코드에는 당시 환경의
+            // SQL 이 들어 있다. 상세 조회(`get_query`)는 이미 이렇게 한다.
+            if !ctx.is_env_allowed(q.env) {
+                continue;
+            }
             // **뷰를 반드시 거친다.** 리터럴 통제가 그 안에 있다.
             items.push(SlowQueryView::from_record(q, &ctx));
         }
@@ -507,12 +521,18 @@ async fn collect_views(
             .list_by_instance(&inst.id, range, page)
             .await
             .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
-        // 페이지를 꽉 채웠다는 것은 더 있을 수 있다는 뜻이다. 저장소가
-        // `LastEvaluatedKey` 를 노출하지 않으므로 이게 유일한 신호다.
+        // 페이지를 꽉 채웠다는 것은 더 있을 수 있다는 뜻이다. 저장소가 1MB 페이지를
+        // 따라가므로(`list_by_instance`) 이 판정이 성립한다.
         if found.len() == page {
             truncated = true;
         }
-        views.extend(found.iter().map(|q| SlowQueryView::from_record(q, ctx)));
+        // **레코드의 환경으로 다시 검사한다** — 위 인스턴스 필터는 현재 환경만 본다.
+        views.extend(
+            found
+                .iter()
+                .filter(|q| ctx.is_env_allowed(q.env))
+                .map(|q| SlowQueryView::from_record(q, ctx)),
+        );
     }
     Ok((views, truncated))
 }
@@ -729,16 +749,38 @@ async fn get_query_markdown(
 // 수집 제어 (참조 구현의 `POST /mysql/start|stop`, `POST /collectors/rds-instances`)
 //
 // **쓰기 경로다.** 조회는 `viewer` 도 하지만, 수집을 멈추는 것은 관측을 멈추는 것이고
-// 그 사이의 슬로우 쿼리는 영구히 없다. `operator` 이상만 허용한다.
+// 그 사이의 슬로우 쿼리는 영구히 없다.
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// 조작 권한. `viewer` 는 볼 수만 있다.
-fn require_operator(ctx: &AuthContext) -> Result<(), ApiError> {
-    match ctx.role {
-        dbmon_core::rbac::Role::Operator | dbmon_core::rbac::Role::Admin => Ok(()),
-        dbmon_core::rbac::Role::Viewer => {
-            Err(ApiError::new(StatusCode::FORBIDDEN, "role_required"))
-        }
+/// 전역 수집 조작 권한.
+///
+/// # 왜 역할만으로는 부족한가
+///
+/// 이 제어는 **전역이다** — 멈추면 이 워커가 수집하는 모든 인스턴스가 멈춘다.
+/// `dev` 스코프만 가진 `operator` 가 누르면 **prd 관측이 멈춘다.** 그래서 역할과
+/// 함께 **전 환경 스코프**를 요구한다. 인스턴스별 제어가 생기면 그때 좁힌다.
+fn require_global_control(ctx: &AuthContext) -> Result<(), ApiError> {
+    use dbmon_core::rbac::Role;
+    if !matches!(ctx.role, Role::Operator | Role::Admin) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "role_required"));
+    }
+    // 스코프가 전 환경을 덮는가. 부분 스코프로 전역 스위치를 누를 수 없다.
+    if !Env::ALL.iter().all(|e| ctx.is_env_allowed(*e)) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "scope_required"));
+    }
+    Ok(())
+}
+
+/// 이 프로세스가 실제로 수집을 도는가.
+///
+/// **아니면 조작을 거부한다.** 플래그는 프로세스 원자값이므로 `role=api` 워커에서
+/// 바꿔도 수집 워커는 모른다 — 200 을 돌려주면 화면이 "멈췄다" 고 거짓말한다.
+/// 여러 워커에 걸쳐 멈추려면 설정 저장소에 상태를 둬야 하고, 그건 별도 작업이다.
+fn require_collector_worker(state: &ApiState) -> Result<(), ApiError> {
+    if state.runs_collector {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::CONFLICT, "not_a_collector"))
     }
 }
 
@@ -749,6 +791,8 @@ struct CollectorStatus {
     worker_id: String,
     /// 이 플래그가 어디까지 적용되는가. 여러 워커를 띄웠으면 **이 프로세스뿐**이다.
     scope: &'static str,
+    /// 이 워커가 수집 루프를 도는가. `false` 면 제어가 거부된다.
+    runs_collector: bool,
     /// 조작할 수 있는 역할인가. 화면이 버튼을 비활성화하는 근거.
     can_control: bool,
     role: String,
@@ -763,7 +807,8 @@ async fn collector_status(
         snapshot: state.controls.snapshot(),
         worker_id: state.worker_id.clone(),
         scope: "process",
-        can_control: require_operator(&ctx).is_ok(),
+        runs_collector: state.runs_collector,
+        can_control: state.runs_collector && require_global_control(&ctx).is_ok(),
         role: ctx.role.as_str().to_string(),
     }))
 }
@@ -773,7 +818,8 @@ async fn collector_pause(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
-    require_operator(&ctx)?;
+    require_global_control(&ctx)?;
+    require_collector_worker(&state)?;
     state.controls.set_paused(true, SystemClock.now_ms());
     // **감사 로그를 남긴다.** 관측이 멈춘 구간은 나중에 반드시 질문거리가 된다.
     tracing::warn!(
@@ -789,7 +835,8 @@ async fn collector_resume(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
-    require_operator(&ctx)?;
+    require_global_control(&ctx)?;
+    require_collector_worker(&state)?;
     state.controls.set_paused(false, SystemClock.now_ms());
     tracing::warn!(subject = %ctx.subject, worker = %state.worker_id, "수집을 재개했다 (화면 조작)");
     collector_status(State(state), headers).await
@@ -801,7 +848,8 @@ async fn discovery_run(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
-    require_operator(&ctx)?;
+    require_global_control(&ctx)?;
+    require_collector_worker(&state)?;
     state.controls.request_discovery();
     tracing::info!(subject = %ctx.subject, "탐색을 요청했다 (화면 조작)");
     collector_status(State(state), headers).await
@@ -817,7 +865,8 @@ async fn backfill_run(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
-    require_operator(&ctx)?;
+    require_global_control(&ctx)?;
+    require_collector_worker(&state)?;
     state.controls.request_backfill();
     tracing::info!(subject = %ctx.subject, "백필을 요청했다 (화면 조작)");
     collector_status(State(state), headers).await
@@ -846,9 +895,25 @@ mod tests {
             can_see_literals: false,
             claims_version: 0,
         };
-        assert!(require_operator(&ctx(Role::Admin)).is_ok());
-        assert!(require_operator(&ctx(Role::Operator)).is_ok());
-        assert!(require_operator(&ctx(Role::Viewer)).is_err());
+        // 전 환경 스코프를 가진 operator·admin 만 통과한다.
+        let all = |role| AuthContext {
+            subject: "u".into(),
+            role,
+            env_scope: Env::ALL.to_vec(),
+            can_see_literals: false,
+            claims_version: 0,
+        };
+        assert!(require_global_control(&all(Role::Admin)).is_ok());
+        assert!(require_global_control(&all(Role::Operator)).is_ok());
+        assert!(require_global_control(&all(Role::Viewer)).is_err());
+
+        // **부분 스코프는 전역 스위치를 누를 수 없다.** dev 만 보는 operator 가
+        // 누르면 prd 관측이 멈춘다.
+        assert!(
+            require_global_control(&ctx(Role::Operator)).is_err(),
+            "dev 스코프 operator 가 전역 수집을 멈출 수 있다"
+        );
+        assert!(require_global_control(&ctx(Role::Admin)).is_err());
     }
 
     /// 월 경계는 **KST** 다. UTC 로 자르면 매월 초 9시간이 이전 달로 간다.

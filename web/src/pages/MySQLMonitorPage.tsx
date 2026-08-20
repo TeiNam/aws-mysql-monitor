@@ -336,10 +336,16 @@ export function MySQLMonitorPage() {
 function ScraperStatus({ instances, tz }: { instances: InstanceView[]; tz: Timezone }) {
   const live = useLive();
   const status = useCollectorStatus();
-  const topics = useMemo(
-    () => instances.slice(0, MAX_TOPICS).map((i) => `status:inst=${i.id}`),
-    [instances],
-  );
+  // **지표와 슬로우 쿼리 방송을 함께 구독한다.**
+  //
+  // `status:` 만 구독하면 새 슬로우 쿼리 방송이 오지 않아 "주기를 기다리지 않고
+  // 즉시 다시 읽는다" 가 거짓말이 된다. 환경은 등록부에서 얻는다 — 목록을 손으로
+  // 적으면 없는 환경을 구독해 `denied` 만 받는다.
+  const topics = useMemo(() => {
+    const status = instances.slice(0, MAX_TOPICS).map((i) => `status:inst=${i.id}`);
+    const envs = [...new Set(instances.map((i) => i.env))].sort();
+    return [...status, ...envs.map((e) => `slowq:env=${e}`)];
+  }, [instances]);
   useLiveTopics(topics);
 
   const collecting = instances.filter((i) => i.collectible).length;

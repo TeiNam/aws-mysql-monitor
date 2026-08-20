@@ -113,18 +113,22 @@ fn classify(statement_type: &str, sql: Option<&str>) -> Kind {
         "select" => Kind::Read,
         "insert" | "update" | "delete" | "replace" => Kind::Write,
         "ddl" => Kind::Ddl,
-        _ => match sql {
-            Some(text) if text.trim_start().len() >= 6 => {
-                let head = &text.trim_start()[..6];
-                if head.eq_ignore_ascii_case("commit") {
-                    Kind::Commit
-                } else {
-                    Kind::Other
-                }
-            }
-            _ => Kind::Other,
-        },
+        // ⚠ **바이트로 자르지 않는다.** `&text[..6]` 은 6바이트째가 UTF-8 문자
+        // 중간이면 패닉한다 — `/*가*/COMMIT` 같은 주석 하나로 다이제스트·통계
+        // 요청 전체가 500 이 된다. 문자 단위로 비교한다.
+        _ if starts_with_ignore_case(sql, "commit") => Kind::Commit,
+        _ => Kind::Other,
     }
+}
+
+/// `sql` 이 `needle` 로 시작하는가 (대소문자 무시, **문자 단위**).
+fn starts_with_ignore_case(sql: Option<&str>, needle: &str) -> bool {
+    let Some(text) = sql else { return false };
+    let mut head = text.trim_start().chars();
+    needle.chars().all(|want| {
+        head.next()
+            .is_some_and(|got| got.eq_ignore_ascii_case(&want))
+    })
 }
 
 /// 누산기. 다이제스트·인스턴스·사용자 집계가 같은 셈을 쓴다.
@@ -466,6 +470,43 @@ mod tests {
         assert_eq!(s.commit_query_count, 1);
         assert_eq!(s.other_query_count, 1);
         assert_eq!(s.total_slow_query_count, 6);
+    }
+
+    /// **멀티바이트 문자로 시작하는 SQL 이 패닉을 만들지 않는다.**
+    ///
+    /// `&text[..6]` 로 자르면 6바이트째가 문자 중간이라 패닉하고, 그런 레코드 하나가
+    /// 다이제스트·통계 요청 전체를 500 으로 만든다.
+    #[test]
+    fn multibyte_sql_does_not_panic_the_classifier() {
+        for sql in [
+            "/*가*/COMMIT",
+            "가",
+            "COM",
+            "  commit",
+            "커밋",
+            "COMMIT /* 한글 주석 */",
+        ] {
+            let stats = instance_stats(&[view(|v| {
+                v.statement_type = "other".into();
+                v.sql_text = Some(sql.to_string());
+            })]);
+            assert_eq!(stats.len(), 1, "{sql:?} 에서 패닉했거나 행이 사라졌다");
+        }
+
+        // 분류 결과도 맞아야 한다.
+        let commit = instance_stats(&[view(|v| {
+            v.statement_type = "other".into();
+            v.sql_text = Some("  commit".into());
+        })]);
+        assert_eq!(commit[0].commit_query_count, 1);
+        let not_commit = instance_stats(&[view(|v| {
+            v.statement_type = "other".into();
+            v.sql_text = Some("/*가*/COMMIT".into());
+        })]);
+        assert_eq!(
+            not_commit[0].other_query_count, 1,
+            "주석으로 시작하면 commit 으로 단정하지 않는다"
+        );
     }
 
     /// SQL 이 가려졌으면 `commit` 을 **추측하지 않는다.**

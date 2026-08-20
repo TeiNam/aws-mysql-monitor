@@ -481,6 +481,18 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         Ok(best)
     }
 
+    /// 구간 안의 레코드를 **최신순으로** 돌려준다.
+    ///
+    /// # 두 가지를 지킨다
+    ///
+    /// **① 최신 파티션부터 본다.** `date_parts()` 는 오래된 순이므로 뒤집는다.
+    /// 안 뒤집으면 `limit` 에 걸릴 때 **남는 것이 가장 오래된 날**이고, 목록·플랜·
+    /// 집계는 전부 최근을 보려는 화면이다 — 조용히 옛날 데이터를 보여주게 된다.
+    ///
+    /// **② `LastEvaluatedKey` 를 따라간다.** DynamoDB `Query` 는 `Limit` 보다 적게
+    /// 돌려줄 수 있다(1MB 페이지 상한). SQL 본문이 큰 레코드는 몇십 건에서 1MB 를
+    /// 넘으므로, 페이지를 안 따라가면 "5000건 요청 → 80건 도착 → 이게 전부다" 로
+    /// 오판한다. 호출부의 절단 판정(`found.len() == page`)도 그 위에서만 맞다.
     async fn list_by_instance(
         &self,
         instance: &InstanceId,
@@ -488,31 +500,42 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         limit: usize,
     ) -> Result<Vec<SlowQuery>> {
         let mut out = Vec::new();
-        // 날짜 파티션을 순회한다. `date_parts()` 에 상한이 있어 폭주하지 않는다.
-        for date in range.date_parts() {
+        for date in range.date_parts().into_iter().rev() {
             if out.len() >= limit {
                 break;
             }
             let pk = format!("SQ#{}#{}", instance.as_str(), date.as_str());
-            let res = self
-                .client
-                .query()
-                .table_name(&self.table)
-                .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
-                .expression_attribute_values(":pk", AttributeValue::S(pk))
-                .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(range.from_ms())))
-                .expression_attribute_values(
-                    ":hi",
-                    AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(range.to_ms()))),
-                )
-                // 최신순.
-                .scan_index_forward(false)
-                .limit((limit - out.len()) as i32)
-                .send()
-                .await
-                .map_err(map_sdk_err)?;
-            for item in res.items.unwrap_or_default() {
-                out.push(Self::from_item(item)?);
+            let mut start_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+            loop {
+                let remaining = limit - out.len();
+                let res = self
+                    .client
+                    .query()
+                    .table_name(&self.table)
+                    .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
+                    .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                    .expression_attribute_values(
+                        ":lo",
+                        AttributeValue::S(sort_key_ms(range.from_ms())),
+                    )
+                    .expression_attribute_values(
+                        ":hi",
+                        AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(range.to_ms()))),
+                    )
+                    // 최신순.
+                    .scan_index_forward(false)
+                    .limit(remaining as i32)
+                    .set_exclusive_start_key(start_key)
+                    .send()
+                    .await
+                    .map_err(map_sdk_err)?;
+                for item in res.items.unwrap_or_default() {
+                    out.push(Self::from_item(item)?);
+                }
+                start_key = res.last_evaluated_key;
+                if start_key.is_none() || out.len() >= limit {
+                    break;
+                }
             }
         }
         out.truncate(limit);

@@ -174,18 +174,24 @@ export function shortInstance(id: string): string {
   return at === -1 ? id : id.slice(at + 1);
 }
 
-/** `YYYY-MM`. 월 선택기의 기본값·옵션에 쓴다. */
-export function monthKey(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  return `${y}-${m}`;
+/**
+ * `YYYY-MM` — **KST 기준**.
+ *
+ * 백엔드가 월 경계를 KST 로 자르므로(`month_range`) 화면의 기본값도 KST 여야 한다.
+ * 브라우저 로컬 시간대를 쓰면 서울 밖에서 월초·월말에 **다른 달이 열린다.**
+ */
+export function monthKey(at: Date, offsetMonths = 0): string {
+  // KST 로 옮긴 뒤 UTC 성분을 읽는다 — 로컬 시간대에 흔들리지 않는다.
+  const kst = new Date(at.getTime() + 9 * 3_600_000);
+  const y = kst.getUTCFullYear();
+  const m = kst.getUTCMonth() + offsetMonths;
+  const shifted = new Date(Date.UTC(y, m, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-/** 최근 N개월 목록 (최신 먼저). */
+/** 최근 N개월 목록 (최신 먼저, KST 기준). */
 export function recentMonths(now: Date, count: number): string[] {
   const out: string[] = [];
-  for (let i = 0; i < count; i += 1) {
-    out.push(monthKey(new Date(now.getFullYear(), now.getMonth() - i, 1)));
-  }
+  for (let i = 0; i < count; i += 1) out.push(monthKey(now, -i));
   return out;
 }
