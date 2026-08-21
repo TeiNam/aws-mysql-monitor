@@ -30,6 +30,9 @@ struct Cached {
     settings: AppSettings,
     /// 마지막으로 **성공한** 조회 시각. `None` 이면 아직 한 번도 못 읽었다.
     loaded_ms: Option<EpochMs>,
+    /// 마지막 조회가 실패한 사유. **화면이 이걸 표시해야 한다** — 실패를 조용히
+    /// 마지막 값으로 덮으면, 손상된 문서 위에서 관리자가 "정상" 을 보고 저장을 누른다.
+    last_error: Option<String>,
 }
 
 pub struct SettingsState {
@@ -60,6 +63,7 @@ impl SettingsState {
                 let mut c = self.cache.lock().expect("settings cache");
                 c.settings = s.clone();
                 c.loaded_ms = Some(now_ms);
+                c.last_error = None;
                 s
             }
             Err(e) => {
@@ -69,6 +73,10 @@ impl SettingsState {
                     version = last.version,
                     "설정을 읽을 수 없다 — 마지막으로 읽은 값을 유지한다"
                 );
+                if let Ok(mut c) = self.cache.lock() {
+                    // 사유는 스크럽한 것만 남긴다 — 화면에 그대로 나가는 문자열이다.
+                    c.last_error = Some(crate::telemetry::scrub(&e.to_string()));
+                }
                 last
             }
         }
@@ -102,6 +110,18 @@ impl SettingsState {
     /// 한 번이라도 읽은 적이 있는가. 기동 직후 기본값과 "정말 비어 있음" 을 구분한다.
     pub fn is_loaded(&self) -> bool {
         self.cache.lock().expect("settings cache").loaded_ms.is_some()
+    }
+
+    /// 마지막 조회가 실패했으면 그 사유. 성공했으면 `None`.
+    ///
+    /// **화면이 이 값을 보여줘야 한다.** 실패를 마지막 값으로 조용히 덮으면, 손상된
+    /// 문서 위에서 관리자가 "빈 설정" 을 정상으로 보고 저장을 누른다.
+    pub fn last_error(&self) -> Option<String> {
+        self.cache
+            .lock()
+            .expect("settings cache")
+            .last_error
+            .clone()
     }
 
     fn fresh(&self, now_ms: EpochMs) -> Option<AppSettings> {
@@ -214,6 +234,7 @@ mod tests {
             cache: Mutex::new(Cached {
                 settings: st.cached(),
                 loaded_ms: Some(0),
+                last_error: None,
             }),
         };
         let after = broken.refresh(CACHE_TTL_MS * 2).await;
@@ -222,6 +243,8 @@ mod tests {
             vec!["us-east-1", "eu-west-1"],
             "실패했는데 기본값으로 접혔다 — 탐색이 자기 리전 하나로 줄어든다"
         );
+        // **실패 사실은 남는다.** 화면이 "저장하지 말라" 를 말할 근거다.
+        assert!(broken.last_error().is_some(), "조회 실패를 조용히 삼켰다");
     }
 
     /// **인증 판정용 접근자는 오래된 값을 주지 않는다.**

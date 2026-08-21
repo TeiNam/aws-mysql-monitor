@@ -45,9 +45,22 @@ const FLEET_LOOKBACK_MULT: i64 = 3;
 ///
 /// **키에 정렬된 창 시작을 넣는다.** 그래서 같은 창 안에서는 몇 명이 보든 1회만 호출하고,
 /// 창이 넘어가면 자동으로 무효해진다 — TTL 타이머가 필요 없다.
+/// 캐시 항목. **실패한 범위를 함께 들고 있는다.**
+///
+/// 처음엔 실패했으면 캐시하지 않았다(복구되면 바로 보이게). 그런데 그러면 권한 오류나
+/// 조절(throttle)이 났을 때 **모든 요청이 CloudWatch 를 다시 때린다** — 사람이 화면을
+/// 열어 둔 만큼 재시도가 는다. 부분 결과와 실패 목록을 함께 캐시하면 재시도가 창당
+/// 1회로 묶이고, 화면은 "못 읽었다" 를 계속 표시한다.
+#[derive(Clone, Default)]
+struct CachedFleet {
+    series: BTreeMap<String, Series>,
+    failed_scopes: Vec<String>,
+}
+
 #[derive(Default)]
 struct Cache {
     entries: BTreeMap<String, BTreeMap<String, Series>>,
+    fleet: BTreeMap<String, CachedFleet>,
 }
 
 pub struct MetricsService {
@@ -113,10 +126,10 @@ impl MetricsService {
     ) -> FleetOutcome {
         let window = align(now_ms, FLEET_PERIOD_SECS);
         let cache_key = format!("fleet@{window}");
-        if let Some(hit) = self.cached(&cache_key) {
+        if let Some(hit) = self.cached_fleet(&cache_key) {
             return FleetOutcome {
-                rows: rows_from(instances, &hit),
-                failed_scopes: Vec::new(),
+                rows: rows_from(instances, &hit.series),
+                failed_scopes: hit.failed_scopes,
             };
         }
 
@@ -166,11 +179,15 @@ impl MetricsService {
             }
         }
 
-        // **실패한 범위가 있으면 캐시하지 않는다.** 캐시하면 다음 15분 동안 빈 값이
-        // 고정되고, 그 사이 복구돼도 화면은 계속 비어 있다.
-        if failed_scopes.is_empty() {
-            self.store(cache_key, merged.clone());
-        }
+        // **부분 실패도 캐시한다.** 실패 목록을 함께 담으므로 화면은 계속 사실을
+        // 말하고, 재시도는 창당 1회로 묶인다(창이 넘어가면 자동으로 다시 시도한다).
+        self.store_fleet(
+            cache_key,
+            CachedFleet {
+                series: merged.clone(),
+                failed_scopes: failed_scopes.clone(),
+            },
+        );
         FleetOutcome {
             rows: rows_from(instances, &merged),
             failed_scopes,
@@ -265,6 +282,18 @@ impl MetricsService {
 
     fn cached(&self, key: &str) -> Option<BTreeMap<String, Series>> {
         self.cache.lock().ok()?.entries.get(key).cloned()
+    }
+
+    fn cached_fleet(&self, key: &str) -> Option<CachedFleet> {
+        self.cache.lock().ok()?.fleet.get(key).cloned()
+    }
+
+    fn store_fleet(&self, key: String, value: CachedFleet) {
+        if let Ok(mut c) = self.cache.lock() {
+            // **창이 넘어간 항목을 버린다** — 안 버리면 창마다 쌓인다.
+            c.fleet.retain(|k, _| k == &key);
+            c.fleet.insert(key, value);
+        }
     }
 
     fn store(&self, key: String, value: BTreeMap<String, Series>) {

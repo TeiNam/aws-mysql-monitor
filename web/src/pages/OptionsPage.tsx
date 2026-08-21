@@ -171,6 +171,18 @@ function ServerSettings() {
 
   return (
     <>
+      {/* **읽기 실패를 정상으로 보여주지 않는다.** 이 경고 없이 빈 설정을 보여주면
+          관리자가 그 위에 저장을 눌러 실제 설정을 지우려 한다(낙관적 잠금이 막지만
+          "저장 실패" 만 보게 된다). */}
+      {view.load_error === null ? null : (
+        <Card>
+          <p className="text-sm text-red-800" role="alert">
+            <strong>설정을 읽지 못했다.</strong> 아래 값은 마지막으로 읽은 것이거나
+            기본값이다 — <strong>저장하지 말고</strong> 사유를 먼저 해결한다.
+            <span className="mt-1 block font-mono text-xs">{view.load_error}</span>
+          </p>
+        </Card>
+      )}
       <NotifySection
         value={draft.notify}
         onChange={(notify) => setDraft({ ...draft, notify })}

@@ -424,6 +424,13 @@ export interface SettingsView {
   effective_auth_mode: AuthModeSetting;
   own_region: string;
   known_regions: string[];
+  /**
+   * 설정을 **읽지 못했다면** 그 사유.
+   *
+   * 이 값이 있으면 보이는 설정은 마지막으로 읽은 값(또는 기본값)이다 —
+   * 그 위에 저장하면 안 된다.
+   */
+  load_error: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

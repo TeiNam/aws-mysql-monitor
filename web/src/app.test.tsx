@@ -27,6 +27,8 @@ const realFetch = globalThis.fetch;
 let unauthorized = false;
 /** 서버가 조회 상한에 걸려 **0건**을 준 상황. */
 let emptyButTruncated = false;
+/** 설정을 읽지 못한 상황(손상된 문서·저장소 장애). */
+let settingsLoadError: string | null = null;
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -242,6 +244,43 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
       }),
     );
   }
+  if (url.startsWith("/api/settings")) {
+    return Promise.resolve(
+      json({
+        settings: {
+          version: 3,
+          notify: {
+            slack_enabled: false,
+            slack_mode: "webhook",
+            slack_channel: "",
+            slack_secret: "",
+            message_template: "{emoji} [{env}] {title} · {instance}\n{detail}",
+          },
+          discovery: { regions: ["ap-northeast-2"], multi_account_enabled: false, accounts: [] },
+          auth: {
+            mode: "token",
+            cognito: { user_pool_id: "", client_id: "", region: "", domain: "" },
+          },
+          ai: {
+            enabled: true,
+            model_id: "global.anthropic.claude-sonnet-5",
+            region: "",
+            max_output_tokens: 4000,
+          },
+          updated_at_ms: Date.now(),
+          updated_by: "admin",
+        },
+        problems: [],
+        can_edit: true,
+        allow_auth_disable: false,
+        cognito_ready: false,
+        effective_auth_mode: "token",
+        own_region: "ap-northeast-2",
+        known_regions: ["ap-northeast-2"],
+        load_error: settingsLoadError,
+      }),
+    );
+  }
   if (url.startsWith("/api/collector/status")) {
     return Promise.resolve(
       json({
@@ -280,6 +319,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
 beforeEach(() => {
   unauthorized = false;
   emptyButTruncated = false;
+  settingsLoadError = null;
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
   // `unauthorized` 가 되면 다음 테스트에서 아예 접속하지 않는다(그게 프로덕션
@@ -489,6 +529,35 @@ describe("다이제스트·통계·플랜·인스턴스 화면", () => {
    * 옵션 탭이 실제로 테마를 바꾸는지 — nav → 화면 → `<html class="dark">` 배선을 본다.
    * 조각마다 테스트가 있어도 이 사슬이 끊기면 "눌러도 안 바뀐다" 가 된다.
    */
+  /**
+   * **설정 화면이 서버 값을 실제로 읽는지.** 타입만 맞으면 컴파일은 통과한다 —
+   * 필드 이름이 어긋나면 화면이 빈 입력을 보여주고, 그건 "설정이 비어 있다" 로 읽힌다.
+   */
+  it("설정 화면이 저장된 값을 그린다", async () => {
+    await renderApp("/options");
+    // AI 절: 모델 ID 가 입력값으로 들어와야 한다.
+    expect(
+      await screen.findByDisplayValue("global.anthropic.claude-sonnet-5"),
+    ).toBeDefined();
+    // 탐색 범위: 리전 목록이 텍스트 영역에 들어오고 칩에 이름이 붙는다.
+    expect(screen.getByDisplayValue("ap-northeast-2")).toBeDefined();
+    // 리전 이름은 여러 곳에 붙는다(칩·머리말·힌트) — 하나라도 있으면 된다.
+    expect(screen.getAllByText("ap-northeast-2 (서울)").length).toBeGreaterThan(0);
+    // 인증: 파일 설정이 허용하지 않으면 "인증 없음" 을 고를 수 없다.
+    expect(screen.getByText(/배포 설정이 허용하지 않는다/)).toBeDefined();
+  });
+
+  /**
+   * **읽기 실패를 정상으로 보여주지 않는다.** 이 경고가 없으면 관리자가 빈 설정을
+   * 정상으로 보고 저장을 눌러 실제 설정을 지우려 한다.
+   */
+  it("설정을 읽지 못하면 저장하지 말라고 말한다", async () => {
+    settingsLoadError = "설정 문서(version 3)를 읽을 수 없다";
+    await renderApp("/options");
+    expect(await screen.findByText(/설정을 읽지 못했다/)).toBeDefined();
+    expect(screen.getByText(/저장하지 말고/)).toBeDefined();
+  });
+
   it("옵션 화면에서 다크를 고르면 문서에 적용된다", async () => {
     await renderApp("/options");
     const dark = (await screen.findByLabelText(/다크/)) as HTMLInputElement;

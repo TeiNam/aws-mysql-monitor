@@ -45,6 +45,12 @@ pub struct SettingsView {
     pub own_region: String,
     /// 화면의 리전 선택에 쓸 목록.
     pub known_regions: Vec<String>,
+    /// **설정을 읽지 못했다면 그 사유.**
+    ///
+    /// 이 값이 있으면 화면이 보여주는 설정은 **마지막으로 읽은 값**(또는 기본값)이다.
+    /// 그 사실을 말하지 않으면 관리자가 빈 설정을 정상으로 보고 저장을 눌러 실제
+    /// 설정을 지울 수 있다(낙관적 잠금이 막지만, 화면은 사실을 말해야 한다).
+    pub load_error: Option<String>,
 }
 
 fn view(state: &ApiState, settings: &AppSettings, can_edit: bool) -> SettingsView {
@@ -60,6 +66,7 @@ fn view(state: &ApiState, settings: &AppSettings, can_edit: bool) -> SettingsVie
         can_edit,
         allow_auth_disable: state.allow_auth_disable,
         cognito_ready: super::auth::COGNITO_READY,
+        load_error: state.settings.last_error(),
         settings: settings.redacted(),
     }
 }
