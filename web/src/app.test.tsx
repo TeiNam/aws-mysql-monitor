@@ -12,7 +12,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeSocket } from "./lib/fake-socket";
@@ -373,10 +373,25 @@ describe("다이제스트·통계·플랜·인스턴스 화면", () => {
     expect(screen.getByText(/읽기 58/)).toBeDefined();
   });
 
-  it("플랜 화면이 계획 그래프를 그린다", async () => {
+  /**
+   * **기본은 표(plan) 탭이다.** 그래프는 한 번 눌러야 나온다.
+   *
+   * 탭 순서를 바꿨을 때 이 테스트가 "그래프가 없다" 로 깨졌다 — 기본 뷰가 무엇인지를
+   * 고정하고 있었다는 뜻이고, 그건 고정해 둘 값어치가 있다. 그래서 둘 다 확인한다.
+   */
+  it("플랜 화면은 표를 먼저 보여주고, 그래프 탭으로 바꿀 수 있다", async () => {
     await renderApp("/plan");
-    // `message` 만 있는 계획도 노드로 나온다. SVG 는 `<text>` 와 툴팁 `<title>`
-    // 둘에 같은 문자열을 담으므로 둘 다 세어 준다.
+    // 표: `message` 만 있는 계획도 행으로 나온다(조건 열에 그대로).
+    expect(await screen.findByRole("columnheader", { name: "Node Type" })).toBeDefined();
+    expect(await screen.findAllByText("No tables used")).toHaveLength(1);
+    // 아직 계획 그래프는 없다.
+    expect(screen.queryByRole("img", { name: /실행계획 노드/ })).toBeNull();
+
+    // 그래프 탭으로. **`fireEvent` 로 누른다** — DOM 의 `.click()` 은 상태 갱신이
+    // `act()` 밖에서 일어나 다음 단정까지 렌더가 반영되지 않을 수 있다(실제로 그래서
+    // 표가 그대로 보였다).
+    fireEvent.click(await screen.findByRole("tab", { name: "그래프" }));
+    // SVG 는 `<text>` 와 툴팁 `<title>` 둘에 같은 문자열을 담으므로 둘 다 세어 준다.
     expect(await screen.findAllByText("No tables used")).toHaveLength(2);
     expect(screen.getByRole("img", { name: /실행계획 노드/ })).toBeDefined();
   });

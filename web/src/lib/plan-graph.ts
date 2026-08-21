@@ -249,7 +249,9 @@ export function parsePlan(json: string): PlanGraph | null {
     // **버리지 않는다** — 이게 유일한 내용인 플랜이 실제로 있다.
     const message = str(block.message);
     if (message !== null) {
-      link(id, add("message", message, [], depth + 1, { condition: message }));
+      // 라벨이 이미 그 문장이다. 조건 열에 또 넣으면 표에 같은 문자열이 두 번 나온다
+      // (화면에서 확인했다).
+      link(id, add("message", message, [], depth + 1));
     }
     linkChildren(block, id, depth + 1);
     return id;

@@ -295,8 +295,9 @@ describe("표(Simple) 행", () => {
   it("비용이 없으면 비중은 `null` — 0% 로 채우지 않는다", () => {
     const rows = planRows(parsePlan('{"query_block":{"message":"No tables used"}}')!, new Set());
     expect(costShare(rows, rows[0]!.node)).toBeNull();
-    // 메시지는 조건 열에 그대로 남는다 — 이게 유일한 내용인 계획이 있다.
-    expect(rows[1]!.node.condition).toBe("No tables used");
+    // 메시지는 **라벨**로 남는다. 조건 열에 또 넣으면 표에 같은 문자열이 두 번 나온다.
+    expect(rows[1]!.node.label).toBe("No tables used");
+    expect(rows[1]!.node.condition).toBeUndefined();
   });
 
   it("v2 의 실측 시간·행 수는 표에 그대로 온다", () => {
