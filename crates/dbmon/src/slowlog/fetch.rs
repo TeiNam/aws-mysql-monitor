@@ -137,9 +137,36 @@ impl SlowLogFetcher for CloudWatchFetcher {
             .limit(self.max_events)
             .send()
             .await
-            .map_err(|e| dbmon_core::error::DomainError::Unavailable {
-                dependency: "cloudwatchlogs",
-                reason: crate::telemetry::scrub(&format!("{e:?}")),
+            .map_err(|e| {
+                use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata as _;
+                // **로그 그룹이 없는 것은 장애가 아니다.**
+                //
+                // 슬로우로그가 한 번도 쓰이지 않았거나(RDS 는 첫 기록 때 그룹을 만든다)
+                // 로그 내보내기가 꺼져 있으면 `ResourceNotFoundException` 이 온다.
+                // 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가 쌓이고**
+                // 재시도 대상으로 분류된다 — 존재하지 않는 그룹을 계속 두드린다.
+                //
+                // `Unsupported` 로 구분하면 호출부가 "이 인스턴스는 원천이 없다" 로
+                // 한 번만 말하고 넘어갈 수 있다.
+                if e.code() == Some("ResourceNotFoundException") {
+                    return dbmon_core::error::DomainError::Unsupported {
+                        what: "slowlog_group".into(),
+                        // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게 유일한 단서다.
+                        reason: format!(
+                            "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 않았거나 \
+                             로그 내보내기가 꺼져 있다"
+                        ),
+                    };
+                }
+                dbmon_core::error::DomainError::Unavailable {
+                    dependency: "cloudwatchlogs",
+                    // 서비스 메시지를 살린다(스크럽 통과). `Debug` 만 넘기면 정작 필요한
+                    // 문장이 `Some('?')` 가 된다 — Bedrock 에서 같은 것을 겪었다.
+                    reason: e
+                        .message()
+                        .map(crate::telemetry::scrub)
+                        .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}"))),
+                }
             })?;
 
         let events = out.events();
