@@ -32,6 +32,12 @@ pub struct DigestRow {
     pub app_digest: String,
     /// 대표 SQL. **권한이 없으면 `None`** — 뷰에서 이미 가려진 값을 쓴다.
     pub digest_query: Option<String>,
+    /// 대표 SQL 이 없는 **이유**. `None` 이면 SQL 이 있다.
+    ///
+    /// 이게 없으면 화면이 "SQL 미저장" 하나로 뭉갠다 — 권한이 없어 가려진 것과
+    /// 애초에 저장하지 않은 것(정책 `off`)은 운영자에게 **다른 행동**을 요구한다
+    /// (권한 요청 vs 정책 변경). 11라운드 지적.
+    pub digest_query_redacted_reason: Option<&'static str>,
     /// 이 다이제스트를 실행한 DB 사용자들.
     pub users: Vec<String>,
     pub statement_type: String,
@@ -415,6 +421,8 @@ struct DigestAcc<'a> {
     users: BTreeSet<&'a str>,
     /// 대표 SQL. 가려지지 않은 첫 값을 쓴다.
     sql: Option<&'a str>,
+    /// 대표 SQL 을 못 쓴 이유 (가려진 행에서 처음 본 값).
+    redacted_reason: Option<&'static str>,
     statement_type: &'a str,
     schema_name: Option<&'a str>,
 }
@@ -430,6 +438,7 @@ pub fn digest_rows(views: &[SlowQueryView]) -> Vec<DigestRow> {
                 counters: Counters::default(),
                 users: BTreeSet::new(),
                 sql: view.sql_text.as_deref(),
+                redacted_reason: view.sql_redacted_reason,
                 statement_type: view.statement_type.as_str(),
                 schema_name: view.schema_name.as_deref(),
             });
@@ -441,6 +450,11 @@ pub fn digest_rows(views: &[SlowQueryView]) -> Vec<DigestRow> {
         // 저장하지 않는 레코드가 섞여 있어도 표에 SQL 이 나오게 한다.
         if entry.sql.is_none() {
             entry.sql = view.sql_text.as_deref();
+            // **사유도 함께 따라간다.** "권한이 없어 가려짐" 과 "저장하지 않음" 은
+            // 운영자에게 다른 행동을 요구한다.
+            if entry.sql.is_none() && entry.redacted_reason.is_none() {
+                entry.redacted_reason = view.sql_redacted_reason;
+            }
         }
     }
 
@@ -452,6 +466,12 @@ pub fn digest_rows(views: &[SlowQueryView]) -> Vec<DigestRow> {
                 instance_id: instance_id.to_string(),
                 app_digest: app_digest.to_string(),
                 digest_query: a.sql.map(str::to_string),
+                // SQL 을 하나라도 얻었으면 이유는 없다.
+                digest_query_redacted_reason: if a.sql.is_some() {
+                    None
+                } else {
+                    a.redacted_reason
+                },
                 users: a.users.into_iter().map(str::to_string).collect(),
                 statement_type: a.statement_type.to_string(),
                 schema_name: a.schema_name.map(str::to_string),
@@ -1048,6 +1068,43 @@ mod tests {
             view(|v| v.sql_text = Some("SELECT 1".into())),
         ]);
         assert_eq!(rows[0].digest_query.as_deref(), Some("SELECT 1"));
+    }
+
+    /// **"가려짐" 과 "미저장" 을 구분해 내보낸다.**
+    ///
+    /// 권한이 없어 가려진 것은 SQL 이 저장돼 있다는 뜻이고(권한을 얻으면 보인다),
+    /// 정책이 저장하지 않은 것은 영구히 없다 — 운영자가 할 일이 다르다(11라운드 지적).
+    #[test]
+    fn the_digest_row_says_why_the_sql_is_missing() {
+        let by_role = digest_rows(&[view(|v| {
+            v.sql_text = None;
+            v.sql_redacted_reason = Some("insufficient_role");
+        })]);
+        assert_eq!(by_role[0].digest_query, None);
+        assert_eq!(
+            by_role[0].digest_query_redacted_reason,
+            Some("insufficient_role")
+        );
+
+        let by_policy = digest_rows(&[view(|v| {
+            v.sql_text = None;
+            v.sql_redacted_reason = Some("not_stored");
+        })]);
+        assert_eq!(
+            by_policy[0].digest_query_redacted_reason,
+            Some("not_stored")
+        );
+
+        // SQL 이 하나라도 있으면 이유는 없다 — 있는데 이유를 달면 화면이 헷갈린다.
+        let mixed = digest_rows(&[
+            view(|v| {
+                v.sql_text = None;
+                v.sql_redacted_reason = Some("insufficient_role");
+            }),
+            view(|v| v.sql_text = Some("SELECT ?".into())),
+        ]);
+        assert_eq!(mixed[0].digest_query.as_deref(), Some("SELECT ?"));
+        assert_eq!(mixed[0].digest_query_redacted_reason, None);
     }
 
     #[test]

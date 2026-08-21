@@ -611,6 +611,26 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             //    첫 일치를 쓰면 쌍둥이가 있을 때 **다른 항목**을 고치고, 고치려던
             //    레코드는 그대로 남는다(`candidates_by_record_id` 주석의 유령 사례).
             let candidates = self.candidates_by_record_id(&q.record_id).await?;
+            // **`record_id` 가 같다고 같은 실행은 아니다.** 멱등 키는
+            // `(인스턴스, 스레드, 시작 초)` 이므로 **중첩 문장**(스토어드 프로시저의
+            // 안쪽/바깥쪽)처럼 같은 스레드·같은 초에 시작한 **다른 문장**이 같은 키를
+            // 갖는다. 그대로 병합하면 두 문장이 한 레코드로 섞이고 한쪽 다이제스트는
+            // 사라진다(11라운드 지적). 같은 실행만 남긴다 —
+            // **다만 물리 키가 같은 후보는 "바로 그 행" 이므로 판정을 거치지 않는다**
+            // (지속시간이 0인 레코드가 자기 자신과 겹치지 않는 것을 피한다).
+            let incoming_span = dbmon_core::slow_query::ExecutionSpan::of(q);
+            let want_sk = keys::slow_query_sk(q.started_at_ms, q.thread_id);
+            let candidates: Vec<Stored> = candidates
+                .into_iter()
+                .filter(|c| {
+                    c.sk == want_sk
+                        || dbmon_core::slow_query::ExecutionSpan::of(&c.record)
+                            .is_same_execution_within(
+                                &incoming_span,
+                                dbmon_core::clock_offset::LIVE_ESTIMATE_SPREAD_MS,
+                            )
+                })
+                .collect();
             let mut existing = pick_target(&candidates, q).cloned();
 
             // ② **±2초 보조 조회.** 없으면 같은 실행이 두 레코드로 갈린다.

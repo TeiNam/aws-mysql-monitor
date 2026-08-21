@@ -30,6 +30,9 @@ import { StateBadge } from "../components/StateBadge";
 import {
   BTN_GHOST,
   CELL_ICON,
+  COL_GROW,
+  COL_TIGHT,
+  COL_TIGHT_CAPPED,
   LABEL,
   PAGE_TITLE,
   SELECT,
@@ -225,15 +228,17 @@ export function MySQLMonitorPage() {
               <table className={TABLE}>
                 <thead>
                   <tr>
-                    <th className={TH}>Start Time</th>
-                    <th className={TH}>Instance</th>
-                    <th className={TH}>Database</th>
-                    <th className={TH}>User</th>
-                    <th className={TH}>State</th>
-                    <th className={TH_NUM}>Thread</th>
-                    <th className={TH_NUM}>Time</th>
-                    <th className={TH_NUM}>Rows</th>
-                    <th className={TH}>Query</th>
+                    {/* **짧은 열은 내용 폭만.** 남는 폭은 Query 가 받는다 — 표에서
+                        정보량이 가장 큰 열이 가장 넓어야 한다. */}
+                    <th className={`${TH} ${COL_TIGHT}`}>Start Time</th>
+                    <th className={`${TH} ${COL_TIGHT_CAPPED}`}>Instance</th>
+                    <th className={`${TH} ${COL_TIGHT_CAPPED}`}>Database</th>
+                    <th className={`${TH} ${COL_TIGHT_CAPPED}`}>User</th>
+                    <th className={`${TH} ${COL_TIGHT}`}>State</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Thread</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Time</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Rows</th>
+                    <th className={`${TH} ${COL_GROW}`}>Query</th>
                   </tr>
                 </thead>
                 <tbody className={TBODY}>
@@ -251,52 +256,54 @@ export function MySQLMonitorPage() {
                   ) : (
                     visible.map((q) => (
                       <tr key={q.record_id} className={`${TR} cursor-pointer`} onClick={() => setOpenSql(q)}>
-                        <td className={TD}>
+                        <td className={`${TD} ${COL_TIGHT}`}>
                           <span className="flex items-center">
                             <Calendar className={CELL_ICON} />
                             {fmtListTime(q.started_at_ms, tz, nowMs)}
                           </span>
                         </td>
-                        <td className={TD} title={q.instance_id}>
+                        <td className={`${TD} ${COL_TIGHT_CAPPED}`} title={q.instance_id}>
                           <span className="flex items-center gap-1">
                             <Database className={CELL_ICON} />
                             {shortInstance(q.instance_id)}
                             <EnvChip env={q.env} />
                           </span>
                         </td>
-                        <td className={TD}>
+                        <td className={`${TD} ${COL_TIGHT}`}>
                           <span className="flex items-center">
                             <Server className={CELL_ICON} />
                             {q.schema_name ?? EMPTY}
                           </span>
                         </td>
-                        <td className={TD}>
+                        <td className={`${TD} ${COL_TIGHT}`}>
                           <span className="flex items-center">
                             <User className={CELL_ICON} />
                             {q.db_user ?? EMPTY}
                           </span>
                         </td>
-                        <td className={TD}>
+                        <td className={`${TD} ${COL_TIGHT}`}>
                           <StateBadge state={q.state} reason={q.abandoned_reason} />
                         </td>
-                        <td className={TD_NUM}>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`}>
                           <span className="flex items-center justify-end">
                             <Hash className={CELL_ICON} />
                             {q.thread_id}
                           </span>
                         </td>
-                        <td className={TD_NUM} title={`측정 소스: ${q.duration_source}`}>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`} title={`측정 소스: ${q.duration_source}`}>
                           <span className="flex items-center justify-end">
                             <Clock className={CELL_ICON} />
                             {(q.duration_ms / 1000).toFixed(1)}s
                           </span>
                         </td>
-                        <td className={TD_NUM} title="조사 행 / 반환 행">
+                        <td className={`${TD_NUM} ${COL_TIGHT}`} title="조사 행 / 반환 행">
                           {fmtInt(q.rows_examined)}
                           <span className="text-gray-400"> / </span>
                           {fmtInt(q.rows_sent)}
                         </td>
-                        <td className="max-w-[520px] px-3 py-2 text-sm text-gray-700">
+                        {/* 남는 폭을 전부 받는다. `max-w-0` 가 있어야 긴 SQL 이 표를
+                            밀어내지 않고 잘린다. */}
+                        <td className={`${COL_GROW} max-w-0 px-3 py-2 text-sm text-gray-700`}>
                           <div className="truncate font-mono text-xs">
                             {q.sql_text ??
                               (q.sql_redacted_reason === "insufficient_role"

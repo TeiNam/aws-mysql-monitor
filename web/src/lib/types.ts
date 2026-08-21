@@ -162,6 +162,8 @@ export interface DigestRow {
   instance_id: string;
   app_digest: string;
   digest_query: string | null;
+  /** 대표 SQL 이 없는 이유. `insufficient_role` 은 권한, `not_stored` 는 정책이다. */
+  digest_query_redacted_reason: string | null;
   users: string[];
   statement_type: string;
   schema_name: string | null;

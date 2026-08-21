@@ -105,10 +105,22 @@ impl SlowQueryStore for FakeSlowQueryStore {
         let key = q.record_id.as_str().to_string();
 
         // 1) record_id 직접 조회
+        //
+        // **같은 키라도 같은 실행인지 확인한다.** 멱등 키는 `(인스턴스, 스레드, 시작
+        // 초)` 이므로 중첩 문장처럼 같은 초에 시작한 다른 문장이 같은 키를 갖는다.
+        // 실제 어댑터와 같은 판정을 쓴다.
+        let incoming = crate::slow_query::ExecutionSpan::of(q);
         if let Some(existing) = items.get(&key) {
-            let merged = merge(existing, q);
-            items.insert(key, merged.clone());
-            return Ok(merged);
+            let same = existing.started_at_ms == q.started_at_ms
+                || crate::slow_query::ExecutionSpan::of(existing).is_same_execution_within(
+                    &incoming,
+                    crate::clock_offset::LIVE_ESTIMATE_SPREAD_MS,
+                );
+            if same {
+                let merged = merge(existing, q);
+                items.insert(key, merged.clone());
+                return Ok(merged);
+            }
         }
         // 2) ±2초 보조 조회 — 시작 시각 추정이 1초 어긋난 같은 실행을 찾는다.
         //

@@ -1254,3 +1254,49 @@ async fn the_store_does_not_merge_a_rerun_into_the_previous_execution() {
         "합쳤지만 슬로우로그의 정확 지표가 반영되지 않았다"
     );
 }
+
+/// **같은 초에 시작한 다른 문장(중첩)이 한 레코드로 섞이지 않는다** (11라운드 지적).
+///
+/// 멱등 키는 `(인스턴스, 스레드, 시작 초)` 다. 스토어드 프로시저의 바깥쪽/안쪽 문장은
+/// 같은 스레드·같은 초에 시작하므로 **키가 같다.** 그대로 병합하면 두 문장이 한
+/// 레코드가 되고 한쪽 다이제스트는 사라진다 — 그 문장은 어느 다이제스트 그룹에도
+/// 속하지 않게 된다.
+#[tokio::test]
+async fn two_statements_in_the_same_second_bucket_stay_separate() {
+    let Some(s) = store("same-second-nested").await else {
+        return;
+    };
+
+    // 바깥쪽 문장: 같은 초의 100ms 지점에서 시작, 2.1초 걸린다.
+    let mut outer = sample(6161, T0 + 100);
+    outer.app_digest = "digest-outer".into();
+    outer.duration_ms = 2_100;
+    s.upsert_merged(&outer).await.expect("바깥쪽 저장");
+
+    // 안쪽 문장: 같은 초의 400ms 지점, 다른 다이제스트. `record_id` 는 **같다.**
+    let mut inner = sample(6161, T0 + 400);
+    inner.app_digest = "digest-inner".into();
+    inner.duration_ms = 900;
+    inner.is_nested = true;
+    assert_eq!(
+        outer.record_id.as_str(),
+        inner.record_id.as_str(),
+        "이 테스트는 두 문장의 멱등 키가 같을 때를 본다"
+    );
+    s.upsert_merged(&inner).await.expect("안쪽 저장");
+
+    let range = TimeRange::new(T0 - 10_000, T0 + 20_000).expect("구간");
+    let all = s
+        .list_by_instance(&instance(), range, 50)
+        .await
+        .expect("조회");
+    let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 6161).collect();
+    assert_eq!(
+        mine.len(),
+        2,
+        "같은 초의 두 문장이 한 레코드로 섞였다 — 한쪽 다이제스트가 사라진다"
+    );
+    let digests: std::collections::BTreeSet<&str> =
+        mine.iter().map(|q| q.app_digest.as_str()).collect();
+    assert!(digests.contains("digest-outer") && digests.contains("digest-inner"));
+}

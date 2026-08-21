@@ -137,6 +137,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
             instance_id: INSTANCE,
             app_digest: "d1",
             digest_query: SQL,
+            digest_query_redacted_reason: null,
             users: ["loadgen"],
             statement_type: "select",
             schema_name: "shop",

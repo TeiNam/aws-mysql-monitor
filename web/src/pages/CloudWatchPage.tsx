@@ -9,6 +9,9 @@ import { EnvChip } from "../components/Shell";
 import { SqlModal } from "../components/SqlModal";
 import {
   CELL_ICON,
+  COL_GROW,
+  COL_TIGHT,
+  COL_TIGHT_CAPPED,
   LABEL,
   MONO,
   PAGE_TITLE,
@@ -157,15 +160,16 @@ export function CloudWatchPage() {
               <table className={TABLE}>
                 <thead>
                   <tr>
-                    <th className={TH}>Instance</th>
-                    <th className={TH}>User</th>
-                    <th className={TH}>Type</th>
-                    <th className={TH_NUM}>Exec Count</th>
-                    <th className={TH_NUM}>Total Time (s)</th>
-                    <th className={TH_NUM}>Avg Time (s)</th>
-                    <th className={TH_NUM}>Max Time (s)</th>
-                    <th className={TH_NUM}>Avg Rows Examined</th>
-                    <th className={TH}>SQL Digest</th>
+                    {/* 짧은 열은 내용 폭만, 남는 폭은 SQL 이 받는다. */}
+                    <th className={`${TH} ${COL_TIGHT_CAPPED}`}>Instance</th>
+                    <th className={`${TH} ${COL_TIGHT_CAPPED}`}>User</th>
+                    <th className={`${TH} ${COL_TIGHT}`}>Type</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Exec Count</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Total Time (s)</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Avg Time (s)</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Max Time (s)</th>
+                    <th className={`${TH_NUM} ${COL_TIGHT}`}>Avg Rows Examined</th>
+                    <th className={`${TH} ${COL_GROW}`}>SQL Digest</th>
                   </tr>
                 </thead>
                 <tbody className={TBODY}>
@@ -187,7 +191,7 @@ export function CloudWatchPage() {
                         className={`${TR} cursor-pointer`}
                         onClick={() => setOpenSql(row)}
                       >
-                        <td className={TD} title={row.instance_id}>
+                        <td className={`${TD} ${COL_TIGHT_CAPPED}`} title={row.instance_id}>
                           <span className="flex items-center gap-1">
                             <Database className={CELL_ICON} />
                             {row.instance_id.split("/").pop()}
@@ -200,20 +204,25 @@ export function CloudWatchPage() {
                             {row.users.length === 0 ? EMPTY : row.users.join(", ")}
                           </span>
                         </td>
-                        <td className={TD}>{row.statement_type}</td>
-                        <td className={TD_NUM}>{fmtInt(row.exec_count)}</td>
-                        <td className={TD_NUM}>{fmtSeconds(row.total_time_ms)}</td>
-                        <td className={TD_NUM}>{fmtSeconds(row.avg_time_ms)}</td>
-                        <td className={TD_NUM}>{fmtSeconds(row.max_time_ms)}</td>
+                        <td className={`${TD} ${COL_TIGHT}`}>{row.statement_type}</td>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`}>{fmtInt(row.exec_count)}</td>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`}>{fmtSeconds(row.total_time_ms)}</td>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`}>{fmtSeconds(row.avg_time_ms)}</td>
+                        <td className={`${TD_NUM} ${COL_TIGHT}`}>{fmtSeconds(row.max_time_ms)}</td>
                         {/* 행 정보가 없는 실행만 있으면 `null` 이다 — 0 이 아니다. */}
                         <td className={TD_NUM}>
                           {row.avg_rows_examined === null
                             ? EMPTY
                             : fmtInt(Math.round(row.avg_rows_examined))}
                         </td>
-                        <td className="max-w-[460px] px-3 py-2 text-sm text-gray-700">
+                        <td className={`${COL_GROW} max-w-0 px-3 py-2 text-sm text-gray-700`}>
                           <div className={`truncate ${MONO}`}>
-                            {row.digest_query ?? "(SQL 미저장)"}
+                            {/* **"미저장" 으로 뭉개지 않는다.** 권한이 없어 가려진 것과
+                                애초에 저장하지 않은 것은 운영자가 할 일이 다르다. */}
+                            {row.digest_query ??
+                              (row.digest_query_redacted_reason === "insufficient_role"
+                                ? "(권한 없음 — SQL 은 저장돼 있다)"
+                                : "(SQL 미저장 — 리터럴 정책)")}
                           </div>
                         </td>
                       </tr>

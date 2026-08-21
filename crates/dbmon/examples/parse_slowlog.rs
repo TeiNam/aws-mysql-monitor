@@ -8,7 +8,7 @@ fn main() {
     let min_ms: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_000);
 
     let text = std::fs::read_to_string(&path).expect("파일 읽기");
-    let out = dbmon::slowlog::parse(&text, min_ms);
+    let out = dbmon::slowlog::parse(&text, min_ms, "dbmon");
 
     println!(
         "엔트리 {}건, 건너뜀 {}건",

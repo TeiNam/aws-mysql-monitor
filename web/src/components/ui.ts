@@ -20,6 +20,35 @@ export const CARD_TITLE = "text-lg font-medium leading-6 text-gray-900 flex item
 export const PAGE_TITLE = "text-3xl font-bold tracking-tight text-gray-900";
 
 export const TABLE = "min-w-full divide-y divide-gray-200";
+
+/**
+ * **내용만큼만 차지하는 열.** 머리와 몸에 함께 붙인다.
+ *
+ * `min-w-full` 표는 남는 폭을 열마다 나눠 주므로, 짧은 값(스레드 번호·시각)이 든 열이
+ * 쓸데없이 넓어지고 **정작 긴 SQL 열이 좁아진다**. `w-px` 는 브라우저에게 "이 열은
+ * 내용 폭으로 계산하라" 는 신호이고, 남는 폭은 [`COL_GROW`] 열이 받는다.
+ *
+ * **고정 폭이 아니다** — 값이 길어지면 열도 늘어난다(실측: 인스턴스 이름을 56자로
+ * 바꾸면 그 열이 177px → 417px). 그래서 이름이 긴 환경에서도 잘리지 않는다.
+ */
+export const COL_TIGHT = "w-px whitespace-nowrap";
+
+/**
+ * 내용만큼 차지하지만 **상한이 있는 열** (인스턴스·스키마·계정처럼 길어질 수 있는 값).
+ *
+ * 상한이 없으면 이름 하나가 표를 독차지한다 — 실측에서 56자 이름이 들어오자 SQL 열이
+ * 386px → 146px 로 줄었다. 상한을 넘으면 말줄임표로 자르고, 전체 값은 `title` 로 남긴다
+ * (그래서 이 열을 쓰는 셀은 `title` 을 함께 준다).
+ */
+export const COL_TIGHT_CAPPED = `${COL_TIGHT} max-w-[16rem] truncate`;
+
+/**
+ * 남는 폭을 전부 받는 열 (SQL 처럼 긴 값).
+ *
+ * **최소 폭을 둔다.** 다른 열이 길어져도 SQL 이 읽을 수 없을 만큼 줄어들면 안 된다 —
+ * 그때는 표에 가로 스크롤이 생기는 편이 낫다(감싼 `div` 가 `overflow-x-auto` 다).
+ */
+export const COL_GROW = "w-full min-w-[22rem]";
 export const TH =
   "px-3 py-2 bg-gray-50 text-left text-xs font-medium text-gray-600 uppercase tracking-wider whitespace-nowrap";
 export const TH_NUM = `${TH} text-right`;

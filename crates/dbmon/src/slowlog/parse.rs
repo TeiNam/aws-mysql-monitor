@@ -84,6 +84,14 @@ pub enum SkipReason {
     BelowThreshold { duration_ms: i64 },
     /// 소요 시간이 있을 수 없는 값이다(음수, 24시간 초과, 오버플로).
     ImplausibleDuration { duration_ms: i64 },
+    /// **우리가 실행한 문장이다.**
+    ///
+    /// 실시간 경로는 `Excludes.users` 로 자기 계정을 이미 뺀다([05 §10]). 그런데
+    /// 슬로우로그에는 그 필터가 없었다 — 플랜 재실행(`EXPLAIN FORMAT=JSON <원문>`)이
+    /// 임계값을 넘으면 MySQL 이 그걸 로그에 쓰고, 백필이 **애플리케이션 쿼리처럼**
+    /// 저장했다. 실측: 로컬 100행 중 34행이 우리 자신의 문장이었고 통계·다이제스트에
+    /// 그대로 섞였다(사용자가 화면을 보고 지적).
+    OwnStatement,
 }
 
 /// 파싱 결과. 버린 것을 **세어서 보고한다** — 조용히 버리면 "왜 백필이 안 되나" 를
@@ -106,6 +114,7 @@ impl ParseOutcome {
                 SkipReason::EmptySql => "empty_sql",
                 SkipReason::BelowThreshold { .. } => "below_threshold",
                 SkipReason::ImplausibleDuration { .. } => "implausible_duration",
+                SkipReason::OwnStatement => "own_statement",
             };
             *m.entry(key).or_insert(0) += 1;
         }
@@ -113,10 +122,31 @@ impl ParseOutcome {
     }
 }
 
+/// 우리가 보낸 문장에 붙는 주석 접두. `mysql::sql` 이 모든 문장에 붙인다.
+const OWN_STATEMENT_TAG: &str = "/* dbmon:";
+
+/// 이 엔트리가 **우리가 실행한 문장**인가.
+///
+/// 두 신호를 본다:
+///
+/// 1. **계정** — 실시간 경로의 `Excludes.users` 와 같은 기준이다. 모니터 계정으로
+///    들어온 것은 애플리케이션 쿼리가 아니다.
+/// 2. **주석 태그** — 우리가 보내는 모든 문장에 `/* dbmon:<용도> */` 가 붙는다
+///    (`mysql::sql` 의 테스트가 그걸 강제한다). 계정이 달라도 이걸로 잡힌다.
+///
+/// **원문(마스킹 전)에서 판정해야 한다** — 리터럴 정책이 주석을 지울 수 있다.
+fn is_own_statement(sql: &str, db_user: Option<&str>, monitor_user: &str) -> bool {
+    if db_user.is_some_and(|u| u == monitor_user) {
+        return true;
+    }
+    sql.trim_start().starts_with(OWN_STATEMENT_TAG)
+}
+
 /// 슬로우 로그 텍스트를 파싱한다. **순수 함수** — 파일도 AWS 도 모른다.
 ///
 /// `min_duration_ms` 미만 엔트리는 버린다(위 모듈 문서 참고).
-pub fn parse(text: &str, min_duration_ms: i64) -> ParseOutcome {
+/// `monitor_user` 로 들어온 문장은 **우리 것이므로** 버린다([`SkipReason::OwnStatement`]).
+pub fn parse(text: &str, min_duration_ms: i64, monitor_user: &str) -> ParseOutcome {
     let mut outcome = ParseOutcome::default();
     let mut current: Option<Builder> = None;
 
@@ -124,7 +154,7 @@ pub fn parse(text: &str, min_duration_ms: i64) -> ParseOutcome {
         // **`# Time:` 이 새 엔트리를 시작하는지는 상태에 달렸다.** 아래 참고.
         if line.starts_with("# Time:") && current.as_ref().is_none_or(Builder::accepts_boundary) {
             if let Some(b) = current.take() {
-                push(&mut outcome, b, min_duration_ms);
+                push(&mut outcome, b, min_duration_ms, monitor_user);
             }
             let mut b = Builder::default();
             b.feed(line);
@@ -137,7 +167,7 @@ pub fn parse(text: &str, min_duration_ms: i64) -> ParseOutcome {
         // `# Time:` 앞의 텍스트(서버 기동 배너)는 버린다.
     }
     if let Some(b) = current.take() {
-        push(&mut outcome, b, min_duration_ms);
+        push(&mut outcome, b, min_duration_ms, monitor_user);
     }
     outcome
 }
@@ -148,8 +178,13 @@ fn lines_of(text: &str) -> impl Iterator<Item = &str> {
         .map(|raw| raw.trim_end_matches(['\n', '\r']))
 }
 
-fn push(outcome: &mut ParseOutcome, b: Builder, min_duration_ms: i64) {
+fn push(outcome: &mut ParseOutcome, b: Builder, min_duration_ms: i64, monitor_user: &str) {
     match b.finish(min_duration_ms) {
+        // **우리 문장은 버린다.** 다른 스킵 사유를 다 통과한 뒤에 보는 이유는 사유
+        // 카운트가 "왜 안 들어왔나" 를 정확히 말해야 하기 때문이다.
+        Ok(entry) if is_own_statement(&entry.sql_text, entry.db_user.as_deref(), monitor_user) => {
+            outcome.skipped.push(SkipReason::OwnStatement);
+        }
         Ok(entry) => outcome.entries.push(entry),
         Err(reason) => outcome.skipped.push(reason),
     }
@@ -472,6 +507,51 @@ fn int_field(line: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// 이 테스트들의 로그에는 이 계정이 나오지 않는다 — 자기 배제가 결과를 바꾸지 않게.
+    const MONITOR_USER: &str = "dbmon-monitor-account";
+
+    /// **우리가 돌린 문장이 화면에 들어오면 안 된다.**
+    ///
+    /// 플랜 재실행(`EXPLAIN FORMAT=JSON <원문>`)이 임계값을 넘으면 MySQL 이 슬로우로그에
+    /// 쓴다. 그걸 그대로 저장하면 목록·다이제스트·통계가 **우리 자신의 문장으로
+    /// 오염된다** — 실측으로 로컬 100행 중 34행이 그랬다(사용자가 화면을 보고 지적).
+    /// 실시간 경로는 `Excludes.users` 로 이미 같은 일을 한다.
+    #[test]
+    fn our_own_statements_are_dropped() {
+        let log = "\
+# Time: 2026-08-20T15:00:00.000000Z
+# User@Host: dbmon[dbmon] @  [10.0.0.5]  Id:   101
+# Query_time: 3.000000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 900000
+SET timestamp=1787238000;
+/* dbmon:planrerun */ EXPLAIN FORMAT=JSON SELECT count(*) FROM orders WHERE status = 'x';
+# Time: 2026-08-20T15:00:10.000000Z
+# User@Host: app[app] @  [10.0.0.9]  Id:   102
+# Query_time: 4.000000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 900000
+SET timestamp=1787238010;
+SELECT count(*) FROM orders WHERE status = 'x';
+";
+        // ① 모니터 계정으로 들어온 것은 버린다.
+        let out = parse(log, 1_000, "dbmon");
+        assert_eq!(out.entries.len(), 1, "우리 문장이 들어왔다");
+        assert_eq!(out.entries[0].db_user.as_deref(), Some("app"));
+        assert_eq!(out.skip_counts().get("own_statement").copied(), Some(1));
+
+        // ② 계정이 달라도 **우리 주석 태그**로 잡는다 — 인스턴스마다 모니터 계정을
+        //    다르게 쓰거나 설정이 어긋난 경우에도 오염되지 않아야 한다.
+        let out = parse(log, 1_000, "someone-else");
+        assert_eq!(out.entries.len(), 1, "태그로도 잡지 못했다");
+        assert_eq!(out.entries[0].db_user.as_deref(), Some("app"));
+        assert_eq!(out.skip_counts().get("own_statement").copied(), Some(1));
+
+        // ③ 애플리케이션이 우연히 `EXPLAIN` 을 돌리는 것은 **버리지 않는다** —
+        //    그건 진짜 슬로우 쿼리다.
+        let app_explain = log
+            .replace("/* dbmon:planrerun */ ", "")
+            .replace("dbmon[dbmon]", "app2[app2]");
+        let out = parse(&app_explain, 1_000, "dbmon");
+        assert_eq!(out.entries.len(), 2);
+    }
+
     use super::*;
 
     /// 실측한 실제 로그 조각. **손으로 만든 예시가 아니다.**
@@ -485,7 +565,7 @@ SELECT /* c26-probe */ SLEEP(8);
 
     #[test]
     fn parses_the_measured_entry() {
-        let out = parse(MEASURED, 1_000);
+        let out = parse(MEASURED, 1_000, MONITOR_USER);
         assert_eq!(out.skipped.len(), 0, "{:?}", out.skipped);
         let e = &out.entries[0];
 
@@ -508,7 +588,7 @@ SELECT /* c26-probe */ SLEEP(8);
     /// 그대로 반환해도 통과했다(2차 리뷰가 지적). 정확한 값을 단정한다.
     #[test]
     fn start_time_is_exactly_end_minus_duration() {
-        let e = &parse(MEASURED, 1_000).entries[0];
+        let e = &parse(MEASURED, 1_000, MONITOR_USER).entries[0];
         assert_eq!(
             e.started_at_ms,
             e.ended_at_ms - e.duration_ms,
@@ -546,7 +626,7 @@ SELECT /* burst-c */ SLEEP(0.2);
     /// 측정으로 확인했다.
     #[test]
     fn each_entry_carries_its_own_time_header_even_within_one_second() {
-        let out = parse(BURST, 0);
+        let out = parse(BURST, 0, MONITOR_USER);
         assert_eq!(out.entries.len(), 3, "{:?}", out.skip_counts());
         // 완료 시각이 서로 다르다 — 마이크로초까지 기록된다.
         let ends: Vec<i64> = out.entries.iter().map(|e| e.ended_at_ms).collect();
@@ -561,13 +641,13 @@ SELECT /* burst-c */ SLEEP(0.2);
     /// 서버의 `long_query_time` 은 우리가 통제하지 않으므로 여기서 막는다.
     #[test]
     fn sub_threshold_entries_are_dropped_to_prevent_silent_merging() {
-        let out = parse(BURST, 1_000);
+        let out = parse(BURST, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 0, "임계값 미만이 통과했다");
         assert_eq!(out.skipped.len(), 3);
         assert_eq!(out.skip_counts().get("below_threshold"), Some(&3));
 
         // 그리고 그 위험이 실재함을 고정한다: 같은 초 + 같은 스레드다.
-        let all = parse(BURST, 0);
+        let all = parse(BURST, 0, MONITOR_USER);
         let secs: Vec<i64> = all
             .entries
             .iter()
@@ -586,7 +666,7 @@ SELECT /* burst-c */ SLEEP(0.2);
              Tcp port: 3306  Unix socket: /var/run/mysqld/mysqld.sock\n\
              Time                 Id Command    Argument\n{MEASURED}"
         );
-        let out = parse(&text, 1_000);
+        let out = parse(&text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
             out.skipped.len(),
@@ -608,7 +688,7 @@ SELECT /* burst-c */ SLEEP(0.2);
 # Query_time: 8.0  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
 SELECT 1;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 0, "시간대 없는 시각을 UTC 로 읽었다");
         assert_eq!(out.skip_counts().get("bad_timestamp"), Some(&1));
     }
@@ -622,7 +702,7 @@ SELECT 1;
 # Query_time: 8.0  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
 SELECT 1;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
         // +09:00 22:48:54 == UTC 13:48:54
         assert_eq!(out.entries[0].ended_at_ms, 1_787_147_334_659);
@@ -637,7 +717,7 @@ SELECT 1;
 # Query_time: 2.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 0
 # administrator command: Quit;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 0);
         assert_eq!(out.skip_counts().get("admin_command"), Some(&1));
     }
@@ -659,7 +739,7 @@ SELECT 1;
 use shop;
 SELECT a FROM t;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
         let e = &out.entries[0];
         assert_eq!(e.rows_examined, Some(900_000));
@@ -681,7 +761,7 @@ SELECT a,
   FROM t
  WHERE c = 1;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
         let sql = &out.entries[0].sql_text;
         assert!(sql.contains("SELECT a,"), "{sql}");
@@ -699,7 +779,7 @@ SELECT a,
 # Query_time: 3.0  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
 SELECT 1;
 ";
-        let out = parse(no_id, 1_000);
+        let out = parse(no_id, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 0);
         assert_eq!(out.skip_counts().get("missing_header"), Some(&1));
 
@@ -709,7 +789,7 @@ SELECT 1;
 # User@Host: u[u] @ h []  Id: 1
 SELECT 1;
 ";
-        assert_eq!(parse(no_time, 1_000).entries.len(), 0);
+        assert_eq!(parse(no_time, 1_000, MONITOR_USER).entries.len(), 0);
     }
 
     /// SQL 이 없으면 버린다 — 빈 문장을 저장하면 다이제스트가 오염된다.
@@ -720,7 +800,7 @@ SELECT 1;
 # User@Host: u[u] @ h []  Id: 1
 # Query_time: 3.0  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 0);
         assert_eq!(out.skip_counts().get("empty_sql"), Some(&1));
     }
@@ -734,7 +814,7 @@ SELECT 1;
 # Query_time: 3.0  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
 SELECT 1;
 ";
-        let e = &parse(text, 1_000).entries[0];
+        let e = &parse(text, 1_000, MONITOR_USER).entries[0];
         assert_eq!(e.db_host.as_deref(), Some("10.0.3.44"));
         assert_eq!(e.db_user.as_deref(), Some("app"));
         assert_eq!(e.thread_id, 42);
@@ -748,7 +828,7 @@ SELECT 1;
     fn degenerate_input_is_skipped_with_a_reason() {
         // 엔트리 경계가 없는 입력 — 조각조차 아니다.
         for text in ["", "\n", "쓰레기", "SELECT 1;"] {
-            let out = parse(text, 1_000);
+            let out = parse(text, 1_000, MONITOR_USER);
             assert!(out.entries.is_empty(), "{text:?} 에서 엔트리가 나왔다");
             assert!(out.skipped.is_empty(), "{text:?} 를 엔트리로 셌다");
         }
@@ -758,7 +838,7 @@ SELECT 1;
             "# Time: \n# Query_time:",
             "# Time: 깨짐\nSELECT 1;",
         ] {
-            let out = parse(text, 1_000);
+            let out = parse(text, 1_000, MONITOR_USER);
             assert!(out.entries.is_empty(), "{text:?} 에서 엔트리가 나왔다");
             assert!(
                 !out.skipped.is_empty(),
@@ -782,7 +862,7 @@ SELECT a
 # 이건 사용자 주석이다
   FROM t;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
         let sql = &out.entries[0].sql_text;
         assert!(
@@ -813,7 +893,7 @@ SELECT SLEEP(3) /*
 use 유출된스키마;
 */;
 ";
-        let out = parse(text, 1_000);
+        let out = parse(text, 1_000, MONITOR_USER);
         assert_eq!(
             out.entries.len(),
             1,
@@ -853,7 +933,7 @@ use 유출된스키마;
 SET timestamp=1787147326;
 SELECT 1;
 ";
-        let e = &parse(text, 1_000).entries[0];
+        let e = &parse(text, 1_000, MONITOR_USER).entries[0];
         assert_eq!(
             e.db_user, None,
             "공백을 포함한 계정명을 통과시켰다 — 정책을 우회해 저장된다"
@@ -876,12 +956,12 @@ SELECT 1;
                  SET timestamp=1787147326;\n\
                  SELECT 1;\n"
             );
-            let out = parse(&text, 1_000);
+            let out = parse(&text, 1_000, MONITOR_USER);
             assert_eq!(out.entries.len(), 0, "Query_time={qt} 를 통과시켰다");
         }
         // 정상 범위는 통과한다 (24시간 이내).
         let ok = MEASURED;
-        assert_eq!(parse(ok, 1_000).entries.len(), 1);
+        assert_eq!(parse(ok, 1_000, MONITOR_USER).entries.len(), 1);
     }
 
     /// 여러 엔트리가 섞여도 각각 독립적으로 처리된다 —
@@ -896,7 +976,7 @@ SELECT 1;
 SELECT 2;
 {MEASURED}"
         );
-        let out = parse(&text, 1_000);
+        let out = parse(&text, 1_000, MONITOR_USER);
         assert_eq!(out.entries.len(), 2, "좋은 엔트리를 버렸다");
         assert_eq!(out.skip_counts().get("bad_timestamp"), Some(&1));
     }

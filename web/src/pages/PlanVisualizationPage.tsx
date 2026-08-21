@@ -19,6 +19,9 @@ import { EnvChip } from "../components/Shell";
 import {
   BTN_GHOST,
   CELL_ICON,
+  COL_GROW,
+  COL_TIGHT,
+  COL_TIGHT_CAPPED,
   LABEL,
   MONO,
   PAGE_TITLE,
@@ -119,12 +122,14 @@ export function PlanVisualizationPage() {
             <table className={TABLE}>
               <thead>
                 <tr>
-                  <th className={TH}>Created At</th>
-                  <th className={TH_NUM}>Thread</th>
-                  <th className={TH}>Instance</th>
-                  <th className={TH}>Schema</th>
-                  <th className={TH_NUM}>Time</th>
-                  <th className={TH}>Query</th>
+                  {/* **짧은 열은 내용 폭만.** 남는 폭은 Query 가 받는다 — 표에서
+                      정보량이 가장 큰 열이 가장 넓어야 한다. */}
+                  <th className={`${TH} ${COL_TIGHT}`}>Created At</th>
+                  <th className={`${TH_NUM} ${COL_TIGHT}`}>Thread</th>
+                  <th className={`${TH} ${COL_TIGHT_CAPPED}`}>Instance</th>
+                  <th className={`${TH} ${COL_TIGHT_CAPPED}`}>Schema</th>
+                  <th className={`${TH_NUM} ${COL_TIGHT}`}>Time</th>
+                  <th className={`${TH} ${COL_GROW}`}>Query</th>
                 </tr>
               </thead>
               <tbody className={TBODY}>
@@ -142,33 +147,35 @@ export function PlanVisualizationPage() {
                       }`}
                       onClick={() => update("record", q.record_id)}
                     >
-                      <td className={TD}>
+                      <td className={`${TD} ${COL_TIGHT}`}>
                         <span className="flex items-center">
                           <Calendar className={CELL_ICON} />
                           {fmtListTime(q.started_at_ms, tz, nowMs)}
                         </span>
                       </td>
-                      <td className={TD_NUM}>
+                      <td className={`${TD_NUM} ${COL_TIGHT}`}>
                         <span className="flex items-center justify-end">
                           <Hash className={CELL_ICON} />
                           {q.thread_id}
                         </span>
                       </td>
-                      <td className={TD} title={q.instance_id}>
+                      <td className={`${TD} ${COL_TIGHT_CAPPED}`} title={q.instance_id}>
                         <span className="flex items-center gap-1">
                           <Database className={CELL_ICON} />
                           {shortInstance(q.instance_id)}
                           <EnvChip env={q.env} />
                         </span>
                       </td>
-                      <td className={TD}>{q.schema_name ?? EMPTY}</td>
-                      <td className={TD_NUM}>
+                      <td className={`${TD} ${COL_TIGHT}`}>{q.schema_name ?? EMPTY}</td>
+                      <td className={`${TD_NUM} ${COL_TIGHT}`}>
                         <span className="flex items-center justify-end">
                           <Clock className={CELL_ICON} />
                           {(q.duration_ms / 1000).toFixed(1)}s
                         </span>
                       </td>
-                      <td className="max-w-[560px] px-3 py-2 text-sm text-gray-700">
+                      {/* 남는 폭을 전부 받는다. `max-w-0` + `truncate` 조합이 있어야
+                          긴 SQL 이 표를 밀어내지 않고 잘린다. */}
+                      <td className={`${COL_GROW} max-w-0 px-3 py-2 text-sm text-gray-700`}>
                         <div className="truncate font-mono text-xs">
                           {q.sql_text ?? "(SQL 미저장)"}
                         </div>

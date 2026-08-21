@@ -401,7 +401,12 @@ async fn backfill_round(
             // 계속 뒤처지면 그걸 알아야 한다.
             total.incomplete += 1;
         }
-        let mut parsed = dbmon::slowlog::parse(&chunk.text, min_ms);
+        // **우리 계정으로 들어온 문장은 버린다.** 플랜 재실행(`EXPLAIN FORMAT=JSON`)이
+        // 임계값을 넘으면 MySQL 이 슬로우로그에 쓰고, 그걸 그대로 저장하면 화면·통계가
+        // **우리 자신의 문장으로 오염된다**(실측: 100행 중 34행). 실시간 경로는
+        // `Excludes.users` 로 이미 같은 일을 한다.
+        let mut parsed =
+            dbmon::slowlog::parse(&chunk.text, min_ms, &config.collector.monitor_db_user);
         // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
         //
         // 파일 소스는 파일 전체를 준다. 그대로 병합하면 매 라운드 같은 수천 건을
