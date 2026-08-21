@@ -54,6 +54,12 @@ const FORMAT_RETRIES: usize = 1;
 /// 정상 경로는 이 상한에 닿지 않는다.
 const TUNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// **요청 경로 전체**의 상한. API 핸들러가 이 값으로 감싼다.
+///
+/// 모델 데드라인([`TUNING_DEADLINE`])보다 조금 크다 — 앞뒤의 스키마 조회·저장에
+/// 여유를 주되 ALB 유휴 타임아웃(300초)보다는 넉넉히 작아야 한다.
+pub const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(200);
+
 pub struct TuningService {
     pub registry: Arc<crate::store::registry::DynamoInstanceRegistry>,
     pub advice: Arc<DynamoTuningStore>,

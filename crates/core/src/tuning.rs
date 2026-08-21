@@ -401,6 +401,41 @@ fn scan(sql: &str) -> Scanned {
     }
 }
 
+/// 마스킹 사본으로 토큰을 나누고 **원문의 같은 자리**를 함께 준다.
+///
+/// # 왜 두 문자열을 나란히 보나 (4차 교차 리뷰)
+///
+/// 인용 안의 글자는 토큰이 아니다. 그래서 키워드는 마스킹 사본에서 찾아야 하는데
+/// (`ON` 이 인덱스 이름 안에 있는 경우), **값은 원문에서** 읽어야 한다(대상 테이블 이름).
+///
+/// `scan` 의 마스킹은 문자 하나를 `_` 하나로 바꾸므로 두 문자열의 길이와 자리가
+/// 정확히 같다. 인용 안의 공백도 `_` 가 되므로 ``​`my table`​`` 은 **한 토큰**이다 —
+/// 공백이 든 식별자가 쪼개지지 않는다.
+fn tokens_with_source(masked: &str, source: &str) -> Vec<(String, String)> {
+    let m: Vec<char> = masked.chars().collect();
+    let src: Vec<char> = source.chars().collect();
+    debug_assert_eq!(m.len(), src.len(), "마스킹 사본과 원문의 길이가 다르다");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < m.len() {
+        if m[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < m.len() && !m[i].is_whitespace() {
+            i += 1;
+        }
+        out.push((
+            m[start..i].iter().collect::<String>().to_ascii_uppercase(),
+            src.get(start..i)
+                .map(|s| s.iter().collect::<String>())
+                .unwrap_or_default(),
+        ));
+    }
+    out
+}
+
 /// 모델이 준 DDL 이 **인덱스를 하나 만드는 문장인가.**
 ///
 /// # 왜 금지어 목록이 아닌가 (교차 리뷰가 high 로 잡았다)
@@ -463,13 +498,31 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
     // `INDEX|KEY` 는 **선택 사항**이다: `ADD UNIQUE (a)` 와
     // `ADD CONSTRAINT uq UNIQUE (a)` 도 유효한 인덱스 추가다(3차 교차 리뷰가 정상
     // 문장을 거부한다고 지적했다).
-    let alter = up.starts_with("ALTER TABLE ")
-        && (up.contains(" ADD INDEX ")
-            || up.contains(" ADD KEY ")
-            || up.contains(" ADD UNIQUE")
-            || up.contains(" ADD FULLTEXT")
-            || up.contains(" ADD SPATIAL")
-            || (up.contains(" ADD CONSTRAINT ") && up.contains(" UNIQUE")))
+    // **토큰 순서로 본다.** `ADD CONSTRAINT unique_fk FOREIGN KEY …` 는 제약 **이름**에
+    // `UNIQUE` 가 들어 있어 문자열 검사를 통과했다(4차 교차 리뷰가 medium 으로 잡았다).
+    let toks: Vec<String> = tokens_with_source(&scanned.keywords_only, &scanned.without_comments)
+        .into_iter()
+        .map(|(kw, _)| kw)
+        .collect();
+    let adds_index = toks.windows(2).enumerate().any(|(i, w)| {
+        if w[0] != "ADD" {
+            return false;
+        }
+        // `ADD INDEX|KEY|UNIQUE|FULLTEXT|SPATIAL …`
+        let direct = matches!(
+            w[1].trim_start_matches('(').trim_end_matches('('),
+            "INDEX" | "KEY" | "UNIQUE" | "FULLTEXT" | "SPATIAL"
+        ) || w[1].starts_with("UNIQUE(")
+            || w[1].starts_with("INDEX(")
+            || w[1].starts_with("KEY(");
+        // `ADD CONSTRAINT <이름> UNIQUE …` — 이름 **다음** 토큰이 UNIQUE 여야 한다.
+        let named = w[1] == "CONSTRAINT"
+            && toks
+                .get(i + 3)
+                .is_some_and(|t| t == "UNIQUE" || t.starts_with("UNIQUE("));
+        direct || named
+    });
+    let alter = up.starts_with("ALTER TABLE ") && adds_index
         // ④ 동작이 하나여야 한다. 괄호 밖 쉼표는 두 번째 동작이다
         //    (`ADD INDEX ix (a), DROP COLUMN x` / `…, RENAME TO other`).
         && !scanned.top_level_comma
@@ -609,25 +662,47 @@ fn resolve_table(name: &str, known: &[String]) -> Option<String> {
 fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
     let scanned = scan(ddl);
     let sql = scanned.without_comments.trim().to_string();
-    let target = ddl_target_table(&sql)?;
-    let bare_expected = bare_name(table);
-    let bare_target = bare_name(&target);
-    if !bare_target.eq_ignore_ascii_case(&bare_expected) {
+    // **파싱 실패는 거부한다.** 대상을 못 찾으면 무엇을 만드는 문장인지 모른다.
+    let Some(target) = ddl_target_table(&scanned) else {
+        return Some("DDL 에서 대상 테이블을 찾을 수 없다".to_string());
+    };
+    // **스키마를 명시했으면 스키마까지 같아야 한다.** `archive.orders` 를 `shop.orders`
+    // 로 보면 다른 스키마의 테이블을 고치는 문장을 통과시킨다(4차 교차 리뷰).
+    let target_clean = target.trim().trim_matches('`').to_string();
+    let same = if target_clean.contains('.') {
+        // 양쪽의 조각을 각각 인용 없이 비교한다.
+        let norm = |q: &str| {
+            q.split('.')
+                .map(|p| p.trim().trim_matches('`').to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        norm(&target_clean) == norm(table)
+    } else {
+        bare_name(&target_clean).eq_ignore_ascii_case(&bare_name(table))
+    };
+    if !same {
         return Some(format!(
-            "DDL 의 대상이 `{target}` 인데 설명은 `{table}` 이다"
+            "DDL 의 대상이 `{target_clean}` 인데 설명은 `{table}` 이다"
         ));
     }
-    // 키파트(첫 괄호 그룹)의 이름들.
-    let parts = ddl_key_parts(&sql);
+    // 키파트(첫 괄호 그룹)의 이름들 + 그 그룹의 원문.
+    let (parts, group) = ddl_key_parts(&sql);
     if parts.is_empty() {
         return Some("DDL 에서 인덱스 컬럼을 찾을 수 없다".to_string());
     }
+    let group_up = group.to_ascii_uppercase();
     for c in columns {
         let name = column_name(c);
         if name.is_empty() {
             continue;
         }
-        if !parts.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+        let exact = parts.iter().any(|p| p.eq_ignore_ascii_case(&name));
+        // **함수 인덱스는 이름이 식으로 감싸여 있다** (`((id + 1))`). 그때는 그
+        // 괄호 그룹 **안에** 이름이 나오면 인정한다 — 그룹 밖(인덱스 이름·다른 테이블)은
+        // 여전히 통하지 않으므로 `ON payments(secret)` 류는 계속 걸린다.
+        let inside = group_up.contains(&name.to_ascii_uppercase());
+        if !exact && !inside {
             return Some(format!("DDL 의 인덱스 컬럼에 `{name}` 이 없다"));
         }
     }
@@ -652,25 +727,30 @@ fn column_name(raw: &str) -> String {
 }
 
 /// DDL 의 대상 테이블. `ON <t>` 또는 `ALTER TABLE <t>`.
-fn ddl_target_table(sql: &str) -> Option<String> {
-    let tokens: Vec<&str> = sql.split_whitespace().collect();
-    let up: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
+///
+/// **인용 안의 `ON` 에 속지 않는다.** ``CREATE INDEX `x ON shop.orders` ON payments(a)``
+/// 에서 첫 `ON` 을 인덱스 이름 안에서 찾으면 실제 대상(`payments`)을 놓친다
+/// (4차 교차 리뷰가 high 로 잡았다).
+fn ddl_target_table(scanned: &Scanned) -> Option<String> {
+    let toks = tokens_with_source(&scanned.keywords_only, &scanned.without_comments);
     // `ALTER TABLE <t>`
-    if up.first().map(String::as_str) == Some("ALTER") && up.get(1).map(String::as_str) == Some("TABLE") {
-        return tokens.get(2).map(|t| t.trim_end_matches('(').to_string());
+    if toks.first().map(|(k, _)| k.as_str()) == Some("ALTER")
+        && toks.get(1).map(|(k, _)| k.as_str()) == Some("TABLE")
+    {
+        return toks.get(2).map(|(_, src)| src.trim_end_matches('(').to_string());
     }
-    // `CREATE … INDEX <name> ON <t> (…)` — 첫 `ON` 다음 토큰.
-    let on = up.iter().position(|t| t == "ON")?;
-    tokens
-        .get(on + 1)
-        .map(|t| t.split('(').next().unwrap_or(t).to_string())
+    // `CREATE … INDEX <name> ON <t> (…)` — **키워드로서의** 첫 `ON` 다음 토큰.
+    let on = toks.iter().position(|(k, _)| k == "ON")?;
+    toks.get(on + 1)
+        .map(|(_, src)| src.split('(').next().unwrap_or(src).to_string())
 }
 
-/// 첫 괄호 그룹의 이름들 = 인덱스 키파트.
-fn ddl_key_parts(sql: &str) -> Vec<String> {
+/// 첫 괄호 그룹의 이름들 = 인덱스 키파트. 그룹 **원문**도 함께 준다
+/// (함수 인덱스처럼 이름이 식 안에 있는 경우를 위해).
+fn ddl_key_parts(sql: &str) -> (Vec<String>, String) {
     let open = match sql.find('(') {
         Some(i) => i,
-        None => return Vec::new(),
+        None => return (Vec::new(), String::new()),
     };
     // 짝이 맞는 닫는 괄호를 찾는다(함수 인덱스의 중첩 괄호 때문에 깊이를 센다).
     let mut depth = 0usize;
@@ -689,9 +769,10 @@ fn ddl_key_parts(sql: &str) -> Vec<String> {
         }
     }
     let Some(end) = end else {
-        return Vec::new();
+        return (Vec::new(), String::new());
     };
-    sql[open + 1..end]
+    let group = sql[open + 1..end].to_string();
+    let parts = group
         .split(',')
         .map(|part| {
             // `status ASC`·`memo(20)`·`(id + 1)` 같은 형태에서 첫 이름만 뽑는다.
@@ -700,7 +781,8 @@ fn ddl_key_parts(sql: &str) -> Vec<String> {
             column_name(first)
         })
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect();
+    (parts, group)
 }
 
 /// 이 테이블의 명세에 없는 컬럼. 명세가 없으면(스키마 조회 실패) `None` —
@@ -1351,6 +1433,93 @@ mod tests {
         };
         let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
         assert_eq!(advice.indexes.len(), 1, "{:?}", advice.caveats);
+    }
+
+    /// **4차 교차 리뷰가 찾은 우회들.** 인용 안의 키워드와 제약 이름으로 속이는 경로다.
+    #[test]
+    fn token_aware_checks_close_the_remaining_bypasses() {
+        // ① 인용 안의 `ON` 으로 대상 테이블을 숨긴다.
+        let mut orders = spec("shop", "orders");
+        orders.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let mut payments = spec("shop", "payments");
+        payments.create_ddl = Some("CREATE TABLE `payments` (`status` varchar(20))".into());
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX `x ON shop.orders` ON payments(status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders.clone(), payments]), "m", 1).expect("검증");
+        assert!(
+            advice.indexes.is_empty(),
+            "인용 안의 ON 으로 대상을 숨겼다: {:?}",
+            advice.indexes
+        );
+
+        // ② 제약 **이름**에 UNIQUE 를 넣어 FOREIGN KEY 를 통과시킨다.
+        assert!(
+            !is_index_creation_ddl(
+                "ALTER TABLE orders ADD CONSTRAINT unique_fk FOREIGN KEY (customer_id) REFERENCES customers(id)"
+            ),
+            "제약 이름의 UNIQUE 로 FOREIGN KEY 가 통과했다"
+        );
+        // 정식 UNIQUE 제약은 통과한다.
+        assert!(is_index_creation_ddl(
+            "ALTER TABLE orders ADD CONSTRAINT uq_status UNIQUE (status)"
+        ));
+
+        // ③ 명시한 스키마가 다르면 거부한다.
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "ALTER TABLE archive.orders ADD INDEX ix (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders.clone()]), "m", 1).expect("검증");
+        assert!(advice.indexes.is_empty(), "다른 스키마의 테이블을 고치는 문장이 통과했다");
+
+        // ④ 공백이 든 백틱 식별자를 쪼개지 않는다.
+        let mut spaced = spec("shop", "my table");
+        spaced.create_ddl = Some("CREATE TABLE `my table` (`status` varchar(20))".into());
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.my table".into(),
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX ix ON `my table` (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![spaced]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "공백이 든 식별자를 쪼갰다: {:?}", advice.caveats);
+    }
+
+    /// **함수 인덱스를 거부하지 않는다.** 이름이 식 안에 있어도 그 그룹 안이면 인정한다.
+    #[test]
+    fn functional_indexes_are_not_rejected() {
+        let mut orders = spec("shop", "orders");
+        orders.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["id".into()],
+                ddl: "CREATE INDEX ix ON orders ((id + 1))".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "함수 인덱스를 버렸다: {:?}", advice.caveats);
     }
 
     /// **명시한 스키마를 갈아치우지 않는다.** `archive.orders` 는 `shop.orders` 가 아니다.

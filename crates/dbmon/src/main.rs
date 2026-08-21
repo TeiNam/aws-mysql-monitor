@@ -251,6 +251,11 @@ fn spawn_settings_poller(
     let budget = interval.saturating_sub(Duration::from_millis(500)).max(Duration::from_secs(2));
     tokio::spawn(async move {
         loop {
+            // **주기를 고정한다.** 조회에 쓴 시간을 다음 대기에서 빼지 않으면,
+            // 예산 직전까지 걸린 조회 뒤에 전체 주기를 다시 자면서 **캐시가 만료된다**
+            // (4차 교차 리뷰가 medium 으로 잡았다: 10초 주기 + 9.5초 조회 → 다음 조회가
+            // 29.5초, TTL 30초에 0.5초만 남는다).
+            let started = tokio::time::Instant::now();
             // **셧다운과 함께 기다린다.** 첫 조회도 예외가 아니다 — 그러지 않으면
             // 기동 직후 종료 신호가 조회 끝까지 막힌다.
             let refreshed = tokio::select! {
@@ -265,8 +270,13 @@ fn spawn_settings_poller(
                 Some(Ok(())) => {}
                 None => break,
             }
+            let rest = interval.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                // 조회가 주기를 다 먹었다 — 쉬지 않고 바로 다시 시도한다(신선함이 우선).
+                continue;
+            }
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(rest) => {}
                 _ = shutdown.wait() => break,
             }
         }
@@ -745,6 +755,19 @@ async fn discover(
                 }
             }
         }
+    }
+
+    // **끝까지 읽은 범위가 하나도 없으면 부분 결과다.**
+    //
+    // 재조정은 `scanned_scope` 가 비어 있으면 "시야를 알 수 없다" 로 보고 판정을 그대로
+    // 한다(옛 호출부 호환). 전 범위가 실패해서 비었을 때도 같은 값이므로, 그대로 두면
+    // **등록부 전체가 미발견 → 삭제**로 간다 — 시야 개념을 도입하면서 만든 회귀다.
+    //
+    // 정상적으로 0대인 리전은 영향받지 않는다: 조회가 성공하면 인스턴스가 없어도
+    // 위에서 시야에 들어간다.
+    if outcome.scanned_scope.is_empty() {
+        tracing::warn!("끝까지 읽은 범위가 없다 — 부분 결과로 처리한다(삭제 판정 없음)");
+        outcome.truncated = true;
     }
     outcome
 }

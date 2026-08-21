@@ -101,7 +101,39 @@ pub async fn post_tuning(
     };
     let now_ms = SystemClock.now_ms();
 
-    let generated = svc.generate(&record, now_ms).await.map_err(|e| {
+    // **경로 전체를 하나의 상한 안에 둔다.**
+    //
+    // 서비스 안쪽에도 모델 호출 데드라인이 있지만, 그 앞뒤(설정·등록부 조회, 대상 DB
+    // 접속·스키마 조회, 결과 저장)는 그 밖이다. 어느 하나가 매달리면 요청이 ALB 유휴
+    // 타임아웃(300초)까지 남아 504 가 되고, 504 는 사유를 말해 주지 않는다
+    // (4차 교차 리뷰가 medium 으로 잡았다).
+    let generated = match tokio::time::timeout(
+        crate::tuning::REQUEST_DEADLINE,
+        svc.generate(&record, now_ms),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                subject = %ctx.subject,
+                record = %record.record_id.as_str(),
+                budget_secs = crate::tuning::REQUEST_DEADLINE.as_secs(),
+                "튜닝 생성이 상한을 넘겼다"
+            );
+            return Err(ApiError::with_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                "tuning_timeout",
+                serde_json::json!({
+                    "reason": format!(
+                        "{}초 안에 끝나지 않았다 — 대상 DB 접속이나 모델 응답이 지연됐다",
+                        crate::tuning::REQUEST_DEADLINE.as_secs()
+                    )
+                }),
+            ));
+        }
+    };
+    let generated = generated.map_err(|e| {
         // **사유를 구분해 코드로 준다.** "실패했다" 하나로는 사용자가 무엇을 고칠지
         // 알 수 없다 — 설정을 켜는 일과 권한을 얻는 일은 완전히 다르다.
         let (status, code, detail) = match &e {

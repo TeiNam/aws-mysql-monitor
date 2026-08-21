@@ -59,30 +59,7 @@ impl SettingsState {
     /// 캐시를 무시하고 읽는다.
     pub async fn refresh(&self, now_ms: EpochMs) -> AppSettings {
         match self.store.load().await {
-            Ok(s) => {
-                let mut c = self.cache.lock().expect("settings cache");
-                // **버전이 낮은 값으로 덮지 않는다.**
-                //
-                // 폴러가 v1 을 읽는 도중 관리자가 v2 를 저장하면, 늦게 끝난 읽기가
-                // 캐시를 v1 로 되돌린다 — 인증을 켠 것이 TTL 동안 무효가 된다
-                // (3차 교차 리뷰가 high 로 잡았다). 버전은 저장마다 오르므로
-                // 비교만으로 순서를 회복할 수 있다.
-                if s.version >= c.settings.version {
-                    c.settings = s.clone();
-                    // **성공 시각은 끝난 시각이다.** 시작 시각을 쓰면 30초 걸린 조회가
-                    // 완료 즉시 낡은 것이 된다.
-                    c.loaded_ms = Some(now_ms);
-                    c.last_error = None;
-                    s
-                } else {
-                    tracing::debug!(
-                        stale = s.version,
-                        current = c.settings.version,
-                        "늦게 끝난 설정 조회를 버린다 (더 새 값이 이미 있다)"
-                    );
-                    c.settings.clone()
-                }
-            }
+            Ok(s) => self.apply(s, now_ms),
             Err(e) => {
                 let last = self.cached();
                 tracing::warn!(
@@ -99,6 +76,39 @@ impl SettingsState {
         }
     }
 
+    /// 캐시에 값을 적용한다. **모든 경로가 이 함수를 지난다** (조회·폴러·저장).
+    ///
+    /// # 왜 한 곳인가 (교차 리뷰가 세 번 지적했다)
+    ///
+    /// 세 경로가 각자 캐시를 쓰면 순서가 어긋난다:
+    ///
+    /// | 상황 | 각자 쓸 때 |
+    /// |---|---|
+    /// | 폴러가 v1 을 읽는 중 관리자가 v2 저장 | 늦게 끝난 v1 이 캐시를 되돌린다 |
+    /// | 이 워커가 v2 저장, 다른 워커가 v3 저장 → 폴러가 v3 캐시 | 늦은 v2 저장 응답이 v3 을 덮는다 |
+    /// | 같은 버전의 늦은 조회 | `loaded_ms` 를 과거로 되돌려 TTL 여유가 준다 |
+    ///
+    /// **인증이 그 캐시를 보므로** 되돌아간 값은 곧 되돌아간 인증이다. 버전은 저장마다
+    /// 오르므로 비교만으로 순서를 회복할 수 있고, 같은 버전이면 **더 늦은 시각**을 남긴다.
+    fn apply(&self, next: AppSettings, now_ms: EpochMs) -> AppSettings {
+        let mut c = self.cache.lock().expect("settings cache");
+        if next.version < c.settings.version {
+            tracing::debug!(
+                stale = next.version,
+                current = c.settings.version,
+                "늦게 도착한 설정을 버린다 (더 새 값이 이미 있다)"
+            );
+            return c.settings.clone();
+        }
+        // 같은 버전이면 내용도 같다(버전은 저장마다 오른다). 그래도 덮어쓴다 —
+        // "같으면 같다" 를 가정하는 대신 **더 오래된 것만** 버리는 규칙 하나로 둔다.
+        c.settings = next;
+        // 시각은 **더 늦은 쪽**이다 — 늦게 도착한 조회가 TTL 여유를 되돌리면 안 된다.
+        c.loaded_ms = Some(c.loaded_ms.map_or(now_ms, |prev| prev.max(now_ms)));
+        c.last_error = None;
+        c.settings.clone()
+    }
+
     /// 지금 읽고 **끝난 시각으로** 기록한다.
     ///
     /// `refresh(now)` 는 호출부가 준 시각을 쓰는데, 조회가 오래 걸리면 그 시각이
@@ -111,12 +121,7 @@ impl SettingsState {
         let now_ms = dbmon_core::time::SystemClock.now_ms();
         match loaded {
             Ok(s) => {
-                let mut c = self.cache.lock().expect("settings cache");
-                if s.version >= c.settings.version {
-                    c.settings = s;
-                    c.loaded_ms = Some(now_ms);
-                    c.last_error = None;
-                }
+                self.apply(s, now_ms);
             }
             Err(e) => {
                 tracing::warn!(
@@ -195,9 +200,8 @@ impl SettingsState {
             .store
             .save(settings, expected_version, by, now_ms)
             .await?;
-        let mut c = self.cache.lock().expect("settings cache");
-        c.settings = saved.clone();
-        c.loaded_ms = Some(now_ms);
+        // **같은 함수를 지난다.** 저장 응답이 늦게 도착해도 더 새 값을 덮지 않는다.
+        self.apply(saved.clone(), now_ms);
         Ok(saved)
     }
 }
@@ -344,6 +348,53 @@ mod tests {
         // TTL 안이지만 방금 저장한 값이 보여야 한다.
         assert_eq!(st.load(5_001).await.discovery.regions, vec!["ap-northeast-2"]);
         assert_eq!(f.loads.load(Ordering::SeqCst), 1, "저장 후 불필요한 재조회");
+    }
+
+    /// **늦게 도착한 옛 버전이 새 값을 덮지 않는다.**
+    ///
+    /// 세 경로(조회·폴러·저장)가 각자 캐시를 쓰면 순서가 어긋나고, 인증이 그 캐시를
+    /// 보므로 되돌아간 값은 곧 되돌아간 인증이다(4차 교차 리뷰가 high 로 잡았다).
+    #[tokio::test]
+    async fn a_late_older_version_never_overwrites_a_newer_one() {
+        let st = SettingsState::new(fake(false, AppSettings::default()));
+
+        let v3 = AppSettings {
+            version: 3,
+            auth: dbmon_core::settings::AuthSettings {
+                mode: dbmon_core::settings::AuthModeSetting::Token,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        st.apply(v3, 10_000);
+
+        // 늦게 도착한 v2 (`off`) — 버려야 한다.
+        let v2 = AppSettings {
+            version: 2,
+            auth: dbmon_core::settings::AuthSettings {
+                mode: dbmon_core::settings::AuthModeSetting::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        st.apply(v2, 11_000);
+        assert_eq!(
+            st.cached().auth.mode,
+            dbmon_core::settings::AuthModeSetting::Token,
+            "늦게 도착한 옛 버전이 인증을 되돌렸다"
+        );
+        assert_eq!(st.cached().version, 3);
+
+        // 같은 버전의 **더 이른** 시각은 신선함을 되돌리지 않는다.
+        let same = AppSettings {
+            version: 3,
+            ..Default::default()
+        };
+        st.apply(same, 1_000);
+        assert!(
+            st.cached_fresh(10_000 + CACHE_TTL_MS - 1).is_some(),
+            "늦게 도착한 조회가 TTL 여유를 과거로 되돌렸다"
+        );
     }
 
     #[tokio::test]
