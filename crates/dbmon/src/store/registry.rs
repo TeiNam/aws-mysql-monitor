@@ -21,7 +21,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use dbmon_core::error::{DomainError, Result};
 use dbmon_core::ids::InstanceId;
-use dbmon_core::instance::Instance;
+use dbmon_core::instance::{Instance, InstanceState};
 use dbmon_core::ports::InstanceRegistry;
 use dbmon_core::time::EpochMs;
 
@@ -250,6 +250,26 @@ impl InstanceRegistry for DynamoInstanceRegistry {
     /// 판정할 수 있고 그건 [`merge_discovered`] 의 일이다. 탐색 루프는 재발견 시
     /// `upsert(merge_discovered(..))` 를 쓴다 — 태그·엔드포인트·버전도 함께 갱신해야
     /// 하므로 그쪽이 본 경로다. 이 함수는 그 외 호출자를 위한 최소 갱신이다.
+    /// **상태 속성 하나만** 쓴다. 사본을 `upsert` 하면 그 사이 탐색이 갱신한 값을
+    /// 되돌린다(포트 주석 참고).
+    ///
+    /// `attribute_exists(PK)` 조건을 건다 — 등록부에 없는 인스턴스에 상태를 쓰면
+    /// **키만 있고 나머지가 빈 항목**이 생기고, `list()` 가 그걸 읽다 실패해 건너뛴다.
+    async fn set_state(&self, id: &InstanceId, state: InstanceState) -> Result<()> {
+        let mut req = self.client.update_item().table_name(&self.table);
+        for (k, v) in self.key(id) {
+            req = req.key(k, v);
+        }
+        req.update_expression("SET #s = :state")
+            .expression_attribute_names("#s", "state")
+            .expression_attribute_values(":state", AttributeValue::S(state.as_str().to_string()))
+            .condition_expression("attribute_exists(PK)")
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        Ok(())
+    }
+
     async fn mark_seen(&self, id: &InstanceId, now_ms: EpochMs) -> Result<()> {
         let mut req = self.client.update_item().table_name(&self.table);
         for (k, v) in self.key(id) {

@@ -17,7 +17,7 @@ import { useSearchParams } from "react-router";
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import {
-  CollectorControls,
+  CollectorBadge,
   CollectorFacts,
   useCollectorStatus,
 } from "../components/CollectorControls";
@@ -25,7 +25,6 @@ import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { EnvChip } from "../components/Shell";
-import { Sparkline } from "../components/Sparkline";
 import { SqlModal } from "../components/SqlModal";
 import { StateBadge } from "../components/StateBadge";
 import {
@@ -47,8 +46,7 @@ import {
 } from "../components/ui";
 import { useLive, useLiveMissed, useLiveSlowqSeen, useLiveTopics } from "../hooks/useLive";
 import { fetchInstances, fetchSlowQueries, queryKeys } from "../lib/api";
-import { EMPTY, fmtInt, fmtListTime, fmtRate, shortInstance, type Timezone } from "../lib/format";
-import { MAX_TOPICS } from "../lib/live-reduce";
+import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
 import type { InstanceView, SlowQueryView } from "../lib/types";
 
 /** 참조 대시보드와 같은 새로고침 간격. */
@@ -158,7 +156,7 @@ export function MySQLMonitorPage() {
         subtitle="= AWS Aurora for MySQL & RDS ="
       />
 
-      <ScraperStatus instances={instances.data ?? []} tz={tz} />
+      <ScraperStatus instances={instances.data ?? []} />
 
       <Card
         title={
@@ -383,24 +381,32 @@ export function MySQLMonitorPage() {
  * 이 백엔드는 **리스를 잡은 워커가 항상 수집한다** — 켜고 끄는 개념이 아니라
  * 리더 선출이다. 그래서 버튼을 흉내내지 않고, 실제로 흐르는 것을 보여준다:
  * 실시간 지표가 오고 있으면 그게 곧 "수집 중" 의 증거다.
+ *
+ * # 인스턴스별 지표 표는 여기 없다
+ *
+ * **Metrics 탭이 같은 목록을 더 잘 보여준다** — CloudWatch 열(CPU·메모리·스토리지)까지
+ * 붙는다. 같은 표를 두 화면에 두면 한쪽만 고치게 되고, 이 화면의 본론(슬로우 쿼리 목록)이
+ * 그만큼 아래로 밀린다.
+ *
+ * 그래도 이 조각은 남는다. **슬로우 쿼리 방송 구독이 여기 있고**, 없으면 목록이 주기를
+ * 기다려야만 갱신된다.
  */
-function ScraperStatus({ instances, tz }: { instances: InstanceView[]; tz: Timezone }) {
+function ScraperStatus({ instances }: { instances: InstanceView[] }) {
   const live = useLive();
   const status = useCollectorStatus();
-  // **지표와 슬로우 쿼리 방송을 함께 구독한다.**
+  // **슬로우 쿼리 방송만 구독한다.**
   //
-  // `status:` 만 구독하면 새 슬로우 쿼리 방송이 오지 않아 "주기를 기다리지 않고
-  // 즉시 다시 읽는다" 가 거짓말이 된다. 환경은 등록부에서 얻는다 — 목록을 손으로
-  // 적으면 없는 환경을 구독해 `denied` 만 받는다.
-  const topics = useMemo(() => {
-    // **슬로우 쿼리 토픽 자리를 먼저 확보한다.** 지표 토픽이 상한(50)을 다 먹으면
-    // 인스턴스가 50개인 순간부터 방송 구독이 전부 거부되고, "즉시 재조회" 가 죽는다.
-    const envs = [...new Set(instances.map((i) => i.env))].sort();
-    const slowq = envs.map((e) => `slowq:env=${e}`);
-    const room = Math.max(0, MAX_TOPICS - slowq.length);
-    const status = instances.slice(0, room).map((i) => `status:inst=${i.id}`);
-    return [...slowq, ...status];
-  }, [instances]);
+  // 구독하지 않으면 새 슬로우 쿼리 방송이 오지 않아 "주기를 기다리지 않고 즉시 다시
+  // 읽는다" 가 거짓말이 된다. 환경은 등록부에서 얻는다 — 목록을 손으로 적으면 없는
+  // 환경을 구독해 `denied` 만 받는다.
+  //
+  // 지표 토픽(`status:inst=`)은 **더 이상 구독하지 않는다.** 인스턴스별 지표 표가
+  // Metrics 탭으로 갔으므로 받아도 쓰지 않는다. 덤으로 상한(50) 다툼이 사라졌다 —
+  // 전에는 인스턴스가 50대를 넘으면 방송 구독이 밀려 거부됐다.
+  const topics = useMemo(
+    () => [...new Set(instances.map((i) => i.env))].sort().map((e) => `slowq:env=${e}`),
+    [instances],
+  );
   useLiveTopics(topics);
 
   const collecting = instances.filter((i) => i.collectible).length;
@@ -414,82 +420,20 @@ function ScraperStatus({ instances, tz }: { instances: InstanceView[]; tz: Timez
           MySQL Slow Query Scraper
         </>
       }
-      actions={<CollectorControls />}
+      // 배지만 둔다 — 조작은 RDS 인스턴스 화면 한 곳에서 한다(`CollectorBadge` 주석).
+      actions={<CollectorBadge />}
       note={
         <>
-          인스턴스 {instances.length}개 · 수집 대상 {collecting}개. 이 수집기는{" "}
+          인스턴스 {instances.length}개 · 수집 대상 {collecting}개 — 인스턴스별 지표는{" "}
+          <strong>Metrics</strong> 탭에 있다. 이 수집기는{" "}
           <strong>리스를 잡은 워커가 돈다</strong> — "정지" 는 리스를 놓는 것이 아니라 수집
-          태스크를 멈추는 것이고, <strong>그 구간의 슬로우 쿼리는 기록되지 않는다.</strong>
-          정지는 이 워커(<span className="font-mono">{status.data?.worker_id ?? "?"}</span>)에만
-          적용된다.
+          태스크를 멈추는 것이고, <strong>그 구간의 슬로우 쿼리는 기록되지 않는다.</strong>{" "}
+          정지·재개는 <strong>RDS Instance Management</strong> 화면에서 하고, 설정 저장소에
+          있으므로 워커 전체에 적용된다.
         </>
       }
     >
-      <div className="mb-4 border-b border-gray-200 pb-4">
-        <CollectorFacts status={status.data} />
-      </div>
-      <div className="overflow-x-auto">
-        <table className={TABLE}>
-          <thead>
-            <tr>
-              <th className={TH}>Instance</th>
-              <th className={TH}>Env</th>
-              <th className={TH}>State</th>
-              <th className={TH_NUM}>QPS</th>
-              <th className={TH_NUM}>Slow/s</th>
-              <th className={TH_NUM}>Threads</th>
-              <th className={TH_NUM}>Conn</th>
-              <th className={TH_NUM}>Lock waits</th>
-              <th className={TH}>QPS 추이</th>
-              <th className={TH_NUM}>Updated</th>
-            </tr>
-          </thead>
-          <tbody className={TBODY}>
-            {instances.length === 0 ? (
-              <EmptyRow colSpan={10}>
-                등록된 인스턴스가 없다. 탐색(discovery)이 아직 돌지 않았거나 필터가 전부
-                제외했다.
-              </EmptyRow>
-            ) : (
-              instances.map((i) => {
-                const m = live.status[i.id];
-                const history = live.qpsHistory[i.id] ?? [];
-                return (
-                  <tr key={i.id} className={TR}>
-                    <td className={TD} title={i.id}>
-                      {i.name}
-                    </td>
-                    <td className={TD}>
-                      <EnvChip env={i.env} />
-                    </td>
-                    <td className={TD}>{i.state}</td>
-                    <td
-                      className={TD_NUM}
-                      title={m?.rate_gap_reason === null ? undefined : `비율 없음: ${m?.rate_gap_reason}`}
-                    >
-                      {fmtRate(m?.qps)}
-                    </td>
-                    <td className={TD_NUM}>{fmtRate(m?.slow_per_sec)}</td>
-                    <td className={TD_NUM}>{fmtInt(m?.threads_running)}</td>
-                    <td className={TD_NUM}>{fmtInt(m?.threads_connected)}</td>
-                    <td className={TD_NUM}>{fmtInt(m?.lock_waits)}</td>
-                    <td className={TD}>
-                      <Sparkline values={history} label={`${i.name} QPS 추이`} />
-                    </td>
-                    <td className={`${TD_NUM} text-gray-500`}>
-                      {m === undefined ? EMPTY : fmtListTime(m.at_ms, tz, Date.now())}
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
-      <Note>
-        <span className="font-mono">{EMPTY}</span> 는 값이 0 이 아니라 <strong>아직 비율을 낼
-        수 없다</strong>는 뜻이다(첫 샘플·카운터 초기화). 끊긴 구간은 추이 선이 끊긴다.
-      </Note>
+      <CollectorFacts status={status.data} />
     </Card>
   );
 }

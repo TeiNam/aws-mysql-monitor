@@ -45,6 +45,7 @@ fn local_instance(name: &str) -> Instance {
         vpc_id: None,
         availability_zone: None,
         instance_class: None,
+        allocated_storage_gb: None,
         is_cluster_writer: true,
         iam_auth_enabled: false,
         tags: Default::default(),

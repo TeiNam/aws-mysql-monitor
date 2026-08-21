@@ -224,3 +224,38 @@ variable "log_retention_days" {
   type        = number
   default     = 14
 }
+
+variable "vpn_enabled" {
+  description = <<-EOT
+    Client VPN 의 subnet association + 인가 규칙을 켠다. **association 이 과금
+    단위다** (연결이 없어도 시간당 과금, 서울 ≈ $0.10/h ≈ 월 $73). endpoint·인증서는
+    무료라 항상 유지하고, 안 쓰는 기간엔 false 로 내려 비용을 0 으로 만든다
+    (재활성화는 apply 후 수 분).
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "vpn_client_cidr" {
+  description = <<-EOT
+    VPN 클라이언트에 배정할 CIDR. VPC(10.1.0.0/16)·prd-lla(10.3.0.0/16)·
+    default(172.31.0.0/16)와 겹치면 안 된다. /12~/22 만 허용된다(AWS 제약).
+  EOT
+  type        = string
+  default     = "10.99.0.0/22"
+
+  validation {
+    condition     = can(cidrhost(var.vpn_client_cidr, 0)) && tonumber(split("/", var.vpn_client_cidr)[1]) >= 12 && tonumber(split("/", var.vpn_client_cidr)[1]) <= 22
+    error_message = "유효한 CIDR 이어야 하고 접두 길이는 /12~/22 여야 한다."
+  }
+}
+
+variable "db_subnet_cidrs" {
+  description = <<-EOT
+    VPN 인가 규칙에 넣을 DB 서브넷 CIDR. association 은 VPC 전체 라우트를 만들지만
+    **인가 규칙이 실제 게이트**라 여기 나열한 대역만 열린다.
+    dev: db-subnet-a/b = 10.1.80.0/24, 10.1.81.0/24.
+  EOT
+  type        = list(string)
+  default     = ["10.1.80.0/24", "10.1.81.0/24"]
+}

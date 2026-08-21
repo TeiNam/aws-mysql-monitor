@@ -7,6 +7,7 @@
 use crate::error::Result;
 use crate::ids::{InstanceId, RecordId};
 use crate::instance::Instance;
+use crate::pause::{PauseScope, PauseSet};
 use crate::rollup::DigestRollupRow;
 use crate::slow_query::SlowQuery;
 use crate::time::{EpochMs, TimeRange};
@@ -114,6 +115,62 @@ pub trait InstanceRegistry: Send + Sync {
     async fn mark_missing(&self, id: &InstanceId, now_ms: EpochMs) -> Result<Instance>;
     /// 탐색에서 다시 보였다 — `missing_count` 를 0으로 되돌린다.
     async fn mark_seen(&self, id: &InstanceId, now_ms: EpochMs) -> Result<()>;
+
+    /// **상태만** 갱신한다 (수집 태스크의 첫 판정: `Pending` → `Collecting`/`Unreachable`).
+    ///
+    /// # 왜 `upsert` 가 아닌가
+    ///
+    /// 수집 태스크가 든 `Instance` 는 태스크가 뜬 시점의 **사본**이다. 그걸 그대로
+    /// `upsert` 하면 그 사이 탐색이 갱신한 값(`last_seen_ms`·태그·버전)을 되돌린다 —
+    /// 되돌린 사실이 로그에도 안 남아 "왜 태그가 옛것으로 보이나" 로만 나타난다.
+    async fn set_state(&self, id: &InstanceId, state: crate::instance::InstanceState) -> Result<()>;
+}
+
+/// 수집 정지 스코프 저장 ([`crate::pause`]).
+///
+/// # 왜 저장소인가
+///
+/// 정지는 **운영자의 의도**이지 프로세스 상태가 아니다. 프로세스 원자값으로 두면
+/// 재배포에 풀리고, 리더가 바뀌면 정지 플래그가 없는 워커가 수집을 이어간다 —
+/// 화면에는 "멈춤" 인데 기록은 계속 쌓인다. 저장소에 두면 모든 워커가 같은 것을 본다.
+#[async_trait]
+pub trait PauseStore: Send + Sync {
+    /// 멈춰 있는 스코프 전부. 한 파티션이므로 조회 1회다.
+    async fn list(&self) -> Result<PauseSet>;
+
+    /// 멈춘다. **이미 멈춰 있으면 시작 시각을 덮지 않는다** — 화면이 "3분 전부터
+    /// 멈춤" 을 말할 수 있어야 한다.
+    async fn pause(&self, scope: &PauseScope, by: &str, now_ms: EpochMs) -> Result<()>;
+
+    /// 재개한다. **멈춰 있지 않아도 성공이다**(멱등) — 두 사람이 같이 눌러도
+    /// 두 번째가 오류로 보이면 안 된다.
+    async fn resume(&self, scope: &PauseScope) -> Result<()>;
+}
+
+/// 운영자가 화면에서 바꾸는 설정 ([`crate::settings`]).
+///
+/// # 왜 낙관적 잠금인가
+///
+/// 저장은 문서 전체를 덮어쓴다(항목 하나에 담기 때문이다). 두 관리자가 같은 화면을
+/// 열어 두고 각자 저장하면 **나중 저장이 앞선 변경을 조용히 지운다** — Slack 참조를
+/// 방금 넣었는데 다른 사람이 리전을 저장하면서 그게 사라지는 식이다.
+/// 그래서 `save` 는 "내가 읽은 버전" 을 함께 받고, 어긋나면 [`DomainError::Conflict`]
+/// 로 거부한다. 화면은 다시 읽어 보여준다.
+#[async_trait]
+pub trait SettingsStore: Send + Sync {
+    /// 저장된 설정. **없으면 기본값이다**(오류가 아니다) — 처음 뜬 배포에서 설정
+    /// 화면이 500 이 되면 손댈 방법이 없다.
+    async fn load(&self) -> Result<crate::settings::AppSettings>;
+
+    /// 저장한다. `expected_version` 이 저장된 값과 다르면 거부한다.
+    /// 반환값은 **저장된 뒤의** 설정이다(버전이 올라간 상태).
+    async fn save(
+        &self,
+        settings: &crate::settings::AppSettings,
+        expected_version: u32,
+        by: &str,
+        now_ms: EpochMs,
+    ) -> Result<crate::settings::AppSettings>;
 }
 
 /// 리스 — 샤드 소유권과 리더 선출 ([05 §7](../../../docs/05-collector.md)).

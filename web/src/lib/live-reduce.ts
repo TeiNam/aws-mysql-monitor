@@ -372,6 +372,9 @@ function normalizeMetrics(raw: Record<string, unknown>): LiveMetrics | null {
     slow_per_sec: numberOrNull(raw.slow_per_sec),
     threads_running: numberOrNull(raw.threads_running),
     threads_connected: numberOrNull(raw.threads_connected),
+    // 모수. **구 서버는 이 필드를 안 보낸다** → `null` 이고, 그러면 화면이 연결 색을
+    // 칠하지 않는다(모수 없이 포화를 판정할 수 없다).
+    max_connections: numberOrNull(raw.max_connections),
     lock_waits: numberOrNull(raw.lock_waits),
     rate_gap_reason: typeof raw.rate_gap_reason === "string" ? raw.rate_gap_reason : null,
   };

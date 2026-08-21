@@ -183,6 +183,39 @@ fn local_dev_context() -> AuthContext {
     }
 }
 
+/// Cognito 토큰 **검증기가 배선돼 있는가.**
+///
+/// `false` 인 동안 설정에서 `cognito` 를 골라도 적용되지 않는다
+/// ([`AppSettings`](dbmon_core::settings::AppSettings) 는 저장하되
+/// `effective_mode` 가 토큰 방식으로 떨어뜨린다). 검증 없이 통과시키는 것보다 낫고,
+/// 화면이 이 값을 받아 "아직 준비되지 않았다" 를 말한다.
+///
+/// M5 에서 JWKS 조회 → 서명 검증 → `AuthContext::intersect` 가 들어오면 `true` 다.
+pub const COGNITO_READY: bool = false;
+
+/// **인증을 끈 배포**의 문맥 (`settings.auth.mode = off`).
+///
+/// # 왜 admin 인가
+///
+/// 인증이 없으면 주체를 알 수 없고, 주체를 모르면 역할을 나눌 근거가 없다.
+/// viewer 로 떨어뜨리면 "권한이 낮아서 안 된다" 는 화면을 보여주면서 정작 아무나
+/// 들어와 있는 상태 — 통제하는 것처럼 보이지만 통제하지 않는다. 그래서 역할 놀이를
+/// 하지 않고, 대신 **화면과 기동 로그가 인증 없음을 크게 알린다.**
+///
+/// 이 문맥이 만들어지는 조건은 두 곳의 명시적 허용이다: 파일 설정
+/// (`api.allow_auth_disable`) 과 운영 설정(`auth.mode = off`). 기본값은 둘 다 아니다.
+pub fn no_auth_context() -> AuthContext {
+    AuthContext {
+        // `local-dev` 와 구분한다 — 감사 로그에서 "루프백 개발" 과 "인증을 끈 배포" 는
+        // 전혀 다른 사실이다.
+        subject: "anonymous".into(),
+        role: Role::Admin,
+        env_scope: Env::ALL.to_vec(),
+        can_see_literals: true,
+        claims_version: 0,
+    }
+}
+
 /// 요청의 인증 문맥을 만든다.
 ///
 /// `bearer` 는 `Authorization: Bearer …` 의 토큰 부분이다.

@@ -89,6 +89,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
           endpoint: "127.0.0.1",
           port: 3306,
           instance_class: "db.t4g.micro",
+          allocated_storage_gb: 20,
           cluster_id: null,
           is_cluster_writer: false,
           iam_auth_enabled: false,
@@ -215,11 +216,37 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
       }),
     );
   }
+  if (url.startsWith("/api/metrics/fleet")) {
+    return Promise.resolve(
+      json({
+        rows: [
+          {
+            instance_id: INSTANCE,
+            metrics: [
+              { name: "CPUUtilization", label: "CPU", unit: "percent", stat: "Average", value: 12.5 },
+              {
+                name: "FreeableMemory",
+                label: "여유 메모리",
+                unit: "bytes",
+                stat: "Average",
+                value: 100_663_296,
+              },
+              // 값이 **없는** 메트릭. `0` 으로 접히면 "스토리지가 꽉 찼다" 가 된다.
+              { name: "FreeStorageSpace", label: "여유 스토리지", unit: "bytes", stat: "Minimum", value: null },
+            ],
+          },
+        ],
+        period_secs: 900,
+        lag_note: "CloudWatch 는 1~3분 지연된다",
+      }),
+    );
+  }
   if (url.startsWith("/api/collector/status")) {
     return Promise.resolve(
       json({
         paused: false,
         paused_since_ms: null,
+        paused_scopes: [],
         is_leader: true,
         collecting: 1,
         last_tick_ms: Date.now(),
@@ -228,9 +255,10 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
         discovery_requested: false,
         backfill_requested: false,
         worker_id: "all-local",
-        scope: "process",
+        scope: "deployment",
         runs_collector: true,
         can_control: true,
+        controllable_envs: ["prd", "stg", "dev", "unknown"],
         role: "admin",
       }),
     );
@@ -290,8 +318,11 @@ describe("MySQL Monitor", () => {
     expect(screen.getByRole("banner").textContent).toContain("ap-northeast-2");
     // 조사 행이 표에 실제로 들어간다.
     expect(screen.getByText(/20,001/)).toBeDefined();
-    // 수집 제어가 상태를 읽어 버튼을 고른다(수집 중이면 "정지").
-    expect(await screen.findByText("수집 정지")).toBeDefined();
+    // **이 화면에는 배지만 있다.** 조작은 RDS 화면 한 곳에서 한다 — 여기 버튼이
+    // 남아 있으면 "어느 화면에서 누른 것이 무엇에 적용되나" 를 되묻게 된다.
+    expect(await screen.findByText("수집 중")).toBeDefined();
+    expect(screen.queryByText("수집 정지")).toBeNull();
+    expect(screen.queryByLabelText("정지 대상 선택")).toBeNull();
     // 상태를 표에 보여준다 — 진행 중·추적 끊김·확정이 같아 보이면 하한을
     // 확정값으로 읽는다.
     expect(screen.getByText("확정")).toBeDefined();
@@ -300,27 +331,17 @@ describe("MySQL Monitor", () => {
     expect(screen.getAllByText(/all-local/).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("실시간 지표가 오면 상태 표에 채운다", async () => {
+  /**
+   * **인스턴스 목록은 이 화면에 없다.** Metrics 탭이 같은 목록에 CloudWatch 열까지
+   * 붙여 보여주므로, 두 화면에 같은 표를 두면 한쪽만 고치게 된다.
+   */
+  it("인스턴스 지표 표를 여기 두지 않는다", async () => {
     await renderApp("/mysql");
     expect(await screen.findByText(SQL)).toBeDefined();
-
-    const socket = FakeSocket.latest();
-    socket.makeReady();
-    socket.deliver({
-      t: "status",
-      instance_id: INSTANCE,
-      metrics: {
-        at_ms: Date.now(),
-        qps: 13.4,
-        slow_per_sec: 0,
-        threads_running: 3,
-        threads_connected: 5,
-        lock_waits: 0,
-        rate_gap_reason: null,
-      },
-    });
-
-    expect(await screen.findByText("13.4")).toBeDefined();
+    expect(screen.queryByText("QPS 추이")).toBeNull();
+    // 수집기 사실(워커·리더·마지막 tick)은 남는다 — 슬로우 쿼리를 보다가
+    // "지금 수집이 도는가" 를 묻게 되는 곳이 여기다.
+    expect(screen.getAllByText(/all-local/).length).toBeGreaterThanOrEqual(1);
   });
 
   /**
@@ -336,6 +357,68 @@ describe("MySQL Monitor", () => {
     await renderApp("/mysql");
     expect(await screen.findByText(/조회 상한에 걸려/)).toBeDefined();
     expect(screen.queryByText(/조회 구간\(최근 24시간\)에 기록이 없다/)).toBeNull();
+  });
+});
+
+/**
+ * 플릿 메트릭 화면. **한 줄에 두 출처가 섞인다** — CloudWatch(15분)와 자체 수집(5초).
+ * 타입만 맞으면 컴파일은 통과하므로, 표가 두 응답의 필드를 실제로 읽는지 DOM 에서 본다.
+ */
+describe("플릿 메트릭", () => {
+  it("CloudWatch 값과 실시간 지표를 한 행에 채운다", async () => {
+    await renderApp("/metrics");
+    expect(await screen.findByText("mysql84-local")).toBeDefined();
+    // CloudWatch 열: 단위는 서버가 알려준 것을 따른다(퍼센트 / 이진 바이트).
+    expect(screen.getByText("12.5%")).toBeDefined();
+    expect(screen.getByText("96MB")).toBeDefined();
+
+    const socket = FakeSocket.latest();
+    socket.makeReady();
+    socket.deliver({
+      t: "status",
+      instance_id: INSTANCE,
+      metrics: {
+        at_ms: Date.now(),
+        qps: 13.4,
+        slow_per_sec: 0,
+        threads_running: 3,
+        threads_connected: 5,
+        max_connections: 60,
+        lock_waits: 0,
+        rate_gap_reason: null,
+      },
+    });
+
+    expect(await screen.findByText("13.4")).toBeDefined();
+    // **연결은 모수와 함께 적는다.** 개수만 보면 `5` 가 한가한지 포화 직전인지 알 수 없다.
+    expect(await screen.findByText("5 / 60")).toBeDefined();
+  });
+
+  /** 모수가 없으면 **개수만** 적는다 — `5 / —` 는 "모수가 0" 으로 읽힌다. */
+  it("모수를 모르면 연결 개수만 적는다", async () => {
+    await renderApp("/metrics");
+    expect(await screen.findByText("mysql84-local")).toBeDefined();
+
+    const socket = FakeSocket.latest();
+    socket.makeReady();
+    socket.deliver({
+      t: "status",
+      instance_id: INSTANCE,
+      metrics: {
+        at_ms: Date.now(),
+        qps: 1,
+        slow_per_sec: 0,
+        threads_running: 3,
+        threads_connected: 5,
+        // 옛 서버는 이 값을 보내지 않는다.
+        max_connections: null,
+        lock_waits: 0,
+        rate_gap_reason: null,
+      },
+    });
+
+    expect(await screen.findByText("5")).toBeDefined();
+    expect(screen.queryByText(/5 \//)).toBeNull();
   });
 });
 
@@ -396,10 +479,51 @@ describe("다이제스트·통계·플랜·인스턴스 화면", () => {
     expect(screen.getByRole("img", { name: /실행계획 노드/ })).toBeDefined();
   });
 
+  /**
+   * 옵션 탭이 실제로 테마를 바꾸는지 — nav → 화면 → `<html class="dark">` 배선을 본다.
+   * 조각마다 테스트가 있어도 이 사슬이 끊기면 "눌러도 안 바뀐다" 가 된다.
+   */
+  it("옵션 화면에서 다크를 고르면 문서에 적용된다", async () => {
+    await renderApp("/options");
+    const dark = (await screen.findByLabelText(/다크/)) as HTMLInputElement;
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+    dark.click();
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+
+    (screen.getByLabelText(/라이트/) as HTMLInputElement).click();
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+  });
+
   it("RDS 화면이 태그와 수집 여부를 보여준다", async () => {
     await renderApp("/rds");
     expect(await screen.findByText("env=dev")).toBeDefined();
     expect(screen.getByText("team=dba")).toBeDefined();
     expect(screen.getByText("수집")).toBeDefined();
+  });
+
+  /**
+   * 정지 조작은 **이 화면에만** 있다. 위쪽 셀렉터는 전체·환경만 담고, 개별 인스턴스는
+   * 표의 행 버튼이 맡는다 — 500대 등록부에서 셀렉터가 500줄이 되지 않게 한다.
+   */
+  it("RDS 화면에서 전체·환경은 셀렉터로, 개별 인스턴스는 행 버튼으로 정지한다", async () => {
+    await renderApp("/rds");
+    const select = (await screen.findByLabelText("정지 대상 선택")) as HTMLSelectElement;
+    // **상태가 오기 전에는 전부 비활성이다** — 권한을 모르는 채로 누를 수 있게 두면
+    // 403 을 받는다. 그래서 상태가 온 뒤에 판정한다.
+    await screen.findByText("수집 중");
+    const options = [...select.options].map((o) => ({ value: o.value, disabled: o.disabled }));
+
+    // 전체는 전 환경 스코프 admin 이므로 누를 수 있다.
+    expect(options[0]).toEqual({ value: "*", disabled: false });
+    // 등록부에 보이는 환경(`env=dev` 태그 하나)이 선택지가 된다. 코드에 박은 목록이
+    // 아니라 응답에서 만들므로 스코프 밖 환경이 제시되지 않는다.
+    expect(options.map((o) => o.value)).toContain("env:dev");
+    // **인스턴스는 셀렉터에 없다.**
+    expect(options.some((o) => o.value.startsWith("id:"))).toBe(false);
+
+    // 멈춘 것이 없으므로 상단 버튼은 "정지" 다.
+    expect(screen.getByText("수집 정지")).toBeDefined();
+    // 표의 행마다 개별 정지 버튼이 있다.
+    expect(screen.getByRole("button", { name: /^정지$/ })).toBeDefined();
   });
 });

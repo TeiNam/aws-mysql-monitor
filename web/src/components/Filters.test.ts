@@ -25,6 +25,7 @@ function inst(name: string, env: Env): InstanceView {
     endpoint: "127.0.0.1",
     port: 3306,
     instance_class: null,
+    allocated_storage_gb: null,
     cluster_id: null,
     is_cluster_writer: false,
     iam_auth_enabled: false,

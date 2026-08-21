@@ -1,7 +1,25 @@
 @import "tailwindcss";
 
+/**
+ * 다크 모드는 **`.dark` 클래스**로 켠다 (`lib/theme.ts` 가 `<html>` 에 붙인다).
+ *
+ * `prefers-color-scheme` 만 쓰면 화면에서 고를 수가 없다 — 운영자가 OS 설정을 바꾸러
+ * 나가야 한다. 기본값은 여전히 OS 설정을 따르고, 옵션 화면에서 덮어쓴다.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /**
+   * 색이 칠해진 버튼·배지 **위의 글자**. 항상 흰색이고 **반전 대상이 아니다.**
+   *
+   * `text-white` 를 쓰면 안 된다 — 아래에서 `--color-white` 를 카드 표면 색으로
+   * 다시 정의하므로, 다크 모드에서 초록 버튼의 글자가 어두워진다.
+   */
+  --color-oncolor: #ffffff;
+}
+
 /*
- * 라이트 테마.
+ * 라이트 테마가 기본이다.
  *
  * 참조 대시보드(`my_slow_query_dashboard`)가 흰 배경·회색 캔버스였고, 이 화면을
  * 쓰는 사람이 그 화면에 익숙하다. `docs/09-frontend.md §9` 는 "다크 모드 기본" 을
@@ -12,6 +30,142 @@
   color-scheme: light;
 }
 
+/*
+ * 스크롤바 자리를 **항상 비워 둔다.**
+ *
+ * 탭마다 내용 높이가 다르다: 계획(2,107px)·슬로우 쿼리는 세로 스크롤바가 생기고
+ * 메트릭·통계는 안 생긴다. 폭을 차지하는 스크롤바(마우스를 꽂은 macOS Chrome,
+ * Windows 전부)에서는 그때마다 본문 폭이 15px 씩 달라져 **탭을 바꿀 때 화면이
+ * 좌우로 튄다** — 사용자에게는 "계획 탭만 시작 위치가 다르다" 로 보인다.
+ *
+ * `stable` 은 스크롤이 없을 때도 그 자리를 예약한다. 오버레이 스크롤바
+ * (트랙패드만 쓰는 macOS)에서는 아무 효과가 없다 — 그쪽은 애초에 폭을 먹지 않는다.
+ */
+html {
+  scrollbar-gutter: stable;
+}
+
 body {
   background-color: var(--color-gray-100);
+}
+
+/*
+ * # 다크 모드 = **색 계단을 뒤집는다**
+ *
+ * 화면 19개 파일에 색 클래스가 250번 쓰여 있다. 거기에 `dark:` 를 하나씩 붙이면
+ * 250줄짜리 변경이 되고, **그 뒤로 새 컴포넌트마다 두 번 칠해야 한다** — 한쪽을
+ * 빠뜨리면 다크 모드에서만 안 보이는 글자가 생기고, 그건 라이트로 개발하는 동안
+ * 아무도 모른다.
+ *
+ * Tailwind v4 유틸리티는 `var(--color-gray-900)` 을 참조하므로, `.dark` 스코프에서
+ * **변수의 뜻을 바꾸면 전 화면이 함께 뒤집힌다.** 컴포넌트는 한 줄도 고치지 않는다.
+ *
+ * ⚠ 대가: `bg-white` 가 어두운 표면을 뜻한다. 처음 보면 놀라는 부분이라 여기에
+ * 매핑을 표로 적어 둔다. 색을 새로 쓸 때는 **이 계단 안에서** 골라야 한다 —
+ * 계단 밖의 값(예: `bg-zinc-950`)은 뒤집히지 않으므로 라이트 모드에서 깨진다.
+ *
+ * | 유틸리티 | 라이트 | 다크 |
+ * |---|---|---|
+ * | `bg-white` | 흰 카드 | 들린 표면 |
+ * | `bg-gray-50` | 표 머리 | 표면보다 한 칸 밝게 |
+ * | `bg-gray-100` | 페이지 캔버스·칩 | 표면보다 어둡게 |
+ * | `border-gray-200/300` | 옅은 경계 | 보이는 경계 |
+ * | `text-gray-500~900` | 어두운 글자 | 밝은 글자 |
+ * | `bg-*-50/100`, `ring-*-200` | 옅은 강조 배경 | 어두운 강조 배경 |
+ * | `text-*-700/800/900` | 진한 강조 글자 | 밝은 강조 글자 |
+ * | `bg-*-500/600` (칠한 버튼) | **그대로** | **그대로** |
+ */
+.dark {
+  color-scheme: dark;
+
+  /* ── 표면과 경계 ─────────────────────────────────────────────────────── */
+  --color-white: oklch(21.5% 0.012 264);
+  --color-gray-50: oklch(26% 0.014 264);
+  --color-gray-100: oklch(16.5% 0.011 264);
+  --color-gray-200: oklch(31% 0.016 264);
+  --color-gray-300: oklch(39% 0.019 264);
+
+  /* ── 글자 (라이트의 반대 방향으로 오른다) ─────────────────────────────── */
+  --color-gray-400: oklch(60% 0.02 264);
+  --color-gray-500: oklch(71% 0.019 264);
+  --color-gray-600: oklch(80% 0.016 264);
+  --color-gray-700: oklch(87% 0.013 264);
+  --color-gray-800: oklch(93% 0.008 264);
+  --color-gray-900: oklch(97% 0.004 264);
+
+  /*
+   * ── 강조색 ────────────────────────────────────────────────────────────
+   *
+   * 500 을 기준으로 **파생**한다. 계열마다 색을 손으로 고르면 8계열 × 5단계 =
+   * 40개를 눈으로 맞춰야 하고, 하나만 어긋나도 그 배지만 안 읽힌다.
+   *
+   * - `50/100`: 어두운 배경 틴트 (칩·배너 바탕)
+   * - `200`: 경계·링
+   * - `700/800/900`: 그 위에 얹는 밝은 글자
+   *
+   * `300~600` 은 건드리지 않는다 — 칠한 버튼(`bg-green-500`)과 포커스 링
+   * (`ring-blue-500`)이 그 대역을 쓰고, 그건 두 모드에서 같아야 한다.
+   */
+  --color-amber-50: color-mix(in oklab, var(--color-amber-500) 16%, oklch(18% 0.01 264));
+  --color-amber-100: color-mix(in oklab, var(--color-amber-500) 26%, oklch(18% 0.01 264));
+  --color-amber-200: color-mix(in oklab, var(--color-amber-500) 42%, oklch(18% 0.01 264));
+  --color-amber-700: color-mix(in oklab, var(--color-amber-400) 78%, white);
+  --color-amber-800: color-mix(in oklab, var(--color-amber-400) 62%, white);
+  --color-amber-900: color-mix(in oklab, var(--color-amber-400) 46%, white);
+
+  --color-blue-50: color-mix(in oklab, var(--color-blue-500) 16%, oklch(18% 0.01 264));
+  --color-blue-100: color-mix(in oklab, var(--color-blue-500) 26%, oklch(18% 0.01 264));
+  --color-blue-200: color-mix(in oklab, var(--color-blue-500) 42%, oklch(18% 0.01 264));
+  --color-blue-700: color-mix(in oklab, var(--color-blue-400) 78%, white);
+  --color-blue-800: color-mix(in oklab, var(--color-blue-400) 62%, white);
+  --color-blue-900: color-mix(in oklab, var(--color-blue-400) 46%, white);
+
+  --color-green-50: color-mix(in oklab, var(--color-green-500) 16%, oklch(18% 0.01 264));
+  --color-green-100: color-mix(in oklab, var(--color-green-500) 26%, oklch(18% 0.01 264));
+  --color-green-200: color-mix(in oklab, var(--color-green-500) 42%, oklch(18% 0.01 264));
+  --color-green-700: color-mix(in oklab, var(--color-green-400) 78%, white);
+  --color-green-800: color-mix(in oklab, var(--color-green-400) 62%, white);
+  --color-green-900: color-mix(in oklab, var(--color-green-400) 46%, white);
+
+  --color-red-50: color-mix(in oklab, var(--color-red-500) 16%, oklch(18% 0.01 264));
+  --color-red-100: color-mix(in oklab, var(--color-red-500) 26%, oklch(18% 0.01 264));
+  --color-red-200: color-mix(in oklab, var(--color-red-500) 42%, oklch(18% 0.01 264));
+  --color-red-700: color-mix(in oklab, var(--color-red-400) 78%, white);
+  --color-red-800: color-mix(in oklab, var(--color-red-400) 62%, white);
+  --color-red-900: color-mix(in oklab, var(--color-red-400) 46%, white);
+
+  --color-orange-50: color-mix(in oklab, var(--color-orange-500) 16%, oklch(18% 0.01 264));
+  --color-orange-100: color-mix(in oklab, var(--color-orange-500) 26%, oklch(18% 0.01 264));
+  --color-orange-200: color-mix(in oklab, var(--color-orange-500) 42%, oklch(18% 0.01 264));
+  --color-orange-700: color-mix(in oklab, var(--color-orange-400) 78%, white);
+  --color-orange-800: color-mix(in oklab, var(--color-orange-400) 62%, white);
+
+  --color-emerald-50: color-mix(in oklab, var(--color-emerald-500) 16%, oklch(18% 0.01 264));
+  --color-emerald-100: color-mix(in oklab, var(--color-emerald-500) 26%, oklch(18% 0.01 264));
+  --color-emerald-200: color-mix(in oklab, var(--color-emerald-500) 42%, oklch(18% 0.01 264));
+  --color-emerald-700: color-mix(in oklab, var(--color-emerald-400) 78%, white);
+
+  --color-purple-50: color-mix(in oklab, var(--color-purple-500) 16%, oklch(18% 0.01 264));
+  --color-purple-100: color-mix(in oklab, var(--color-purple-500) 26%, oklch(18% 0.01 264));
+  --color-purple-200: color-mix(in oklab, var(--color-purple-500) 42%, oklch(18% 0.01 264));
+  --color-purple-700: color-mix(in oklab, var(--color-purple-400) 78%, white);
+
+  --color-violet-50: color-mix(in oklab, var(--color-violet-500) 16%, oklch(18% 0.01 264));
+  --color-violet-100: color-mix(in oklab, var(--color-violet-500) 26%, oklch(18% 0.01 264));
+  --color-violet-200: color-mix(in oklab, var(--color-violet-500) 42%, oklch(18% 0.01 264));
+  --color-violet-700: color-mix(in oklab, var(--color-violet-400) 78%, white);
+
+  /*
+   * 그림자는 어두운 표면에서 보이지 않는다. 카드 경계를 잃지 않도록 **테두리로
+   * 바꿔 준다** — `shadow`·`shadow-md` 를 쓰는 곳이 카드·헤더·모달이다.
+   */
+  --tw-shadow-color: oklch(0% 0 0 / 0.6);
+}
+
+/* 어두운 표면에서 그림자만으로는 카드 경계가 사라진다. 얇은 테두리를 더한다. */
+.dark .shadow,
+.dark .shadow-md,
+.dark .shadow-xl,
+.dark .shadow-inner {
+  border: 1px solid var(--color-gray-200);
 }

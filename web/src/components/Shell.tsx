@@ -1,5 +1,15 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { BarChart3, CloudCog, Database, ExternalLink, Server, Share2 } from "lucide-react";
+import {
+  BarChart3,
+  CloudCog,
+  Database,
+  ExternalLink,
+  Gauge,
+  LineChart,
+  Server,
+  Settings,
+  Share2,
+} from "lucide-react";
 import { useEffect } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 import { useLive } from "../hooks/useLive";
@@ -39,13 +49,31 @@ function useScrollToTopOnTabChange() {
   }, [pathname]);
 }
 
-/** 참조 대시보드와 같은 5탭. 순서까지 같다 — 손이 기억하는 위치다. */
+/**
+ * 상단 탭. **순서가 작업 흐름이다** — 대상을 고르고(RDS) → 플릿 상태(Metrics) →
+ * 그 인스턴스(Instance) → 느린 쿼리(Slow Query) → 그 계획(Plan) → 원문 로그(Slow Log).
+ *
+ * 참조 대시보드는 슬로우 쿼리가 첫 탭이었다. 메트릭 화면이 생기면서 "무엇이 이상한가" 를
+ * 먼저 보고 들어가는 순서로 바꿨고, 그보다 앞에 **무엇을 수집할지 정하는 화면**이 온다.
+ *
+ * **첫 탭이 첫 화면은 아니다.** `/` 는 `/metrics` 로 간다(`App.tsx`) — 등록은 한 번,
+ * 상태 확인은 매일이다.
+ *
+ * **설정은 여기 없다.** 조사하는 화면들과 성격이 다르므로 오른쪽 상태 배지 옆에 둔다
+ * (`OptionsLink`) — 탭 줄은 "무엇을 볼까" 만 담는다.
+ */
 const NAV = [
-  { to: "/mysql", label: "MySQL Monitor", Icon: Database },
-  { to: "/plan", label: "Plan Visualization", Icon: Share2 },
-  { to: "/cloudwatch", label: "CloudWatch", Icon: CloudCog },
+  // **RDS 가 맨 앞이다.** 등록·수집 시작·정지가 여기 있다. 아무것도 수집하지 않는
+  // 상태에서 다른 탭은 전부 빈 화면이므로, 흐름의 출발점이 이 화면이다.
+  { to: "/rds", label: "RDS", Icon: Server },
+  { to: "/metrics", label: "Metrics", Icon: Gauge },
+  { to: "/instance", label: "Instance", Icon: LineChart },
+  { to: "/mysql", label: "Slow Query", Icon: Database },
+  { to: "/plan", label: "Plan", Icon: Share2 },
+  // **"CloudWatch" 가 아니라 "Slow Log" 다.** 이 화면은 슬로우로그 백필이고, 메트릭
+  // 화면이 따로 생기면서 그 이름이 무엇을 가리키는지 알 수 없게 됐다.
+  { to: "/cloudwatch", label: "Slow Log", Icon: CloudCog },
   { to: "/statistics", label: "Statistics", Icon: BarChart3 },
-  { to: "/rds", label: "RDS Instances", Icon: Server },
 ] as const;
 
 /**
@@ -61,33 +89,52 @@ export function Shell() {
     <div className="flex min-h-screen flex-col bg-gray-100">
       <header className="bg-white shadow-md">
         <div className={`${PAGE} flex h-16 items-center justify-between`}>
-          <div className="flex items-center gap-8">
-            <span className="flex items-center gap-2 text-xl font-bold text-gray-900">
-              <Database className="h-6 w-6 text-blue-600" />
-              MySQL Query Monitor
+          {/* **줄바꿈을 막는다.** 탭이 늘어나면 flex 가 라벨을 두 줄로 접는데, 그러면
+              머리말 높이가 흔들리고 계정·리전 값이 겹친다. 넘칠 때는 접는 것보다
+              가로로 밀리는 편이 낫다(`min-w-[1280px]` 안에서는 넘치지 않는다). */}
+          <div className="flex min-w-0 items-center gap-5">
+            {/* **이름 글자를 버려 탭에 폭을 넘긴다.** `MySQL Query Monitor` 는 222px,
+                `dbmon` 은 96px 를 먹었다. 1280px 창에서 그 폭은 탭 간격으로 쓰는 편이
+                낫다 — 무엇을 보는 도구인지는 브라우저 탭 제목과 화면 머리말이 이미
+                말하고, 이름은 아무도 읽지 않지만 탭은 매번 누른다.
+                아이콘은 남긴다: 머리말의 왼쪽 끝을 잡아 주고, `title` 이 이름을 준다. */}
+            <span
+              className="flex items-center whitespace-nowrap text-gray-900"
+              title="dbmon — MySQL Query Monitor"
+            >
+              <Database className="h-7 w-7 text-blue-600" />
             </span>
-            <nav aria-label="주요 화면" className="flex gap-6">
+            {/* 탭 글자는 **본문보다 크다**(`text-xl` = 20px, 이전 14px). 화면을 고르는
+                것이 이 도구에서 가장 자주 하는 동작이고, 표 머리글을 굵게 키운 뒤로는
+                탭이 표보다 작아 보였다.
+
+                탭 사이 28px 은 **아이콘–라벨 간격(6px)의 네 배**다. "무엇이 한 탭인가" 를
+                간격만으로 읽을 수 있어야 한다 — 안쪽이 좁고 바깥쪽이 넓다.
+                1280px 창을 넘기면 마지막 탭이 계정 배지 아래로 들어가므로(실측) 이
+                간격이 상한이다. */}
+            <nav aria-label="주요 화면" className="flex gap-7">
               {NAV.map(({ to, label, Icon }) => (
                 <NavLink
                   key={to}
                   to={to}
                   className={({ isActive }) =>
-                    `inline-flex items-center gap-2 border-b-2 pt-1 pb-0.5 text-sm font-medium ${
+                    `inline-flex items-center gap-1.5 border-b-2 pt-1 pb-0.5 text-xl font-medium whitespace-nowrap ${
                       isActive
                         ? "border-blue-600 text-blue-700"
                         : "border-transparent text-gray-700 hover:text-blue-600"
                     }`
                   }
                 >
-                  <Icon className="h-4 w-4" />
+                  <Icon className="h-5 w-5" />
                   {label}
                 </NavLink>
               ))}
             </nav>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex shrink-0 items-center gap-4 whitespace-nowrap">
             <AwsBadge />
             <StreamBadge />
+            <OptionsLink />
           </div>
         </div>
         <StreamNotices />
@@ -118,6 +165,33 @@ export function Shell() {
   );
 }
 
+/**
+ * 설정. **탭 줄이 아니라 상태 배지 옆이다.**
+ *
+ * 조사 화면들과 성격이 다르고 자주 가지 않는다. 탭 줄에 두면 (a) "무엇을 볼까" 목록에
+ * 설정이 끼어 익숙한 탭 위치가 밀리고 (b) 탭이 늘어날 때마다 폭 다툼을 한다.
+ *
+ * 밑줄(탭의 활성 표시)을 쓰지 않는다 — 배지 옆에서는 어색하다. 대신 배경·색으로 표시한다.
+ */
+function OptionsLink() {
+  return (
+    <NavLink
+      to="/options"
+      title="Options"
+      aria-label="Options"
+      className={({ isActive }) =>
+        `rounded-md p-1.5 ${
+          isActive
+            ? "bg-blue-50 text-blue-700"
+            : "text-gray-500 hover:bg-gray-100 hover:text-gray-800"
+        }`
+      }
+    >
+      <Settings className="h-4 w-4" />
+    </NavLink>
+  );
+}
+
 /** 어느 계정·리전을 보고 있는가. 계정 착각이 이런 도구에서 가장 비싼 실수다. */
 function AwsBadge() {
   const info = useQuery({
@@ -130,13 +204,28 @@ function AwsBadge() {
     return <span className="text-sm text-gray-500">AWS 정보 확인 중…</span>;
   }
   const { account_id, region, deployment_env } = info.data;
+  // **라벨을 지우고 값만 둔다.** 탭이 8개가 되면서 `Account:`·`Region:` 글자가
+  // 폭을 먹어 머리말이 겹쳤다(실측). 의미는 `title` 로 남긴다 — 계정 착각을 막는 것이
+  // 이 배지의 목적이므로 값 자체는 절대 줄이지 않는다.
+  //
+  // **배포 환경 칩은 프로덕션에서만 띄운다.** `dev` 라고 적혀 있는 것은 계정·리전이
+  // 이미 보이는 상황에서 소음이다. 반대로 `prd` 는 "이 화면은 프로덕션 대시보드다" 를
+  // 말하는 유일한 표시이고, 두 탭을 열어 두고 일할 때 엉뚱한 쪽을 조작하는 것을 막는다.
+  // `unknown` 도 띄운다 — `Env::treat_as_production()` 이 그걸 프로덕션으로 보기 때문이다.
+  const loudEnv = deployment_env === "prd" || deployment_env === "unknown";
   return (
     <span className="text-sm text-gray-700">
-      <strong className="font-medium">Account:</strong> {account_id}
+      <span title="AWS 계정">{account_id}</span>
       <span className="mx-1.5 text-gray-300">|</span>
-      <strong className="font-medium">Region:</strong> {region}
-      <span className="mx-1.5 text-gray-300">|</span>
-      <EnvChip env={deployment_env} />
+      <span title="리전">{region}</span>
+      {loudEnv ? (
+        <>
+          <span className="mx-1.5 text-gray-300">|</span>
+          <span title="이 대시보드의 배포 환경">
+            <EnvChip env={deployment_env} />
+          </span>
+        </>
+      ) : null}
     </span>
   );
 }

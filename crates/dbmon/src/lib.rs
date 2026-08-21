@@ -17,6 +17,7 @@ pub mod health;
 pub mod metrics;
 pub mod mysql;
 pub mod orphan;
+pub mod settings_state;
 pub mod shutdown;
 pub mod slowlog;
 pub mod store;

@@ -90,6 +90,21 @@ pub struct HttpConfig {
     /// 로드밸런서가 없으면(로컬 개발·collector 전용 워커) 0 이 맞다.
     /// 0이 아니면 이만큼 기다린 뒤에야 나머지 정리가 시작된다.
     pub deregistration_wait_secs: u64,
+    /// **운영 설정으로 인증을 끄는 것을 허용하는가.**
+    ///
+    /// # 왜 두 곳에서 허용해야 하는가
+    ///
+    /// 인증을 끄는 화면은 인증 뒤에 있다 — 끄는 순간 그 화면도 누구에게나 열린다.
+    /// 되돌리려면 다시 켤 권한이 필요한데, 그 권한을 판정할 근거가 사라진 상태다.
+    /// 클릭 한 번으로 갈 수 있는 상태여서는 안 된다.
+    ///
+    /// 그래서 **파일(배포)** 과 **화면(운영)** 두 곳의 명시적 허용을 요구한다. 이 값이
+    /// 거짓이면 화면의 선택은 저장되되 적용되지 않고, 화면이 그 사실을 표시한다.
+    ///
+    /// 켜야 하는 경우: VPN·사설 ALB 뒤의 내부 도구처럼 **네트워크가 이미 경계인** 배포.
+    /// 그 판단은 코드가 대신할 수 없으므로 운영자가 파일에 적는다.
+    #[serde(default)]
+    pub allow_auth_disable: bool,
 }
 
 impl Default for HttpConfig {
@@ -100,6 +115,8 @@ impl Default for HttpConfig {
             port: 8080,
             shutdown_grace_secs: 45,
             deregistration_wait_secs: 20,
+            // 기본은 **인증을 끌 수 없다.** 열려면 배포 설정에 한 줄 적는다.
+            allow_auth_disable: false,
         }
     }
 }
@@ -199,6 +216,31 @@ pub struct CollectorConfig {
     /// SSO 가 만료돼도 백필 경로를 끝까지 돌릴 수 있게 한다.
     #[serde(default)]
     pub slowlog_file: Option<String>,
+    /// 식별자 → `호스트:포트`. **개발 전용, 루프백만.** SSM 터널로 붙기 위한 것이다.
+    ///
+    /// # 무엇을 푸는가
+    ///
+    /// 시드 DB 는 프라이빗 서브넷에 있다(`PubliclyAccessible=false`). ECS 는 VPC
+    /// 안이라 등록부의 엔드포인트로 그냥 붙지만, **노트북에서는 그 주소가 라우팅되지
+    /// 않는다.** SSM 포트 포워딩은 `127.0.0.1:1432x` 로 열리는데 수집기는 등록부
+    /// 주소로 붙으므로 터널이 소용없었다.
+    ///
+    /// ```toml
+    /// [collector.target_endpoint_overrides]
+    /// dbmon-seed-dev-mysql = "127.0.0.1:14321"
+    /// ```
+    ///
+    /// # 무엇을 바꾸지 않는가
+    ///
+    /// **IAM 토큰은 여전히 실제 엔드포인트로 서명한다.** RDS 가 검증하는 대상이
+    /// 그것이기 때문이다 — 루프백으로 서명하면 `Access denied` 가 되고 원인이
+    /// IAM 정책처럼 보인다. 이 값은 TCP 접속 주소만 바꾼다.
+    ///
+    /// 루프백이므로 TLS 는 `PlaintextLoopback` 이 된다(`mysql::connect::tls_mode`) —
+    /// 터널 안에서 RDS 인증서를 `127.0.0.1` 로 검증할 수는 없으므로 그게 맞다.
+    /// 대신 **암호는 SSM 터널이 감싸는 구간에서만 평문**이다.
+    #[serde(default)]
+    pub target_endpoint_overrides: std::collections::BTreeMap<String, String>,
 }
 
 fn default_literal_policy() -> dbmon_core::slow_query::LiteralPolicy {
@@ -234,6 +276,7 @@ impl Default for CollectorConfig {
             orphan_sweep_secs: default_orphan_sweep_secs(),
             backfill_secs: default_backfill_secs(),
             slowlog_file: None,
+            target_endpoint_overrides: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -267,6 +310,22 @@ pub struct DiscoveryConfig {
     /// 환경 태그가 prd 인 인스턴스를 거부한다. 비프로덕션 배포에서 기본 `true`.
     #[serde(default)]
     pub reject_production_tags: bool,
+    /// **prd 격리 게이트를 끈다** — 이름·태그가 prd 여도 제외하지 않는다.
+    ///
+    /// # 이 값이 필요한 이유
+    ///
+    /// T-37 게이트는 "개발계 계정에 남의 프로덕션 워크로드가 섞여 있다" 를 가정한다.
+    /// 그런데 **prd 를 흉내낸 시드 DB 를 일부러 두고 관측하는** 계정도 있다
+    /// (`60-seed` 가 `dbmon-seed-prd-*` 를 만든다). 그 계정에서는 이름 거부가
+    /// 관측 대상을 지워 버린다.
+    ///
+    /// 그런 배포에서는 **환경을 이름이 아니라 태그로만 분류한다.** 이 플래그가 그
+    /// 의도를 명시하는 자리다 — 켜면 기동 로그가 경고로 말한다.
+    ///
+    /// ⚠ 켜도 `allowed_vpc_ids` 는 여전히 필수다(검증). 격리를 통째로 여는 것이
+    /// 아니라 **이름·태그 조건만** 빼는 것이다.
+    #[serde(default)]
+    pub collect_production_targets: bool,
 }
 
 fn default_discovery_interval_secs() -> u64 {
@@ -281,7 +340,18 @@ impl Default for DiscoveryConfig {
             required_tags: Vec::new(),
             denied_name_substrings: Vec::new(),
             reject_production_tags: false,
+            collect_production_targets: false,
         }
+    }
+}
+
+impl CollectorConfig {
+    /// 이 식별자로 열린 터널이 있으면 `(호스트, 포트)`. **검증을 통과한 값만 온다**
+    /// (`validate`: dev + 루프백 + 포트 범위).
+    pub fn tunnel_for(&self, identifier: &str) -> Option<(&str, u16)> {
+        let addr = self.target_endpoint_overrides.get(identifier)?;
+        let (host, port) = addr.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
     }
 }
 
@@ -444,7 +514,12 @@ impl Config {
         // ⚠ 이 호출부가 없어서 **기본 거부 목록이 한 번도 적용되지 않았다.**
         // 함수는 있었고 테스트도 있었지만 프로덕션 경로가 부르지 않았다 —
         // 이 프로젝트에서 다섯 번째로 재발한 부류다.
-        if self.deployment_env != Env::Prd {
+        // **명시적으로 prd 를 수집하겠다고 적었으면 이름·태그 게이트를 켜지 않는다.**
+        //
+        // 이 분기가 없으면 prd 시드를 일부러 두고 관측하는 계정에서 그 인스턴스가
+        // 통째로 사라진다. 대신 기동 로그가 경고로 말하고(`main.rs`), VPC 필터는
+        // 그대로 필수다(`validate`).
+        if self.deployment_env != Env::Prd && !self.discovery.collect_production_targets {
             // **대체가 아니라 합친다.** 비어 있을 때만 채우면, 운영자가
             // `denied_name_substrings = ["canary"]` 한 줄을 더하는 순간 `prd`/`prod`/
             // `production` 이 조용히 사라진다 — 설정을 좁히려는 행위가 방어선을 넓힌다
@@ -660,6 +735,44 @@ impl Config {
                 "로컬 슬로우로그 파일은 deployment_env=dev 에서만 쓴다 \
                  (prd 는 CloudWatch Logs 를 읽는다)",
             ));
+        }
+
+        // **대상 엔드포인트 오버라이드(SSM 터널)도 `dev` + 루프백에서만.**
+        //
+        // 루프백을 강제하는 이유: 임의 호스트를 허용하면 등록부의 주소 검증
+        // (`is_valid_target_host`)을 설정으로 우회하는 문이 된다 — 그 검증이 막으려던
+        // 것이 "남의 계정 RDS 로 평문 비밀번호를 보내는" 경로다.
+        if !self.collector.target_endpoint_overrides.is_empty() {
+            if self.deployment_env != Env::Dev {
+                return Err(err(
+                    "collector.target_endpoint_overrides",
+                    "SSM 터널용 오버라이드는 deployment_env=dev 에서만 쓴다 \
+                     (ECS 는 VPC 안이므로 등록부 엔드포인트로 바로 붙는다)",
+                ));
+            }
+            for (id, addr) in &self.collector.target_endpoint_overrides {
+                let Some((host, port)) = addr.rsplit_once(':') else {
+                    return Err(err(
+                        "collector.target_endpoint_overrides",
+                        format!("{id}: `호스트:포트` 형태여야 한다 (받은 값: {addr})"),
+                    ));
+                };
+                if port.parse::<u16>().is_err() || port.parse::<u16>() == Ok(0) {
+                    return Err(err(
+                        "collector.target_endpoint_overrides",
+                        format!("{id}: 포트가 1~65535 가 아니다 ({port})"),
+                    ));
+                }
+                if !crate::mysql::connect::is_loopback_host(host) {
+                    return Err(err(
+                        "collector.target_endpoint_overrides",
+                        format!(
+                            "{id}: 루프백만 허용한다 (받은 호스트: {host}) — \
+                             터널은 항상 localhost 에 열린다"
+                        ),
+                    ));
+                }
+            }
         }
 
         // **엔드포인트 재지정은 `dev` + 루프백에서만 허용한다.**
@@ -1430,6 +1543,89 @@ config_table = "c"
             .expect("테스트 TOML"),
         );
         Config::from_value(root).expect("기본 설정")
+    }
+
+    /// **명시적으로 밝히면 prd 격리 게이트가 켜지지 않는다.**
+    ///
+    /// prd 를 흉내낸 시드 DB 를 두고 관측하는 계정이 있다(`60-seed`). 그 계정에서는
+    /// 이름 거부가 관측 대상을 지워 버리므로, 태그로만 분류하겠다고 적을 자리가 필요하다.
+    #[test]
+    fn collecting_production_targets_must_be_stated_explicitly() {
+        let mut c = base();
+        c.deployment_env = Env::Dev;
+        c.discovery.allowed_vpc_ids = vec!["vpc-1".into()];
+
+        // 기본: 이름·태그 게이트가 둘 다 켜진다.
+        c.discovery.collect_production_targets = false;
+        c.discovery.denied_name_substrings.clear();
+        c.discovery.reject_production_tags = false;
+        c.apply_derived_defaults();
+        assert!(c.discovery.denied_name_substrings.contains(&"prd".to_string()));
+        assert!(c.discovery.reject_production_tags);
+
+        // 명시하면 둘 다 켜지지 않는다 — 대신 VPC 필터가 범위를 정한다.
+        let mut c = base();
+        c.deployment_env = Env::Dev;
+        c.discovery.allowed_vpc_ids = vec!["vpc-1".into()];
+        c.discovery.collect_production_targets = true;
+        c.discovery.denied_name_substrings.clear();
+        c.discovery.reject_production_tags = false;
+        c.apply_derived_defaults();
+        assert!(
+            c.discovery.denied_name_substrings.is_empty(),
+            "이름 거부가 남으면 prd 시드가 여전히 제외된다: {:?}",
+            c.discovery.denied_name_substrings
+        );
+        assert!(!c.discovery.reject_production_tags);
+    }
+
+    /// **SSM 터널 오버라이드는 dev + 루프백만.**
+    ///
+    /// 임의 호스트를 허용하면 등록부 주소 검증(`is_valid_target_host`)을 설정으로
+    /// 우회하는 문이 된다 — 그 검증이 막으려던 것이 "남의 계정 RDS 로 평문 비밀번호를
+    /// 보내는" 경로다.
+    #[test]
+    fn a_tunnel_override_is_dev_and_loopback_only() {
+        let with = |env: Env, addr: &str| {
+            let mut c = base();
+            c.deployment_env = env;
+            c.discovery.allowed_vpc_ids = vec!["vpc-1".into()];
+            c.collector
+                .target_endpoint_overrides
+                .insert("dbmon-seed-dev-mysql".into(), addr.into());
+            c.validate()
+        };
+
+        assert!(with(Env::Dev, "127.0.0.1:14321").is_ok());
+        assert!(with(Env::Dev, "localhost:14321").is_ok());
+        // prd·stg·unknown 배포에서는 아예 금지다.
+        for env in [Env::Prd, Env::Stg, Env::Unknown] {
+            assert!(with(env, "127.0.0.1:14321").is_err(), "{env} 에서 통과했다");
+        }
+        // 루프백이 아니면 거부한다.
+        assert!(with(Env::Dev, "10.0.1.5:3306").is_err());
+        assert!(
+            with(Env::Dev, "orders.abc.ap-northeast-2.rds.amazonaws.com:3306").is_err(),
+            "실제 RDS 주소를 오버라이드로 받으면 검증을 우회하는 문이 된다"
+        );
+        // 형태·포트 범위.
+        assert!(with(Env::Dev, "127.0.0.1").is_err());
+        assert!(with(Env::Dev, "127.0.0.1:0").is_err());
+        assert!(with(Env::Dev, "127.0.0.1:칠만").is_err());
+    }
+
+    /// 조회는 식별자로 한다 — 터널 설정에 사람이 적는 값이 그것이다.
+    #[test]
+    fn tunnel_lookup_uses_the_bare_identifier() {
+        let mut c = base();
+        c.collector
+            .target_endpoint_overrides
+            .insert("dbmon-seed-dev-mysql".into(), "127.0.0.1:14321".into());
+        assert_eq!(
+            c.collector.tunnel_for("dbmon-seed-dev-mysql"),
+            Some(("127.0.0.1", 14321))
+        );
+        assert_eq!(c.collector.tunnel_for("dbmon-seed-prd-mysql"), None);
     }
 
     /// **`0` 은 비활성이 아니라 매 tick 반복이다.**

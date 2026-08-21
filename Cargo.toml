@@ -54,6 +54,7 @@ rand = "0.9"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
 aws-sdk-rds = "1"
+aws-sdk-cloudwatch = "1"
 aws-sdk-cloudwatchlogs = "1"
 aws-sigv4 = { version = "1", features = ["http1"] }
 percent-encoding = "2"

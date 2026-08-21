@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use dbmon_core::instance::Instance;
+use dbmon_core::pause::PauseSet;
 use dbmon_core::time::EpochMs;
 
 /// 수집 태스크가 있어야 하는 인스턴스들.
@@ -29,10 +30,30 @@ use dbmon_core::time::EpochMs;
 ///
 /// ⚠ `is_collectible()` 은 이 파일이 만들어질 때까지 **비테스트 호출부가 없었다**
 /// (2차 리뷰가 지적). 이 함수가 그 유일한 호출부다.
-pub fn desired_ids(instances: &[Instance]) -> BTreeSet<String> {
+///
+/// # 정지 스코프도 여기서만 적용한다
+///
+/// 사람이 멈춘 인스턴스는 **목표 집합에서 빠진다** — 그러면 태스크 정리(중지·진행 중
+/// 레코드 확정)가 "인스턴스가 사라졌다" 와 완전히 같은 경로를 탄다. 태스크 쪽에
+/// "멈췄나?" 검사를 심으면 태스크는 살아 있는데 아무 일도 안 하는 상태가 되고,
+/// 화면의 `collecting` 수가 거짓말을 한다.
+pub fn desired_ids(instances: &[Instance], pause: &PauseSet) -> BTreeSet<String> {
     instances
         .iter()
-        .filter(|i| i.is_collectible())
+        .filter(|i| i.is_collectible() && !pause.is_paused(i))
+        .map(|i| i.id.as_str().to_string())
+        .collect()
+}
+
+/// 지금 멈춰 있는 인스턴스들. **[`desired_ids`] 의 여집합 중 "멈춰서 빠진" 것**이다.
+///
+/// 이 목록이 필요한 이유는 태스크를 내린 뒤 **진행 중 레코드를 확정해야** 하기
+/// 때문이다. 남겨 두면 그 레코드는 이 워커·이 epoch 소유이므로 고아 스윕이 `Mine`
+/// 으로 보고 매번 건너뛴다 — 리더가 바뀔 때까지 화면에 유령 "실행 중" 이 남는다.
+pub fn paused_ids(instances: &[Instance], pause: &PauseSet) -> BTreeSet<String> {
+    instances
+        .iter()
+        .filter(|i| pause.is_paused(i))
         .map(|i| i.id.as_str().to_string())
         .collect()
 }
@@ -154,7 +175,7 @@ mod tests {
             instance("deleted", InstanceState::Deleted, true),
             instance("no-endpoint", InstanceState::Collecting, false),
         ];
-        let desired = desired_ids(&instances);
+        let desired = desired_ids(&instances, &PauseSet::default());
         assert_eq!(desired, ids(&[&id_of("ok")]), "{desired:?}");
     }
 
@@ -166,7 +187,7 @@ mod tests {
     fn unreachable_instances_keep_their_task_for_recovery() {
         let instances = vec![instance("down", InstanceState::Unreachable, true)];
         assert_eq!(
-            desired_ids(&instances),
+            desired_ids(&instances, &PauseSet::default()),
             ids(&[&id_of("down")]),
             "태스크를 내리면 서킷이 열린 채로 영구히 복구되지 않는다"
         );
@@ -176,7 +197,68 @@ mod tests {
     #[test]
     fn degraded_instances_keep_collecting() {
         let instances = vec![instance("half", InstanceState::Degraded, true)];
-        assert_eq!(desired_ids(&instances), ids(&[&id_of("half")]));
+        assert_eq!(
+            desired_ids(&instances, &PauseSet::default()),
+            ids(&[&id_of("half")])
+        );
+    }
+
+    /// **멈춘 스코프는 목표 집합에서 빠진다** — 스코프별로 정확히 그것만.
+    ///
+    /// 여기가 틀리면 두 방향으로 틀린다: 멈추라고 한 것이 계속 수집되거나(관측을
+    /// 멈춘 이유가 무의미해진다), 멈추지 않은 것이 함께 멈춘다(구간이 영구히 빈다).
+    #[test]
+    fn a_paused_scope_drops_exactly_its_instances() {
+        use dbmon_core::env::Env;
+        use dbmon_core::pause::PauseScope;
+
+        // 태그가 없으므로 셋 다 `Unknown` 환경이다. 환경별 정지는 그 사실로 검증한다.
+        let instances = vec![
+            instance("orders", InstanceState::Collecting, true),
+            instance("billing", InstanceState::Collecting, true),
+        ];
+        let all_ids = ids(&[&id_of("orders"), &id_of("billing")]);
+
+        let none = PauseSet::default();
+        assert_eq!(desired_ids(&instances, &none), all_ids);
+        assert!(paused_ids(&instances, &none).is_empty());
+
+        let all = PauseSet::from_entries([(PauseScope::All.as_key(), 1)]);
+        assert!(desired_ids(&instances, &all).is_empty());
+        assert_eq!(paused_ids(&instances, &all), all_ids);
+
+        let by_env = PauseSet::from_entries([(PauseScope::Env(Env::Unknown).as_key(), 1)]);
+        assert!(
+            desired_ids(&instances, &by_env).is_empty(),
+            "환경 전체가 멈춘다"
+        );
+
+        let other_env = PauseSet::from_entries([(PauseScope::Env(Env::Prd).as_key(), 1)]);
+        assert_eq!(
+            desired_ids(&instances, &other_env),
+            all_ids,
+            "다른 환경의 정지는 이 인스턴스들에 닿지 않는다"
+        );
+
+        let one = PauseSet::from_entries([(format!("id:{}", id_of("orders")), 1)]);
+        assert_eq!(desired_ids(&instances, &one), ids(&[&id_of("billing")]));
+        assert_eq!(paused_ids(&instances, &one), ids(&[&id_of("orders")]));
+    }
+
+    /// **수집 불가 인스턴스는 "멈춘 것" 이 아니다.**
+    ///
+    /// 둘을 섞으면 정지 때문에 내려간 태스크와 인스턴스가 죽어서 내려간 태스크를
+    /// 구분할 수 없고, 진행 중 레코드에 `collector_paused` 사유가 잘못 붙는다.
+    #[test]
+    fn a_stopped_instance_is_not_reported_as_paused() {
+        let instances = vec![instance("gone", InstanceState::Deleted, true)];
+        let all = PauseSet::from_entries([(dbmon_core::pause::ALL_KEY.to_string(), 1)]);
+        assert!(desired_ids(&instances, &all).is_empty());
+        // 전체 정지면 "멈춘 것" 으로 센다 — 진행 중 레코드가 남아 있을 수 있으므로
+        // 확정 대상이어야 한다.
+        assert_eq!(paused_ids(&instances, &all), ids(&[&id_of("gone")]));
+        // 정지가 없으면 멈춘 것도 없다.
+        assert!(paused_ids(&instances, &PauseSet::default()).is_empty());
     }
 
     #[test]

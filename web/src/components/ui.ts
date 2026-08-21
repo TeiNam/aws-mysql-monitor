@@ -60,8 +60,19 @@ export const COL_TIGHT_CAPPED = `${COL_TIGHT} max-w-[16rem] truncate`;
  * 그때는 표에 가로 스크롤이 생기는 편이 낫다(감싼 `div` 가 `overflow-x-auto` 다).
  */
 export const COL_GROW = "w-full min-w-[22rem]";
+/**
+ * 표 머리.
+ *
+ * **`text-xs font-medium` 에서 올렸다.** 열이 12개가 되자(메트릭 표) 머리글이 값보다
+ * 작고 흐려서 어느 열을 보고 있는지 눈으로 잡기 어려웠다(사용자 지적). 값은
+ * `text-sm` 이므로 머리도 같은 크기에 더 굵게 둔다 — 머리가 값보다 약하면 표가
+ * "숫자 덩어리" 로 읽힌다.
+ *
+ * 공통 상수라 **모든 표에 함께 적용된다.** 그게 의도다 — 표마다 머리 굵기가 다르면
+ * 화면을 옮길 때마다 눈이 다시 적응해야 한다.
+ */
 export const TH =
-  `${CELL_X} py-2 bg-gray-50 text-left text-xs font-medium text-gray-600 uppercase tracking-wider whitespace-nowrap`;
+  `${CELL_X} py-2 bg-gray-50 text-left text-sm font-bold text-gray-700 uppercase tracking-wide whitespace-nowrap`;
 export const TH_NUM = `${TH} text-right`;
 export const TBODY = "bg-white divide-y divide-gray-200";
 export const TR = "hover:bg-gray-50";
@@ -76,10 +87,13 @@ export const LABEL = "flex items-center gap-2 text-sm text-gray-600";
 
 export const BTN =
   "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium shadow-sm disabled:opacity-50 disabled:cursor-not-allowed";
-export const BTN_PRIMARY = `${BTN} bg-blue-600 text-white hover:bg-blue-700`;
+// **`text-oncolor` 다 (`text-white` 가 아니다).** 다크 모드는 `--color-white` 를 카드
+// 표면 색으로 다시 정의하므로, `text-white` 를 쓰면 칠한 버튼의 글자가 어두워진다.
+// hover 도 500 대역으로 간다 — 700/800 은 다크에서 밝은 글자색으로 뒤집힌다.
+export const BTN_PRIMARY = `${BTN} bg-blue-600 text-oncolor hover:bg-blue-500`;
 export const BTN_GHOST = `${BTN} bg-gray-100 text-gray-700 hover:bg-gray-200`;
-export const BTN_GREEN = `${BTN} bg-green-500 text-white hover:bg-green-600`;
-export const BTN_RED = `${BTN} bg-red-500 text-white hover:bg-red-600`;
+export const BTN_GREEN = `${BTN} bg-green-500 text-oncolor hover:bg-green-600`;
+export const BTN_RED = `${BTN} bg-red-500 text-oncolor hover:bg-red-600`;
 
 export const MONO = "font-mono text-xs";
 export const LINK = "text-blue-600 hover:text-blue-800 hover:underline underline-offset-2";

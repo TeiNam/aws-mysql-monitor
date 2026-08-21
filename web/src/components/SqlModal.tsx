@@ -48,7 +48,8 @@ export function SqlModal({ title, sql, reason, truncated, onClose }: SqlModalPro
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-gray-900/40 p-6"
+      // 배경 막. `gray-900` 은 다크에서 밝은 글자색으로 뒤집히므로 여기서는 검정을 쓴다.
+      className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-6 dark:bg-black/60"
       role="dialog"
       aria-modal="true"
       aria-label={title}

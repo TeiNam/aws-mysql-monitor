@@ -24,6 +24,8 @@
 //! | [`inflight`] | in-flight 상태 머신, 스레드 재사용 방어 (R5) |
 //! | [`clock_offset`] | 시계 오프셋 추정 (F14) |
 //! | [`rollup`] | 상위 N + `_other` 총량 보존 (F6, R9) |
+//! | [`pause`] | 수집 정지 스코프 (전체 / 환경 / 인스턴스) |
+//! | [`cw_metrics`] | CloudWatch 메트릭 카탈로그·period 규칙 (엔진별 분리) |
 //! | [`rbac`] | 토큰 ∩ 서버 레코드 인가 (T-20) |
 //! | [`secret`] | 로깅할 수 없는 값 |
 //! | [`error`] | 에러 체계, AWS 오류 분류 (F25) |
@@ -31,6 +33,7 @@
 //! | `fakes` | 테스트용 인메모리 구현 = **두 번째 구현** |
 
 pub mod clock_offset;
+pub mod cw_metrics;
 pub mod digest;
 pub mod env;
 pub mod error;
@@ -41,10 +44,12 @@ pub mod ids;
 pub mod inflight;
 pub mod instance;
 pub mod merge;
+pub mod pause;
 pub mod ports;
 pub mod rbac;
 pub mod rollup;
 pub mod secret;
+pub mod settings;
 pub mod slow_query;
 pub mod time;
 

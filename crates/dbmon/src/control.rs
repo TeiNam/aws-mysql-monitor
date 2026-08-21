@@ -12,24 +12,28 @@
 //! 즉시 리더가 되어 수집을 계속한다** — 멈춘 게 아니다. 그래서 리스는 그대로 쥐고
 //! 수집 태스크만 멈춘다.
 //!
-//! # 프로세스 범위다
+//! # 두 종류의 제어가 있다
 //!
-//! 이 플래그는 **요청을 받은 프로세스에만** 적용된다(원자값이므로 재시작하면
-//! 초기화된다). 여러 워커를 띄운 배포에서 전체를 멈추려면 설정 저장소에 상태를
-//! 둬야 하고, 그건 이 구조보다 크다. 그래서 상태 응답이 `worker_id` 와
-//! `scope: "process"` 를 함께 말한다 — 어느 워커를 멈췄는지 화면이 알 수 있어야 한다.
+//! | 종류 | 어디 사는가 | 왜 |
+//! |---|---|---|
+//! | **정지 스코프** (전체·환경·인스턴스) | 저장소 ([`PauseState`]) | 사람의 의도다. 재시작·리더 교체에도 남아야 한다 |
+//! | **"지금 훑어"·"지금 백필"** | 프로세스 원자값 ([`Controls`]) | 리더에게 한 번 찌르는 것이다. 남을 이유가 없다 |
+//!
+//! 정지가 프로세스 원자값이었을 때는 재배포에 풀렸고, 리더가 바뀌면 플래그가 없는
+//! 워커가 수집을 이어갔다 — **화면에는 "멈춤" 인데 기록은 계속 쌓인다.** 그래서
+//! 정지만 저장소로 옮겼다. 반대로 즉시 실행 요청을 저장소에 두면 "한 번 소비" 를
+//! 위해 조건부 쓰기가 필요해지는데, 그 요청은 리더에게만 의미가 있어 이득이 없다.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// 수집 제어 플래그와 런타임 사실. API 와 리더 루프가 `Arc` 로 공유한다.
+use dbmon_core::pause::{PauseScope, PauseSet};
+use dbmon_core::ports::PauseStore;
+use dbmon_core::time::EpochMs;
+
+/// 즉시 실행 요청과 런타임 사실. API 와 리더 루프가 `Arc` 로 공유한다.
 #[derive(Debug, Default)]
 pub struct Controls {
-    /// **0 이면 안 멈춤, >0 이면 멈춘 시각.**
-    ///
-    /// `paused: AtomicBool` 과 `paused_since_ms: AtomicI64` 로 나누면 두 요청이
-    /// 겹칠 때 `paused=false` 인데 시각이 남는 모순 상태가 만들어진다. 하나로 합치면
-    /// 그 상태가 **표현 불가능**하다.
-    paused_since_ms: AtomicI64,
     /// 다음 tick 에 탐색을 강제한다. **한 번 소비되면 내려간다.**
     discover_now: AtomicBool,
     /// 다음 tick 에 슬로우로그 백필을 강제한다.
@@ -49,26 +53,6 @@ impl Controls {
     }
 
     // ── 조작 ────────────────────────────────────────────────────────────────
-
-    /// 수집을 멈춘다/재개한다. 이미 멈춰 있으면 **시작 시각을 덮지 않는다** —
-    /// 화면이 "3분 전부터 멈춤" 을 말할 수 있어야 한다.
-    pub fn set_paused(&self, paused: bool, now_ms: i64) {
-        if !paused {
-            self.paused_since_ms.store(0, Ordering::SeqCst);
-            return;
-        }
-        // 0 → now 로만 바꾼다. 이미 값이 있으면 그대로 둔다.
-        let _ = self.paused_since_ms.compare_exchange(
-            0,
-            now_ms.max(1),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused_since_ms.load(Ordering::SeqCst) != 0
-    }
 
     pub fn request_discovery(&self) {
         self.discover_now.store(true, Ordering::SeqCst);
@@ -106,11 +90,7 @@ impl Controls {
     /// 화면에 그대로 내보내는 스냅샷. **`0` 은 "아직 없다" 이므로 `None` 으로 바꾼다.**
     pub fn snapshot(&self) -> ControlSnapshot {
         let opt = |v: i64| if v == 0 { None } else { Some(v) };
-        // **한 번만 읽는다.** 두 번 읽으면 그 사이에 바뀌어 다시 모순이 생긴다.
-        let paused_since = self.paused_since_ms.load(Ordering::SeqCst);
         ControlSnapshot {
-            paused: paused_since != 0,
-            paused_since_ms: opt(paused_since),
             is_leader: self.is_leader.load(Ordering::Relaxed),
             collecting: self.collecting.load(Ordering::Relaxed),
             last_tick_ms: opt(self.last_tick_ms.load(Ordering::Relaxed)),
@@ -123,10 +103,11 @@ impl Controls {
 }
 
 /// 수집기 상태. 참조 대시보드의 `Status: running` 카드에 대응한다.
+///
+/// ⚠ **정지 여부는 여기 없다.** 그건 프로세스가 아니라 저장소의 사실이므로
+/// API 응답이 [`PauseState`] 에서 읽어 함께 내보낸다.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ControlSnapshot {
-    pub paused: bool,
-    pub paused_since_ms: Option<i64>,
     /// 이 프로세스가 수집 리더인가. **아니면 멈추고 있는 것이 정상이다.**
     pub is_leader: bool,
     /// 지금 수집 중인 인스턴스 수.
@@ -139,48 +120,174 @@ pub struct ControlSnapshot {
     pub backfill_requested: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// 정지 스코프 집합의 **공유 캐시**.
+///
+/// # 왜 캐시인가
+///
+/// 리더 루프는 1초마다 돈다(`detect_interval_ms`). 매 tick 저장소를 읽으면 조회
+/// 비용은 사소하지만 **tick 안에 네트워크 왕복이 하나 늘어난다** — 이 루프가 늦으면
+/// `gate.refresh()` 가 늦고, 리스 TTL(60초)을 놓치면 리더가 바뀐다. 그래서 짧게
+/// 캐시한다. 정지 반영이 최대 [`CACHE_TTL_MS`] 늦지만, 사람이 버튼을 누르는 일에
+/// 5초는 보이지 않는다.
+///
+/// # 왜 실패하면 마지막 값을 쓰는가
+///
+/// 조회 실패를 "아무것도 안 멈춰 있다" 로 접으면 **저장소가 흔들릴 때 멈춰 둔 prd 가
+/// 다시 수집된다.** 사람이 관측을 멈춘 이유(유지보수·부하)는 그때도 유효하다.
+/// 그래서 마지막으로 성공한 집합을 유지하고 경고만 남긴다.
+pub struct PauseState {
+    store: Arc<dyn PauseStore>,
+    cache: Mutex<Cached>,
+}
 
-    /// **`paused` 와 시각이 어긋난 상태가 표현 불가능해야 한다.**
-    ///
-    /// 둘을 따로 둔 판에서는 요청이 겹칠 때 `paused=false` + 시각 있음이 나올 수
-    /// 있었다. 하나의 원자값으로 합쳐 그 조합을 없앴다.
-    #[test]
-    fn paused_and_its_timestamp_cannot_disagree() {
-        let c = Controls::new();
-        for (paused, now) in [(true, 5), (true, 9), (false, 11), (true, 20), (false, 30)] {
-            c.set_paused(paused, now);
-            let s = c.snapshot();
-            assert_eq!(
-                s.paused,
-                s.paused_since_ms.is_some(),
-                "paused={} 인데 시각은 {:?} 다",
-                s.paused,
-                s.paused_since_ms
-            );
+/// 캐시 유효 기간. 사람 손으로 누르는 조작에 대해 보이지 않는 지연이다.
+pub const CACHE_TTL_MS: i64 = 5_000;
+
+#[derive(Default)]
+struct Cached {
+    set: PauseSet,
+    /// 마지막으로 **성공한** 조회 시각. `None` 이면 아직 한 번도 못 읽었다.
+    loaded_ms: Option<EpochMs>,
+}
+
+impl PauseState {
+    pub fn new(store: Arc<dyn PauseStore>) -> Self {
+        Self {
+            store,
+            cache: Mutex::new(Cached::default()),
         }
     }
 
-    #[test]
-    fn pause_records_when_it_started_and_resume_clears_it() {
-        let c = Controls::new();
-        assert!(!c.is_paused());
-        assert_eq!(c.snapshot().paused_since_ms, None);
+    /// 캐시가 유효하면 그대로, 아니면 저장소에서 읽는다.
+    pub async fn load(&self, now_ms: EpochMs) -> PauseSet {
+        if let Some(fresh) = self.fresh(now_ms) {
+            return fresh;
+        }
+        self.refresh(now_ms).await
+    }
 
-        c.set_paused(true, 1_000);
-        assert!(c.is_paused());
-        assert_eq!(c.snapshot().paused_since_ms, Some(1_000));
+    /// 캐시를 무시하고 읽는다. **쓰기 직후**에 부른다 — 같은 요청의 응답이
+    /// 방금 누른 결과를 말해야 한다.
+    pub async fn refresh(&self, now_ms: EpochMs) -> PauseSet {
+        match self.store.list().await {
+            Ok(set) => {
+                let mut c = self.cache.lock().expect("pause cache");
+                c.set = set.clone();
+                c.loaded_ms = Some(now_ms);
+                set
+            }
+            Err(e) => {
+                // **마지막 값을 유지한다.** 빈 집합으로 접으면 멈춰 둔 수집이 재개된다.
+                let last = self.cached();
+                tracing::warn!(
+                    error = %crate::telemetry::Scrubbed(&e),
+                    paused_scopes = last.len(),
+                    "정지 스코프를 읽을 수 없다 — 마지막으로 읽은 집합을 유지한다"
+                );
+                last
+            }
+        }
+    }
 
-        // 같은 상태를 다시 눌러도 시작 시각을 덮지 않는다 — 화면이 "3분 전부터
-        // 멈춤" 을 말할 수 있어야 한다.
-        c.set_paused(true, 9_000);
-        assert_eq!(c.snapshot().paused_since_ms, Some(1_000));
+    /// 지금 들고 있는 값. **I/O 를 하지 않는다.**
+    pub fn cached(&self) -> PauseSet {
+        self.cache.lock().expect("pause cache").set.clone()
+    }
 
-        c.set_paused(false, 9_000);
-        assert!(!c.is_paused());
-        assert_eq!(c.snapshot().paused_since_ms, None);
+    fn fresh(&self, now_ms: EpochMs) -> Option<PauseSet> {
+        let c = self.cache.lock().expect("pause cache");
+        let loaded = c.loaded_ms?;
+        (now_ms - loaded < CACHE_TTL_MS).then(|| c.set.clone())
+    }
+
+    pub async fn pause(
+        &self,
+        scope: &PauseScope,
+        by: &str,
+        now_ms: EpochMs,
+    ) -> dbmon_core::Result<PauseSet> {
+        self.store.pause(scope, by, now_ms).await?;
+        Ok(self.refresh(now_ms).await)
+    }
+
+    pub async fn resume(
+        &self,
+        scope: &PauseScope,
+        now_ms: EpochMs,
+    ) -> dbmon_core::Result<PauseSet> {
+        self.store.resume(scope).await?;
+        Ok(self.refresh(now_ms).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbmon_core::env::Env;
+    use dbmon_core::fakes::FakePauseStore;
+
+    fn state() -> (Arc<FakePauseStore>, PauseState) {
+        let store = Arc::new(FakePauseStore::new());
+        (Arc::clone(&store), PauseState::new(store))
+    }
+
+    /// **캐시가 유효한 동안에는 저장소를 다시 읽지 않는다.** 리더 루프가 1초마다
+    /// 부르므로 여기가 새면 tick 마다 왕복이 하나 붙는다.
+    #[tokio::test]
+    async fn a_fresh_cache_does_not_hit_the_store() {
+        let (store, state) = state();
+        state.load(1_000).await;
+        assert_eq!(store.list_calls(), 1);
+
+        state.load(1_000 + CACHE_TTL_MS - 1).await;
+        assert_eq!(store.list_calls(), 1, "캐시가 유효하면 읽지 않는다");
+
+        state.load(1_000 + CACHE_TTL_MS).await;
+        assert_eq!(store.list_calls(), 2, "만료되면 다시 읽는다");
+    }
+
+    /// **저장소가 흔들려도 멈춰 둔 것은 멈춰 있어야 한다.**
+    ///
+    /// 빈 집합으로 접으면 사람이 멈춰 둔 prd 가 조용히 다시 수집된다 — 관측을 멈춘
+    /// 이유는 저장소 장애와 무관하게 유효하다.
+    #[tokio::test]
+    async fn a_store_failure_keeps_the_last_known_set() {
+        let (store, state) = state();
+        state
+            .pause(&PauseScope::Env(Env::Prd), "tester", 1_000)
+            .await
+            .expect("정지");
+        assert!(
+            state.cached().is_paused_id(
+                &dbmon_core::InstanceId::new("123456789012", "ap-northeast-2", "orders-prd-01")
+                    .expect("id"),
+                Env::Prd
+            )
+        );
+
+        store.set_failing(true);
+        let after = state.load(1_000 + CACHE_TTL_MS).await;
+        assert!(
+            after.contains(&PauseScope::Env(Env::Prd)),
+            "조회 실패가 정지를 풀어서는 안 된다"
+        );
+    }
+
+    /// 같은 스코프를 다시 눌러도 **시작 시각을 덮지 않는다** — 화면이 "3분 전부터
+    /// 멈춤" 을 말할 수 있어야 한다. (저장소가 `if_not_exists` 로 지키는 계약이다.)
+    #[tokio::test]
+    async fn pausing_twice_keeps_the_first_timestamp() {
+        let (_store, state) = state();
+        let scope = PauseScope::Env(Env::Dev);
+        state.pause(&scope, "a", 1_000).await.expect("정지");
+        let set = state.pause(&scope, "b", 9_000).await.expect("재정지");
+        assert_eq!(set.since_ms(&scope), Some(1_000));
+
+        state.resume(&scope, 9_500).await.expect("재개");
+        assert!(state.cached().is_empty());
+        // 재개 후 다시 멈추면 그때가 시작이다.
+        let set = state.pause(&scope, "a", 10_000).await.expect("정지");
+        assert_eq!(set.since_ms(&scope), Some(10_000));
     }
 
     /// **요청은 한 번만 소비된다.** 안 그러면 매 tick 탐색이 돌아 핫 루프가 된다.

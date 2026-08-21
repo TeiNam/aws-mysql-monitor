@@ -362,6 +362,19 @@ impl InstanceRegistry for FakeInstanceRegistry {
         Ok(inst.clone())
     }
 
+    async fn set_state(&self, id: &InstanceId, state: crate::instance::InstanceState) -> Result<()> {
+        let mut m = self.items.lock().unwrap();
+        // 프로덕션 구현이 `attribute_exists(PK)` 를 걸므로 없는 항목은 오류다.
+        let inst = m
+            .get_mut(id.as_str())
+            .ok_or_else(|| DomainError::NotFound {
+                kind: "인스턴스",
+                id: id.to_string(),
+            })?;
+        inst.state = state;
+        Ok(())
+    }
+
     async fn mark_seen(&self, id: &InstanceId, now_ms: EpochMs) -> Result<()> {
         let mut m = self.items.lock().unwrap();
         if let Some(inst) = m.get_mut(id.as_str()) {
@@ -461,6 +474,68 @@ impl LeaseStore for FakeLeaseStore {
             .filter(|l| l.key.starts_with(key_prefix))
             .cloned()
             .collect())
+    }
+}
+
+// ── PauseStore ──────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct FakePauseStore {
+    since: Mutex<BTreeMap<String, EpochMs>>,
+    /// `list` 를 실패시킨다. **저장소 장애 중에 정지가 풀리지 않는지**가 요점이다.
+    fail_list: AtomicBool,
+    /// `list` 호출 횟수. 캐시가 실제로 읽기를 아끼는지 센다.
+    pub list_count: AtomicUsize,
+}
+
+impl FakePauseStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_failing(&self, failing: bool) {
+        self.fail_list.store(failing, Ordering::SeqCst);
+    }
+
+    pub fn list_calls(&self) -> usize {
+        self.list_count.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl crate::ports::PauseStore for FakePauseStore {
+    async fn list(&self) -> Result<crate::pause::PauseSet> {
+        self.list_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_list.load(Ordering::SeqCst) {
+            return Err(DomainError::Unavailable {
+                dependency: "pause_store",
+                reason: "주입된 장애".into(),
+            });
+        }
+        let m = self.since.lock().unwrap();
+        Ok(crate::pause::PauseSet::from_entries(
+            m.iter().map(|(k, v)| (k.clone(), *v)),
+        ))
+    }
+
+    /// 프로덕션 구현의 `if_not_exists` 의미를 재현한다 — **시작 시각을 덮지 않는다.**
+    async fn pause(
+        &self,
+        scope: &crate::pause::PauseScope,
+        _by: &str,
+        now_ms: EpochMs,
+    ) -> Result<()> {
+        self.since
+            .lock()
+            .unwrap()
+            .entry(scope.as_key())
+            .or_insert(now_ms);
+        Ok(())
+    }
+
+    async fn resume(&self, scope: &crate::pause::PauseScope) -> Result<()> {
+        self.since.lock().unwrap().remove(&scope.as_key());
+        Ok(())
     }
 }
 

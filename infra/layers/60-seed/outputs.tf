@@ -115,6 +115,23 @@ output "slowlog_log_group_arns" {
   )
 }
 
+output "vpn_endpoint_id" {
+  description = "Client VPN endpoint. scripts/vpn.sh 가 .ovpn 생성에 쓴다."
+  value       = aws_ec2_client_vpn_endpoint.seed.id
+}
+
+output "vpn_client_cert" {
+  description = ".ovpn 에 들어갈 클라이언트 인증서 (scripts/vpn.sh 가 읽는다)."
+  value       = tls_locally_signed_cert.vpn_client.cert_pem
+  sensitive   = true
+}
+
+output "vpn_client_key" {
+  description = ".ovpn 에 들어갈 클라이언트 개인키 (scripts/vpn.sh 가 읽는다)."
+  value       = tls_private_key.vpn_client.private_key_pem
+  sensitive   = true
+}
+
 output "reboot_reminder" {
   description = "정적 파라미터는 재부팅해야 적용된다."
   value       = <<-EOT

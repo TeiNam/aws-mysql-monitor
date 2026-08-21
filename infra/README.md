@@ -52,6 +52,20 @@ scripts/db-tunnel.sh prd-aurora-writer    # 터널 열기
 mysql -h127.0.0.1 -P14310 -udbmonadmin -p # 다른 셸에서 접속
 ```
 
+**여러 대에 동시에 붙어야 하면 Client VPN 을 쓴다** (터널은 타깃당 1개).
+mutual TLS, split tunnel, 인가는 DB 서브넷 + VPC 리졸버만. 로컬 `cargo run`
+수집기가 9대 전부에 실제 호스트네임으로 직접 붙는다.
+
+```bash
+scripts/vpn.sh                            # dbmon-seed.ovpn 생성 (개인키 포함, gitignore 됨)
+# AWS VPN Client (brew install --cask aws-vpn-client) 에 프로파일 추가 → 연결
+mysql -h dbmon-seed-prd-mysql.<...>.rds.amazonaws.com -udbmonadmin -p   # 직접 접속
+```
+
+⚠ **association 이 시간당 과금이다** (서울 $0.10/h ≈ 월 $73, 연결 시 +$0.05/h).
+안 쓰는 기간엔 `-var vpn_enabled=false` 로 apply 하면 비용이 0 이 된다
+(endpoint·인증서는 무료로 보존, 재활성화는 apply 후 수 분).
+
 ## 기존 리소스는 `data` 로만 참조한다
 
 `dev-vpc-01`·서브넷·라우트 테이블은 **우리가 만들지 않았다.** `resource` 로 관리하면

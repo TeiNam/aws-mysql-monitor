@@ -156,6 +156,15 @@ impl ClusterId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// **맨 클러스터 식별자** (계정·리전 없이).
+    ///
+    /// AWS API 의 `DBClusterIdentifier` 는 이 값이다 — `as_str()` 의 정규화 형태
+    /// (`계정/리전/이름`)를 그대로 넘기면 CloudWatch 차원이 맞지 않아 **빈 값이 오면서
+    /// 과금된다**(테스트가 잡았다).
+    pub fn identifier(&self) -> &str {
+        self.0.rsplit('/').next().unwrap_or(&self.0)
+    }
 }
 impl TryFrom<String> for ClusterId {
     type Error = IdError;

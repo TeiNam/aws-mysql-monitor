@@ -27,6 +27,15 @@ impl Env {
 
     pub const ALL: [Env; 4] = [Self::Prd, Self::Stg, Self::Dev, Self::Unknown];
 
+    /// [`Env::as_str`] 의 역함수. **모르는 값은 `None`** 이다 — `Unknown` 으로 접으면
+    /// 오타(`env:prod`)가 조용히 "태그 없는 인스턴스" 를 가리킨다.
+    ///
+    /// 태그 값 매핑(`prod` → `Prd`)은 [`EnvMapping::classify`] 의 일이고 여기가 아니다.
+    /// 이건 우리가 쓴 문자열을 되읽는 것뿐이다.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+
     /// 프로덕션으로 **취급해야 하는가**.
     ///
     /// `Unknown` 도 true 다. 프로덕션 안전 규칙과 같은 방향으로 기운다:

@@ -1300,3 +1300,86 @@ async fn two_statements_in_the_same_second_bucket_stay_separate() {
         mine.iter().map(|q| q.app_digest.as_str()).collect();
     assert!(digests.contains("digest-outer") && digests.contains("digest-inner"));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 정지 스코프 — 저장소가 진실이다
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use dbmon::store::pause::DynamoPauseStore;
+use dbmon_core::pause::{PauseScope, PauseSet};
+use dbmon_core::ports::PauseStore;
+
+/// 프로덕션은 `config_table` 을 쓴다. 여기서 데이터 테이블에 붙이는 이유는 스키마가
+/// PK/SK 두 개로 같고, **이 테스트가 검증하는 것은 키 배치와 조건부 쓰기**이기
+/// 때문이다 — 테이블 생성 코드를 하나 더 만들 이유가 없다.
+async fn pause_store(name: &str) -> Option<DynamoPauseStore> {
+    let _ = store(name).await?;
+    Some(DynamoPauseStore::new(
+        client(),
+        format!("dbmon-test-{name}"),
+    ))
+}
+
+/// **왕복.** 저장한 스코프를 그대로 읽어야 한다 — 키 문자열은 컴파일러가 검사하지
+/// 않으므로 이 확인이 유일한 방법이다.
+#[tokio::test]
+async fn pause_scopes_round_trip_through_the_store() {
+    let Some(s) = pause_store("pause-roundtrip").await else {
+        return;
+    };
+    let one = PauseScope::Instance(instance());
+    let env = PauseScope::Env(Env::Prd);
+
+    assert_eq!(s.list().await.expect("조회"), PauseSet::default());
+
+    s.pause(&env, "operator@example.com", T0)
+        .await
+        .expect("정지");
+    s.pause(&one, "operator@example.com", T0 + 5_000)
+        .await
+        .expect("정지");
+
+    let set = s.list().await.expect("조회");
+    assert_eq!(set.len(), 2);
+    assert_eq!(set.since_ms(&env), Some(T0));
+    assert_eq!(set.since_ms(&one), Some(T0 + 5_000));
+    assert!(!set.is_all_paused(), "전체를 멈춘 적이 없다");
+    assert!(set.is_paused_id(&instance(), Env::Prd));
+
+    // 재개는 그 스코프만 지운다.
+    s.resume(&env).await.expect("재개");
+    let set = s.list().await.expect("조회");
+    assert_eq!(set.len(), 1);
+    assert_eq!(set.since_ms(&one), Some(T0 + 5_000));
+
+    // **없는 것을 지워도 성공이다** — 두 사람이 같이 눌러도 두 번째가 오류로 보이면 안 된다.
+    s.resume(&env).await.expect("멱등 재개");
+    s.resume(&one).await.expect("재개");
+    assert!(s.list().await.expect("조회").is_empty());
+}
+
+/// **이미 멈춘 스코프를 다시 눌러도 시작 시각이 유지된다.**
+///
+/// `PutItem` 으로 덮으면 화면이 "3분 전부터 멈춤" 을 말할 수 없다. `if_not_exists`
+/// 조건이 실제로 걸려 있는지는 저장소를 거쳐야만 확인된다.
+#[tokio::test]
+async fn pausing_an_already_paused_scope_keeps_the_original_time() {
+    let Some(s) = pause_store("pause-keeps-time").await else {
+        return;
+    };
+    let all = PauseScope::All;
+    s.pause(&all, "first", T0).await.expect("정지");
+    s.pause(&all, "second", T0 + 600_000).await.expect("재정지");
+
+    let set = s.list().await.expect("조회");
+    assert_eq!(set.since_ms(&all), Some(T0), "시작 시각이 덮였다");
+    assert!(set.is_all_paused());
+
+    // 재개 후 다시 멈추면 그때가 시작이다.
+    s.resume(&all).await.expect("재개");
+    s.pause(&all, "third", T0 + 900_000).await.expect("정지");
+    assert_eq!(
+        s.list().await.expect("조회").since_ms(&all),
+        Some(T0 + 900_000)
+    );
+}

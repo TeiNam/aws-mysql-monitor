@@ -21,6 +21,8 @@ import type {
   AwsInfo,
   CollectorStatus,
   DigestRow,
+  FleetMetricsResponse,
+  InstanceMetricsResponse,
   InstanceStats,
   InstanceView,
   ListResponse,
@@ -154,15 +156,51 @@ export function fetchPlan(recordId: string, signal: AbortSignal | null): Promise
   return apiGet<PlanView>(`/api/queries/${encodeURIComponent(recordId)}/plan`, signal);
 }
 
+/**
+ * 배열 필드가 없으면 빈 배열로 접는다.
+ *
+ * **롤링 배포 중에는 구 백엔드가 응답한다.** `paused_scopes` 가 없으면
+ * `s.paused_scopes.length` 가 던지고, 그 예외는 카드 하나가 아니라 **화면 전체를
+ * 흰 화면으로** 만든다(실측: `controllable_envs` 누락으로 RDS 화면이 죽었다).
+ * 배포 순서에 의존하지 않도록 경계에서 한 번 정규화한다.
+ */
+const withArrayDefaults = (s: CollectorStatus): CollectorStatus => ({
+  ...s,
+  paused_scopes: s.paused_scopes ?? [],
+  controllable_envs: s.controllable_envs ?? [],
+});
+
+/**
+ * 플릿 메트릭. **엔진별 최소 세트만** 온다 — 연결·QPS 는 WS 스냅샷에서 받는다
+ * (자체 수집이 더 신선하고 무료다).
+ */
+export function fetchFleetMetrics(signal: AbortSignal | null): Promise<FleetMetricsResponse> {
+  return apiGet<FleetMetricsResponse>("/api/metrics/fleet", signal);
+}
+
+/** 인스턴스 하나의 전체 메트릭. `rangeMs` 만큼 과거부터 지금까지. */
+export function fetchInstanceMetrics(
+  instanceId: string,
+  rangeMs: number,
+  signal: AbortSignal | null,
+): Promise<InstanceMetricsResponse> {
+  const to = Date.now();
+  const qs = queryString({ from_ms: to - rangeMs, to_ms: to });
+  return apiGet<InstanceMetricsResponse>(
+    `/api/metrics/instance/${encodeURIComponent(instanceId)}${qs}`,
+    signal,
+  );
+}
+
 export function fetchCollectorStatus(signal: AbortSignal | null): Promise<CollectorStatus> {
-  return apiGet<CollectorStatus>("/api/collector/status", signal);
+  return apiGet<CollectorStatus>("/api/collector/status", signal).then(withArrayDefaults);
 }
 
 /**
  * 수집 제어. **쓰기 경로이므로 `operator` 이상만 통과한다** — 403 이면 화면이
  * "권한이 없다" 를 말해야 한다(버튼을 숨기지 않는다: 왜 못 누르는지 알려야 한다).
  */
-async function post<T>(path: string): Promise<T> {
+async function post<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
     headers: {
@@ -171,8 +209,11 @@ async function post<T>(path: string): Promise<T> {
       // 있고 서버는 CORS 를 열지 않는다 — 로컬 개발(토큰 없이 통과)에서 아무 웹페이지가
       // `POST /api/collector/pause` 로 수집을 멈추는 것을 막는다.
       "x-dbmon-control": "1",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
       ...authHeaders(),
     },
+    // `exactOptionalPropertyTypes` 라 `undefined` 를 넣을 수 없다 — 키 자체를 뺀다.
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     cache: "no-store",
   });
   if (res.status === 401) {
@@ -183,10 +224,26 @@ async function post<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-export const pauseCollector = () => post<CollectorStatus>("/api/collector/pause");
-export const resumeCollector = () => post<CollectorStatus>("/api/collector/resume");
-export const runDiscovery = () => post<CollectorStatus>("/api/discovery/run");
-export const runBackfill = () => post<CollectorStatus>("/api/backfill/run");
+/**
+ * 정지·재개는 **스코프를 반드시 보낸다.** 서버에 기본값이 없다 — 빈 본문을 "전체" 로
+ * 해석하면 오래된 화면이 실수로 전 환경 관측을 멈출 수 있다.
+ */
+const postStatus = (path: string, body?: unknown) =>
+  post<CollectorStatus>(path, body).then(withArrayDefaults);
+
+/**
+ * 수집을 시작한다 (`Pending` → `Collecting`).
+ *
+ * **등록은 자동, 시작은 사람이다** — 시작은 대상 DB 에 매초 쿼리를 날리기 시작하는 일이다.
+ * 태그·버전·필터가 근거인 상태(`disabled`·`unsupported`·`excluded`)는 서버가 409 로 거부한다.
+ */
+export const startInstance = (instanceId: string) =>
+  post<InstanceView>(`/api/instances/${encodeURIComponent(instanceId)}/start`);
+
+export const pauseCollector = (scope: string) => postStatus("/api/collector/pause", { scope });
+export const resumeCollector = (scope: string) => postStatus("/api/collector/resume", { scope });
+export const runDiscovery = () => postStatus("/api/discovery/run");
+export const runBackfill = () => postStatus("/api/backfill/run");
 
 /** 마크다운은 JSON 이 아니다 — 텍스트로 받아 브라우저 다운로드로 넘긴다. */
 export async function fetchMarkdown(recordId: string): Promise<string> {
@@ -233,4 +290,7 @@ export const queryKeys = {
   digests: (p: QueryParams) => ["digests", p] as const,
   statistics: (p: QueryParams) => ["statistics", p] as const,
   userStatistics: (p: QueryParams) => ["user-statistics", p] as const,
+  fleetMetrics: ["fleet-metrics"] as const,
+  /** 범위가 키에 들어간다 — 안 넣으면 범위를 바꿔도 앞 결과가 그려진다. */
+  instanceMetrics: (id: string, rangeMs: number) => ["instance-metrics", id, rangeMs] as const,
 };

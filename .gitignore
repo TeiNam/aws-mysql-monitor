@@ -29,3 +29,6 @@ local/logs/
 # Playwright MCP 산출물 (스냅샷·스크린샷) — 검증 흔적이지 소스가 아니다
 .playwright-mcp/
 dbmon-ui.png
+
+# Client VPN 프로파일 — 클라이언트 개인키가 들어 있다
+*.ovpn

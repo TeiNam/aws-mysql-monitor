@@ -14,6 +14,7 @@ import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
+import { Pagination } from "../components/Pagination";
 import { PlanGraph } from "../components/PlanGraph";
 import { PlanTable } from "../components/PlanTable";
 import { StateBadge } from "../components/StateBadge";
@@ -36,8 +37,17 @@ import {
 } from "../components/ui";
 import { fetchInstances, fetchMarkdown, fetchPlan, fetchPlans, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
-import { downloadText, formatSql } from "../lib/sql";
+import { downloadText, formatMarkdown, formatSql } from "../lib/sql";
 import type { SlowQueryView } from "../lib/types";
+
+/**
+ * 한 페이지에 보여줄 플랜 수.
+ *
+ * 슬로우 쿼리 목록(20)보다 적다 — 이 화면은 목록 **아래에** 쿼리 정보·실행계획·그래프가
+ * 이어지므로, 목록이 길면 고른 계획을 보러 매번 스크롤해야 한다. 16줄이면 목록과
+ * "쿼리 정보" 머리가 한 화면에 같이 들어온다.
+ */
+const PAGE_SIZE = 16;
 
 /**
  * 실행계획 화면. 참조 대시보드의 `Plan Visualization` 과 같은 구성:
@@ -50,6 +60,7 @@ export function PlanVisualizationPage() {
   const instanceLike = params.get("instance_like") ?? "";
   const tz: Timezone = params.get("tz") === "UTC" ? "UTC" : "KST";
   const selected = params.get("record") ?? "";
+  const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
 
   // **필터는 조회 키에 들어간다.** 안 넣으면 필터를 바꿔도 캐시된 앞 결과가 그려진다.
   const listParams = useMemo(
@@ -69,6 +80,15 @@ export function PlanVisualizationPage() {
     queryFn: ({ signal }) => fetchInstances(signal),
   });
 
+  /**
+   * 조회 대상을 좁히는 키들. **이게 바뀌면 첫 페이지로 돌아간다** — 3페이지를 보다
+   * 필터를 바꾸면 결과가 그보다 짧아 빈 표가 되고, 그건 "기록이 없다" 로 읽힌다.
+   *
+   * `record`(선택한 계획)와 `tz` 는 여기 없다. 3페이지에서 행을 눌렀는데 1페이지로
+   * 튀면 방금 고른 줄이 화면에서 사라진다.
+   */
+  const FILTER_KEYS = ["env", "instance", "instance_like"];
+
   /** 여러 값을 **한 번에** 바꾼다 — env 를 바꾸며 인스턴스를 지울 때 두 번 쓰면
    *  중간 상태(새 env + 옛 인스턴스)로 한 번 조회가 나간다. */
   function updateMany(patch: Record<string, string>) {
@@ -77,6 +97,7 @@ export function PlanVisualizationPage() {
       if (value === "") next.delete(key);
       else next.set(key, value);
     }
+    if (Object.keys(patch).some((k) => FILTER_KEYS.includes(k))) next.delete("page");
     setParams(next, { replace: true });
   }
 
@@ -84,10 +105,15 @@ export function PlanVisualizationPage() {
     const next = new URLSearchParams(params);
     if (value === "") next.delete(key);
     else next.set(key, value);
+    if (FILTER_KEYS.includes(key)) next.delete("page");
     setParams(next, { replace: true });
   }
 
   const items = plans.data?.items ?? [];
+  // **결과가 줄면 페이지를 당긴다.** 안 당기면 빈 표가 나오고 이유가 화면에 없다.
+  const lastPage = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const safePage = Math.min(page, lastPage);
+  const visible = items.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
   // **없는 레코드를 다른 것으로 갈아치우지 않는다.** 오래된 북마크나 필터 변경으로
   // 목록에서 사라진 경우 **다른 쿼리의 계획**을 보여주게 되고, 그건 조사 도구에서
   // 가장 위험한 거짓말이다.
@@ -168,7 +194,7 @@ export function PlanVisualizationPage() {
                     넘는 쿼리가 한 번은 돌아야 한다.
                   </EmptyRow>
                 ) : (
-                  items.map((q) => (
+                  visible.map((q) => (
                     <tr
                       key={q.record_id}
                       className={`${TR} cursor-pointer ${
@@ -216,6 +242,15 @@ export function PlanVisualizationPage() {
             </table>
           </div>
         )}
+        {plans.data === undefined ? null : (
+          <Pagination
+            page={safePage}
+            pageSize={PAGE_SIZE}
+            total={items.length}
+            truncated={plans.data.has_more}
+            onChange={(n) => update("page", String(n))}
+          />
+        )}
       </Card>
 
       {missing ? (
@@ -251,7 +286,9 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
   async function download() {
     setDownloading(true);
     try {
-      const md = await fetchMarkdown(query.record_id);
+      // 서버는 저장된 원문(한 줄 SQL·압축 JSON)을 준다. 내려받는 파일은 읽으려고
+      // 받는 것이므로 여기서 편다 (`formatMarkdown`).
+      const md = formatMarkdown(await fetchMarkdown(query.record_id));
       downloadText(`slow-query-${query.thread_id}.md`, md);
     } catch {
       // 실패는 아래 오류 표시로 드러난다. 다운로드는 재시도가 값싸다.

@@ -174,6 +174,21 @@ resource "aws_iam_role_policy" "task_discovery" {
         }
       },
       {
+        # **`GetMetricData` 는 리소스 수준 권한을 지원하지 않는다** — `rds:Describe*` 와
+        # 같은 사정이다. 대신 네임스페이스 조건으로 좁힌다: 이 롤은 `AWS/RDS` 메트릭만
+        # 읽는다. 조건이 없으면 계정의 모든 메트릭(비용·보안 지표 포함)이 읽힌다.
+        #
+        # `ListMetrics` 는 주지 않는다 — 카탈로그는 코드가 갖고 있다
+        # (`dbmon_core::cw_metrics`). 목록을 조회할 이유가 없다.
+        Sid      = "MetricsRead"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:GetMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = "AWS/RDS" }
+        }
+      },
+      {
         Sid    = "SlowLogRead"
         Effect = "Allow"
         # `DescribeLogStreams` 는 코드가 부르지 않는다 — `FilterLogEvents` 만 쓴다.

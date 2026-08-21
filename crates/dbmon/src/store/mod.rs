@@ -22,7 +22,9 @@ pub mod broadcast;
 pub mod checkpoint;
 pub mod keys;
 pub mod lease;
+pub mod pause;
 pub mod registry;
+pub mod settings;
 
 use std::collections::HashMap;
 

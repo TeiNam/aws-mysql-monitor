@@ -9,8 +9,8 @@ pub mod target_db;
 
 pub use stores::{
     COLLECT_LEADER_KEY, CRON_LEADER_KEY, DigestStore, DigestTextEntry, DigestTextSource,
-    InstanceRegistry, LEASE_RENEW_INTERVAL_MS, LEASE_TTL_MS, Lease, LeaseStore, SHARD_COUNT,
-    SlowQueryStore, shard_key, shard_of,
+    InstanceRegistry, LEASE_RENEW_INTERVAL_MS, LEASE_TTL_MS, Lease, LeaseStore, PauseStore,
+    SHARD_COUNT, SettingsStore, SlowQueryStore, shard_key, shard_of,
 };
 pub use target_db::{
     DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,

@@ -7,10 +7,16 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 import { ApiError } from "./lib/api";
 import { takeToken } from "./lib/auth";
+import { startTheme } from "./lib/theme";
 
 // **아무것도 렌더하기 전에** 토큰을 URL 에서 걷어낸다. 라우터가 먼저 돌면
 // `?token=` 이 히스토리 항목으로 남는다.
 takeToken();
+
+// 테마도 렌더 전에 붙인다 — 나중에 붙이면 첫 프레임이 라이트로 깜빡인다.
+// ponytail: `index.html` 인라인 스크립트면 깜빡임이 완전히 사라지지만 키 이름이
+// 두 곳에 생긴다. 번들이 defer 로 실행되는 그 한 프레임을 감수한다.
+startTheme();
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -164,7 +164,19 @@ WHERE VARIABLE_NAME IN (
   'Table_locks_waited','Handler_read_rnd_next','Open_tables','Opened_tables',
   'Com_select','Com_insert','Com_update','Com_delete','Com_commit','Com_rollback',
   'Bytes_received','Bytes_sent','Uptime'
-)";
+)
+UNION ALL
+-- **`max_connections` 는 상태가 아니라 변수다.** 그래도 같은 왕복에 담는다.
+--
+-- 연결 수는 그 자체로는 위험을 말하지 못한다 — `Threads_connected=10` 이 정상인지
+-- 포화 직전인지는 **모수**에 달렸다. CloudWatch 에는 그 모수(`max_connections`)
+-- 메트릭이 **없다**. 그래서 여기서 읽는다.
+--
+-- 별도 쿼리로 빼지 않는 이유: 인스턴스 500대 × 5초면 왕복이 초당 100회 늘어난다.
+-- 이름이 상태 변수와 겹치지 않으므로(소문자) 같은 맵에 담아도 충돌하지 않는다.
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM performance_schema.global_variables
+WHERE VARIABLE_NAME = 'max_connections'";
 
 /// 대상 DB 시각. `probe` 가 0행일 때 시계 오프셋을 갱신한다.
 pub const DB_NOW: &str = "/* dbmon:dbnow */ SELECT UNIX_TIMESTAMP(NOW(6))";

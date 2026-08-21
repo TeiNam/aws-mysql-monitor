@@ -1,0 +1,87 @@
+# **AWS 탐색 + 로컬 저장소.** 실제 RDS 목록을 가져오되 쓰기는 DynamoDB Local 에 한다.
+#
+#   export AWS_PROFILE=teinam-primary-123456789012
+#   aws sso login --profile "$AWS_PROFILE"
+#   just local-init-aws                 # DynamoDB Local 테이블 (한 번만)
+#   cargo run -p dbmon -- --config local/dbmon-aws.toml --log-pretty serve
+#
+# `local/dbmon.toml`(도커 MySQL)과 **저장소 테이블이 다르다.** 같은 테이블을 쓰면
+# AWS 탐색이 도커 인스턴스를 "사라졌다" 로 판정해 2라운드 뒤 등록부에서 지운다.
+#
+# # 되는 것과 안 되는 것 (노트북에서)
+#
+# | 경로 | 상태 | 이유 |
+# |---|---|---|
+# | RDS 탐색 (인스턴스 목록·태그·버전) | **된다** | `rds:Describe*` 는 API 다 |
+# | CloudWatch 슬로우로그 백필 | **된다** | `logs:FilterLogEvents` 도 API 다 |
+# | 실시간 캡처 (`performance_schema` 조회) | **안 된다** | 시드 DB 가 전부 프라이빗이다 (`PubliclyAccessible=false`) |
+#
+# 실시간 캡처까지 보려면 VPC 안에서 돌려야 한다(40-compute). SSM 터널
+# (`scripts/db-tunnel.sh`)은 `localhost:1432x` 로 열리는데, 수집기는 등록부의
+# **엔드포인트 주소**로 붙으므로 터널로는 대체되지 않는다.
+
+deployment_env = "dev"
+role = "all"
+
+[http]
+bind = "127.0.0.1"
+port = 8080
+deregistration_wait_secs = 0
+
+[aws]
+region = "ap-northeast-2"
+# **실제 계정 ID.** `instance_id` 의 첫 성분이라 나중에 바꿀 수 없다 (M0-2a).
+account_id = "123456789012"
+
+[storage]
+data_table = "dbmon-data-awsdev"
+config_table = "dbmon-config-awsdev"
+# 저장은 여전히 로컬이다 — 개발계 테이블에 쓰지 않는다.
+endpoint_url = "http://127.0.0.1:18000"
+
+[collector]
+slow_threshold_secs = 2
+monitor_db_user = "dbmon"
+orphan_sweep_secs = 60
+backfill_secs = 30
+
+# **원문(리터럴)을 저장한다.** 기본값 `masked` 는 `?` 로 치환해 저장하므로 화면에서
+# 복사한 SQL 을 그대로 실행할 수 없다 — 재현 테스트가 이 도구의 목적 중 하나다
+# (FR-DGS-06 "실행 가능한 샘플 쿼리").
+#
+# `full` 이 아니라 `full_restricted` 다: 저장은 같고 **열람이 operator 이상**으로
+# 제한된다. 08 §6.1 이 prd 기본값으로 규정한 값이고, 이 계정에는 `env=prd` 태그가
+# 붙은 시드가 함께 있으므로 느슨한 쪽을 고를 이유가 없다.
+#
+# ⚠ **앞으로 저장되는 레코드에만 적용된다.** 이미 `?` 로 저장된 것은 되돌릴 수 없다
+# (마스킹은 단방향이다). 반대로 여기서 다시 `masked` 로 조여도 **이미 저장된 원문은
+# 남는다** — 지우는 것이 유일한 수단이다.
+#
+# ⚠ 실행계획 JSON 은 이 설정과 **무관하게 항상 마스킹된다**(T-16,
+# `planparse::parse`). `attached_condition` 의 상수는 계속 `?` 다.
+literal_policy = "full_restricted"
+
+# **Client VPN 을 쓰면 오버라이드가 필요 없다.** 엔드포인트가 사설 IP 로 풀리고
+# 라우팅되므로 ECS 와 **같은 경로**(실제 주소 + 정상 TLS + IAM 토큰)로 붙는다.
+#
+# VPN 없이 SSM 터널로 개발할 때만 아래를 켠다 (dev + 루프백만 허용된다):
+#
+#   [collector.target_endpoint_overrides]
+#   dbmon-seed-dev-mysql = "127.0.0.1:14321"
+
+[discovery]
+# 시드 DB 가 사는 VPC (60-seed).
+#
+# ⚠ **dev 와 prd 시드가 같은 VPC 에 있다.** 그래서 VPC 필터는 "이 계정의 시드 전부" 를
+# 뜻하고, 환경 구분은 하지 못한다.
+allowed_vpc_ids = ["vpc-0123456789abcdef0"]
+
+# **환경은 태그로만 분류한다.**
+#
+# 기본값(dev 배포)은 이름에 `prd`/`prod`/`production` 이 들어가면 제외하고, 태그가
+# prd 인 것도 거부한다(T-37). 이 계정에서는 그 게이트가 **관측 대상을 지운다** —
+# `dbmon-seed-prd-*` 는 프로덕션 워크로드가 아니라 prd 를 흉내낸 시드다.
+#
+# 켜면 9대가 모두 등록되고 `env` 는 태그(`env=dev`/`env=prd`)로 정해진다. 범위는
+# 위의 VPC 필터가 정한다 — 그건 이 플래그로도 열리지 않는다.
+collect_production_targets = true

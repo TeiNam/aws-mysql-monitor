@@ -193,7 +193,18 @@ impl InstanceState {
     /// ([05 §6](../../../docs/05-collector.md)). 실제 쿼리 빈도는 태스크 안의
     /// 서킷 상태가 정한다 — 열려 있으면 60초에 1회다.
     ///
-    /// `Pending` 은 제외한다. 부트스트랩·자가진단이 먼저다.
+    /// `Pending` 은 **제외한다** — 등록만 됐고 아직 사람이 켜지 않은 상태다.
+    ///
+    /// # 왜 자동으로 켜지 않는가
+    ///
+    /// 수집을 시작하는 것은 **대상 DB 에 매초 쿼리를 날리기 시작하는 것**이다. 새 RDS 가
+    /// 생기자마자 자동으로 붙으면 (a) 운영자가 모르는 접속이 생기고 (b) 모니터링 계정이
+    /// 아직 없으면 실패 로그가 쏟아진다 — 실측으로 겪었다(계정을 만들지 않은 시드 5대가
+    /// `Access denied` 를 반복했다).
+    ///
+    /// 그래서 등록은 자동, **시작은 사람**이다(`POST /api/instances/{id}/start`).
+    /// 켠 뒤에는 상태가 스스로 움직인다: 못 붙으면 `Unreachable`, 되돌아오면 `Collecting`.
+    /// 항목별 사유(performance_schema 꺼짐 등)를 함께 보여주는 것은 FR-DSC-10 의 몫이다.
     pub fn should_collect(self) -> bool {
         matches!(self, Self::Collecting | Self::Degraded | Self::Unreachable)
     }
@@ -216,6 +227,15 @@ pub struct Instance {
     pub vpc_id: Option<String>,
     pub availability_zone: Option<String>,
     pub instance_class: Option<String>,
+    /// 할당 스토리지(GiB). **RDS 전용, Aurora 는 `None`** (볼륨이 자동 증가한다).
+    ///
+    /// `FreeStorageSpace` 를 퍼센트로 바꿀 분모다 — 바이트만으로는 "18GB 남음" 이
+    /// 위험한지 알 수 없다.
+    ///
+    /// ⚠ **`serde(default)` 가 필수다.** 이 필드가 없던 시절에 저장된 등록부 레코드가
+    /// 이미 있고, 없으면 그 항목을 읽다 실패해 `list()` 가 조용히 건너뛴다.
+    #[serde(default)]
+    pub allocated_storage_gb: Option<i32>,
     /// Aurora 클러스터에서 라이터인가. 페일오버로 바뀐다.
     pub is_cluster_writer: bool,
     pub iam_auth_enabled: bool,

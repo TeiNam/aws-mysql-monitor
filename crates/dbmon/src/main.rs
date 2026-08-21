@@ -162,14 +162,28 @@ async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Re
             client.clone(),
             config.storage.data_table.clone(),
         )),
+        // **config 테이블의 유일한 소비자다.** 정지 스코프는 수집 데이터가 아니라
+        // 사람이 정한 상태이므로 데이터 테이블의 TTL·GSI 규칙과 섞지 않는다.
+        pause: Arc::new(dbmon::control::PauseState::new(Arc::new(
+            dbmon::store::pause::DynamoPauseStore::new(
+                client.clone(),
+                config.storage.config_table.clone(),
+            ),
+        ))),
         registry: Arc::new(dbmon::store::registry::DynamoInstanceRegistry::new(
             client.clone(),
             config.storage.data_table.clone(),
         )),
         checkpoint: Arc::new(dbmon::store::checkpoint::DynamoCheckpointStore::new(
-            client,
+            client.clone(),
             config.storage.data_table.clone(),
         )),
+        settings: Arc::new(dbmon::settings_state::SettingsState::new(Arc::new(
+            dbmon::store::settings::DynamoSettingsStore::new(
+                client,
+                config.storage.config_table.clone(),
+            ),
+        ))),
     })
 }
 
@@ -177,32 +191,64 @@ async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Re
 struct Stores {
     slow_query: Arc<dbmon::store::AppSlowQueryStore>,
     lease: Arc<dbmon::store::lease::DynamoLeaseStore>,
+    /// 정지 스코프. **API 와 리더 루프가 같은 것을 본다** — 그래서 어느 워커에서
+    /// 눌러도 같은 상태가 되고, 재시작·리더 교체에도 남는다.
+    pause: Arc<dbmon::control::PauseState>,
     registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
     /// 백필 재개 지점. **없으면 중단 구간이 영구히 빈다.**
     checkpoint: Arc<dbmon::store::checkpoint::DynamoCheckpointStore>,
+    /// 운영 설정(탐색 범위·알림·인증·모델). config 테이블의 `CFG/GLOBAL`.
+    settings: Arc<dbmon::settings_state::SettingsState>,
 }
 
-/// 리전별 RDS 탐색기.
+/// CloudWatch 메트릭 서비스를 만든다.
+///
+/// **저장소가 로컬인지로 판단하지 않는다.** 처음엔 `endpoint_url` 이 있으면 만들지 않게
+/// 했는데, "DynamoDB 는 로컬 + 대상은 실제 AWS" 조합(개발 중 가장 흔한 형태)에서
+/// 메트릭이 조용히 꺼졌다. 자격증명이 없으면 조회가 실패하고 그때 **빈 값 + 경고 로그**로
+/// 나타난다 — 그게 화면이 503 을 받는 것보다 낫다(다른 값은 계속 보인다).
+///
+/// ⚠ **리전별로 만들어야 한다.** 메트릭은 대상 인스턴스의 리전에 있다 — 배포 리전
+/// 클라이언트로 다른 리전을 물으면 빈 값이 오면서 과금된다(탐색·슬로우로그와 같은 함정).
+/// 지금은 `target_regions` 의 첫 리전만 쓴다. 멀티 리전 대상이 생기면 리전별 맵으로
+/// 바꿔야 한다 — 그때까지는 이 주석이 그 사실을 남긴다.
+async fn build_metrics(config: &Config) -> Arc<dbmon::api::metrics::MetricsService> {
+    use aws_config::BehaviorVersion;
+    let region = config
+        .target_regions()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| config.aws.region.clone());
+    let sdk = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.clone()))
+        .load()
+        .await;
+    tracing::info!(%region, "CloudWatch 메트릭 준비");
+    Arc::new(dbmon::api::metrics::MetricsService::new(Arc::new(
+        dbmon::aws::cloudwatch::MetricFetcher::new(aws_sdk_cloudwatch::Client::new(&sdk)),
+    )))
+}
+
+/// 탐색 대상(리전 × 계정)별 RDS 탐색기.
 ///
 /// **DynamoDB 와 달리 `endpoint_url` 을 적용하지 않는다.** RDS 를 로컬로 흉내낼 방법이
 /// 없고, 흉내낸다면 그건 탐색을 검증하는 게 아니라 목(mock)을 검증하는 것이다.
 /// 로컬에서 탐색 로직을 검증하는 방법은 순수 함수 전수 테스트다
 /// ([`dbmon::aws::discovery`], [`dbmon::discovery`]).
-async fn build_discovery(config: &Config) -> Vec<dbmon::aws::rds::RdsDiscovery> {
-    use aws_config::BehaviorVersion;
-
-    let mut out = Vec::new();
-    for region in config.target_regions() {
-        let sdk = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.clone()))
-            .load()
-            .await;
-        out.push(dbmon::aws::rds::RdsDiscovery::new(
-            aws_sdk_rds::Client::new(&sdk),
-            region,
-        ));
-    }
-    out
+///
+/// 범위는 **운영 설정**이 정하고 배포 설정이 기본값이다
+/// ([`dbmon_core::settings::DiscoverySettings::targets`]).
+async fn build_discovery(
+    config: &Config,
+    discovery: &dbmon_core::settings::DiscoverySettings,
+) -> dbmon::aws::fleet::DiscoveryFleet {
+    dbmon::aws::fleet::build(
+        discovery,
+        &config.aws.account_id,
+        // 설정이 비었을 때의 기본값 — 배포 설정의 대상 리전이다.
+        &config.target_regions(),
+    )
+    .await
 }
 
 /// 첫 실행이 거슬러 올라갈 구간 (5분).
@@ -239,6 +285,61 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
     tokio::time::timeout(dbmon::worker::work_budget(), f)
         .await
         .map_err(|_| ())
+}
+
+/// 내가 소유한 **진행 중 레코드를 사유와 함께 확정한다.**
+///
+/// # 왜 필요한가
+///
+/// 태스크를 내리기만 하면 그 레코드는 이 워커·이 epoch 소유로 남고, 고아 스윕은
+/// 그것을 [`dbmon::orphan::Verdict::Mine`] 으로 보고 **매번 건너뛴다** — 리더가
+/// 바뀌거나 TTL(35일)이 지날 때까지 화면에 유령 "실행 중" 으로 남는다(F4 가 막으려던
+/// 상태). `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
+///
+/// # 왜 전역 목록을 훑는가
+///
+/// GSI1 은 워커별로 나뉘어 있지 않고 **오래된 순**으로 온다. 그래서 다른 워커의
+/// 레코드가 앞자리를 차지할 수 있다. 상한을 스윕과 같게 두고, 꽉 찼으면 말한다 —
+/// 그 뒤에 내 레코드가 남았을 수 있다는 뜻이다.
+///
+/// `only` 가 `None` 이면 내 것 전부(전체 정지), `Some(ids)` 면 그 인스턴스 것만
+/// 확정한다(부분 정지 — 멈추지 않은 인스턴스의 실행 중 쿼리를 끊으면 안 된다).
+async fn close_in_flight_mine(
+    store: &Arc<dbmon::store::AppSlowQueryStore>,
+    worker_id: &str,
+    epoch: Option<u64>,
+    now_ms: i64,
+    only: Option<&std::collections::BTreeSet<String>>,
+) {
+    use dbmon_core::ports::SlowQueryStore as _;
+    let Ok(in_flight) = store.list_in_flight(ORPHAN_SWEEP_LIMIT).await else {
+        return;
+    };
+    if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
+        tracing::warn!(
+            limit = ORPHAN_SWEEP_LIMIT,
+            "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
+        );
+    }
+    let mut closed = 0usize;
+    for q in &in_flight {
+        if q.owner_worker.as_deref() != Some(worker_id) || q.owner_epoch != epoch {
+            continue;
+        }
+        if only.is_some_and(|ids| !ids.contains(q.instance_id.as_str())) {
+            continue;
+        }
+        let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
+        if store.upsert_merged(&marked).await.is_ok() {
+            closed += 1;
+        }
+    }
+    if closed > 0 {
+        tracing::warn!(
+            closed,
+            "정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
+        );
+    }
 }
 
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
@@ -498,7 +599,7 @@ async fn backfill_round(
 /// 단, "봤지만 제외" 와 "사라졌다" 는 구분해서 넘긴다 — 섞으면 필터 사고 하나로
 /// 등록부가 비워진다.
 async fn discover(
-    sources: Arc<Vec<dbmon::aws::rds::RdsDiscovery>>,
+    fleet: Arc<dbmon::aws::fleet::DiscoveryFleet>,
     config: Arc<Config>,
     now_ms: i64,
 ) -> dbmon::discovery::RoundOutcome {
@@ -514,7 +615,7 @@ async fn discover(
 
     // **탐색기가 없으면 부분 결과로 본다.** 빈 결과를 온전한 결과로 취급하면
     // 등록부의 전 인스턴스가 "사라졌다" 로 판정된다.
-    if sources.is_empty() {
+    if fleet.is_empty() {
         tracing::error!("탐색 대상 리전이 없다 — 부분 결과로 처리한다");
         outcome.truncated = true;
         return outcome;
@@ -531,7 +632,11 @@ async fn discover(
             .map(|id| id.as_str().to_string())
     }
 
-    for source in sources.iter() {
+    for source in fleet.sources.iter() {
+        // **계정은 탐색기가 안다.** 배포 설정의 계정 번호를 쓰면 크로스 계정
+        // 인스턴스가 우리 계정 키로 등록되고, 같은 이름의 DB 가 두 계정에 있을 때
+        // 하나가 다른 하나를 덮어쓴다(`InstanceId` 가 계정을 포함하는 이유다).
+        let account_id = source.account_id();
         let page = match source.describe().await {
             Ok(p) => p,
             Err(e) => {
@@ -554,13 +659,12 @@ async fn discover(
                     "탐색 필터가 거부했다"
                 );
                 outcome.filtered += 1;
-                if let Some(id) = excluded_id(&config.aws.account_id, &raw.region, &raw.identifier)
-                {
+                if let Some(id) = excluded_id(account_id, &raw.region, &raw.identifier) {
                     outcome.excluded_ids.insert(id);
                 }
                 continue;
             }
-            match to_instance(raw, &config.aws.account_id, &mapping, now_ms) {
+            match to_instance(raw, account_id, &mapping, now_ms) {
                 Ok(i) => outcome.discovered.push(i),
                 // MySQL 이 아닌 엔진은 정상적으로 흔하다 — 등록부에 있을 수 없으므로
                 // 제외 목록에 넣지 않는다(넣어도 무해하지만 통계를 흐린다).
@@ -577,9 +681,7 @@ async fn discover(
                         "인스턴스 매핑 실패 — 제외로 기록한다(삭제하지 않는다)"
                     );
                     outcome.unmappable += 1;
-                    if let Some(id) =
-                        excluded_id(&config.aws.account_id, &raw.region, &raw.identifier)
-                    {
+                    if let Some(id) = excluded_id(account_id, &raw.region, &raw.identifier) {
                         outcome.excluded_ids.insert(id);
                     }
                 }
@@ -715,6 +817,7 @@ impl CollectTasks {
     async fn reconcile(
         &mut self,
         instances: &[dbmon_core::instance::Instance],
+        pause: &dbmon_core::pause::PauseSet,
         deps: &CollectDeps,
     ) {
         use dbmon::collect_loop::{desired_ids, index_by_id, task_delta};
@@ -729,7 +832,7 @@ impl CollectTasks {
             );
         }
 
-        let desired = desired_ids(instances);
+        let desired = desired_ids(instances, pause);
         let delta = task_delta(&self.running(), &desired);
         let by_id = index_by_id(instances);
 
@@ -805,6 +908,12 @@ impl CollectTasks {
 #[derive(Clone)]
 struct CollectDeps {
     store: Arc<dbmon::store::AppSlowQueryStore>,
+    /// 등록부. **첫 판정을 여기 쓴다** — `Pending` → `Collecting`/`Unreachable`.
+    ///
+    /// 탐색은 `Pending` 으로만 등록하므로, 붙어 본 결과를 아무도 쓰지 않으면 인스턴스가
+    /// 영원히 `Pending` 에 머문다(실측). 항목별 사유까지 판정하는 것은 FR-DSC-10 의 몫이고
+    /// 여기서는 **붙었는가/못 붙었는가**만 정한다.
+    registry: Arc<dbmon::store::registry::DynamoInstanceRegistry>,
     /// 실시간 지표 방송. 슬로우 쿼리는 저장소 래퍼가 방송하지만 지표는
     /// 저장하지 않으므로(휘발성) 여기서 직접 넣는다.
     hub: dbmon::api::hub::Hub,
@@ -866,6 +975,32 @@ fn spawn_instance_collector(
         let db_user = deps.config.collector.monitor_db_user.clone();
         let label = instance.id.as_str().to_string();
 
+        // **첫 판정을 한 번만 쓴다.**
+        //
+        // 매 tick 쓰면 인스턴스 500대 × 초당 1회의 등록부 쓰기가 된다. 그리고 `Pending`
+        // 에서만 움직인다 — 이미 `Collecting` 인 인스턴스를 tick 하나 실패로 내리면
+        // 일시적 장애마다 상태가 진동하고, 그 판정(Degraded/Unreachable 세분)은
+        // 서킷 브레이커와 FR-DSC-10 의 몫이다.
+        let promote = |to: dbmon_core::instance::InstanceState| {
+            let registry = Arc::clone(&deps.registry);
+            let id = instance.id.clone();
+            let label = label.clone();
+            async move {
+                match registry.set_state(&id, to).await {
+                    Ok(()) => tracing::info!(instance = %label, state = to.as_str(), "첫 판정 기록"),
+                    Err(e) => tracing::warn!(
+                        instance = %label,
+                        state = to.as_str(),
+                        error = %telemetry::Scrubbed(&e),
+                        "첫 판정을 등록부에 쓰지 못했다 — 다음 태스크가 다시 시도한다"
+                    ),
+                }
+            }
+        };
+        // **지금 등록부에 적혀 있다고 아는 상태.** 전이될 때만 쓴다.
+        let mut recorded = instance.state;
+
+
         // **엔드포인트를 먼저 확인한다.** 없으면 토큰을 요청하지 않는다 —
         // 빈 호스트로 서명하면 STS 왕복만 낭비하고, 이어지는 오류가
         // "연결 옵션 구성 실패" 로만 나와 실제 원인(엔드포인트 없음)을 가린다.
@@ -874,6 +1009,9 @@ fn spawn_instance_collector(
                 instance = %label,
                 "엔드포인트가 없다 — 수집하지 않는다 (생성 중이거나 정지 상태다)"
             );
+            if recorded == dbmon_core::instance::InstanceState::Collecting {
+                promote(dbmon_core::instance::InstanceState::Unreachable).await;
+            }
             return;
         };
 
@@ -895,15 +1033,25 @@ fn spawn_instance_collector(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(instance = %label, error = %telemetry::Scrubbed(&e), "대상 인증 실패");
+                if recorded == dbmon_core::instance::InstanceState::Collecting {
+                    promote(dbmon_core::instance::InstanceState::Unreachable).await;
+                }
                 return;
             }
         };
+        // **SSM 터널 오버라이드** (dev 전용). 토큰은 위에서 실제 엔드포인트로 이미
+        // 서명됐고, 여기서 바뀌는 것은 TCP 주소뿐이다.
+        let via = deps.config.collector.tunnel_for(instance.id.identifier());
+        if let Some((h, p)) = via {
+            tracing::info!(instance = %label, tunnel = %format!("{h}:{p}"), "터널로 접속한다 (dev)");
+        }
         let make_db = |secret: &dbmon_core::secret::ExpiringSecret| -> anyhow::Result<TargetMysql> {
             let opts = target_opts(
                 &instance,
                 &db_user,
                 secret.expose(),
                 deps.config.deployment_env,
+                via,
             )?;
             // **계획 JSON 형식을 버전으로 가른다.** 8.3+ 는 v2, 그 미만(Aurora 3.x 포함)은
             // v1. 판정이 틀려도 v1 로 흘러가므로 최악이 "예전과 같은 형식" 이다.
@@ -916,6 +1064,9 @@ fn spawn_instance_collector(
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(instance = %label, error = %telemetry::Scrubbed(&*e), "연결 옵션 구성 실패");
+                if recorded == dbmon_core::instance::InstanceState::Collecting {
+                    promote(dbmon_core::instance::InstanceState::Unreachable).await;
+                }
                 return;
             }
         };
@@ -1023,6 +1174,17 @@ fn spawn_instance_collector(
 
             match collector.detect_tick().await {
                 Ok(stats) => {
+                    // **복구가 되돌아올 수 있어야 한다.** 못 올리면 일시적으로 못 붙었던
+                    // 인스턴스가 영구히 `Unreachable` 에 갇힌다 — 탐색의 `pick_state` 도
+                    // 그 상태를 되돌리지 않는다(실측: `dev-mysql-ro` 가 QPS 는 흐르는데
+                    // unreachable 로 남았다).
+                    //
+                    // `Pending` 은 여기 올 수 없다 — 그 상태는 태스크를 갖지 않는다
+                    // (`should_collect`). 시작은 사람이 누른다.
+                    if recorded != dbmon_core::instance::InstanceState::Collecting {
+                        recorded = dbmon_core::instance::InstanceState::Collecting;
+                        promote(recorded).await;
+                    }
                     // **성공한 tick 만 신선도를 갱신한다.** 그리고 **인스턴스별로** 쓴다 —
                     // 전역 값 하나면 정상인 1대가 나머지 499대의 실패를 가린다.
                     // 준비 상태에 올리는 것은 리더 루프가 최솟값으로 한다.
@@ -1034,11 +1196,22 @@ fn spawn_instance_collector(
                         "수집 tick"
                     );
                 }
-                Err(e) => tracing::warn!(
-                    instance = %label,
-                    error = %telemetry::Scrubbed(&e),
-                    "수집 tick 실패"
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        instance = %label,
+                        error = %telemetry::Scrubbed(&e),
+                        "수집 tick 실패"
+                    );
+                    // **첫 tick 이 실패하면 그 사실을 등록부에 남긴다.** 화면이
+                    // `pending` 만 보여 주면 "왜 수집이 안 되나" 의 단서가 로그뿐이다.
+                    // **`Collecting` 에서만 내린다.** 이미 `Unreachable` 인 것을 다시
+                    // 쓰면 tick 마다 등록부에 쓰게 된다. 세분(Degraded / Unreachable)은
+                    // 서킷 브레이커와 FR-DSC-10 의 몫이다.
+                    if recorded == dbmon_core::instance::InstanceState::Collecting {
+                        recorded = dbmon_core::instance::InstanceState::Unreachable;
+                        promote(recorded).await;
+                    }
+                }
             }
             // **소요 시간을 뺀 만큼만 쉰다.**
             //
@@ -1137,6 +1310,7 @@ fn spawn_leader_loop(
     let config = Arc::new(config.clone());
     let collect_deps = CollectDeps {
         store: Arc::clone(&stores.slow_query),
+        registry: Arc::clone(&stores.registry),
         hub,
         auth,
         config: Arc::clone(&config),
@@ -1147,11 +1321,21 @@ fn spawn_leader_loop(
         epoch: None,
     };
 
+    // **`stores` 가 태스크로 이동하기 전에 뽑아 든다.** 리스 필드가 `LeaderGate` 로
+    // 옮겨가면서 부분 이동이 일어나므로 여기서 `Arc` 를 복제하는 편이 읽기 쉽다.
+    let pause_state = Arc::clone(&stores.pause);
+    // 탐색 범위(리전·계정)의 출처. API 와 **같은 캐시**를 본다 — 화면에서 저장한
+    // 것이 그대로 다음 라운드의 범위가 된다.
+    let settings_state = Arc::clone(&stores.settings);
+
     Some(tokio::spawn(async move {
         let mut gate = LeaderGate::new(stores.lease, SystemClock, worker_id);
         // 탐색기는 리더가 될 때까지 만들지 않는다 — standby 워커가 AWS 자격증명을
         // 요구하면 로컬 개발(SSO 만료)에서 기동만으로 에러가 난다.
-        let mut sources: Option<Arc<Vec<dbmon::aws::rds::RdsDiscovery>>> = None;
+        //
+        // **설정이 바뀌면 다시 만든다**(리전·계정 추가). 지문으로 판정하므로 같은
+        // 범위에서는 재사용되고, 크로스 계정 `AssumeRole` 을 매 라운드 다시 하지 않는다.
+        let mut fleet: Option<Arc<dbmon::aws::fleet::DiscoveryFleet>> = None;
         // **마지막 탐색 시각.** 0 이면 리더가 된 직후 한 번 돈다 — 5분을 기다리면
         // 배포 직후 목록이 비어 있고, 그건 장애로 보인다.
         let mut last_discovery_ms: i64 = 0;
@@ -1162,6 +1346,8 @@ fn spawn_leader_loop(
         let mut tasks = CollectTasks::new();
         // 슬로우로그 소스는 리더가 될 때까지 만들지 않는다(탐색기와 같은 이유).
         let mut fetcher: Option<Arc<dyn dbmon::slowlog::SlowLogFetcher>> = None;
+        // **마지막으로 본 정지 집합.** 바뀐 순간을 알아야 즉시 반영할 수 있다.
+        let mut last_pause = dbmon_core::pause::PauseSet::default();
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -1216,11 +1402,36 @@ fn spawn_leader_loop(
             } else {
                 let now_ms = SystemClock.now_ms();
 
-                // ── 화면에서 멈춤을 눌렀다 ────────────────────────────────────
+                // ── 정지 스코프를 읽는다 ──────────────────────────────────────
+                //
+                // 저장소가 진실이므로 **어느 워커에서 눌렀든 여기 반영된다.** 5초
+                // 캐시가 붙어 있어 tick 마다 왕복이 생기지는 않는다
+                // (`control::PauseState`).
+                let pause = pause_state.load(now_ms).await;
+                // **바뀌면 즉시 한 라운드 돈다.** 그냥 두면 다음 탐색 주기(기본 5분)
+                // 까지 반영되지 않는다 — 누르고 5분간 계속 수집되면 그 버튼은 고장난
+                // 것으로 보인다.
+                //
+                // ponytail: 탐색 한 라운드를 통째로 돌리는 것은 필요보다 크다(RDS
+                // Describe 까지 부른다). 토글은 사람 손이고 같은 경로가 이미 "인스턴스
+                // 수집" 버튼으로 노출돼 있어 새 분기를 만들지 않았다. 자동 토글이
+                // 생기면 태스크 재조정만 떼어낸다.
+                let pause_changed = pause != last_pause;
+                if pause_changed {
+                    let scopes: Vec<&str> = pause.entries().map(|(k, _)| k).collect();
+                    tracing::warn!(
+                        ?scopes,
+                        "정지 스코프가 바뀌었다 — 태스크 집합을 즉시 다시 맞춘다"
+                    );
+                    last_pause = pause.clone();
+                    last_discovery_ms = 0;
+                }
+
+                // ── 전체가 멈춰 있다 ─────────────────────────────────────────
                 //
                 // **리스는 그대로 쥔다.** 반납하면 다른 워커가 즉시 리더가 되어
                 // 수집을 계속하고, 그건 멈춘 것이 아니다. 태스크만 멈춘다.
-                if controls.is_paused() {
+                if pause.is_all_paused() {
                     if !tasks.running().is_empty() {
                         tracing::warn!(
                             stopped = tasks.running().len(),
@@ -1247,47 +1458,15 @@ fn spawn_leader_loop(
                     // **영구히 굶는다**(6라운드 지적).
                     let mut swept = false;
                     let maintenance = run_in_budget(async {
-                        // 남은 **진행 중 레코드를 사유와 함께 확정한다.**
-                        //
-                        // 남겨 두면 그 레코드는 이 워커의 epoch 소유이므로 **고아 스윕이
-                        // `Mine` 으로 보고 매번 건너뛴다** — 리더가 바뀌거나 TTL 이 지날
-                        // 때까지 영구히 "진행 중" 이다(F4 가 막으려던 유령 상태).
-                        // `collector_paused` 로 적어 두면 화면이 "사람이 멈췄다" 를 말한다.
-                        //
-                        // **전역 목록에서 내 것을 골라낸다.** GSI1 은 워커로 나뉘어 있지
-                        // 않으므로 다른 워커의 진행 중 레코드가 앞자리를 차지할 수 있다
-                        // (오래된 순). 상한을 스윕과 같게 두고, **꽉 찼으면 말한다** —
-                        // 그 뒤에 내 레코드가 남았을 수 있다는 뜻이다.
-                        use dbmon_core::ports::SlowQueryStore as _;
-                        if let Ok(in_flight) =
-                            stores.slow_query.list_in_flight(ORPHAN_SWEEP_LIMIT).await
-                        {
-                            if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
-                                tracing::warn!(
-                                    limit = ORPHAN_SWEEP_LIMIT,
-                                    "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
-                                );
-                            }
-                            let mut closed = 0usize;
-                            for q in &in_flight {
-                                if q.owner_worker.as_deref() != Some(gate.worker_id())
-                                    || q.owner_epoch != gate.epoch()
-                                {
-                                    continue;
-                                }
-                                let marked =
-                                    dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
-                                if stores.slow_query.upsert_merged(&marked).await.is_ok() {
-                                    closed += 1;
-                                }
-                            }
-                            if closed > 0 {
-                                tracing::warn!(
-                                    closed,
-                                    "일시정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
-                                );
-                            }
-                        }
+                        // 남은 진행 중 레코드를 확정한다. **전체 정지이므로 내 것 전부다.**
+                        close_in_flight_mine(
+                            &stores.slow_query,
+                            gate.worker_id(),
+                            gate.epoch(),
+                            now_ms,
+                            None,
+                        )
+                        .await;
 
                         // **멈춰 있어도 고아 스윕은 돈다.**
                         //
@@ -1337,12 +1516,23 @@ fn spawn_leader_loop(
                     // 실패 시 즉시 재시도하면 AWS 장애 중에 핫 루프가 된다.
                     last_discovery_ms = now_ms;
                     controls.publish_discovery(now_ms);
-                    if sources.is_none() {
-                        sources = Some(Arc::new(build_discovery(&config).await));
+                    // **운영 설정을 읽어 범위를 정한다.** 30초 캐시라 매 라운드
+                    // 저장소를 때리지 않는다. 읽지 못하면 마지막 값을 쓴다 —
+                    // 기본값으로 접히면 타 리전·타 계정 인스턴스가 통째로
+                    // "사라졌다" 로 판정된다.
+                    let discovery_settings = settings_state.load(now_ms).await.discovery;
+                    let fallback = config.target_regions();
+                    if !fleet
+                        .as_ref()
+                        .is_some_and(|f| f.matches(&discovery_settings, &fallback))
+                    {
+                        fleet = Some(Arc::new(
+                            build_discovery(&config, &discovery_settings).await,
+                        ));
                     }
-                    // `sources` 는 바로 위에서 채워졌다. 빈 벡터여도 `discover` 가
-                    // 부분 결과로 처리하므로 등록부가 비워지지 않는다.
-                    let srcs = sources.clone().unwrap_or_default();
+                    // 바로 위에서 채워졌다. 비어 있어도 `discover` 가 부분 결과로
+                    // 처리하므로 등록부가 비워지지 않는다.
+                    let srcs = fleet.clone().expect("탐색 대상은 위에서 만들어진다");
 
                     // ① 조회 — 취소 가능하다(읽기와 순수 판정뿐).
                     //
@@ -1419,15 +1609,44 @@ fn spawn_leader_loop(
                                     epoch: gate.epoch(),
                                     ..collect_deps.clone()
                                 };
-                                tasks.reconcile(&instances, &deps).await;
+                                tasks.reconcile(&instances, &pause, &deps).await;
                                 // 사라진 인스턴스를 신선도 맵에서 잊는다 — 안 잊으면
                                 // 최솟값이 영구히 과거에 고정된다.
                                 collect_deps.freshness.retain(&tasks.running());
+                                let paused = dbmon::collect_loop::paused_ids(&instances, &pause);
                                 tracing::info!(
                                     collecting = tasks.running().len(),
                                     registered = instances.len(),
+                                    paused = paused.len(),
                                     "수집 태스크 집합 갱신"
                                 );
+
+                                // **부분 정지도 진행 중 레코드를 확정해야 한다.**
+                                //
+                                // 방금 태스크를 내린 인스턴스의 레코드를 남겨 두면 고아
+                                // 스윕이 `Mine` 으로 보고 건너뛰어 유령 "실행 중" 이 남는다.
+                                // 정지 집합이 바뀐 tick 에만 한 번 돈다 — 매 탐색마다
+                                // 돌리면 멈춰 있는 동안 같은 조회를 5분마다 반복한다.
+                                //
+                                // ⚠ `abort()` 는 다음 await 지점에서 끊으므로, 확정과
+                                // 태스크의 마지막 쓰기가 겹칠 좁은 틈이 있다. 전체 정지
+                                // 경로도 같은 틈을 갖고 있고(먼저 abort 하고 확정한다),
+                                // 그 경우 다음 리더 교체 때 epoch 가 달라져 스윕이 걷어간다.
+                                if pause_changed && !paused.is_empty() {
+                                    let closed = run_in_budget(close_in_flight_mine(
+                                        &stores.slow_query,
+                                        gate.worker_id(),
+                                        gate.epoch(),
+                                        now_ms,
+                                        Some(&paused),
+                                    ))
+                                    .await;
+                                    if closed.is_err() {
+                                        tracing::warn!(
+                                            "정지 인스턴스의 진행 중 레코드 확정이 예산을 넘겼다 — 남은 것은 다음 정지 변경이나 리더 교체가 걷어간다"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => tracing::warn!(
                                 error = %telemetry::Scrubbed(&e),
@@ -1669,6 +1888,25 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         "기동"
     );
 
+    // **prd 격리를 끈 배포는 그 사실을 경고로 남긴다.**
+    //
+    // 이 플래그는 T-37 방어선 두 개(이름 거부·태그 거부)를 빼는 것이므로 `info` 로
+    // 묻히면 안 된다. 시드 계정에서는 의도된 설정이지만, 남의 프로덕션이 섞인 계정에
+    // 같은 파일이 복사되면 그때도 조용히 통과한다.
+    if config.discovery.collect_production_targets {
+        tracing::warn!(
+            vpc_filter = ?config.discovery.allowed_vpc_ids,
+            "prd 격리 게이트를 껐다 (collect_production_targets) — 이름·태그가 prd 인 \
+             인스턴스도 수집한다. 환경은 태그로만 분류되고, 범위는 VPC 필터가 정한다"
+        );
+    }
+    if !config.collector.target_endpoint_overrides.is_empty() {
+        tracing::warn!(
+            targets = ?config.collector.target_endpoint_overrides.keys().collect::<Vec<_>>(),
+            "대상 엔드포인트를 오버라이드했다 (SSM 터널, dev 전용) — 이 구간은 평문이다"
+        );
+    }
+
     // **리터럴 정책을 기동 로그에 알린다** (FR-CAP-07 / OPEN-Q-15).
     //
     // 코드 기본값(`masked`)이 FR-CAP-07 의 `prd → full_restricted` 와 다르다.
@@ -1769,7 +2007,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 // 이런 도구에서 가장 비싼 실수다.
                 aws_account_id: config.aws.account_id.clone(),
                 aws_region: config.aws.region.clone(),
+                discovery_fallback_regions: config.target_regions(),
                 controls: Arc::clone(&controls),
+                pause: Arc::clone(&stores.pause),
+                settings: Arc::clone(&stores.settings),
+                // **파일 설정만이 인증 끄기를 허용할 수 있다.** 화면에서 두 번째
+                // 허용을 눌러야 실제로 꺼진다.
+                allow_auth_disable: config.http.allow_auth_disable,
+                metrics: build_metrics(&config).await,
                 worker_id: worker_id.clone(),
                 // 이 프로세스가 수집 루프를 도는가. `role=api` 워커는 제어를 받지
                 // 않는다 — 플래그가 프로세스 원자값이라 수집 워커가 모른다.

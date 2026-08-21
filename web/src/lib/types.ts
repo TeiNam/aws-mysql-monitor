@@ -34,14 +34,29 @@ export interface AwsInfo {
 }
 
 /**
- * 수집기 상태. `crates/dbmon/src/control.rs` 의 `ControlSnapshot` + 워커 사실.
+ * 멈춰 있는 스코프 하나. 키는 `*` · `env:prd` · `id:<account>/<region>/<identifier>`.
  *
- * ⚠ `scope` 가 `"process"` 다 — 이 플래그는 **요청을 받은 워커에만** 적용된다.
- * 여러 워커를 띄운 배포에서 전체를 멈추려면 설정 저장소가 필요하다.
+ * **문자열을 화면에서 만들지 않는다** — `scopeKey()` 를 쓴다. 서버(`core::pause`)와
+ * 같은 규칙이어야 하고, 어긋나면 정지가 조용히 아무 인스턴스에도 걸리지 않는다.
+ */
+export interface PausedScope {
+  scope: string;
+  since_ms: number;
+}
+
+/**
+ * 수집기 상태. `crates/dbmon/src/control.rs` 의 `ControlSnapshot` + 정지 스코프 + 워커 사실.
+ *
+ * `scope` 가 `"deployment"` 다 — 정지는 설정 저장소에 있으므로 **모든 워커에**
+ * 적용되고 재시작·리더 교체에도 남는다.
  */
 export interface CollectorStatus {
+  /** **전체(`*`) 정지 여부다.** 부분 정지는 `paused_scopes` 로 판단한다. */
   paused: boolean;
+  /** 가장 먼저 멈춘 스코프의 시각. */
   paused_since_ms: number | null;
+  /** 멈춰 있는 스코프 전부(`*` 포함). */
+  paused_scopes: PausedScope[];
   /** 이 워커가 수집 리더인가. 아니면 멈추고 있는 것이 정상이다. */
   is_leader: boolean;
   collecting: number;
@@ -52,10 +67,12 @@ export interface CollectorStatus {
   backfill_requested: boolean;
   worker_id: string;
   scope: string;
-  /** 이 워커가 수집 루프를 도는가. `false` 면 제어가 409 로 거부된다. */
+  /** 이 워커가 수집 루프를 도는가. `false` 면 즉시 탐색·백필이 409 로 거부된다. */
   runs_collector: boolean;
-  /** 조작할 수 있는 역할인가. 버튼 비활성의 근거. */
+  /** **전체(`*`)** 를 조작할 수 있는가 — 전 환경 스코프 operator 만 참이다. */
   can_control: boolean;
+  /** 환경·인스턴스 스코프를 조작할 수 있는 환경들. 그 밖은 누르면 403 이다. */
+  controllable_envs: Env[];
   role: string;
 }
 
@@ -133,6 +150,8 @@ export interface InstanceView {
   endpoint: string | null;
   port: number;
   instance_class: string | null;
+  /** 할당 스토리지(GiB). **RDS 전용, Aurora 는 `null`.** 스토리지 위험도의 분모다. */
+  allocated_storage_gb: number | null;
   cluster_id: string | null;
   is_cluster_writer: boolean;
   iam_auth_enabled: boolean;
@@ -225,6 +244,14 @@ export interface LiveMetrics {
   slow_per_sec: number | null;
   threads_running: number | null;
   threads_connected: number | null;
+  /**
+   * 연결 수의 **모수** (`@@max_connections`). 자체 수집으로 읽는다 —
+   * CloudWatch 에는 이 값의 메트릭이 없다.
+   *
+   * 이게 없으면 `threads_connected` 로 포화를 판정할 수 없다: `10` 이 정상인지
+   * 위험인지는 모수에 달렸다.
+   */
+  max_connections: number | null;
   lock_waits: number | null;
   rate_gap_reason: string | null;
 }
@@ -265,3 +292,50 @@ export interface ReadyUser {
 }
 
 export const ALL_ENVS: readonly Env[] = ["prd", "stg", "dev", "unknown"];
+
+/**
+ * CloudWatch 메트릭 한 점. `crates/dbmon/src/api/metrics.rs` 의 `MetricPoint`.
+ *
+ * `value` 가 `null` 이면 **값이 없다** — `0` 이 아니다. 방금 뜬 인스턴스, CloudWatch
+ * 지연 구간, 또는 그 구성에서 발행되지 않는 메트릭이다.
+ */
+export interface MetricPoint {
+  name: string;
+  label: string;
+  /** `percent` · `bytes` · `bytes_per_second` · `count` · `count_per_second` · `seconds` · `milliseconds` */
+  unit: string;
+  stat: string;
+  value: number | null;
+}
+
+export interface FleetMetricsRow {
+  instance_id: string;
+  metrics: MetricPoint[];
+}
+
+export interface FleetMetricsResponse {
+  rows: FleetMetricsRow[];
+  /** 이 값들의 조회 주기(초). 15분이다 — 개수 × 주기가 곧 비용이다. */
+  period_secs: number;
+  lag_note: string;
+}
+
+export interface MetricSeries {
+  name: string;
+  label: string;
+  unit: string;
+  stat: string;
+  timestamps_ms: number[];
+  values: number[];
+}
+
+export interface InstanceMetricsResponse {
+  instance_id: string;
+  engine: string;
+  series: MetricSeries[];
+  period_secs: number;
+  /** 요청 구간이 오래돼 **CloudWatch 가 더 큰 period 만 허용**했다. 화면이 표시해야 한다. */
+  period_adjusted: boolean;
+  from_ms: number;
+  to_ms: number;
+}

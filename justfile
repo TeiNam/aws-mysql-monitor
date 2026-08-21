@@ -154,6 +154,15 @@ local-init:
       echo "테이블 있음: dbmon-data-local"
     fi
 
+    # 설정 테이블. **정지 스코프가 여기 산다** — 없으면 리더 루프가 매 tick
+    # `ResourceNotFoundException` 을 찍고 정지가 동작하지 않는다.
+    if ! ddb describe-table --table-name dbmon-config-local >/dev/null 2>&1; then
+      ddb create-table --cli-input-json file://local/config-table.json >/dev/null
+      echo "테이블 생성: dbmon-config-local"
+    else
+      echo "테이블 있음: dbmon-config-local"
+    fi
+
     # 로컬 MySQL 을 감시 대상으로 등록한다. `endpoint` 가 루프백이므로 평문 접속
     # 경로를 탄다(`dev` + 루프백일 때만 허용된다 — `mysql::connect` 참고).
     ddb put-item --table-name dbmon-data-local --item file://local/instance.json >/dev/null
@@ -166,7 +175,8 @@ local-reset:
     set -euo pipefail
     export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=ap-northeast-2
     aws dynamodb --endpoint-url http://127.0.0.1:18000       delete-table --table-name dbmon-data-local >/dev/null 2>&1 || true
-    echo "테이블 삭제: dbmon-data-local"
+    aws dynamodb --endpoint-url http://127.0.0.1:18000       delete-table --table-name dbmon-config-local >/dev/null 2>&1 || true
+    echo "테이블 삭제: dbmon-data-local, dbmon-config-local"
 
 # 저장된 슬로우 쿼리를 본다
 local-show:

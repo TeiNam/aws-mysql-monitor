@@ -127,13 +127,18 @@ fn day_to_epoch_ms(day: &str) -> Option<i64> {
 ///
 /// `secret` 은 IAM 토큰이거나 폴백 비밀번호다. 어느 쪽인지 이 함수는 모른다 —
 /// MySQL 프로토콜에서 둘 다 비밀번호 자리에 들어간다.
+///
+/// `via` 는 **접속 주소만** 바꾼다 (SSM 터널, dev 전용 —
+/// `collector.target_endpoint_overrides`). 등록부의 엔드포인트는 그대로 남고
+/// IAM 토큰도 그 주소로 서명된 채로 들어온다 — RDS 가 검증하는 대상이 그것이다.
 pub fn target_opts(
     instance: &Instance,
     db_user: &str,
     secret: &str,
     deployment_env: Env,
+    via: Option<(&str, u16)>,
 ) -> Result<Opts> {
-    let host = instance
+    let registry_host = instance
         .endpoint
         .as_deref()
         .ok_or_else(|| DomainError::InvalidInput {
@@ -143,6 +148,12 @@ pub fn target_opts(
                 instance.id.as_str()
             ),
         })?;
+    // 터널을 쓰면 그 주소로 붙는다. **엔드포인트가 없는 인스턴스는 여전히 오류다** —
+    // 터널만 있고 대상이 정지 상태인 것을 성공으로 볼 이유가 없다.
+    let (host, port) = match via {
+        Some((h, p)) => (h, p),
+        None => (registry_host, instance.port),
+    };
 
     // **엔드포인트 형태를 확인한다 (등록부를 신뢰하지 않는 두 번째 방어선).**
     //
@@ -164,7 +175,7 @@ pub fn target_opts(
 
     let builder = OptsBuilder::default()
         .ip_or_hostname(host.to_string())
-        .tcp_port(instance.port)
+        .tcp_port(port)
         .user(Some(db_user.to_string()))
         .pass(Some(secret.to_string()))
         // **DB 를 고정하지 않는다.** 대상마다 스키마가 다르고, 우리 쿼리는
@@ -294,7 +305,7 @@ pub fn tls_mode(host: &str, deployment_env: Env) -> TlsMode {
 ///
 /// `127.0.0.1.attacker.example` 같은 이름이 통과하면 안 된다 — 설정 검증에서 실제로
 /// 그 구멍을 만들었다가 테스트가 잡았다. 주소를 파싱해 `is_loopback()` 에 맡긴다.
-fn is_loopback_host(host: &str) -> bool {
+pub fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -424,7 +435,7 @@ mod tests {
         ] {
             let i = instance(Some(bad));
             assert!(
-                target_opts(&i, "dbmon", "s", Env::Prd).is_err(),
+                target_opts(&i, "dbmon", "s", Env::Prd, None).is_err(),
                 "{bad} 를 대상으로 받았다"
             );
         }
@@ -434,7 +445,7 @@ mod tests {
             "ORDERS-01.ABC.AP-NORTHEAST-2.RDS.AMAZONAWS.COM",
         ] {
             let i = instance(Some(ok));
-            target_opts(&i, "dbmon", "s", Env::Prd).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            target_opts(&i, "dbmon", "s", Env::Prd, None).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
     }
 
@@ -443,10 +454,10 @@ mod tests {
     fn dev_loopback_hosts_are_accepted() {
         for ok in ["127.0.0.1", "localhost", "::1"] {
             let i = instance(Some(ok));
-            target_opts(&i, "dbmon", "pw", Env::Dev).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            target_opts(&i, "dbmon", "pw", Env::Dev, None).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
         // prd 에서는 같은 호스트가 거부된다.
-        assert!(target_opts(&instance(Some("127.0.0.1")), "dbmon", "pw", Env::Prd).is_err());
+        assert!(target_opts(&instance(Some("127.0.0.1")), "dbmon", "pw", Env::Prd, None).is_err());
     }
 
     /// **`Opts` 의 `Debug` 는 비밀번호를 평문으로 담는다.**
@@ -461,7 +472,7 @@ mod tests {
     #[test]
     fn opts_debug_leaks_the_password_so_never_print_it() {
         let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
-        let opts = target_opts(&i, "dbmon", "super-secret-token", Env::Prd).expect("옵션");
+        let opts = target_opts(&i, "dbmon", "super-secret-token", Env::Prd, None).expect("옵션");
         assert!(
             format!("{opts:?}").contains("super-secret-token"),
             "mysql_async 가 `Opts` 의 Debug 를 가리도록 바뀌었다 — 이 테스트와 \
@@ -496,9 +507,50 @@ mod tests {
     }
 
     /// 엔드포인트가 없으면 옵션을 만들 수 없다 — 조용히 빈 호스트로 붙으면 안 된다.
+    /// **SSM 터널: 접속 주소만 바뀌고 등록부 엔드포인트는 남는다.**
+    ///
+    /// 토큰은 호출부에서 실제 엔드포인트로 서명된다(`main.rs`). 여기서 호스트까지
+    /// 루프백으로 서명하면 RDS 가 거부하고, 원인이 IAM 정책처럼 보인다.
+    #[test]
+    fn a_tunnel_changes_the_connect_address_only() {
+        let i = instance(Some("orders.abc.ap-northeast-2.rds.amazonaws.com"));
+        let opts = target_opts(&i, "dbmon", "pw", Env::Dev, Some(("127.0.0.1", 14321)))
+            .expect("터널 옵션");
+        assert_eq!(opts.ip_or_hostname(), "127.0.0.1");
+        assert_eq!(opts.tcp_port(), 14321);
+        // 등록부 값은 그대로다 — 화면과 토큰이 같은 주소를 봐야 한다.
+        assert_eq!(
+            i.endpoint.as_deref(),
+            Some("orders.abc.ap-northeast-2.rds.amazonaws.com")
+        );
+
+        // 터널이 없으면 등록부 주소·포트를 쓴다.
+        let direct = target_opts(&i, "dbmon", "pw", Env::Dev, None).expect("직접 옵션");
+        assert_eq!(
+            direct.ip_or_hostname(),
+            "orders.abc.ap-northeast-2.rds.amazonaws.com"
+        );
+        assert_eq!(direct.tcp_port(), 3306);
+    }
+
+    /// 터널이 있어도 **엔드포인트가 없는 인스턴스는 오류다.** 대상이 정지 상태인 것을
+    /// 터널이 있다는 이유로 성공으로 볼 수 없다.
+    #[test]
+    fn a_tunnel_does_not_rescue_an_instance_without_an_endpoint() {
+        let e = target_opts(
+            &instance(None),
+            "dbmon",
+            "pw",
+            Env::Dev,
+            Some(("127.0.0.1", 14321)),
+        )
+        .expect_err("엔드포인트가 없다");
+        assert!(format!("{e}").contains("엔드포인트"), "{e}");
+    }
+
     #[test]
     fn missing_endpoint_is_an_error_not_an_empty_host() {
-        let e = target_opts(&instance(None), "dbmon", "secret", Env::Prd)
+        let e = target_opts(&instance(None), "dbmon", "secret", Env::Prd, None)
             .expect_err("엔드포인트 없이 옵션을 만들었다");
         assert!(matches!(e, DomainError::InvalidInput { .. }), "{e:?}");
     }
@@ -507,7 +559,7 @@ mod tests {
     #[test]
     fn opts_carry_host_port_and_user() {
         let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
-        let opts = target_opts(&i, "dbmon", "tok", Env::Prd).expect("옵션");
+        let opts = target_opts(&i, "dbmon", "tok", Env::Prd, None).expect("옵션");
         assert_eq!(
             opts.ip_or_hostname(),
             "orders-01.abc.ap-northeast-2.rds.amazonaws.com"
@@ -525,7 +577,7 @@ mod tests {
     #[test]
     fn rds_targets_enable_the_cleartext_plugin_over_tls() {
         let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
-        let opts = target_opts(&i, "dbmon", "tok", Env::Prd).expect("옵션");
+        let opts = target_opts(&i, "dbmon", "tok", Env::Prd, None).expect("옵션");
         assert!(
             opts.enable_cleartext_plugin(),
             "cleartext 플러그인이 꺼져 있다 — IAM 토큰으로 접속할 수 없다"
@@ -540,7 +592,7 @@ mod tests {
     #[test]
     fn plaintext_targets_never_enable_the_cleartext_plugin() {
         let i = instance(Some("127.0.0.1"));
-        let opts = target_opts(&i, "dbmon", "pw", Env::Dev).expect("옵션");
+        let opts = target_opts(&i, "dbmon", "pw", Env::Dev, None).expect("옵션");
         assert!(opts.ssl_opts().is_none());
         assert!(
             !opts.enable_cleartext_plugin(),
@@ -559,7 +611,7 @@ mod tests {
         let i = instance(Some("127.0.0.1"));
         // 실제 IAM DB Auth 토큰 길이대 (서명 쿼리 문자열이 붙어 매우 길다).
         let token = "x".repeat(1_000);
-        let err = target_opts(&i, "dbmon", &token, Env::Dev).expect_err("통과했다");
+        let err = target_opts(&i, "dbmon", &token, Env::Dev, None).expect_err("통과했다");
         let msg = format!("{err}");
         assert!(
             msg.contains(crate::aws::auth_token::TARGET_PASSWORD_ENV),
@@ -573,7 +625,7 @@ mod tests {
         let i = instance(Some("127.0.0.1"));
         for pw in ["p", "dbmon-local-monitor", &"a".repeat(245)] {
             assert!(
-                target_opts(&i, "dbmon", pw, Env::Dev).is_ok(),
+                target_opts(&i, "dbmon", pw, Env::Dev, None).is_ok(),
                 "{}바이트 비밀번호가 막혔다",
                 pw.len()
             );
@@ -589,7 +641,7 @@ mod tests {
     fn tls_targets_accept_long_iam_tokens() {
         let i = instance(Some("orders-01.abc.ap-northeast-2.rds.amazonaws.com"));
         let token = "x".repeat(1_000);
-        assert!(target_opts(&i, "dbmon", &token, Env::Prd).is_ok());
+        assert!(target_opts(&i, "dbmon", &token, Env::Prd, None).is_ok());
     }
 
     /// **`mysql_old_password` 다운그레이드를 열지 않는다.**
@@ -603,7 +655,7 @@ mod tests {
             ("127.0.0.1", Env::Dev),
         ] {
             let i = instance(Some(host));
-            let opts = target_opts(&i, "dbmon", "s", env).expect("옵션");
+            let opts = target_opts(&i, "dbmon", "s", env, None).expect("옵션");
             assert!(
                 opts.secure_auth(),
                 "{host}: mysql_old_password 다운그레이드가 열려 있다"
@@ -616,7 +668,7 @@ mod tests {
     fn loopback_dev_target_has_no_tls() {
         let mut i = instance(Some("127.0.0.1"));
         i.state = InstanceState::Collecting;
-        let opts = target_opts(&i, "dbmon", "pw", Env::Dev).expect("옵션");
+        let opts = target_opts(&i, "dbmon", "pw", Env::Dev, None).expect("옵션");
         assert!(opts.ssl_opts().is_none());
     }
 

@@ -23,6 +23,8 @@ pub mod aggregate;
 pub mod auth;
 pub mod cursor;
 pub mod hub;
+pub mod metrics;
+pub mod settings;
 pub mod topic;
 pub mod view;
 pub mod ws;
@@ -35,6 +37,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use dbmon_core::env::Env;
+use dbmon_core::pause::{PauseScope, PauseSet};
 use dbmon_core::ports::SlowQueryStore;
 use dbmon_core::rbac::AuthContext;
 use dbmon_core::time::{Clock, SystemClock, TimeRange};
@@ -122,15 +125,32 @@ pub struct ApiState {
     /// 운영자가 "지금 어느 계정을 보고 있나" 를 화면에서 확인해야 한다.
     pub aws_account_id: String,
     pub aws_region: String,
-    /// 수집 제어. 리더 루프와 공유한다 (`crate::control`).
+    /// 즉시 실행 요청과 런타임 사실. 리더 루프와 공유한다 (`crate::control`).
     pub controls: Arc<crate::control::Controls>,
-    /// 이 워커의 식별자. **어느 워커를 멈췄는지** 화면이 알아야 한다.
+    /// 정지 스코프. **저장소가 진실이므로 어느 워커에서 눌러도 같은 상태가 된다.**
+    pub pause: Arc<crate::control::PauseState>,
+    /// CloudWatch 메트릭. 자격증명이 없으면 조회가 실패하고 **빈 값 + 경고 로그**가 된다
+    /// (503 이 아니다 — 다른 값은 계속 보여야 한다).
+    pub metrics: Arc<crate::api::metrics::MetricsService>,
+    /// 이 워커의 식별자. 감사 로그와 화면 표시용.
     pub worker_id: String,
+    /// 운영자가 화면에서 바꾸는 설정. **저장소가 진실이므로 워커 전체에 적용된다.**
+    pub settings: Arc<crate::settings_state::SettingsState>,
+    /// 운영 설정의 리전 목록이 비었을 때 실제로 탐색되는 리전 (`aws.target_regions`).
+    ///
+    /// **화면이 이 값을 알아야 한다** — 설정이 비어 있을 때 "그럼 어디를 보고 있나" 의
+    /// 답이 이것이고, 리전 선택기의 항목도 여기서 나온다.
+    pub discovery_fallback_regions: Vec<String>,
+    /// 파일 설정이 **인증 끄기**를 허용하는가 (`api.allow_auth_disable`).
+    ///
+    /// 두 곳의 명시적 허용이 필요하다: 이 값과 운영 설정(`auth.mode = off`).
+    /// 한 곳으로 끌 수 있게 하면 실수 한 번으로 인증이 사라진다.
+    pub allow_auth_disable: bool,
     /// 이 프로세스가 수집 루프를 도는가 (`role` 이 collector·all).
     ///
-    /// **`false` 면 제어를 받지 않는다.** 제어 플래그는 프로세스 원자값이라
-    /// `role=api` 워커에서 눌러도 수집 워커는 모른다 — 성공을 돌려주면 화면이
-    /// "멈췄다" 고 거짓말한다.
+    /// **즉시 탐색·백필은 `false` 면 받지 않는다.** 그 요청은 프로세스 원자값을
+    /// 세우는 것이라 `role=api` 워커에서 눌러도 수집 워커는 모른다 — 성공을
+    /// 돌려주면 화면이 "돌린다" 고 거짓말한다. 정지는 저장소를 거치므로 제약이 없다.
     pub runs_collector: bool,
 }
 
@@ -147,6 +167,12 @@ pub fn router(state: ApiState) -> axum::Router {
         .route("/api/statistics", get(instance_statistics))
         .route("/api/statistics/users", get(user_statistics))
         .route("/api/instances", get(list_instances))
+        .route(
+            "/api/instances/{id}/start",
+            axum::routing::post(instance_start),
+        )
+        .route("/api/metrics/fleet", get(metrics_fleet))
+        .route("/api/metrics/instance/{id}", get(metrics_instance))
         .route("/api/collector/status", get(collector_status))
         .route("/api/collector/pause", axum::routing::post(collector_pause))
         .route(
@@ -155,30 +181,89 @@ pub fn router(state: ApiState) -> axum::Router {
         )
         .route("/api/discovery/run", axum::routing::post(discovery_run))
         .route("/api/backfill/run", axum::routing::post(backfill_run))
+        .route(
+            "/api/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
         .route("/api/ws", get(ws::handler))
         .with_state(state)
 }
 
+/// 실제로 적용 중인 로그인 방식.
+///
+/// 도메인 규칙([`dbmon_core::settings::AuthSettings::effective_mode`])에 **어댑터 사실**을
+/// 하나 더 씌운다: Cognito 검증기가 아직 없으면 그 방식을 고를 수 없다. 이 판정을 core
+/// 안에 두면 "코드가 배선됐는가" 를 도메인이 알아야 한다.
+fn effective_auth_mode(
+    state: &ApiState,
+    settings: &dbmon_core::settings::AppSettings,
+) -> dbmon_core::settings::AuthModeSetting {
+    use dbmon_core::settings::AuthModeSetting as M;
+    let mode = settings.auth.effective_mode(state.allow_auth_disable);
+    if mode == M::Cognito && !auth::COGNITO_READY {
+        return M::Token;
+    }
+    mode
+}
+
 /// API 오류. **내부 사정을 노출하지 않는다.**
-struct ApiError {
+pub struct ApiError {
     status: StatusCode,
     code: &'static str,
+    /// 코드로 부족할 때 함께 주는 구조화된 사실.
+    ///
+    /// **자유 서술이 아니라 화면이 소비할 값만** 담는다(어느 필드가 왜 틀렸는가).
+    /// 내부 오류 메시지를 여기 실으면 그게 곧 정보 노출이다.
+    detail: Option<serde_json::Value>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, code: &'static str) -> Self {
-        Self { status, code }
+        Self {
+            status,
+            code,
+            detail: None,
+        }
+    }
+
+    fn with_body(status: StatusCode, code: &'static str, detail: serde_json::Value) -> Self {
+        Self {
+            status,
+            code,
+            detail: Some(detail),
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.code }))).into_response()
+        let mut body = serde_json::json!({ "error": self.code });
+        if let (Some(detail), Some(obj)) = (self.detail, body.as_object_mut()) {
+            // 최상위에 펼친다 — `{error, problems}` 가 화면이 읽기 쉬운 모양이다.
+            if let Some(fields) = detail.as_object() {
+                for (k, v) in fields {
+                    obj.insert(k.clone(), v.clone());
+                }
+            } else {
+                obj.insert("detail".into(), detail);
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
 /// `Authorization: Bearer …` 에서 토큰을 뽑고 인증한다.
 fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+    // **인증을 끈 배포**는 여기서 끝난다 (`api.allow_auth_disable` + `auth.mode = off`).
+    //
+    // `cached()` 를 쓴다 — 요청 경로에서 설정 저장소를 때리지 않는다. 캐시가 비어
+    // 있으면(기동 직후, 아직 아무도 안 읽었다) 기본값 `token` 이므로 **인증이 켜진
+    // 쪽으로 떨어진다.** 방향이 이래야 한다: 캐시 미스가 문을 열어서는 안 된다.
+    if effective_auth_mode(state, &state.settings.cached())
+        == dbmon_core::settings::AuthModeSetting::Off
+    {
+        return Ok(auth::no_auth_context());
+    }
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -350,6 +435,8 @@ struct InstanceView {
     endpoint: Option<String>,
     port: u16,
     instance_class: Option<String>,
+    /// 할당 스토리지(GiB). **RDS 전용.** 화면이 `FreeStorageSpace` 를 퍼센트로 바꾸는 분모다.
+    allocated_storage_gb: Option<i32>,
     cluster_id: Option<String>,
     is_cluster_writer: bool,
     iam_auth_enabled: bool,
@@ -377,38 +464,47 @@ async fn list_instances(
     Ok(Json(
         all.iter()
             .filter(|i| ctx.is_env_allowed(i.env.effective))
-            .map(|i| InstanceView {
-                id: i.id.as_str().to_string(),
-                name: i
-                    .id
-                    .as_str()
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(i.id.as_str())
-                    .to_string(),
-                env: i.env.effective.as_str().to_string(),
-                env_from_tags: i.env.from_tags.as_str().to_string(),
-                env_override: i.env.override_value.map(|e| e.as_str().to_string()),
-                state: i.state.as_str().to_string(),
-                engine: format!("{:?}", i.engine).to_lowercase(),
-                engine_version: i.engine_version.raw.clone(),
-                endpoint: i.endpoint.clone(),
-                port: i.port,
-                instance_class: i.instance_class.clone(),
-                cluster_id: i.cluster_id.as_ref().map(|c| c.as_str().to_string()),
-                is_cluster_writer: i.is_cluster_writer,
-                iam_auth_enabled: i.iam_auth_enabled,
-                vpc_id: i.vpc_id.clone(),
-                availability_zone: i.availability_zone.clone(),
-                collectible: i.is_collectible(),
-                tags: i.tags.clone(),
-                first_seen_ms: i.first_seen_ms,
-                last_seen_ms: i.last_seen_ms,
-                deleted_at_ms: i.deleted_at_ms,
-                cert_valid_till_ms: i.cert_valid_till_ms,
-            })
+            .map(instance_view)
             .collect(),
     ))
+}
+
+/// 등록부 레코드 → 화면 뷰.
+///
+/// **함수로 뽑아 둔다.** 목록과 "수집 시작" 응답이 각자 매핑하면 한쪽만 필드를 놓치고,
+/// 그러면 버튼을 누른 직후의 행만 다른 값을 보여준다.
+fn instance_view(i: &dbmon_core::instance::Instance) -> InstanceView {
+    InstanceView {
+        id: i.id.as_str().to_string(),
+        name: i
+            .id
+            .as_str()
+            .rsplit('/')
+            .next()
+            .unwrap_or(i.id.as_str())
+            .to_string(),
+        env: i.env.effective.as_str().to_string(),
+        env_from_tags: i.env.from_tags.as_str().to_string(),
+        env_override: i.env.override_value.map(|e| e.as_str().to_string()),
+        state: i.state.as_str().to_string(),
+        engine: format!("{:?}", i.engine).to_lowercase(),
+        engine_version: i.engine_version.raw.clone(),
+        endpoint: i.endpoint.clone(),
+        port: i.port,
+        instance_class: i.instance_class.clone(),
+        allocated_storage_gb: i.allocated_storage_gb,
+        cluster_id: i.cluster_id.as_ref().map(|c| c.as_str().to_string()),
+        is_cluster_writer: i.is_cluster_writer,
+        iam_auth_enabled: i.iam_auth_enabled,
+        vpc_id: i.vpc_id.clone(),
+        availability_zone: i.availability_zone.clone(),
+        collectible: i.is_collectible(),
+        tags: i.tags.clone(),
+        first_seen_ms: i.first_seen_ms,
+        last_seen_ms: i.last_seen_ms,
+        deleted_at_ms: i.deleted_at_ms,
+        cert_valid_till_ms: i.cert_valid_till_ms,
+    }
 }
 
 /// 조회 대상 인스턴스를 정한다.
@@ -1053,7 +1149,10 @@ async fn get_query_markdown(
 ///
 /// 이 제어는 **전역이다** — 멈추면 이 워커가 수집하는 모든 인스턴스가 멈춘다.
 /// `dev` 스코프만 가진 `operator` 가 누르면 **prd 관측이 멈춘다.** 그래서 역할과
-/// 함께 **전 환경 스코프**를 요구한다. 인스턴스별 제어가 생기면 그때 좁힌다.
+/// 함께 **전 환경 스코프**를 요구한다.
+///
+/// 스코프별 정지는 [`require_scope_control`] 이 더 좁게 판정한다. 즉시 탐색·백필은
+/// 대상을 고를 수 없으므로(수집기 전체를 훑는다) 여전히 이 게이트를 쓴다.
 fn require_global_control(ctx: &AuthContext) -> Result<(), ApiError> {
     use dbmon_core::rbac::Role;
     if !matches!(ctx.role, Role::Operator | Role::Admin) {
@@ -1061,6 +1160,62 @@ fn require_global_control(ctx: &AuthContext) -> Result<(), ApiError> {
     }
     // 스코프가 전 환경을 덮는가. 부분 스코프로 전역 스위치를 누를 수 없다.
     if !Env::ALL.iter().all(|e| ctx.is_env_allowed(*e)) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "scope_required"));
+    }
+    Ok(())
+}
+
+/// 조작할 수 있는 환경들. **화면이 못 누를 옵션을 비활성화하는 근거다.**
+///
+/// 역할이 모자라면 빈 목록이다 — "환경은 보이는데 아무것도 못 누른다" 를 화면이
+/// 스스로 알 수 있어야 한다.
+fn controllable_envs(ctx: &AuthContext) -> Vec<Env> {
+    use dbmon_core::rbac::Role;
+    if !matches!(ctx.role, Role::Operator | Role::Admin) {
+        return Vec::new();
+    }
+    Env::ALL
+        .into_iter()
+        .filter(|e| ctx.is_env_allowed(*e))
+        .collect()
+}
+
+/// 이 스코프를 멈추거나 재개할 권한이 있는가.
+///
+/// # 왜 전역 게이트를 그대로 쓰지 않는가
+///
+/// 스코프가 생기면서 "dev 만 멈춘다" 가 표현 가능해졌다. `dev` 스코프 operator 에게
+/// 그걸 금지할 이유가 없다 — 그 사람은 이미 dev 데이터를 다 볼 수 있다. 반대로
+/// **전체(`*`) 는 여전히 전 환경 스코프를 요구한다**: prd 관측이 함께 멈추기 때문이다.
+///
+/// 인스턴스 스코프는 그 인스턴스의 **적용 환경**으로 판정한다. 등록부에 없는
+/// 인스턴스는 `404` 다 — 없는 것을 멈춰 두면 나중에 그 이름으로 인스턴스가 생길 때
+/// 조용히 수집되지 않는다.
+async fn require_scope_control(
+    state: &ApiState,
+    ctx: &AuthContext,
+    scope: &PauseScope,
+) -> Result<(), ApiError> {
+    use dbmon_core::rbac::Role;
+    if !matches!(ctx.role, Role::Operator | Role::Admin) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "role_required"));
+    }
+    let required = match scope {
+        // 전체는 전 환경을 덮어야 한다.
+        PauseScope::All => return require_global_control(ctx),
+        PauseScope::Env(e) => *e,
+        PauseScope::Instance(id) => {
+            use dbmon_core::ports::InstanceRegistry as _;
+            let found = state
+                .registry
+                .get(id)
+                .await
+                .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"))?;
+            found.env.effective
+        }
+    };
+    if !ctx.is_env_allowed(required) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "scope_required"));
     }
     Ok(())
@@ -1090,9 +1245,11 @@ fn require_control_header(headers: &HeaderMap) -> Result<(), ApiError> {
 
 /// 이 프로세스가 실제로 수집을 도는가.
 ///
-/// **아니면 조작을 거부한다.** 플래그는 프로세스 원자값이므로 `role=api` 워커에서
-/// 바꿔도 수집 워커는 모른다 — 200 을 돌려주면 화면이 "멈췄다" 고 거짓말한다.
-/// 여러 워커에 걸쳐 멈추려면 설정 저장소에 상태를 둬야 하고, 그건 별도 작업이다.
+/// **아니면 즉시 실행 요청을 거부한다.** "지금 훑어"·"지금 백필" 은 프로세스 원자값을
+/// 세우는 것이므로 `role=api` 워커에서 눌러도 수집 워커는 모른다 — 200 을 돌려주면
+/// 화면이 "돌린다" 고 거짓말한다.
+///
+/// 정지·재개는 이 게이트를 쓰지 않는다. 저장소에 쓰므로 모든 워커가 본다.
 fn require_collector_worker(state: &ApiState) -> Result<(), ApiError> {
     if state.runs_collector {
         Ok(())
@@ -1101,18 +1258,57 @@ fn require_collector_worker(state: &ApiState) -> Result<(), ApiError> {
     }
 }
 
+/// 멈춰 있는 스코프 하나. 화면이 칩으로 그린다.
+#[derive(Debug, serde::Serialize)]
+struct PausedScope {
+    /// 정규 키 (`*` · `env:prd` · `id:<account>/<region>/<identifier>`).
+    scope: String,
+    since_ms: i64,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct CollectorStatus {
     #[serde(flatten)]
     snapshot: crate::control::ControlSnapshot,
+    /// **전체 정지 여부다** (`*` 스코프). 부분 정지는 `paused_scopes` 로 본다 —
+    /// 여기에 부분 정지까지 넣으면 "멈췄다" 를 보고 전체가 멈춘 줄 알게 된다.
+    paused: bool,
+    /// 가장 먼저 멈춘 시각. 부분 정지에서도 "언제부터" 를 말할 수 있어야 한다.
+    paused_since_ms: Option<i64>,
+    /// 멈춰 있는 스코프 전부(`*` 포함). 키 순서다.
+    paused_scopes: Vec<PausedScope>,
     worker_id: String,
-    /// 이 플래그가 어디까지 적용되는가. 여러 워커를 띄웠으면 **이 프로세스뿐**이다.
+    /// 정지 상태가 어디까지 적용되는가. 저장소에 있으므로 **배포 전체**다.
     scope: &'static str,
-    /// 이 워커가 수집 루프를 도는가. `false` 면 제어가 거부된다.
+    /// 이 워커가 수집 루프를 도는가. 즉시 탐색·백필은 여기서만 받는다.
     runs_collector: bool,
-    /// 조작할 수 있는 역할인가. 화면이 버튼을 비활성화하는 근거.
+    /// **전체(`*`) 를** 조작할 수 있는가. 화면이 "전체" 옵션을 비활성화하는 근거.
     can_control: bool,
+    /// 환경·인스턴스 스코프를 조작할 수 있는 환경들. 그 밖은 누르면 403 이다 —
+    /// 항상 실패하는 선택지를 보여주지 않으려면 화면이 이걸 알아야 한다.
+    controllable_envs: Vec<Env>,
     role: String,
+}
+
+fn status_body(state: &ApiState, ctx: &AuthContext, pause: &PauseSet) -> CollectorStatus {
+    CollectorStatus {
+        snapshot: state.controls.snapshot(),
+        paused: pause.is_all_paused(),
+        paused_since_ms: pause.earliest_since_ms(),
+        paused_scopes: pause
+            .entries()
+            .map(|(scope, since_ms)| PausedScope {
+                scope: scope.to_string(),
+                since_ms,
+            })
+            .collect(),
+        worker_id: state.worker_id.clone(),
+        scope: "deployment",
+        runs_collector: state.runs_collector,
+        can_control: require_global_control(ctx).is_ok(),
+        controllable_envs: controllable_envs(ctx),
+        role: ctx.role.as_str().to_string(),
+    }
 }
 
 async fn collector_status(
@@ -1120,45 +1316,263 @@ async fn collector_status(
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
-    Ok(Json(CollectorStatus {
-        snapshot: state.controls.snapshot(),
-        worker_id: state.worker_id.clone(),
-        scope: "process",
-        runs_collector: state.runs_collector,
-        can_control: state.runs_collector && require_global_control(&ctx).is_ok(),
-        role: ctx.role.as_str().to_string(),
-    }))
+    // **저장소가 진실이다.** 이 워커가 수집기가 아니어도 같은 정지 상태를 말한다.
+    let pause = state.pause.load(SystemClock.now_ms()).await;
+    Ok(Json(status_body(&state, &ctx, &pause)))
 }
 
+/// 정지·재개 요청 본문.
+///
+/// **기본값을 두지 않는다.** 빈 본문을 "전체" 로 해석하면 오래된 화면이나 잘못된
+/// 스크립트가 실수로 전 환경 관측을 멈출 수 있다 — 이 요청은 그만큼 비싸다.
+#[derive(Debug, serde::Deserialize)]
+struct ScopeBody {
+    scope: String,
+}
+
+fn parse_scope(body: &ScopeBody) -> Result<PauseScope, ApiError> {
+    PauseScope::parse(&body.scope)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_scope"))
+}
+
+/// 스코프를 멈춘다.
+///
+/// # 왜 `runs_collector` 를 요구하지 않는가
+///
+/// 정지 상태가 저장소에 있으므로 **어느 워커가 받아도 수집 워커가 다음 tick 에
+/// 본다**(최대 `control::CACHE_TTL_MS`). 프로세스 원자값이던 시절에는 `role=api`
+/// 워커에서 누르면 화면만 "멈춤" 이 되어 거짓말이었고, 그래서 409 로 거부했다.
 async fn collector_pause(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Json(body): Json<ScopeBody>,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     require_control_header(&headers)?;
-    require_global_control(&ctx)?;
-    require_collector_worker(&state)?;
-    state.controls.set_paused(true, SystemClock.now_ms());
+    let scope = parse_scope(&body)?;
+    require_scope_control(&state, &ctx, &scope).await?;
+    let pause = state
+        .pause
+        .pause(&scope, &ctx.subject, SystemClock.now_ms())
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
     // **감사 로그를 남긴다.** 관측이 멈춘 구간은 나중에 반드시 질문거리가 된다.
     tracing::warn!(
         subject = %ctx.subject,
         worker = %state.worker_id,
-        "수집을 멈췄다 (화면 조작) — 이 구간의 슬로우 쿼리는 기록되지 않는다"
+        scope = %body.scope,
+        "수집을 멈췄다 (화면 조작) — 이 스코프의 슬로우 쿼리는 기록되지 않는다"
     );
-    collector_status(State(state), headers).await
+    Ok(Json(status_body(&state, &ctx, &pause)))
 }
 
 async fn collector_resume(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    Json(body): Json<ScopeBody>,
 ) -> Result<Json<CollectorStatus>, ApiError> {
     let ctx = context_of(&state, &headers)?;
     require_control_header(&headers)?;
-    require_global_control(&ctx)?;
-    require_collector_worker(&state)?;
-    state.controls.set_paused(false, SystemClock.now_ms());
-    tracing::warn!(subject = %ctx.subject, worker = %state.worker_id, "수집을 재개했다 (화면 조작)");
-    collector_status(State(state), headers).await
+    let scope = parse_scope(&body)?;
+    require_scope_control(&state, &ctx, &scope).await?;
+    let pause = state
+        .pause
+        .resume(&scope, SystemClock.now_ms())
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+    tracing::warn!(
+        subject = %ctx.subject,
+        worker = %state.worker_id,
+        scope = %body.scope,
+        "수집을 재개했다 (화면 조작)"
+    );
+    Ok(Json(status_body(&state, &ctx, &pause)))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FleetMetricsResponse {
+    rows: Vec<crate::api::metrics::FleetRow>,
+    /// 이 값들의 조회 주기(초). 화면이 "15분마다 갱신" 을 말할 수 있어야 한다.
+    period_secs: i64,
+    /// **CloudWatch 는 1~3분 지연된다.** 자체 수집 지표와 나란히 놓으면 값이 어긋나
+    /// 보이므로 화면이 그 사실을 적어야 한다.
+    lag_note: &'static str,
+}
+
+/// 플릿 메트릭 표.
+///
+/// **엔진별 최소 세트만** 15분 창으로 가져온다([06 §2.3] 비용 설계). 연결 수·QPS 는
+/// 여기 없다 — 자체 수집이 더 신선하고 무료이므로 화면이 WS 스냅샷에서 받는다.
+async fn metrics_fleet(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<FleetMetricsResponse>, ApiError> {
+    use dbmon_core::ports::InstanceRegistry as _;
+
+    let ctx = context_of(&state, &headers)?;
+    let svc = &state.metrics;
+
+    let all = state
+        .registry
+        .list()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+    // **스코프 밖 인스턴스는 요청조차 하지 않는다.** 걸러서 표시만 하면 그 인스턴스의
+    // 메트릭에 돈을 내면서 아무도 못 본다.
+    let visible: Vec<_> = all
+        .into_iter()
+        .filter(|i| ctx.is_env_allowed(i.env.effective))
+        .collect();
+
+    let rows = svc.fleet(&visible, SystemClock.now_ms()).await;
+    Ok(Json(FleetMetricsResponse {
+        rows,
+        period_secs: dbmon_core::cw_metrics::FLEET_PERIOD_SECS,
+        lag_note: "CloudWatch 는 1~3분 지연된다. 실시간 값은 자체 수집 열을 본다",
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MetricRangeParams {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InstanceMetricsResponse {
+    instance_id: String,
+    engine: String,
+    series: Vec<crate::api::metrics::MetricSeries>,
+    period_secs: i64,
+    /// **요청 범위 때문에 period 를 올려 잡았다.** CloudWatch 는 15~63일 전 구간에
+    /// 60초를 허용하지 않는다 — 화면이 이걸 표시해야 "왜 해상도가 낮나" 를 답한다.
+    period_adjusted: bool,
+    from_ms: i64,
+    to_ms: i64,
+}
+
+/// 인스턴스 상세 메트릭. **엔진에 맞는 전체 세트**를 시계열로.
+///
+/// 화면을 보고 있을 때만 호출되고 60초 창으로 캐시된다 — 여러 사람이 같은 화면을 봐도
+/// 1회만 CloudWatch 를 때린다.
+async fn metrics_instance(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<MetricRangeParams>,
+) -> Result<Json<InstanceMetricsResponse>, ApiError> {
+    use dbmon_core::ports::InstanceRegistry as _;
+
+    let ctx = context_of(&state, &headers)?;
+    let svc = &state.metrics;
+
+    let instance_id = dbmon_core::ids::InstanceId::parse(&id)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_instance_id"))?;
+    let found = state
+        .registry
+        .get(&instance_id)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"))?;
+    // 조회 권한은 목록과 같은 규칙이다 — 스코프 밖이면 존재를 알려주지 않는다.
+    if !ctx.is_env_allowed(found.env.effective) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"));
+    }
+
+    let now = SystemClock.now_ms();
+    let to_ms = params.to_ms.unwrap_or(now);
+    // 기본 3시간. 그 범위는 60초 period 를 쓸 수 있는 구간이다.
+    let from_ms = params.from_ms.unwrap_or(to_ms - 3 * 3_600_000);
+    let range = checked_range(from_ms, to_ms)?;
+
+    let (series, choice) = svc
+        .detail(&found, range.from_ms(), range.to_ms(), now)
+        .await;
+    Ok(Json(InstanceMetricsResponse {
+        instance_id: found.id.as_str().to_string(),
+        engine: format!("{:?}", found.engine).to_lowercase(),
+        series,
+        period_secs: choice.period_secs,
+        period_adjusted: choice.adjusted,
+        from_ms: range.from_ms(),
+        to_ms: range.to_ms(),
+    }))
+}
+
+/// **수집을 시작한다** (`Pending` → `Collecting`).
+///
+/// # 왜 사람이 눌러야 하는가
+///
+/// 수집 시작은 대상 DB 에 매초 쿼리를 날리기 시작하는 일이다. 탐색이 새 인스턴스를
+/// 자동으로 켜면 운영자가 모르는 접속이 생기고, 모니터링 계정이 아직 없으면 실패 로그가
+/// 쏟아진다(실측). 그래서 **등록은 자동, 시작은 명시적**이다
+/// ([`InstanceState::should_collect`](dbmon_core::instance::InstanceState::should_collect)).
+///
+/// # 무엇을 켜지 않는가
+///
+/// `Disabled`(태그 `dbmon:enabled=false`)·`Unsupported`(버전 미달)·`Excluded`(탐색 필터)·
+/// `Deleted` 는 **거부한다.** 그 상태의 근거는 AWS 쪽 사실이므로 화면 버튼으로 덮으면
+/// 다음 탐색이 되돌린다 — 눌리는데 5분 뒤 풀리는 버튼은 고장으로 읽힌다.
+/// 각각 태그·엔진 업그레이드·필터 설정을 고쳐야 한다.
+async fn instance_start(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<InstanceView>, ApiError> {
+    use dbmon_core::instance::InstanceState as S;
+    use dbmon_core::ports::InstanceRegistry as _;
+
+    let ctx = context_of(&state, &headers)?;
+    require_control_header(&headers)?;
+    let instance_id = dbmon_core::ids::InstanceId::parse(&id)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_instance_id"))?;
+    // 정지·재개와 **같은 권한 규칙**을 쓴다 — 그 인스턴스의 환경 권한이 필요하다.
+    require_scope_control(&state, &ctx, &PauseScope::Instance(instance_id.clone())).await?;
+
+    let found = state
+        .registry
+        .get(&instance_id)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"))?;
+
+    match found.state {
+        // 이미 돌고 있거나 스스로 움직이는 상태다 — 멱등하게 통과시킨다.
+        S::Collecting | S::Degraded | S::Unreachable => {}
+        S::Pending => {
+            state
+                .registry
+                .set_state(&instance_id, S::Collecting)
+                .await
+                .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+            // **즉시 반영시킨다.** `reconcile` 은 탐색 주기(기본 5분)에만 도는데,
+            // 그때까지 태스크가 안 뜨면 누르고 5분 기다리는 버튼이 된다 — 고장으로 읽힌다.
+            //
+            // ⚠ 이 요청은 **프로세스 원자값**이다(`Controls`). 워커가 여럿이고 이 요청이
+            // 수집 리더가 아닌 워커에 닿으면 반영이 다음 탐색 주기로 밀린다. 상태 자체는
+            // 저장소에 있으므로 결과가 틀리지는 않는다 — 늦어질 뿐이다.
+            state.controls.request_discovery();
+            // **감사 로그를 남긴다.** 대상 DB 에 접속이 시작되는 시점이다.
+            tracing::warn!(
+                subject = %ctx.subject,
+                instance = %instance_id.as_str(),
+                "수집을 시작했다 (화면 조작) — 이 인스턴스에 접속이 시작된다"
+            );
+        }
+        // 근거가 AWS 쪽 사실인 상태는 버튼으로 덮지 않는다.
+        S::Disabled | S::Unsupported | S::Excluded | S::Deleted => {
+            return Err(ApiError::new(StatusCode::CONFLICT, "state_not_startable"));
+        }
+    }
+
+    // 방금 쓴 상태를 반영해 돌려준다 — 화면이 다시 조회하지 않아도 버튼이 바뀐다.
+    let fresh = state
+        .registry
+        .get(&instance_id)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"))?;
+    Ok(Json(instance_view(&fresh)))
 }
 
 /// 탐색을 즉시 돌린다. 참조 구현의 "인스턴스 수집" 버튼.
@@ -1196,6 +1610,57 @@ async fn backfill_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(role: dbmon_core::rbac::Role, envs: &[Env]) -> AuthContext {
+        AuthContext {
+            subject: "tester".into(),
+            role,
+            env_scope: envs.to_vec(),
+            can_see_literals: false,
+            claims_version: 1,
+        }
+    }
+
+    /// 화면이 **누를 수 있는 것만** 제시할 수 있어야 한다.
+    ///
+    /// 이 목록이 없으면 dev 스코프 사용자에게 `prd` 옵션을 보여주고, 그걸 고르면
+    /// 서버가 403 으로 거부한다 — **항상 실패하는 선택지**다(`Filters.tsx` 규칙 1과 같은 이유).
+    #[test]
+    fn controllable_envs_follows_role_and_scope() {
+        use dbmon_core::rbac::Role;
+        assert_eq!(
+            controllable_envs(&ctx(Role::Operator, &[Env::Dev, Env::Stg])),
+            vec![Env::Stg, Env::Dev],
+            "Env::ALL 순서를 따른다"
+        );
+        assert_eq!(
+            controllable_envs(&ctx(Role::Admin, &Env::ALL)),
+            Env::ALL.to_vec()
+        );
+        assert!(
+            controllable_envs(&ctx(Role::Viewer, &Env::ALL)).is_empty(),
+            "역할이 모자라면 빈 목록이다 — 스코프가 있어도 못 누른다"
+        );
+    }
+
+    /// **본문이 없거나 모르는 키면 거부한다.** 빈 본문을 "전체" 로 접으면 오래된
+    /// 화면이나 스크립트가 실수로 전 환경 관측을 멈출 수 있다.
+    #[test]
+    fn a_scope_body_must_name_a_known_scope() {
+        let ok = |s: &str| {
+            parse_scope(&ScopeBody { scope: s.into() })
+                .map(|x| x.as_key())
+                .ok()
+        };
+        assert_eq!(ok("*"), Some("*".to_string()));
+        assert_eq!(ok("env:prd"), Some("env:prd".to_string()));
+        let id = "123456789012/ap-northeast-2/orders-prd-01";
+        assert_eq!(ok(&format!("id:{id}")), Some(format!("id:{id}")));
+
+        for bad in ["", "all", "env:", "env:prod", "id:nope", "prd"] {
+            assert!(ok(bad).is_none(), "{bad} 는 거부해야 한다");
+        }
+    }
 
     /// **균등 분배만 쓰면 바쁜 인스턴스의 최근 데이터가 표본에서 사라진다.**
     ///

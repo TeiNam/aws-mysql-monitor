@@ -151,6 +151,7 @@ mod tests {
             slow_per_sec: None,
             threads_running: None,
             threads_connected: None,
+            max_connections: None,
             lock_waits: None,
             rate_gap_reason: None,
         }

@@ -35,14 +35,31 @@ pub struct DiscoveryPage {
 pub struct RdsDiscovery {
     client: Client,
     region: String,
+    /// 이 클라이언트가 보는 **계정**.
+    ///
+    /// 크로스 계정 탐색이 생기면서 필요해졌다. 배포 설정의 계정 번호로 키를 만들면
+    /// 다른 계정의 인스턴스가 **우리 계정 키로 등록**되고, 그러면 같은 이름의 DB 가
+    /// 두 계정에 있을 때 하나가 다른 하나를 덮어쓴다(`InstanceId` 가 계정을 포함하는
+    /// 이유가 그것이다).
+    account_id: String,
 }
 
 impl RdsDiscovery {
-    pub fn new(client: Client, region: impl Into<String>) -> Self {
+    pub fn new(
+        client: Client,
+        region: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             region: region.into(),
+            account_id: account_id.into(),
         }
+    }
+
+    /// 이 대상의 계정 번호. 탐색 루프가 인스턴스 키를 만들 때 쓴다.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
     /// 이 리전의 DB 인스턴스를 모두 나열한다.
@@ -131,6 +148,8 @@ impl RdsDiscovery {
             // Aurora 라이터 여부는 클러스터 응답에만 있다. 여기서는 알 수 없다(M2-5b).
             is_cluster_writer: false,
             iam_auth_enabled: db.iam_database_authentication_enabled().unwrap_or(false),
+            // Aurora 는 이 값을 주지 않거나 무의미하다(볼륨이 자동 증가한다).
+            allocated_storage_gb: db.allocated_storage(),
             cert_valid_till_ms: db
                 .certificate_details()
                 .and_then(|c| c.valid_till())
@@ -166,7 +185,7 @@ mod tests {
     }
 
     fn disco() -> RdsDiscovery {
-        RdsDiscovery::new(client(), "ap-northeast-2")
+        RdsDiscovery::new(client(), "ap-northeast-2", "000000000000")
     }
 
     /// SDK 응답의 필드가 **하나도 빠지지 않고** 옮겨져야 한다.

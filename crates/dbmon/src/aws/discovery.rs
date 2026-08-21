@@ -44,6 +44,12 @@ pub struct RawDbInstance {
     pub instance_class: Option<String>,
     /// Aurora 클러스터 식별자. RDS MySQL 이면 `None`.
     pub cluster_identifier: Option<String>,
+    /// 할당 스토리지(GiB). **RDS 전용** — Aurora 는 볼륨이 자동으로 늘어나 이 값이 없다.
+    ///
+    /// 이걸 받는 이유는 `FreeStorageSpace` 를 **퍼센트로 바꿀 분모**이기 때문이다.
+    /// 바이트만 보여주면 "18GB 남았다" 가 위험한지 알 수 없다 — 20GB 할당이면 위험이고
+    /// 1TB 할당이면 정상이다.
+    pub allocated_storage_gb: Option<i32>,
     pub is_cluster_writer: bool,
     pub iam_auth_enabled: bool,
     /// `CertificateDetails.ValidTill` (FR-DSC-13).
@@ -133,6 +139,13 @@ pub fn to_instance(
         vpc_id: raw.vpc_id.clone(),
         availability_zone: raw.availability_zone.clone(),
         instance_class: raw.instance_class.clone(),
+        // **Aurora 의 값은 버린다.** AWS 가 `1` 을 자리표로 준다(볼륨이 자동 증가하므로
+        // 할당량이라는 개념이 없다). 그대로 두면 언젠가 누군가 `1GiB` 를 분모로 써서
+        // "스토리지 위험" 을 오판한다 — 실측: 시드 Aurora 5대 전부 `allocated=1` 이었다.
+        allocated_storage_gb: match engine {
+            Engine::AuroraMysql => None,
+            Engine::Mysql => raw.allocated_storage_gb,
+        },
         is_cluster_writer: raw.is_cluster_writer,
         iam_auth_enabled: raw.iam_auth_enabled,
         tags: raw.tags.clone(),
@@ -212,6 +225,41 @@ mod tests {
 
     const ACCOUNT: &str = "123456789012";
     const NOW: EpochMs = 1_755_500_400_000;
+    /// **Aurora 의 `AllocatedStorage` 는 자리표(`1`)다.** 그대로 두면 언젠가 그것을
+    /// 분모로 써서 "스토리지 1GiB 중 256TB 남음" 같은 판정을 만든다.
+    #[test]
+    fn aurora_allocated_storage_placeholder_is_discarded() {
+        let raw = RawDbInstance {
+            identifier: "aur-1".into(),
+            engine: "aurora-mysql".into(),
+            engine_version: "8.0.mysql_aurora.3.08.0".into(),
+            region: "ap-northeast-2".into(),
+            endpoint_address: Some("aur-1.rds.amazonaws.com".into()),
+            endpoint_port: Some(3306),
+            // AWS 가 실제로 이 값을 준다(실측: 시드 Aurora 5대 전부 1).
+            allocated_storage_gb: Some(1),
+            ..Default::default()
+        };
+        let i = to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW)
+            .expect("매핑");
+        assert_eq!(i.allocated_storage_gb, None, "Aurora 자리표가 그대로 남았다");
+
+        // RDS 는 실제 할당량이므로 보존한다.
+        let raw = RawDbInstance {
+            identifier: "rds-1".into(),
+            engine: "mysql".into(),
+            engine_version: "8.4.6".into(),
+            region: "ap-northeast-2".into(),
+            endpoint_address: Some("rds-1.rds.amazonaws.com".into()),
+            endpoint_port: Some(3306),
+            allocated_storage_gb: Some(20),
+            ..Default::default()
+        };
+        let i = to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW)
+            .expect("매핑");
+        assert_eq!(i.allocated_storage_gb, Some(20));
+    }
+
 
     fn raw(engine: &str, version: &str) -> RawDbInstance {
         RawDbInstance {

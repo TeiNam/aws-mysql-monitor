@@ -62,6 +62,12 @@ pub struct LiveMetrics {
     /// 실행 중 스레드 (게이지) — 항상 있다.
     pub threads_running: Option<u64>,
     pub threads_connected: Option<u64>,
+    /// 연결 수의 **모수** (`@@max_connections`).
+    ///
+    /// 이게 없으면 `threads_connected` 로 포화를 판정할 수 없다 — `10` 이 정상인지
+    /// 위험인지는 모수에 달렸다. CloudWatch 에는 이 값의 메트릭이 없어서 자체 수집으로
+    /// 읽는다(`sql::GLOBAL_STATUS` 의 UNION).
+    pub max_connections: Option<u64>,
     /// InnoDB 행 락 대기 중 (게이지).
     pub lock_waits: Option<u64>,
     /// 비율을 내지 못한 이유. 화면이 "—" 와 "0" 을 구분하게 한다.
@@ -78,6 +84,8 @@ pub fn derive(prev: Option<&StatusSample>, cur: &StatusSample) -> LiveMetrics {
         slow_per_sec: None,
         threads_running: cur.counter("Threads_running"),
         threads_connected: cur.counter("Threads_connected"),
+        // 변수도 같은 맵에 담겨 온다(`sql::GLOBAL_STATUS` 의 UNION).
+        max_connections: cur.counter("max_connections"),
         lock_waits: cur.counter("Innodb_row_lock_current_waits"),
         rate_gap_reason: None,
     };
