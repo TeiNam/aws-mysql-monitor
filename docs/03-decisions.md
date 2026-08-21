@@ -922,6 +922,23 @@ MySQL 5.7과 Aurora MySQL 2.x는 지원하지 않는다.
 **대가** — Aurora 3.x는 8.4 전용 기능(예: `explain_json_format_version=2`)을 못 쓴다.
 → 해당 기능은 사용하지 않거나, 버전 감지 후 선택적으로만 사용한다.
 
+**실제로 그렇게 했다 (2026-08-21, 계획 JSON 형식).** `EngineVersion::supports_explain_json_v2()`
+가 **커뮤니티 성분**으로 8.3 이상을 판정하고, 세션 변수를 재실행 직전에 따로 보내
+실패하면 v1 으로 흐른다. 실측: MySQL 8.0.46 에서 그 변수는 `1193 Unknown system variable` 다.
+
+**⚠ Aurora 버전 번호 체계가 바뀌었다.** AWS 가 실제로 보고하는 문자열
+(`aws rds describe-db-engine-versions --engine aurora-mysql`, ap-northeast-2, 2026-08):
+
+| 엔진 버전 문자열 | 커뮤니티 | Aurora | 계획 형식 |
+|---|---|---|---|
+| `8.0.mysql_aurora.3.12.0` | 8.0 | 3.12.0 | v1 |
+| **`8.4.mysql_aurora.8.4.7`** | **8.4** | **8.4.7** | **v2** |
+
+즉 새 Aurora 는 Aurora 성분도 `8.4.7` 이다 — **"Aurora 3.x" 를 가정한 비교는 여기서
+깨진다.** `MIN_AURORA = (3,5,0)` 하한은 `(8,4,7) >= (3,5,0)` 으로 여전히 통과하지만,
+그건 번호 체계가 올라갔기 때문이지 같은 계열을 비교한 것이 아니다. 두 문자열 모두
+테스트에 실제 값으로 박아 뒀다(`explain_json_v2_is_gated_by_the_community_version`).
+
 **⚠ 이 결정은 실사 없이는 확정할 수 없다** — 두 가지가 미확인이다.
 
 1. **Aurora 버전 문자열은 순서 비교가 안 된다.** Aurora `EngineVersion`은

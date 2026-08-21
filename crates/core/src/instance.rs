@@ -274,12 +274,37 @@ mod tests {
         let v80 = EngineVersion::parse("8.0.46").expect("8.0");
         assert!(!v80.supports_explain_json_v2());
 
-        // Aurora MySQL 3.05 = 커뮤니티 8.0.32 → v2 없음.
-        let aurora3 = EngineVersion::parse("8.0.mysql_aurora.3.05.2").expect("aurora3");
-        assert!(!aurora3.supports_explain_json_v2());
-        // 커뮤니티가 8.4 인 Aurora 는 된다.
-        let aurora84 = EngineVersion::parse("8.4.mysql_aurora.3.10.0").expect("aurora84");
+        // ── AWS 가 실제로 보고하는 문자열로 검증한다 ──────────────────────────
+        //
+        // `aws rds describe-db-engine-versions --engine aurora-mysql` (ap-northeast-2):
+        //   … 8.0.mysql_aurora.3.12.0, **8.4.mysql_aurora.8.4.7**
+        // 새 Aurora 는 Aurora 성분도 `8.4.7` 이다 — 3.x 를 가정한 비교는 여기서 깨진다.
+        for v1_only in ["8.0.mysql_aurora.3.05.2", "8.0.mysql_aurora.3.12.0"] {
+            let v = EngineVersion::parse(v1_only).expect(v1_only);
+            assert!(
+                !v.supports_explain_json_v2(),
+                "Aurora 3.x 는 커뮤니티 8.0 이므로 v2 가 없다: {v1_only}"
+            );
+            // 지원 대상 판정은 그대로 통과해야 한다(엔진 하한과 별개다).
+            assert!(v.is_supported(Engine::AuroraMysql), "{v1_only}");
+        }
+
+        let aurora84 = EngineVersion::parse("8.4.mysql_aurora.8.4.7").expect("aurora 8.4.7");
+        assert_eq!(aurora84.community, (8, 4, 0));
+        assert_eq!(aurora84.aurora, Some((8, 4, 7)));
         assert!(aurora84.supports_explain_json_v2());
+        // **하한 판정도 통과해야 한다.** Aurora 성분이 3.x 가 아니라 8.x 가 됐으므로
+        // `>= (3,5,0)` 비교가 여전히 성립하는지 확인한다 — 여기서 막히면 새 Aurora 가
+        // 통째로 "지원하지 않는 엔진" 이 된다.
+        assert!(aurora84.is_supported(Engine::AuroraMysql));
+        assert_eq!(aurora84.binary_log_status_stmt(), "SHOW BINARY LOG STATUS");
+
+        // RDS MySQL 8.4.x (실제 목록: 8.4.6 … 8.4.11)
+        for raw in ["8.4.6", "8.4.11"] {
+            let v = EngineVersion::parse(raw).expect(raw);
+            assert!(v.supports_explain_json_v2(), "{raw}");
+            assert!(v.is_supported(Engine::Mysql), "{raw}");
+        }
     }
     use super::*;
 
