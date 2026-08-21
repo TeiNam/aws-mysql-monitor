@@ -515,11 +515,14 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
         ) || w[1].starts_with("UNIQUE(")
             || w[1].starts_with("INDEX(")
             || w[1].starts_with("KEY(");
-        // `ADD CONSTRAINT <이름> UNIQUE …` — 이름 **다음** 토큰이 UNIQUE 여야 한다.
-        let named = w[1] == "CONSTRAINT"
-            && toks
-                .get(i + 3)
-                .is_some_and(|t| t == "UNIQUE" || t.starts_with("UNIQUE("));
+        // `ADD CONSTRAINT [이름] UNIQUE …` — **이름은 선택 사항**이다(MySQL 문법의
+        // `[CONSTRAINT [symbol]]`). 이름 자리(i+2) 또는 그 다음(i+3)이 UNIQUE 다.
+        // 그 밖의 위치에 있는 UNIQUE 는 제약 **이름**일 뿐이다(`unique_fk`).
+        let unique_at = |k: usize| {
+            toks.get(k)
+                .is_some_and(|t| t == "UNIQUE" || t.starts_with("UNIQUE("))
+        };
+        let named = w[1] == "CONSTRAINT" && (unique_at(i + 2) || unique_at(i + 3));
         direct || named
     });
     let alter = up.starts_with("ALTER TABLE ") && adds_index
@@ -668,19 +671,25 @@ fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
     };
     // **스키마를 명시했으면 스키마까지 같아야 한다.** `archive.orders` 를 `shop.orders`
     // 로 보면 다른 스키마의 테이블을 고치는 문장을 통과시킨다(4차 교차 리뷰).
-    let target_clean = target.trim().trim_matches('`').to_string();
-    let same = if target_clean.contains('.') {
-        // 양쪽의 조각을 각각 인용 없이 비교한다.
-        let norm = |q: &str| {
-            q.split('.')
-                .map(|p| p.trim().trim_matches('`').to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(".")
-        };
-        norm(&target_clean) == norm(table)
+    // **백틱 안의 점은 구분자가 아니다.** ``` `shop.orders` ``` 는 점이 든 **한** 테이블
+    // 이름이고 `shop`.`orders` 가 아니다 — 먼저 벗기고 나누면 그 둘을 같다고 본다
+    // (5차 교차 리뷰가 medium 으로 잡았다).
+    let target_parts = split_qualified(target.trim());
+    let expected_parts = split_qualified(table);
+    let same = if target_parts.len() > 1 {
+        target_parts.len() == expected_parts.len()
+            && target_parts
+                .iter()
+                .zip(expected_parts.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
     } else {
-        bare_name(&target_clean).eq_ignore_ascii_case(&bare_name(table))
+        // 스키마를 안 적었으면 테이블 이름만 비교한다.
+        target_parts
+            .last()
+            .zip(expected_parts.last())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
     };
+    let target_clean = target_parts.join(".");
     if !same {
         return Some(format!(
             "DDL 의 대상이 `{target_clean}` 인데 설명은 `{table}` 이다"
@@ -691,7 +700,10 @@ fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
     if parts.is_empty() {
         return Some("DDL 에서 인덱스 컬럼을 찾을 수 없다".to_string());
     }
-    let group_up = group.to_ascii_uppercase();
+    // 그룹 안의 **식별자들**. 부분 문자열이 아니라 낱말로 본다 —
+    // `order_id` 가 `id` 를 포함한다고 통과시키면 다른 컬럼에 인덱스를 걸어도 맞다고
+    // 판정한다(5차 교차 리뷰가 medium 으로 잡았다).
+    let group_idents = identifiers_in(&group);
     for c in columns {
         let name = column_name(c);
         if name.is_empty() {
@@ -699,9 +711,9 @@ fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
         }
         let exact = parts.iter().any(|p| p.eq_ignore_ascii_case(&name));
         // **함수 인덱스는 이름이 식으로 감싸여 있다** (`((id + 1))`). 그때는 그
-        // 괄호 그룹 **안에** 이름이 나오면 인정한다 — 그룹 밖(인덱스 이름·다른 테이블)은
-        // 여전히 통하지 않으므로 `ON payments(secret)` 류는 계속 걸린다.
-        let inside = group_up.contains(&name.to_ascii_uppercase());
+        // 괄호 그룹 안의 **식별자로서** 나오면 인정한다 — 그룹 밖(인덱스 이름·다른
+        // 테이블)은 여전히 통하지 않으므로 `ON payments(secret)` 류는 계속 걸린다.
+        let inside = group_idents.iter().any(|i| i.eq_ignore_ascii_case(&name));
         if !exact && !inside {
             return Some(format!("DDL 의 인덱스 컬럼에 `{name}` 이 없다"));
         }
@@ -709,15 +721,48 @@ fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
     None
 }
 
-/// `스키마.테이블` 에서 테이블만. 인용부호도 벗긴다.
-fn bare_name(qualified: &str) -> String {
-    qualified
-        .rsplit('.')
-        .next()
-        .unwrap_or(qualified)
-        .trim()
-        .trim_matches('`')
-        .to_string()
+/// `스키마.테이블` 을 조각으로. **백틱 안의 점은 구분자가 아니다.**
+fn split_qualified(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                // ``` `` ``` 는 이스케이프된 백틱이다.
+                if in_quote && chars.peek() == Some(&'`') {
+                    cur.push('`');
+                    chars.next();
+                    continue;
+                }
+                in_quote = !in_quote;
+            }
+            '.' if !in_quote => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+/// 문자열 안의 식별자들. 낱말 경계로 나눈다(영숫자·`_`·`$` 가 식별자 문자다).
+///
+/// 부분 문자열 비교를 피하기 위한 것이다 — `order_id` 안의 `id` 는 다른 컬럼이다.
+fn identifiers_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// `memo(20)` → `memo`. 인용부호도 벗긴다.
@@ -1433,6 +1478,73 @@ mod tests {
         };
         let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
         assert_eq!(advice.indexes.len(), 1, "{:?}", advice.caveats);
+    }
+
+    /// **5차 교차 리뷰가 찾은 것들.** 부분 문자열·인용된 점·이름 없는 제약.
+    #[test]
+    fn identifier_boundaries_and_quoted_dots() {
+        let mut orders = spec("shop", "orders");
+        orders.create_ddl =
+            Some("CREATE TABLE `orders` (`id` int, `order_id` int, `status` varchar(20))".into());
+
+        // ① `order_id` 가 `id` 를 포함한다고 통과시키면 안 된다.
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["id".into()],
+                ddl: "CREATE INDEX ix ON orders (order_id)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders.clone()]), "m", 1).expect("검증");
+        assert!(
+            advice.indexes.is_empty(),
+            "부분 문자열로 다른 컬럼을 통과시켰다: {:?}",
+            advice.indexes
+        );
+
+        // ② ``` `shop.orders` ``` 는 점이 든 **한** 이름이다 — `shop`.`orders` 가 아니다.
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "ALTER TABLE `shop.orders` ADD INDEX ix (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders.clone()]), "m", 1).expect("검증");
+        assert!(
+            advice.indexes.is_empty(),
+            "인용 안의 점을 스키마 구분자로 봤다: {:?}",
+            advice.indexes
+        );
+
+        // 정상적인 스키마 한정 대상은 통과한다.
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "ALTER TABLE `shop`.`orders` ADD INDEX ix (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "{:?}", advice.caveats);
+
+        // ③ 이름 없는 UNIQUE 제약도 인덱스 추가다.
+        assert!(is_index_creation_ddl(
+            "ALTER TABLE orders ADD CONSTRAINT UNIQUE (status)"
+        ));
+        // 이름이 UNIQUE 로 시작해도 실제 동작이 FK 면 거부한다.
+        assert!(!is_index_creation_ddl(
+            "ALTER TABLE orders ADD CONSTRAINT unique_x FOREIGN KEY (a) REFERENCES b(id)"
+        ));
     }
 
     /// **4차 교차 리뷰가 찾은 우회들.** 인용 안의 키워드와 제약 이름으로 속이는 경로다.

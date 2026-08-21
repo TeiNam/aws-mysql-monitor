@@ -123,8 +123,16 @@ impl SettingsStore for DynamoSettingsStore {
         by: &str,
         now_ms: EpochMs,
     ) -> Result<AppSettings> {
+        // **포화를 오류로 만든다.** `saturating_add` 로 두면 상한에서 여러 저장이 같은
+        // 버전으로 성공하고, 그러면 늦게 도착한 응답이 캐시를 되돌릴 수 있다
+        // (5차 교차 리뷰가 low 로 잡았다 — 42억 번 저장해야 닿지만 조용히 깨진다).
+        let Some(next_version) = expected_version.checked_add(1) else {
+            return Err(DomainError::Conflict(
+                "설정 버전이 상한에 닿았다 — 항목을 새로 만들어야 한다".to_string(),
+            ));
+        };
         let mut next = settings.clone();
-        next.version = expected_version.saturating_add(1);
+        next.version = next_version;
         next.updated_at_ms = now_ms;
         next.updated_by = by.to_string();
 
