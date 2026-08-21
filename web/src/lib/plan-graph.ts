@@ -22,10 +22,27 @@ export interface PlanNode {
   id: string;
   kind: NodeKind;
   label: string;
-  /** 라벨 아래 줄들 (`Cost: …`, `Rows: …`). */
+  /** 라벨 아래 줄들 (`Cost: …`, `Rows: …`). 그래프 카드가 쓴다. */
   details: string[];
   depth: number;
   children: string[];
+
+  // ── 표(Simple) 뷰가 쓰는 **구조화된 값** ─────────────────────────────────
+  //
+  // 그래프는 문자열 몇 줄로 충분하지만 표는 열마다 정렬·비교를 해야 한다. 문자열을
+  // 다시 파싱하는 것은 같은 정보를 두 번 해석하는 것이고, 형식이 바뀌면 한쪽만 깨진다.
+  /** 대상 테이블·CTE 이름. 연산 노드에는 없다. */
+  entity?: string;
+  /** 이 노드까지의 비용. v1 은 `cost_info`, v2 는 `estimated_total_cost`. */
+  cost?: number;
+  /** 예상 행 수. */
+  rows?: number;
+  /** 실제 소요 시간(ms). **`EXPLAIN ANALYZE`(v2) 에만 있다** — 없으면 표에 `—`. */
+  timeMs?: number;
+  /** 붙은 조건(`attached_condition`)·인덱스 조건. */
+  condition?: string;
+  /** 사용한 인덱스. */
+  key?: string;
 }
 
 export interface PlanGraph {
@@ -72,9 +89,15 @@ export function parsePlan(json: string): PlanGraph | null {
   const nodes: PlanNode[] = [];
   const edges: Array<{ from: string; to: string }> = [];
 
-  const add = (kind: NodeKind, label: string, details: string[], depth: number): string => {
+  const add = (
+    kind: NodeKind,
+    label: string,
+    details: string[],
+    depth: number,
+    fields: Partial<PlanNode> = {},
+  ): string => {
     const id = `n${nodes.length}`;
-    nodes.push({ id, kind, label, details, depth, children: [] });
+    nodes.push({ id, kind, label, details, depth, children: [], ...fields });
     return id;
   };
   const link = (from: string, to: string) => {
@@ -93,11 +116,26 @@ export function parsePlan(json: string): PlanGraph | null {
     if (filtered !== null) details.push(`Filtered: ${filtered}%`);
     const key = str(table.key);
     details.push(key === null ? "Key: (없음)" : `Key: ${key}`);
+    let cost: number | null = null;
     if (isRecord(table.cost_info)) {
-      const cost = num(table.cost_info.prefix_cost) ?? num(table.cost_info.read_cost);
+      cost = num(table.cost_info.prefix_cost) ?? num(table.cost_info.read_cost);
       if (cost !== null) details.push(`Cost: ${COST.format(cost)}`);
     }
-    const id = add("table", access === null ? name : `${name} (${access})`, details, depth);
+    // **조건은 표의 마지막 열이다.** 인덱스 조건이 있으면 그게 더 구체적이다.
+    const condition = str(table.index_condition) ?? str(table.attached_condition);
+    const id = add(
+      "table",
+      access === null ? name : `${name} (${access})`,
+      details,
+      depth,
+      {
+        entity: name,
+        ...(cost === null ? {} : { cost }),
+        ...(rows === null ? {} : { rows }),
+        ...(condition === null ? {} : { condition }),
+        ...(key === null ? {} : { key }),
+      },
+    );
 
     // 파생 테이블·서브쿼리는 이 테이블 아래로 이어진다.
     for (const key2 of ["materialized_from_subquery", "attached_subqueries"]) {
@@ -135,7 +173,11 @@ export function parsePlan(json: string): PlanGraph | null {
     const details: string[] = [];
     if (op.using_filesort === true) details.push("using filesort");
     if (op.using_temporary_table === true) details.push("using temporary");
-    const id = add("operation", label, details, depth);
+    // 표의 조건 열에는 이 연산이 왜 비싼지를 적는다 — `using filesort` 는 정렬 버퍼를
+    // 넘겼다는 신호이고, 그게 이 행을 보는 이유다.
+    const id = add("operation", label, details, depth, {
+      ...(details.length === 0 ? {} : { condition: details.join(", ") }),
+    });
     linkChildren(op, id, depth + 1);
     return id;
   };
@@ -155,6 +197,10 @@ export function parsePlan(json: string): PlanGraph | null {
     }
 
     if (Array.isArray(block.nested_loop)) {
+      // ⚠ **자식 수를 `rows` 에 넣지 않는다.** 표의 `Rows` 열은 "이 노드가 다룰 행 수"
+      // 이고, 거기에 조인 단계 수(3)를 넣으면 **3행짜리 조인**으로 읽힌다 —
+      // 화면에서 `Nested loop (3) … Rows 3` 이 나오는 것을 보고 잡았다. 단계 수는
+      // 라벨에만 남긴다.
       const loopId = add("loop", `Nested loop (${block.nested_loop.length})`, [], depth);
       link(parent, loopId);
       for (const step of block.nested_loop) {
@@ -190,17 +236,20 @@ export function parsePlan(json: string): PlanGraph | null {
     const details: string[] = [];
     const selectId = num(block.select_id);
     if (selectId !== null) details.push(`select_id: ${selectId}`);
+    let cost: number | null = null;
     if (isRecord(block.cost_info)) {
-      const cost = num(block.cost_info.query_cost);
+      cost = num(block.cost_info.query_cost);
       if (cost !== null) details.push(`Cost: ${COST.format(cost)}`);
     }
-    const id = add("select", label, details, depth);
+    const id = add("select", label, details, depth, {
+      ...(cost === null ? {} : { cost }),
+    });
 
     // `message` 는 "테이블을 쓰지 않는다" 처럼 옵티마이저가 남긴 설명이다.
     // **버리지 않는다** — 이게 유일한 내용인 플랜이 실제로 있다.
     const message = str(block.message);
     if (message !== null) {
-      link(id, add("message", message, [], depth + 1));
+      link(id, add("message", message, [], depth + 1, { condition: message }));
     }
     linkChildren(block, id, depth + 1);
     return id;
@@ -232,7 +281,19 @@ export function parsePlan(json: string): PlanGraph | null {
 
     // 테이블 접근인지 연산인지로 색을 나눈다.
     const kind: NodeKind = table !== null && operation === null ? "table" : "operation";
-    const id = add(kind, label, details, depth);
+    // **v2 는 `EXPLAIN ANALYZE` 의 실측값을 담을 수 있다.** 있으면 표의 Time 열에 낸다 —
+    // 없으면 비워 둔다(추정 시간을 실측처럼 보여주지 않는다).
+    const actualMs = num(node.actual_total_time_ms);
+    const actualRows = num(node.actual_rows);
+    // 실측 행 수가 있으면 그쪽이 진실이다.
+    const rowsForTable = actualRows ?? rows;
+    const id = add(kind, label, details, depth, {
+      ...(table === null ? {} : { entity: table }),
+      ...(cost === null ? {} : { cost }),
+      ...(rowsForTable === null ? {} : { rows: rowsForTable }),
+      ...(actualMs === null ? {} : { timeMs: actualMs }),
+      ...(key === null ? {} : { key }),
+    });
 
     if (Array.isArray(node.inputs)) {
       for (const child of node.inputs) {

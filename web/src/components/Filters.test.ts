@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { instancesInEnv, instancesMatching, visibleEnvs, visibleInstances } from "./Filters";
-import type { InstanceView } from "../lib/types";
+import type { Env, InstanceView } from "../lib/types";
 
 /**
  * 필터 판정만 테스트한다 — 여기서 두 번 틀렸다.
@@ -12,7 +12,7 @@ import type { InstanceView } from "../lib/types";
  * 둘 다 "두 필터가 조합되지 않는다" 는 같은 원인이었고, 브라우저에서 숫자를 재보고서야
  * 드러났다. 그래서 조합을 순수 함수로 두고 여기서 고정한다.
  */
-function inst(name: string, env: string): InstanceView {
+function inst(name: string, env: Env): InstanceView {
   return {
     id: `000000000000/ap-northeast-2/${name}`,
     name,
@@ -56,7 +56,7 @@ describe("환경 선택지", () => {
   });
 
   it("규정에 없는 값도 숨기지 않는다 — 숨기면 그 인스턴스를 고를 방법이 없다", () => {
-    expect(visibleEnvs([inst("a", "sandbox"), inst("b", "prd")])).toEqual(["prd", "sandbox"]);
+    expect(visibleEnvs([inst("a", "unknown"), inst("b", "prd")])).toEqual(["prd", "unknown"]);
   });
 });
 

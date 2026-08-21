@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { layoutPlan, parsePlan } from "./plan-graph";
+import { costShare, planRows } from "./plan-rows";
 
 /**
  * 참조 대시보드는 노드 좌표를 **라벨 문자열로** 정했다(`case 'Nested_Loop#2'`).
@@ -148,5 +149,113 @@ describe("배치", () => {
     const loop = layout.nodes.find((n) => n.kind === "loop")!;
     const tables = layout.nodes.filter((n) => n.kind === "table");
     expect(loop.y).toBeCloseTo((tables[0]!.y + tables[1]!.y) / 2);
+  });
+});
+
+describe("표(Simple) 행", () => {
+  it("전위 순회로 펼치고 들여쓰기는 순회 깊이다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        select_id: 1,
+        cost_info: { query_cost: "353891.58" },
+        nested_loop: [
+          {
+            table: {
+              table_name: "sg",
+              access_type: "ref",
+              rows_examined_per_scan: 2,
+              attached_condition: "(sg.id = 7)",
+              cost_info: { prefix_cost: "1.20" },
+            },
+          },
+          { table: { table_name: "g", access_type: "ALL", rows_examined_per_scan: 3113305 } },
+        ],
+      },
+    });
+    const rows = planRows(parsePlan(json)!, new Set());
+    expect(rows.map((r) => `${"  ".repeat(r.indent)}${r.node.label}`)).toEqual([
+      "Select",
+      "  Nested loop (2)",
+      "    sg (ref)",
+      "    g (ALL)",
+    ]);
+    // 표가 쓰는 구조화된 값이 채워져 있어야 한다.
+    const sg = rows[2]!.node;
+    expect(sg.entity).toBe("sg");
+    expect(sg.rows).toBe(2);
+    expect(sg.cost).toBeCloseTo(1.2);
+    expect(sg.condition).toBe("(sg.id = 7)");
+    // **시간은 없다** — `EXPLAIN FORMAT=JSON` 은 시간을 주지 않는다. 추정으로 채우지 않는다.
+    expect(sg.timeMs).toBeUndefined();
+  });
+
+  it("조인 단계 수를 행 수로 내지 않는다", () => {
+    // `Nested loop (3)` 의 3 은 **자식 수**다. 표의 `Rows` 열에 넣으면 3행짜리 조인으로
+    // 읽힌다 — 화면에서 그렇게 나오는 것을 보고 잡았다.
+    const json = JSON.stringify({
+      query_block: {
+        nested_loop: [
+          { table: { table_name: "a", rows_examined_per_scan: 60023 } },
+          { table: { table_name: "b", rows_examined_per_scan: 2 } },
+          { table: { table_name: "c" } },
+        ],
+      },
+    });
+    const rows = planRows(parsePlan(json)!, new Set());
+    const loop = rows.find((r) => r.node.kind === "loop")!;
+    expect(loop.node.label).toBe("Nested loop (3)");
+    expect(loop.node.rows).toBeUndefined();
+    // 테이블의 행 수는 그대로 온다.
+    expect(rows.find((r) => r.node.entity === "a")!.node.rows).toBe(60023);
+  });
+
+  it("접힌 노드의 **자손 전체**를 건너뛴다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        nested_loop: [{ table: { table_name: "a" } }, { table: { table_name: "b" } }],
+      },
+    });
+    const graph = parsePlan(json)!;
+    const loop = graph.nodes.find((n) => n.kind === "loop")!;
+    const rows = planRows(graph, new Set([loop.id]));
+    expect(rows.map((r) => r.node.label)).toEqual(["Select", "Nested loop (2)"]);
+    expect(rows[1]!.hasChildren).toBe(true);
+    expect(rows[1]!.collapsed).toBe(true);
+  });
+
+  it("비용 비중은 가장 비싼 노드를 100% 로 본다", () => {
+    const json = JSON.stringify({
+      query_block: {
+        cost_info: { query_cost: "100.00" },
+        table: { table_name: "t", cost_info: { prefix_cost: "25.00" } },
+      },
+    });
+    const rows = planRows(parsePlan(json)!, new Set());
+    expect(costShare(rows, rows[0]!.node)).toBe(100);
+    expect(costShare(rows, rows[1]!.node)).toBe(25);
+  });
+
+  it("비용이 없으면 비중은 `null` — 0% 로 채우지 않는다", () => {
+    const rows = planRows(parsePlan('{"query_block":{"message":"No tables used"}}')!, new Set());
+    expect(costShare(rows, rows[0]!.node)).toBeNull();
+    // 메시지는 조건 열에 그대로 남는다 — 이게 유일한 내용인 계획이 있다.
+    expect(rows[1]!.node.condition).toBe("No tables used");
+  });
+
+  it("v2 의 실측 시간·행 수는 표에 그대로 온다", () => {
+    const json = JSON.stringify({
+      query_plan: {
+        operation: "Nested loop inner join",
+        estimated_total_cost: 1234.5,
+        estimated_rows: 5,
+        actual_rows: 7,
+        actual_total_time_ms: 12.5,
+        inputs: [{ table_name: "o", access_type: "table_scan", estimated_rows: 3113305 }],
+      },
+    });
+    const rows = planRows(parsePlan(json)!, new Set());
+    expect(rows[0]!.node.timeMs).toBe(12.5);
+    expect(rows[0]!.node.rows).toBe(7);
+    expect(rows[1]!.node.entity).toBe("o");
   });
 });

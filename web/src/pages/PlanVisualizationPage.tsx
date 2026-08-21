@@ -14,6 +14,7 @@ import { Card } from "../components/Card";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { PlanGraph } from "../components/PlanGraph";
+import { PlanTable } from "../components/PlanTable";
 import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
 import {
@@ -339,7 +340,7 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
                   : `300KB 를 넘어 S3 로 오프로드됐다 (${plan.data.s3_key}). 본문 조회 경로는 아직 없다.`}
               </p>
             ) : (
-              <PlanGraph json={plan.data.normalized_json} />
+              <PlanTabs json={plan.data.normalized_json} />
             )}
 
             {plan.data.referenced_tables.length === 0 ? null : (
@@ -371,6 +372,49 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
         )}
       </Card>
     </>
+  );
+}
+
+/**
+ * 계획을 **두 가지로** 보여준다 — 그래프(모양)와 표(숫자).
+ *
+ * # 왜 둘 다 필요한가
+ *
+ * 그래프는 "어디서 조인이 터지나" 를 한눈에 보여주지만, **무엇이 제일 비싼가**를 비교하려면
+ * 숫자를 나란히 놓아야 한다. 참조 도구(DataGrip)도 같은 이유로 `Graph`/`Simple` 두 탭을 둔다.
+ *
+ * 원본 JSON 은 탭 아래에 그대로 남긴다 — 두 뷰가 못 읽는 형식이 오면 그게 유일한 근거다.
+ */
+function PlanTabs({ json }: { json: string }) {
+  const [tab, setTab] = useState<"graph" | "plan">("graph");
+
+  const button = (id: "graph" | "plan", label: string) => (
+    <button
+      type="button"
+      onClick={() => setTab(id)}
+      // **선택 상태를 색만으로 말하지 않는다** — 밑줄과 `aria-selected` 를 함께 쓴다.
+      className={`-mb-px border-b-2 px-3 py-1.5 text-sm font-medium ${
+        tab === id
+          ? "border-blue-500 text-blue-700"
+          : "border-transparent text-gray-500 hover:text-gray-800"
+      }`}
+      role="tab"
+      aria-selected={tab === id}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div>
+      <div className="mb-3 flex gap-1 border-b border-gray-200" role="tablist" aria-label="계획 보기 방식">
+        {button("graph", "그래프")}
+        {button("plan", "plan")}
+      </div>
+      {/* **양쪽을 항상 마운트하지 않는다.** 큰 계획에서 두 배로 그리게 되고, 그래프는
+          SVG 를 노드 수만큼 만든다. 탭을 바꿀 때 다시 파싱하는 비용은 순수 함수라 작다. */}
+      {tab === "graph" ? <PlanGraph json={json} /> : <PlanTable json={json} />}
+    </div>
   );
 }
 
