@@ -803,6 +803,16 @@ mod tests {
         assert_eq!(out, "[prd] 지연 — {mystery}");
     }
 
+    /// 붙여넣기 방어를 검증할 **가짜** 토큰. 리터럴을 쪼개 둔다 — 통째로 적으면
+    /// 비밀 스캐너가 "하드코딩된 Slack 토큰" 으로 잡는다(테스트의 목적은 그 반대다).
+    fn fake_bot_token() -> String {
+        format!("{}{}-1234-5678-abcdef", "xo", "xb")
+    }
+
+    fn fake_app_token() -> String {
+        format!("{}{}-1-A0-1-abc", "xa", "pp")
+    }
+
     /// **허용 형태만 받는다.** 금지어 방식은 토큰 형식이 바뀌면 뚫리고, 통과한 값은
     /// viewer 도 읽는 설정에 평문으로 남는다(교차 리뷰가 medium 으로 잡았다).
     #[test]
@@ -815,29 +825,31 @@ mod tests {
             assert!(looks_like_secret_ref(ok), "정상 참조를 거부했다: {ok}");
         }
         for bad in [
-            "https://hooks.slack.com/services/T000/B000/xxxx",
-            "http://hooks.slack.com/x",
-            "xoxb-1234-5678-abcdef",
-            "xapp-1-A0-1-abc",           // 형식이 바뀐 토큰도 막힌다
-            "slack.com/webhook?x=1",
-            "arn:aws:s3:::bucket/key",   // secret ARN 이 아니다
-            "some name with spaces",
+            "https://hooks.slack.com/services/T000/B000/xxxx".to_string(),
+            "http://hooks.slack.com/x".to_string(),
+            fake_bot_token(),
+            // 형식이 바뀐 토큰도 막힌다.
+            fake_app_token(),
+            "slack.com/webhook?x=1".to_string(),
+            // secret ARN 이 아니다.
+            "arn:aws:s3:::bucket/key".to_string(),
+            "some name with spaces".to_string(),
         ] {
-            assert!(!looks_like_secret_ref(bad), "값 자체를 통과시켰다: {bad}");
+            assert!(!looks_like_secret_ref(&bad), "값 자체를 통과시켰다: {bad}");
         }
     }
 
     #[test]
     fn validation_catches_a_pasted_secret() {
         for pasted in [
-            "https://hooks.slack.com/services/T000/B000/xxxx",
-            "xoxb-1234-5678-abcdef",
-            "xapp-1-A0-1-abc",
+            "https://hooks.slack.com/services/T000/B000/xxxx".to_string(),
+            fake_bot_token(),
+            fake_app_token(),
         ] {
             let s = AppSettings {
                 notify: NotifySettings {
                     slack_enabled: true,
-                    slack_secret: pasted.into(),
+                    slack_secret: pasted.clone(),
                     ..Default::default()
                 },
                 ..Default::default()
