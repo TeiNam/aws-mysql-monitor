@@ -107,18 +107,43 @@ impl BedrockClient {
                 // 불러야 했다. 이 메시지는 **우리 요청의 형태**에 대한 진단이고
                 // (모델 ID·파라미터·길이) 사용자 데이터가 아니므로 살려도 안전하다.
                 // 길이는 자른다 — 응답 본문 전체가 로그로 흐르는 것은 막는다.
+                // **스크럽을 통과시킨다.** 이 메시지는 화면까지 가고, AWS 가 요청 내용
+                // 일부를 되풀이할 수 있다(3차 교차 리뷰가 medium 으로 지적). 스크럽은
+                // 인용된 값과 숫자 뭉치를 가리므로 "temperature is deprecated" 같은
+                // 진단 문장은 살아남는다.
                 let message = e
                     .as_service_error()
                     .and_then(ProvideErrorMetadata::message)
-                    .map(|m| m.chars().take(MAX_ERROR_CHARS).collect::<String>())
-                    .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}")));
+                    .map(crate::telemetry::scrub)
+                    .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}")))
+                    .chars()
+                    .take(MAX_ERROR_CHARS)
+                    .collect::<String>();
                 DomainError::Unavailable {
                     dependency: "bedrock",
                     reason: message,
                 }
             })?;
 
-        let truncated = out.stop_reason().as_str() == "max_tokens";
+        let stop = out.stop_reason().as_str().to_string();
+        let truncated = stop == "max_tokens";
+
+        // **차단은 텍스트보다 먼저 본다.**
+        //
+        // `content_filtered` 인데 본문이 비어 있지 않을 수도 있다(계약이 빈 출력을
+        // 보장하지 않는다). 그때 텍스트만 보고 저장하면 **차단된 응답을 권고로 쓴다**
+        // (3차 교차 리뷰가 medium 으로 잡았다).
+        if stop == "content_filtered" {
+            return Err(DomainError::Unavailable {
+                dependency: "bedrock",
+                reason: concat!(
+                    "모델이 응답을 차단했다 (content_filtered) — 쿼리에 `SLEEP()` 처럼 ",
+                    "공격 시그니처로 읽히는 함수가 있으면 일부 모델이 막는다. ",
+                    "설정에서 다른 모델(예: Sonnet)로 바꾼다"
+                )
+                .to_string(),
+            });
+        }
         let (input_tokens, output_tokens) = out
             .usage()
             .map(|u| (u.input_tokens(), u.output_tokens()))
@@ -152,14 +177,6 @@ impl BedrockClient {
             // 않는다 — 권고를 어느 모델이 냈는지가 흐려진다.
             let stop = out.stop_reason().as_str().to_string();
             let reason = match stop.as_str() {
-                // 한 줄로 둔다 — Rust 의 줄 이음(`\` + 개행)은 다음 줄 들여쓰기를
-                // 문자열에 남겨서 화면에 공백 뭉치가 나온다(실측).
-                "content_filtered" => concat!(
-                    "모델이 응답을 차단했다 (content_filtered) — 쿼리에 `SLEEP()` 처럼 ",
-                    "공격 시그니처로 읽히는 함수가 있으면 일부 모델이 막는다. ",
-                    "설정에서 다른 모델(예: Sonnet)로 바꾼다"
-                )
-                .to_string(),
                 "max_tokens" => format!(
                     "모델이 출력 상한({max_tokens})에 걸려 아무것도 내지 못했다 — 설정에서 출력 토큰 상한을 올린다"
                 ),

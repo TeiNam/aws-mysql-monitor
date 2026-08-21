@@ -57,9 +57,20 @@ struct CachedFleet {
     failed_scopes: Vec<String>,
 }
 
+/// 상세 조회 캐시 항목. **잘렸는지 함께 들고 있는다.**
+///
+/// 잘린 결과를 캐시하지 않으면 긴 구간 조회가 **매 요청마다 20페이지를 다시 부른다** —
+/// 60초 자동 새로고침 × 사용자 수만큼 비용이 는다(3차 교차 리뷰가 medium 으로 잡았다).
+/// 잘렸다는 사실을 함께 캐시하면 화면은 계속 그 사실을 말하고 호출은 창당 1회다.
+#[derive(Clone, Default)]
+struct CachedDetail {
+    series: BTreeMap<String, Series>,
+    truncated: bool,
+}
+
 #[derive(Default)]
 struct Cache {
-    entries: BTreeMap<String, BTreeMap<String, Series>>,
+    entries: BTreeMap<String, CachedDetail>,
     fleet: BTreeMap<String, CachedFleet>,
 }
 
@@ -225,7 +236,10 @@ impl MetricsService {
         let specs = detail_metrics(instance.engine);
         let mut truncated = false;
         let series = match self.cached(&cache_key) {
-            Some(hit) => hit,
+            Some(hit) => {
+                truncated = hit.truncated;
+                hit.series
+            }
             None => {
                 let pairs = detail_pairs(instance, &specs);
                 // **이 인스턴스의 계정·리전**으로 묻는다. 우리 계정·배포 리전으로
@@ -243,13 +257,16 @@ impl MetricsService {
                     .await
                 {
                     Ok(f) => {
-                        if f.truncated {
-                            // **잘렸으면 캐시하지 않는다.** 잘린 결과를 60초 고정하면
-                            // 그 창 동안 뒤쪽이 영구히 비어 보인다.
-                            truncated = true;
-                        } else {
-                            self.store(cache_key, f.series.clone());
-                        }
+                        truncated = f.truncated;
+                        // **잘려도 캐시한다.** 잘린 사실을 함께 담으므로 화면은 계속
+                        // 그 사실을 말하고, 재조회는 창당 1회로 묶인다.
+                        self.store(
+                            cache_key,
+                            CachedDetail {
+                                series: f.series.clone(),
+                                truncated: f.truncated,
+                            },
+                        );
                         f.series
                     }
                     Err(e) => {
@@ -288,7 +305,7 @@ impl MetricsService {
         (out, choice, truncated)
     }
 
-    fn cached(&self, key: &str) -> Option<BTreeMap<String, Series>> {
+    fn cached(&self, key: &str) -> Option<CachedDetail> {
         self.cache.lock().ok()?.entries.get(key).cloned()
     }
 
@@ -304,7 +321,7 @@ impl MetricsService {
         }
     }
 
-    fn store(&self, key: String, value: BTreeMap<String, Series>) {
+    fn store(&self, key: String, value: CachedDetail) {
         if let Ok(mut c) = self.cache.lock() {
             // **창이 넘어간 항목을 버린다.** 안 버리면 화면을 오래 열어 둔 동안
             // 창마다 항목이 쌓여 메모리가 계속 는다.

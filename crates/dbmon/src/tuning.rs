@@ -42,16 +42,17 @@ use crate::store::tuning::DynamoTuningStore;
 /// 계속 시도하면 토큰만 쓴다.
 const FORMAT_RETRIES: usize = 1;
 
-/// 모델 호출 상한 (시도당).
+/// **요청 전체** 상한.
 ///
-/// # 왜 우리가 상한을 두는가
+/// # 시도별이 아니라 전체다 (3차 교차 리뷰)
 ///
-/// 실측 30초, 재시도까지 60초다. 상한이 없으면 모델이 응답하지 않을 때 요청이
-/// **ALB 유휴 타임아웃(300초)까지 매달려** 있고, 그동안 커넥션과 대상 DB 연결을 잡고
-/// 있다. 우리가 먼저 끊으면 화면이 사유를 받는다 — 504 는 아무것도 말해 주지 않는다.
+/// 처음엔 시도당 120초로 뒀는데, 형식 위반 재시도가 붙으면 모델에만 238초가 되고
+/// 앞단(설정·스키마 조회·SDK 구성)까지 합치면 **ALB 유휴 타임아웃 300초를 넘긴다** —
+/// 그러면 화면은 504 를 받고, 504 는 아무것도 말해 주지 않는다.
 ///
-/// 재시도를 포함한 전체는 이 값의 2배까지다(형식 위반 1회 재시도).
-const MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 그래서 데드라인을 하나 두고 각 시도에 **남은 시간만** 준다. 실측은 30초이므로
+/// 정상 경로는 이 상한에 닿지 않는다.
+const TUNING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
 
 pub struct TuningService {
     pub registry: Arc<crate::store::registry::DynamoInstanceRegistry>,
@@ -76,7 +77,11 @@ impl TuningService {
     }
 
     /// 새로 만든다. **호출부가 이미 권한·환경 스코프를 확인한 레코드를 넘긴다.**
+    ///
+    /// 전체가 [`TUNING_DEADLINE`] 안에 끝난다 — 스키마 조회와 모델 호출이 그 예산을
+    /// 나눠 쓴다.
     pub async fn generate(&self, record: &SlowQuery, now_ms: EpochMs) -> Result<Generated> {
+        let deadline = tokio::time::Instant::now() + TUNING_DEADLINE;
         let settings = self.settings.load(now_ms).await;
         let ai = settings.ai;
         if !ai.enabled {
@@ -99,7 +104,7 @@ impl TuningService {
         let client = self.bedrock(&ai).await?;
         let prompt = tuning::build_prompt(&context);
         let advice = self
-            .ask(&client, &ai, &prompt, &context, now_ms)
+            .ask(&client, &ai, &prompt, &context, now_ms, deadline)
             .await?;
 
         self.advice.put(&record.record_id, &advice.advice).await?;
@@ -208,6 +213,7 @@ impl TuningService {
         prompt: &str,
         context: &TuningContext,
         now_ms: EpochMs,
+        deadline: tokio::time::Instant,
     ) -> Result<Generated> {
         let mut last_error = String::new();
         for attempt in 0..=FORMAT_RETRIES {
@@ -217,16 +223,16 @@ impl TuningService {
                 prompt,
                 ai.max_output_tokens,
             );
-            // **우리가 먼저 끊는다.** 매달려 있으면 ALB 가 504 를 주고, 그건 사유를
-            // 말해 주지 않는다.
-            let reply = match tokio::time::timeout(MODEL_TIMEOUT, call).await {
+            // **남은 예산만 준다.** 시도마다 상한을 새로 주면 재시도가 붙을 때 전체가
+            // ALB 유휴 타임아웃을 넘긴다.
+            let reply = match tokio::time::timeout_at(deadline, call).await {
                 Ok(r) => r?,
                 Err(_) => {
                     return Err(DomainError::Unavailable {
                         dependency: "bedrock",
                         reason: format!(
                             "모델이 {}초 안에 응답하지 않았다 — 출력 상한을 줄이거나 다른 모델을 쓴다",
-                            MODEL_TIMEOUT.as_secs()
+                            TUNING_DEADLINE.as_secs()
                         ),
                     });
                 }

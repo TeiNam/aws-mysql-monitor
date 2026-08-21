@@ -485,6 +485,7 @@ impl TargetMysql {
                     index_bytes: opt(r, 5),
                     // 빈 문자열은 "모른다" 다 — `UPDATE_TIME` 은 InnoDB 에서 흔히 NULL 이다.
                     stats_updated_at: (!updated.is_empty()).then_some(updated),
+                    ddl_truncated: false,
                     indexes: Vec::new(),
                 },
             );
@@ -539,10 +540,11 @@ impl TargetMysql {
                 Ok(rows) => {
                     if let Some(ddl) = rows.first().and_then(|r| opt::<String>(r, 1)) {
                         let clean = dbmon_core::tuning::neutralize_ddl(&ddl);
-                        spec.create_ddl = Some(truncate_chars(
-                            &clean,
-                            dbmon_core::tuning::MAX_DDL_CHARS,
-                        ));
+                        let max = dbmon_core::tuning::MAX_DDL_CHARS;
+                        // **잘렸다는 사실을 남긴다.** 잘린 DDL 로 컬럼을 판정하면
+                        // 뒤쪽 컬럼이 "없는 컬럼" 이 되어 정상 권고를 버린다.
+                        spec.ddl_truncated = clean.chars().count() > max;
+                        spec.create_ddl = Some(truncate_chars(&clean, max));
                     }
                 }
                 Err(e) => tracing::warn!(

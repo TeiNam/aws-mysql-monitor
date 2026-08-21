@@ -242,18 +242,31 @@ fn spawn_settings_poller(
     settings: Arc<dbmon::settings_state::SettingsState>,
     shutdown: Arc<dbmon::shutdown::Shutdown>,
 ) {
-    use dbmon_core::time::Clock as _;
     let interval = Duration::from_millis(
         (dbmon::settings_state::CACHE_TTL_MS / 3).max(1_000) as u64,
     );
+    // **조회에 상한을 둔다.** AWS SDK 에는 요청 전체 상한이 기본으로 없다 — 응답하지
+    // 않는 조회가 걸리면 폴러가 그 자리에 멈추고, 30초 뒤 인증이 조용히 잠긴다
+    // (3차 교차 리뷰가 medium 으로 잡았다). 주기보다 짧게 잡아 매 주기 기회를 준다.
+    let budget = interval.saturating_sub(Duration::from_millis(500)).max(Duration::from_secs(2));
     tokio::spawn(async move {
-        // 기동 직후 한 번 읽는다 — 첫 요청이 캐시 미스로 인증을 조이지 않게.
-        settings.refresh(dbmon_core::time::SystemClock.now_ms()).await;
         loop {
+            // **셧다운과 함께 기다린다.** 첫 조회도 예외가 아니다 — 그러지 않으면
+            // 기동 직후 종료 신호가 조회 끝까지 막힌다.
+            let refreshed = tokio::select! {
+                r = tokio::time::timeout(budget, settings.refresh_now()) => Some(r),
+                _ = shutdown.wait() => None,
+            };
+            match refreshed {
+                Some(Err(_)) => tracing::warn!(
+                    budget_ms = budget.as_millis() as u64,
+                    "설정 조회가 예산을 넘겼다 — 캐시가 낡으면 인증은 켜진 쪽으로 떨어진다"
+                ),
+                Some(Ok(())) => {}
+                None => break,
+            }
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    settings.refresh(dbmon_core::time::SystemClock.now_ms()).await;
-                }
+                _ = tokio::time::sleep(interval) => {}
                 _ = shutdown.wait() => break,
             }
         }

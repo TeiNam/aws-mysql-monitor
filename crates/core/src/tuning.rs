@@ -88,6 +88,12 @@ pub struct TableSpec {
     pub index_bytes: Option<u64>,
     /// 통계가 마지막으로 갱신된 시각(문자열 그대로). 낡음 판정의 근거다.
     pub stats_updated_at: Option<String>,
+    /// DDL 이 길이 상한([`MAX_DDL_CHARS`])에 걸려 **잘렸는가.**
+    ///
+    /// 잘린 DDL 로 컬럼을 판정하면 **뒤쪽 컬럼이 "없는 컬럼" 이 된다** — 정상 권고를
+    /// 버리게 되므로(3차 교차 리뷰가 medium 으로 잡았다) 그때는 판정을 건너뛴다.
+    #[serde(default)]
+    pub ddl_truncated: bool,
     pub indexes: Vec<IndexSpec>,
 }
 
@@ -256,22 +262,36 @@ impl Quote {
 struct Scanned {
     /// 주석을 지운 문장(인용 안은 그대로).
     without_comments: String,
-    /// **인용 밖** 세미콜론이 문장 끝이 아닌 자리에 있는가 = 여러 문장이다.
+    /// 주석을 지우고 **인용 안을 `_` 로 덮은** 문장.
+    ///
+    /// 키워드 검사는 이걸 본다. 그러지 않으면 인용 안의 글자가 키워드로 읽힌다 —
+    /// ``ALTER TABLE t RENAME COLUMN a TO `x ADD INDEX y` `` 가 "인덱스 추가" 로
+    /// 통과했다(3차 교차 리뷰가 high 로 잡았다).
+    keywords_only: String,
+    /// **인용 밖** 세미콜론 뒤에 (주석이 아닌) 내용이 있는가 = 여러 문장이다.
     multi_statement: bool,
     /// **인용·괄호 밖** 쉼표가 있는가 = `ALTER` 의 동작이 여럿이다.
     top_level_comma: bool,
     /// 실행 주석(`/*! … */`). MySQL 이 **실행하는** 주석이라 지우면 안 되고 거부한다.
     executable_comment: bool,
+    /// `"` 인용이 쓰였는가.
+    ///
+    /// `sql_mode` 에 `ANSI_QUOTES` 가 있으면 그건 **식별자**이고 없으면 **문자열**이다.
+    /// 우리는 사람이 어디서 실행할지 모르므로, 해석이 갈리는 문장은 판정하지 않는다.
+    double_quoted: bool,
 }
 
 fn scan(sql: &str) -> Scanned {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
+    let mut masked = String::with_capacity(sql.len());
     let mut quote = Quote::None;
     let mut depth: i32 = 0;
-    let mut multi = false;
     let mut comma = false;
     let mut exec_comment = false;
+    let mut double_quoted = false;
+    // 인용 밖 세미콜론의 위치(주석을 지운 문장 기준). 뒤에 내용이 있는지는 나중에 본다.
+    let mut semicolons: Vec<usize> = Vec::new();
     let mut i = 0;
 
     while i < chars.len() {
@@ -279,14 +299,18 @@ fn scan(sql: &str) -> Scanned {
         if quote != Quote::None {
             // 인용 안이다. 이스케이프와 이중 인용부호만 본다.
             out.push(c);
+            // **키워드 검사용 사본에서는 내용을 덮는다.** 인용 안의 글자는 토큰이 아니다.
+            masked.push('_');
             if c == '\\' && quote != Quote::Backtick && i + 1 < chars.len() {
                 out.push(chars[i + 1]);
+                masked.push('_');
                 i += 2;
                 continue;
             }
             if c == quote.ch() {
                 if chars.get(i + 1) == Some(&quote.ch()) {
                     out.push(chars[i + 1]);
+                    masked.push('_');
                     i += 2;
                     continue;
                 }
@@ -298,7 +322,11 @@ fn scan(sql: &str) -> Scanned {
         // 인용 밖.
         if let Some(q) = Quote::of(c) {
             quote = q;
+            if q == Quote::Double {
+                double_quoted = true;
+            }
             out.push(c);
+            masked.push('_');
             i += 1;
             continue;
         }
@@ -317,43 +345,59 @@ fn scan(sql: &str) -> Scanned {
                 }
                 // 주석 자리에 공백을 남긴다 — 토큰이 붙어 버리면 안 된다.
                 out.push(' ');
+                masked.push(' ');
             }
-            '-' if chars.get(i + 1) == Some(&'-') => {
+            // **MySQL 의 `--` 규칙**: 뒤에 공백·제어문자가 와야 주석이다.
+            // `(id--1)` 은 이중 부호이므로 주석이 아니다 — 주석으로 보면 뒤의
+            // `; DROP TABLE …` 을 지워 놓치게 된다(3차 교차 리뷰가 high 로 잡았다).
+            '-' if chars.get(i + 1) == Some(&'-')
+                && chars
+                    .get(i + 2)
+                    .is_none_or(|c| c.is_whitespace() || c.is_control()) =>
+            {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
                 out.push(' ');
+                masked.push(' ');
             }
             '#' => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
                 out.push(' ');
+                masked.push(' ');
             }
             _ => {
                 match c {
                     '(' => depth += 1,
                     ')' => depth -= 1,
                     ',' if depth <= 0 => comma = true,
-                    // 뒤에 공백·세미콜론 말고 무언가 있으면 두 번째 문장이다.
-                    ';' if chars[i + 1..]
-                        .iter()
-                        .any(|c| !c.is_whitespace() && *c != ';') =>
-                    {
-                        multi = true;
-                    }
+                    // 위치만 기록한다. **주석을 지운 뒤** 뒤에 내용이 있는지 본다 —
+                    // `CREATE INDEX …; -- 설명` 을 두 문장으로 보면 정상 문장이 거부된다.
+                    ';' => semicolons.push(out.chars().count()),
                     _ => {}
                 }
                 out.push(c);
+                masked.push(c);
                 i += 1;
             }
         }
     }
+    // 주석을 지운 뒤 각 세미콜론 뒤에 내용이 남았는지 본다.
+    let flat: Vec<char> = out.chars().collect();
+    let multi = semicolons.iter().any(|at| {
+        flat.get(at + 1..)
+            .is_some_and(|rest| rest.iter().any(|c| !c.is_whitespace() && *c != ';'))
+    });
+
     Scanned {
         without_comments: out,
+        keywords_only: masked,
         multi_statement: multi,
         top_level_comma: comma,
         executable_comment: exec_comment,
+        double_quoted,
     }
 }
 
@@ -391,8 +435,17 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
     if scanned.multi_statement {
         return false;
     }
+    // ③ `"` 가 쓰였으면 판정하지 않는다.
+    //
+    // `sql_mode` 에 `ANSI_QUOTES` 가 있으면 식별자, 없으면 문자열이다 — **같은 문장이
+    // 두 가지로 읽힌다.** 사람이 어디서 실행할지 우리는 모르므로, 해석이 갈리는 문장을
+    // "검증됨" 으로 보여주지 않는다. 백틱을 쓰면 그 모호함이 없다.
+    if scanned.double_quoted {
+        return false;
+    }
+    // **키워드는 인용을 덮은 사본에서 찾는다.** 인용 안의 글자는 토큰이 아니다.
     let flat = scanned
-        .without_comments
+        .keywords_only
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -406,16 +459,24 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
         || up.starts_with("CREATE FULLTEXT INDEX ")
         || up.starts_with("CREATE SPATIAL INDEX ");
     // `ALTER TABLE t ADD INDEX ix (a)` — 인덱스 추가의 정식 문법.
+    //
+    // `INDEX|KEY` 는 **선택 사항**이다: `ADD UNIQUE (a)` 와
+    // `ADD CONSTRAINT uq UNIQUE (a)` 도 유효한 인덱스 추가다(3차 교차 리뷰가 정상
+    // 문장을 거부한다고 지적했다).
     let alter = up.starts_with("ALTER TABLE ")
         && (up.contains(" ADD INDEX ")
             || up.contains(" ADD KEY ")
-            || up.contains(" ADD UNIQUE INDEX ")
-            || up.contains(" ADD UNIQUE KEY ")
-            || up.contains(" ADD FULLTEXT ")
-            || up.contains(" ADD SPATIAL "))
-        // ③ 동작이 하나여야 한다. 괄호 밖 쉼표는 두 번째 동작이다
+            || up.contains(" ADD UNIQUE")
+            || up.contains(" ADD FULLTEXT")
+            || up.contains(" ADD SPATIAL")
+            || (up.contains(" ADD CONSTRAINT ") && up.contains(" UNIQUE")))
+        // ④ 동작이 하나여야 한다. 괄호 밖 쉼표는 두 번째 동작이다
         //    (`ADD INDEX ix (a), DROP COLUMN x` / `…, RENAME TO other`).
-        && !scanned.top_level_comma;
+        && !scanned.top_level_comma
+        // 인덱스 추가 문장에 이 낱말들이 있을 이유가 없다. 인용을 덮은 사본에서
+        // 보므로 식별자 이름에 걸리지 않는다.
+        && !up.contains(" DROP ")
+        && !up.contains(" RENAME ");
     create || alter
 }
 
@@ -518,6 +579,11 @@ fn resolve_table(name: &str, known: &[String]) -> Option<String> {
     if let Some(exact) = known.iter().find(|k| k.eq_ignore_ascii_case(name)) {
         return Some(exact.clone());
     }
+    // **스키마를 명시했으면 그것이 답이다.** `archive.orders` 를 `shop.orders` 로
+    // 해석하면 모델이 지정한 스키마를 우리가 갈아치우는 셈이다(3차 교차 리뷰).
+    if name.contains('.') {
+        return None;
+    }
     let bare = name.rsplit('.').next().unwrap_or(name);
     let mut matches = known.iter().filter(|k| {
         k.rsplit('.')
@@ -532,25 +598,109 @@ fn resolve_table(name: &str, known: &[String]) -> Option<String> {
 
 /// DDL 이 설명(`table`·`columns`)과 어긋나는가. 어긋나면 사유를 준다.
 ///
-/// **완전한 파서가 아니다.** DDL 안에 그 테이블 이름과 컬럼 이름이 나오는지만 본다 —
-/// 목적은 "설명과 문장이 다른 것을 말하는" 경우를 잡는 것이다.
+/// # 부분 문자열로는 부족하다 (3차 교차 리뷰)
+///
+/// 처음에는 "DDL 안에 그 이름이 나오는가" 만 봤다. 그러면
+/// `CREATE INDEX orders_status ON payments(secret)` 이 통과한다 — 기대한 이름이
+/// **인덱스 이름**에 들어 있기 때문이다. 그래서 **대상 테이블과 키파트를 뽑아** 비교한다.
+///
+/// 완전한 파서가 아니다. 대상은 `CREATE INDEX … ON <t> (…)` 의 `<t>` 이거나
+/// `ALTER TABLE <t> …` 의 `<t>` 이고, 키파트는 **첫 괄호 그룹**이다.
 fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
-    let up = ddl.to_ascii_uppercase();
-    let bare = table.rsplit('.').next().unwrap_or(table).to_ascii_uppercase();
-    if !up.contains(&bare) {
-        return Some(format!("DDL 에 테이블 `{bare}` 가 없다"));
+    let scanned = scan(ddl);
+    let sql = scanned.without_comments.trim().to_string();
+    let target = ddl_target_table(&sql)?;
+    let bare_expected = bare_name(table);
+    let bare_target = bare_name(&target);
+    if !bare_target.eq_ignore_ascii_case(&bare_expected) {
+        return Some(format!(
+            "DDL 의 대상이 `{target}` 인데 설명은 `{table}` 이다"
+        ));
+    }
+    // 키파트(첫 괄호 그룹)의 이름들.
+    let parts = ddl_key_parts(&sql);
+    if parts.is_empty() {
+        return Some("DDL 에서 인덱스 컬럼을 찾을 수 없다".to_string());
     }
     for c in columns {
-        let name = c.trim().trim_matches('`');
-        let name = name.split('(').next().unwrap_or(name).trim();
+        let name = column_name(c);
         if name.is_empty() {
             continue;
         }
-        if !up.contains(&name.to_ascii_uppercase()) {
-            return Some(format!("DDL 에 컬럼 `{name}` 이 없다"));
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+            return Some(format!("DDL 의 인덱스 컬럼에 `{name}` 이 없다"));
         }
     }
     None
+}
+
+/// `스키마.테이블` 에서 테이블만. 인용부호도 벗긴다.
+fn bare_name(qualified: &str) -> String {
+    qualified
+        .rsplit('.')
+        .next()
+        .unwrap_or(qualified)
+        .trim()
+        .trim_matches('`')
+        .to_string()
+}
+
+/// `memo(20)` → `memo`. 인용부호도 벗긴다.
+fn column_name(raw: &str) -> String {
+    let bare = raw.trim().trim_matches('`');
+    bare.split('(').next().unwrap_or(bare).trim().trim_matches('`').to_string()
+}
+
+/// DDL 의 대상 테이블. `ON <t>` 또는 `ALTER TABLE <t>`.
+fn ddl_target_table(sql: &str) -> Option<String> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    let up: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
+    // `ALTER TABLE <t>`
+    if up.first().map(String::as_str) == Some("ALTER") && up.get(1).map(String::as_str) == Some("TABLE") {
+        return tokens.get(2).map(|t| t.trim_end_matches('(').to_string());
+    }
+    // `CREATE … INDEX <name> ON <t> (…)` — 첫 `ON` 다음 토큰.
+    let on = up.iter().position(|t| t == "ON")?;
+    tokens
+        .get(on + 1)
+        .map(|t| t.split('(').next().unwrap_or(t).to_string())
+}
+
+/// 첫 괄호 그룹의 이름들 = 인덱스 키파트.
+fn ddl_key_parts(sql: &str) -> Vec<String> {
+    let open = match sql.find('(') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    // 짝이 맞는 닫는 괄호를 찾는다(함수 인덱스의 중첩 괄호 때문에 깊이를 센다).
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in sql[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return Vec::new();
+    };
+    sql[open + 1..end]
+        .split(',')
+        .map(|part| {
+            // `status ASC`·`memo(20)`·`(id + 1)` 같은 형태에서 첫 이름만 뽑는다.
+            let cleaned = part.trim().trim_matches('(').trim_matches(')');
+            let first = cleaned.split_whitespace().next().unwrap_or(cleaned);
+            column_name(first)
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// 이 테이블의 명세에 없는 컬럼. 명세가 없으면(스키마 조회 실패) `None` —
@@ -563,6 +713,10 @@ fn unknown_column(table: &str, columns: &[String], context: &TuningContext) -> O
         .tables
         .iter()
         .find(|t| t.table.qualified().eq_ignore_ascii_case(table))?;
+    // **잘린 DDL 로는 판정하지 않는다.** 뒤쪽 컬럼이 "없다" 로 보인다.
+    if spec.ddl_truncated {
+        return None;
+    }
     let ddl = spec.create_ddl.as_deref()?;
     let known: Vec<String> = backticked_names(ddl);
     if known.is_empty() {
@@ -1031,6 +1185,7 @@ mod tests {
             data_bytes: Some(4_096),
             index_bytes: Some(1_024),
             stats_updated_at: None,
+            ddl_truncated: false,
             indexes: vec![IndexSpec {
                 name: "PRIMARY".into(),
                 unique: true,
@@ -1156,6 +1311,77 @@ mod tests {
         assert!(advice.caveats.iter().any(|c| c.contains("ghost")), "{:?}", advice.caveats);
     }
 
+    /// **DDL 의 실제 대상을 본다.** 이름이 인덱스 이름에만 있어도 통과하면 안 된다.
+    #[test]
+    fn the_ddl_target_is_extracted_not_substring_matched() {
+        let mut orders = spec("shop", "orders");
+        orders.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let mut payments = spec("shop", "payments");
+        payments.create_ddl = Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
+
+        // 인덱스 **이름**에 `orders` 가 들어 있지만 대상은 `payments` 다.
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX orders_status ON payments(secret)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders.clone(), payments]), "m", 1).expect("검증");
+        assert!(advice.indexes.is_empty(), "인덱스 이름의 부분 문자열로 통과했다");
+        assert!(
+            advice.caveats.iter().any(|c| c.contains("대상")),
+            "{:?}",
+            advice.caveats
+        );
+
+        // 대상·컬럼이 맞으면 통과한다(정렬 지정·prefix 도).
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX ix ON `orders` (`status` ASC)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "{:?}", advice.caveats);
+    }
+
+    /// **명시한 스키마를 갈아치우지 않는다.** `archive.orders` 는 `shop.orders` 가 아니다.
+    #[test]
+    fn an_explicit_schema_is_not_reinterpreted() {
+        let known = vec!["shop.orders".to_string()];
+        assert_eq!(resolve_table("archive.orders", &known), None);
+        assert_eq!(resolve_table("orders", &known).as_deref(), Some("shop.orders"));
+    }
+
+    /// **잘린 DDL 로 컬럼을 판정하지 않는다.** 뒤쪽 컬럼이 "없다" 로 보인다.
+    #[test]
+    fn truncated_ddl_skips_the_column_check() {
+        let mut wide = spec("shop", "orders");
+        wide.create_ddl = Some("CREATE TABLE `orders` (`id` int".into());
+        wide.ddl_truncated = true;
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "shop.orders".into(),
+                // 잘린 부분에 있던 컬럼.
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX ix ON orders (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![wide]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "잘린 DDL 로 정상 권고를 버렸다: {:?}", advice.caveats);
+    }
+
     /// 정규 이름으로 **바꿔서 저장한다** — 화면이 어느 스키마인지 알 수 있어야 한다.
     #[test]
     fn resolved_tables_are_stored_qualified() {
@@ -1264,6 +1490,45 @@ mod tests {
         assert!(is_index_creation_ddl(
             "ALTER TABLE orders ADD INDEX ix (status, created_at)"
         ));
+    }
+
+    /// **3차 교차 리뷰가 찾은 우회들.** MySQL 의 실제 렉서 규칙과 어긋난 지점이다.
+    #[test]
+    fn the_lexer_follows_mysql_rules() {
+        // ① `--` 는 **뒤에 공백이 와야** 주석이다. `(id--1)` 은 이중 부호다 —
+        //    주석으로 보면 뒤의 `; DROP TABLE` 을 지워 놓친다.
+        assert!(
+            !is_index_creation_ddl("CREATE INDEX ix ON orders ((id--1)); DROP TABLE audit"),
+            "`--` 를 무조건 주석으로 보아 두 번째 문장을 놓쳤다"
+        );
+        // 정상 주석은 그대로 주석이다.
+        assert!(is_index_creation_ddl("CREATE INDEX ix ON orders (id) -- 설명"));
+        assert!(
+            is_index_creation_ddl("CREATE INDEX ix ON orders (id); -- 설명"),
+            "세미콜론 뒤 주석을 두 번째 문장으로 봤다"
+        );
+
+        // ② 인용 안의 키워드로 통과하지 못한다.
+        assert!(
+            !is_index_creation_ddl(
+                "ALTER TABLE orders RENAME COLUMN status TO `status ADD INDEX marker`"
+            ),
+            "인용 안의 `ADD INDEX` 를 키워드로 읽었다"
+        );
+
+        // ③ `\"` 인용은 `sql_mode` 에 따라 해석이 갈린다 — 판정하지 않는다.
+        assert!(
+            !is_index_creation_ddl("CREATE INDEX \"ix\" ON orders (id)"),
+            "ANSI_QUOTES 여부로 해석이 갈리는 문장을 검증됨으로 표시했다"
+        );
+
+        // ④ `INDEX|KEY` 없는 UNIQUE 도 인덱스 추가다.
+        for ok in [
+            "ALTER TABLE orders ADD UNIQUE (status)",
+            "ALTER TABLE orders ADD CONSTRAINT uq_status UNIQUE (status)",
+        ] {
+            assert!(is_index_creation_ddl(ok), "정상 문장을 거부했다: {ok}");
+        }
     }
 
     /// **백틱 식별자가 리터럴 중화를 우회하면 안 된다.**

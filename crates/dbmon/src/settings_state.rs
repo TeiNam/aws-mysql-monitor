@@ -61,10 +61,27 @@ impl SettingsState {
         match self.store.load().await {
             Ok(s) => {
                 let mut c = self.cache.lock().expect("settings cache");
-                c.settings = s.clone();
-                c.loaded_ms = Some(now_ms);
-                c.last_error = None;
-                s
+                // **버전이 낮은 값으로 덮지 않는다.**
+                //
+                // 폴러가 v1 을 읽는 도중 관리자가 v2 를 저장하면, 늦게 끝난 읽기가
+                // 캐시를 v1 로 되돌린다 — 인증을 켠 것이 TTL 동안 무효가 된다
+                // (3차 교차 리뷰가 high 로 잡았다). 버전은 저장마다 오르므로
+                // 비교만으로 순서를 회복할 수 있다.
+                if s.version >= c.settings.version {
+                    c.settings = s.clone();
+                    // **성공 시각은 끝난 시각이다.** 시작 시각을 쓰면 30초 걸린 조회가
+                    // 완료 즉시 낡은 것이 된다.
+                    c.loaded_ms = Some(now_ms);
+                    c.last_error = None;
+                    s
+                } else {
+                    tracing::debug!(
+                        stale = s.version,
+                        current = c.settings.version,
+                        "늦게 끝난 설정 조회를 버린다 (더 새 값이 이미 있다)"
+                    );
+                    c.settings.clone()
+                }
             }
             Err(e) => {
                 let last = self.cached();
@@ -78,6 +95,37 @@ impl SettingsState {
                     c.last_error = Some(crate::telemetry::scrub(&e.to_string()));
                 }
                 last
+            }
+        }
+    }
+
+    /// 지금 읽고 **끝난 시각으로** 기록한다.
+    ///
+    /// `refresh(now)` 는 호출부가 준 시각을 쓰는데, 조회가 오래 걸리면 그 시각이
+    /// 이미 과거다 — 30초 걸린 조회는 완료 즉시 낡은 값이 된다(3차 교차 리뷰).
+    /// 폴러는 이걸 쓴다.
+    pub async fn refresh_now(&self) {
+        use dbmon_core::time::Clock as _;
+        // 조회를 먼저 하고, 끝난 뒤의 시각으로 캐시에 기록한다.
+        let loaded = self.store.load().await;
+        let now_ms = dbmon_core::time::SystemClock.now_ms();
+        match loaded {
+            Ok(s) => {
+                let mut c = self.cache.lock().expect("settings cache");
+                if s.version >= c.settings.version {
+                    c.settings = s;
+                    c.loaded_ms = Some(now_ms);
+                    c.last_error = None;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %crate::telemetry::Scrubbed(&e),
+                    "설정을 읽을 수 없다 — 마지막으로 읽은 값을 유지한다"
+                );
+                if let Ok(mut c) = self.cache.lock() {
+                    c.last_error = Some(crate::telemetry::scrub(&e.to_string()));
+                }
             }
         }
     }
