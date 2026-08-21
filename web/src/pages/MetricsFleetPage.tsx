@@ -224,6 +224,17 @@ export function MetricsFleetPage() {
             <span className="font-mono">cloudwatch:GetMetricData</span> 가 있는지 확인한다.
           </Note>
         )}
+        {/* **일부 범위만 실패한 경우.** 그 계정·리전의 CloudWatch 열이 비어 있는 이유다 —
+            말하지 않으면 "그 인스턴스는 지표가 없다" 로 읽힌다. */}
+        {(fleet.data?.failed_scopes ?? []).length === 0 ? null : (
+          <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800" role="alert">
+            일부 범위의 CloudWatch 조회가 실패했다:{" "}
+            <span className="font-mono">{(fleet.data?.failed_scopes ?? []).join(", ")}</span> — 그
+            범위의 CPU·메모리·스토리지 열은 <strong>값이 없는 것이 아니라 못 읽은 것</strong>이다.
+            크로스 계정이면 그 계정 역할에 <span className="font-mono">cloudwatch:GetMetricData</span>{" "}
+            가 있는지 확인한다.
+          </p>
+        )}
         <Note>
           <strong>두 출처를 한 줄에 놓는다.</strong> 연결·QPS·스레드는{" "}
           <strong>자체 수집</strong>(5초, 비용 0)이고, CPU·메모리·스토리지는{" "}

@@ -7,6 +7,7 @@
 pub mod auth_token;
 pub mod bedrock;
 pub mod cloudwatch;
+pub mod cw_fetchers;
 pub mod discovery;
 pub mod filter;
 pub mod fleet;

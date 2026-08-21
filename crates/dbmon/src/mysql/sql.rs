@@ -196,7 +196,10 @@ pub fn show_create_table(schema: &str, name: &str) -> Option<String> {
 /// 거부가 중요하다: 백틱만 이중화하면 개행이 든 이름으로 주석(`/* … */`)을 닫고 다른
 /// 문장을 붙일 수 있다. RDS 식별자 규칙에 그런 이름은 없으므로 잃는 것이 없다.
 pub fn quote_ident(raw: &str) -> Option<String> {
-    if raw.is_empty() || raw.len() > 64 {
+    // **문자 수로 센다.** MySQL 식별자 상한(64)은 문자 기준이라 바이트로 재면
+    // 한글·이모지 이름을 실재하는데도 거부한다(`raw.len()` 은 UTF-8 바이트다).
+    let chars = raw.chars().count();
+    if chars == 0 || chars > 64 {
         return None;
     }
     if raw.chars().any(|c| c.is_control()) {
@@ -547,5 +550,54 @@ mod tests {
         ] {
             assert!(q.contains("/* dbmon:"), "태그가 없다: {q}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ident_tests {
+    use super::*;
+
+    /// 백틱을 **이중화**한다. 그러지 않으면 식별자를 닫고 다른 문법을 붙일 수 있다.
+    #[test]
+    fn backticks_are_doubled() {
+        assert_eq!(quote_ident("orders").as_deref(), Some("`orders`"));
+        assert_eq!(
+            quote_ident("we`ird").as_deref(),
+            Some("`we``ird`"),
+            "백틱을 이중화하지 않으면 식별자를 닫을 수 있다"
+        );
+    }
+
+    /// 제어문자·개행은 **거부한다.** 백틱만 막으면 개행으로 주석을 닫고 문장을 붙일 수
+    /// 있다. RDS 식별자 규칙에 그런 이름은 없으므로 잃는 것이 없다.
+    #[test]
+    fn control_characters_are_rejected() {
+        assert_eq!(quote_ident("a\nb"), None);
+        assert_eq!(quote_ident("a\tb"), None);
+        assert_eq!(quote_ident("a\0b"), None);
+        assert_eq!(quote_ident(""), None);
+    }
+
+    /// **길이는 문자 수다.** 바이트로 재면 한글 이름을 실재하는데도 거부한다.
+    #[test]
+    fn the_length_limit_counts_characters_not_bytes() {
+        let korean = "주문내역".repeat(10); // 40자 = 120바이트
+        assert!(korean.len() > 64, "이 테스트의 전제가 깨졌다");
+        assert!(
+            quote_ident(&korean).is_some(),
+            "64자 미만 한글 이름을 바이트 길이로 거부했다"
+        );
+        assert_eq!(quote_ident(&"a".repeat(65)), None);
+    }
+
+    /// 스키마·테이블이 모두 인용된 문장이 나온다.
+    #[test]
+    fn show_create_quotes_both_parts() {
+        assert_eq!(
+            show_create_table("shop", "orders").as_deref(),
+            Some("/* dbmon:showcreate */ SHOW CREATE TABLE `shop`.`orders`")
+        );
+        // 인용할 수 없는 이름이면 **문장을 만들지 않는다.**
+        assert_eq!(show_create_table("shop", "a\nb"), None);
     }
 }

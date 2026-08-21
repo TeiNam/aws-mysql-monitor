@@ -60,6 +60,25 @@ pub struct RoundOutcome {
     pub filtered: usize,
     /// 도메인 매핑에 실패한 수 (관측용).
     pub unmappable: usize,
+    /// **이번 라운드가 실제로 들여다본 `(계정, 리전)` 조합.**
+    ///
+    /// # 왜 필요한가 (실측으로 찾은 파괴적 결함)
+    ///
+    /// 탐색 범위는 운영 설정이고 **줄어들 수 있다** — 운영자가 리전 하나를 목록에서
+    /// 지우거나 계정 토글을 끈다. 그때 그 범위의 인스턴스는 결과에 없는데, 재조정은
+    /// "결과에 없으면 사라졌다" 로 읽어 2라운드 뒤 `deleted_at` 을 찍는다.
+    ///
+    /// **보지 않은 것과 없는 것은 다르다.** 리전을 다시 넣어도 등록부의 그 행은 이미
+    /// 삭제 판정을 받은 상태다. 그래서 라운드가 자기 시야를 함께 보고하고, 재조정은
+    /// 시야 밖 인스턴스를 건드리지 않는다.
+    ///
+    /// 비어 있으면 "시야를 알 수 없다" 는 뜻이고, 그때는 판정을 하지 않는다.
+    pub scanned_scope: BTreeSet<String>,
+}
+
+/// 시야 키 — `계정/리전`. **인스턴스 id 의 앞 두 조각과 같은 표기여야 한다.**
+pub fn scope_key(account: &str, region: &str) -> String {
+    format!("{account}/{region}")
 }
 
 /// 재조정 결과. 로그·메트릭에 그대로 쓴다.
@@ -71,6 +90,8 @@ pub struct DiscoveryStats {
     pub missing: usize,
     /// `deleted_at` 이 찍힌 수.
     pub deleted: usize,
+    /// **이번 라운드의 시야 밖이라 건드리지 않은 수.** 미발견이 아니다.
+    pub out_of_scope: usize,
     /// **필터가 제외해서 `Excluded` 로 전환한 수.** 미발견이 아니다.
     pub excluded: usize,
     /// **부분 결과라 미발견 판정을 건너뛴 수.** 0이 아니면 로그에 남아야 한다 —
@@ -208,7 +229,19 @@ pub async fn reconcile<R: InstanceRegistry>(
             continue;
         }
 
-        // **③ 진짜로 없다.** 2회 연속이면 `deleted_at` 이 찍힌다.
+        // **③ 이번 라운드의 시야 밖이다.** 탐색 범위가 줄었거나(운영자가 리전·계정을
+        // 목록에서 뺐다) 애초에 다른 범위의 인스턴스다. **보지 않은 것을 없다고
+        // 말하지 않는다** — 그러면 리전을 다시 넣어도 이미 삭제 판정된 행이 남는다.
+        if !outcome.scanned_scope.is_empty()
+            && !outcome
+                .scanned_scope
+                .contains(&scope_key(gone.id.account(), gone.id.region()))
+        {
+            stats.out_of_scope += 1;
+            continue;
+        }
+
+        // **④ 진짜로 없다.** 2회 연속이면 `deleted_at` 이 찍힌다.
         match registry.mark_missing(&gone.id, now_ms).await {
             Ok(after) if after.deleted_at_ms.is_some() => stats.deleted += 1,
             Ok(_) => stats.missing += 1,
@@ -223,6 +256,14 @@ pub async fn reconcile<R: InstanceRegistry>(
         }
     }
 
+    if stats.out_of_scope > 0 {
+        // 조용히 넘기지 않는다 — "왜 이 인스턴스가 갱신되지 않나" 의 답이다.
+        tracing::info!(
+            out_of_scope = stats.out_of_scope,
+            scope = ?outcome.scanned_scope,
+            "탐색 범위 밖 인스턴스는 그대로 둔다 (삭제 판정하지 않는다)"
+        );
+    }
     if stats.skipped_missing_check > 0 {
         tracing::warn!(
             skipped = stats.skipped_missing_check,
@@ -259,16 +300,21 @@ mod tests {
     const NOW: EpochMs = 1_755_500_400_000;
 
     fn inst(identifier: &str) -> Instance {
+        inst_in("123456789012", "ap-northeast-2", identifier)
+    }
+
+    /// 다른 계정·리전의 인스턴스. 탐색 범위 축소를 검증할 때 쓴다.
+    fn inst_in(account: &str, region: &str, identifier: &str) -> Instance {
         let raw = RawDbInstance {
             identifier: identifier.into(),
             engine: "mysql".into(),
             engine_version: "8.4.6".into(),
-            region: "ap-northeast-2".into(),
+            region: region.into(),
             endpoint_address: Some(format!("{identifier}.rds.amazonaws.com")),
             endpoint_port: Some(3306),
             ..Default::default()
         };
-        to_instance(&raw, "123456789012", &EnvMapping::default(), NOW).expect("매핑")
+        to_instance(&raw, account, &EnvMapping::default(), NOW).expect("매핑")
     }
 
     fn registry(seed: &[Instance]) -> Arc<FakeInstanceRegistry> {
@@ -283,6 +329,55 @@ mod tests {
             discovered: instances.to_vec(),
             ..Default::default()
         }
+    }
+
+    /// **탐색 범위를 좁히면 그 밖의 인스턴스를 삭제 판정하지 않는다.**
+    ///
+    /// 운영자가 설정에서 리전 하나를 지우거나 계정 토글을 끄면 그 범위는 조회되지
+    /// 않는다. "결과에 없으면 사라졌다" 로 읽으면 2라운드 뒤 `deleted_at` 이 찍히고,
+    /// 리전을 다시 넣어도 이미 삭제된 행이 남는다 — **보지 않은 것과 없는 것은 다르다.**
+    #[tokio::test]
+    async fn narrowing_the_scope_does_not_delete_out_of_scope_instances() {
+        let seoul = inst("in-scope");
+        let virginia = inst_in("123456789012", "us-east-1", "other-region");
+        let other_account = inst_in("111111111111", "ap-northeast-2", "other-account");
+        let r = registry(&[seoul.clone(), virginia.clone(), other_account.clone()]);
+
+        // 서울만 훑은 라운드. 나머지 둘은 결과에 없다.
+        let outcome = RoundOutcome {
+            discovered: vec![seoul.clone()],
+            scanned_scope: [scope_key("123456789012", "ap-northeast-2")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = reconcile(Arc::clone(&r), outcome, NOW).await.expect("재조정");
+
+        assert_eq!(s.out_of_scope, 2, "시야 밖 판정이 빠졌다: {s:?}");
+        assert_eq!(s.missing, 0, "보지 않은 인스턴스를 미발견으로 찍었다");
+        assert_eq!(s.deleted, 0);
+
+        // 같은 계정·리전인데 결과에 없는 것은 여전히 미발견이다 — 시야 안이니까.
+        let outcome = RoundOutcome {
+            discovered: vec![],
+            scanned_scope: [scope_key("123456789012", "ap-northeast-2")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = reconcile(Arc::clone(&r), outcome, NOW + 1_000).await.expect("재조정");
+        assert_eq!(s.missing, 1, "시야 안에서 사라진 것을 놓쳤다: {s:?}");
+        assert_eq!(s.out_of_scope, 2);
+    }
+
+    /// 시야를 알 수 없으면(빈 집합) **판정을 그대로 한다** — 옛 호출부가 이 필드를
+    /// 채우지 않아도 동작이 바뀌지 않아야 한다.
+    #[tokio::test]
+    async fn an_unknown_scope_falls_back_to_the_old_behaviour() {
+        let r = registry(&[inst("a")]);
+        let s = reconcile(Arc::clone(&r), found(&[]), NOW).await.expect("재조정");
+        assert_eq!(s.missing, 1);
+        assert_eq!(s.out_of_scope, 0);
     }
 
     #[tokio::test]

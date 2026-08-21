@@ -59,19 +59,22 @@ impl DynamoTuningStore {
         let Some(doc) = item.get("doc").and_then(|v| v.as_s().ok()) else {
             return Ok(None);
         };
-        match serde_json::from_str::<TuningAdvice>(doc) {
-            Ok(a) => Ok(Some(a)),
-            Err(e) => {
-                // **없는 것으로 취급한다.** 깨진 문서로 화면을 500 내면 다시 생성할
-                // 방법이 없다 — 다시 누르면 덮어쓴다.
+        // **읽지 못한 것과 없는 것을 구분한다.**
+        //
+        // 처음에는 `None` 으로 접었다(다시 누르면 덮어쓰니까). 그러면 화면이 "아직
+        // 분석하지 않았다" 로 보여 주고, 사용자는 이미 만든 권고가 사라졌다고 생각한다
+        // (교차 리뷰가 medium 으로 잡았다). 오류로 올리면 화면이 사유를 말하고,
+        // 다시 분석하면 덮어쓸 수 있다는 사실은 그대로다.
+        serde_json::from_str::<TuningAdvice>(doc)
+            .map(Some)
+            .map_err(|e| {
                 tracing::error!(
                     record = %record_id.as_str(),
                     error = %crate::telemetry::Scrubbed(&e),
-                    "튜닝 권고를 읽지 못했다 — 없는 것으로 처리한다"
+                    "튜닝 권고를 읽지 못했다"
                 );
-                Ok(None)
-            }
-        }
+                DomainError::Internal("저장된 튜닝 권고를 읽을 수 없다".to_string())
+            })
     }
 
     pub async fn put(&self, record_id: &RecordId, advice: &TuningAdvice) -> Result<()> {

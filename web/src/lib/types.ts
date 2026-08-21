@@ -17,12 +17,25 @@
 /** 배포 환경. Rust `Env` 와 같은 문자열이다. */
 export type Env = "prd" | "stg" | "dev" | "unknown";
 
-/** 인증 방식. `GET /api/auth/config` 의 `mode`. */
-export type AuthMode = "local-dev" | "local-token" | "cognito";
+/**
+ * 인증 방식. `GET /api/auth/config` 의 `mode` — **실제로 적용 중인 것**이다.
+ *
+ * `off` 는 운영 설정이 인증을 껐다는 뜻이다(배포 설정도 허용해야 그 값이 나온다).
+ * 그때 화면은 토큰 안내를 띄우면 안 된다 — 있지도 않은 토큰을 찾게 만든다.
+ */
+export type AuthMode = "off" | "local-dev" | "local-token" | "cognito";
 
 export interface AuthConfig {
   mode: AuthMode;
+  /** 검증기가 배선됐고 설정도 완전한가. **둘 다여야 참이다.** */
   cognito_configured: boolean;
+  /** 로그인 화면을 만들 공개 값. 비밀이 아니다. */
+  cognito: {
+    user_pool_id: string;
+    client_id: string;
+    region: string | null;
+    domain: string;
+  };
   deployment_env: Env;
 }
 
@@ -315,6 +328,13 @@ export interface FleetMetricsRow {
 
 export interface FleetMetricsResponse {
   rows: FleetMetricsRow[];
+  /**
+   * 조회가 **실패한** `계정/리전`. 비어 있으면 전부 성공했다.
+   *
+   * 값이 `null` 인 것과 조회 실패는 다르다 — 실패를 빈 값으로만 보여주면
+   * 모니터링 장애가 "데이터 없음" 으로 읽힌다.
+   */
+  failed_scopes: string[];
   /** 이 값들의 조회 주기(초). 15분이다 — 개수 × 주기가 곧 비용이다. */
   period_secs: number;
   lag_note: string;
@@ -451,6 +471,8 @@ export interface TuningAdvice {
 }
 
 export interface TuningView {
+  /** 저장된 권고를 **읽지 못했다**. `advice: null`(아직 안 만듦)과 다르다. */
+  read_failed: boolean;
   /** `null` 이면 **아직 만들지 않았다** — "권고가 비어 있다" 와 다르다. */
   advice: TuningAdvice | null;
   /** 이 배포에서 생성이 가능한가(설정이 켜져 있고 모델이 지정됐는가). */

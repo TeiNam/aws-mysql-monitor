@@ -62,6 +62,11 @@ impl RdsDiscovery {
         &self.account_id
     }
 
+    /// 이 탐색기가 보는 리전. 라운드의 시야(`scanned_scope`)를 기록할 때 쓴다.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
     /// 이 리전의 DB 인스턴스를 모두 나열한다.
     ///
     /// **엔진 필터를 API 에 걸지 않는다.** `--filters engine=mysql` 을 쓰면 새 엔진

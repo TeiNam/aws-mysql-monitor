@@ -236,6 +236,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
             ],
           },
         ],
+        failed_scopes: [],
         period_secs: 900,
         lag_note: "CloudWatch 는 1~3분 지연된다",
       }),
@@ -265,7 +266,12 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   }
   if (url.startsWith("/api/auth/config")) {
     return Promise.resolve(
-      json({ mode: "local-token", cognito_configured: false, deployment_env: "dev" }),
+      json({
+        mode: "local-token",
+        cognito_configured: false,
+        cognito: { user_pool_id: "", client_id: "", region: null, domain: "" },
+        deployment_env: "dev",
+      }),
     );
   }
   return Promise.resolve(new Response("not found", { status: 404 }));

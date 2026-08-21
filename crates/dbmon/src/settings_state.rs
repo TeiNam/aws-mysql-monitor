@@ -75,8 +75,28 @@ impl SettingsState {
     }
 
     /// 지금 들고 있는 값. **I/O 를 하지 않는다.**
+    ///
+    /// ⚠ **인증 판정에 쓰지 마라.** 이 값은 오래됐을 수 있고(저장소 장애 시 무기한),
+    /// "인증 없음" 이 캐시돼 있으면 인증을 다시 켜도 전파되지 않는다.
+    /// 그 판정에는 [`Self::cached_fresh`] 를 쓴다.
     pub fn cached(&self) -> AppSettings {
         self.cache.lock().expect("settings cache").settings.clone()
+    }
+
+    /// **신선한** 값만. TTL 이 지났거나 한 번도 읽지 못했으면 `None`.
+    ///
+    /// # 왜 인증에는 이것만 쓰는가 (교차 리뷰가 critical 로 잡았다)
+    ///
+    /// `cached()` 는 조회 실패 때 마지막 값을 유지한다 — 탐색 범위에는 그게 맞다
+    /// (범위가 갑자기 줄면 인스턴스가 사라진 것처럼 보인다). **인증은 반대다.**
+    /// `off` 가 캐시된 워커에서 관리자가 인증을 다시 켰는데 그 뒤로 저장소가 죽으면,
+    /// 마지막 값을 믿는 한 익명 admin 접근이 **무기한** 계속된다.
+    ///
+    /// 그래서 인증 판정은 신선한 값만 보고, 없으면 켜진 쪽(토큰)으로 떨어진다.
+    /// 대가: 저장소가 죽은 동안 "인증 없음" 배포는 토큰을 요구하게 된다 — 접근이
+    /// 막히는 것이 열리는 것보다 낫다.
+    pub fn cached_fresh(&self, now_ms: EpochMs) -> Option<AppSettings> {
+        self.fresh(now_ms)
     }
 
     /// 한 번이라도 읽은 적이 있는가. 기동 직후 기본값과 "정말 비어 있음" 을 구분한다.
@@ -201,6 +221,32 @@ mod tests {
             after.discovery.regions,
             vec!["us-east-1", "eu-west-1"],
             "실패했는데 기본값으로 접혔다 — 탐색이 자기 리전 하나로 줄어든다"
+        );
+    }
+
+    /// **인증 판정용 접근자는 오래된 값을 주지 않는다.**
+    ///
+    /// 교차 리뷰가 critical 로 잡은 경로다: `off` 가 캐시된 워커에서 인증을 다시 켠 뒤
+    /// 저장소가 죽으면, 마지막 값을 믿는 한 익명 admin 접근이 무기한 계속된다.
+    #[tokio::test]
+    async fn the_auth_accessor_refuses_stale_values() {
+        let mut stored = AppSettings::default();
+        stored.auth.mode = dbmon_core::settings::AuthModeSetting::Off;
+        let st = SettingsState::new(fake(false, stored));
+        st.load(1_000).await;
+
+        assert!(
+            st.cached_fresh(1_000 + CACHE_TTL_MS - 1).is_some(),
+            "TTL 안인데 신선하지 않다고 했다"
+        );
+        assert!(
+            st.cached_fresh(1_000 + CACHE_TTL_MS).is_none(),
+            "TTL 이 지난 값을 인증 판정에 내줬다 — 인증이 무기한 꺼진다"
+        );
+        // 반면 탐색 범위용 접근자는 마지막 값을 계속 준다(범위가 사라지면 안 된다).
+        assert_eq!(
+            st.cached().auth.mode,
+            dbmon_core::settings::AuthModeSetting::Off
         );
     }
 

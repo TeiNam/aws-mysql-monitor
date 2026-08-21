@@ -441,6 +441,13 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
             순서가 그렇다. 생성 중에는 자리를 미리 잡아 화면이 튀지 않게 한다. */}
         {generate.isPending ? (
           <Pending label="스키마를 읽고 모델에 묻는 중… (수십 초 걸릴 수 있다)" />
+        ) : tuning.data?.read_failed === true ? (
+          // **읽기 실패를 "아직 안 만들었다" 로 보여주지 않는다.** 그러면 사용자는
+          // 이미 만든 권고가 사라졌다고 생각한다.
+          <Note>
+            저장된 AI 권고를 읽지 못했다 — 문서가 손상됐거나 저장소에 닿지 못했다.
+            <strong> 다시 분석</strong>을 누르면 덮어쓴다.
+          </Note>
         ) : tuning.data?.advice === null || tuning.data?.advice === undefined ? null : (
           <TuningPanel advice={tuning.data.advice} />
         )}

@@ -36,6 +36,9 @@ pub struct TuningView {
     pub can_generate: bool,
     /// 설정된 모델. 화면이 "무엇으로 분석하는가" 를 보여준다.
     pub model_id: String,
+    /// 저장된 권고를 **읽지 못했다**. `advice: null` 과 구분해야 한다 —
+    /// 전자는 "고장", 후자는 "아직 안 만들었다" 다.
+    pub read_failed: bool,
 }
 
 /// 저장된 권고를 읽는다.
@@ -50,18 +53,22 @@ pub async fn get_tuning(
     let now_ms = SystemClock.now_ms();
     let settings = state.settings.load(now_ms).await;
 
-    let advice = match &state.tuning {
-        Some(svc) => svc.stored(&record.record_id).await.unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %crate::telemetry::Scrubbed(&e),
-                "저장된 튜닝 권고를 읽지 못했다"
-            );
-            None
-        }),
-        None => None,
+    let (advice, read_failed) = match &state.tuning {
+        Some(svc) => match svc.stored(&record.record_id).await {
+            Ok(a) => (a, false),
+            Err(e) => {
+                tracing::warn!(
+                    error = %crate::telemetry::Scrubbed(&e),
+                    "저장된 튜닝 권고를 읽지 못했다"
+                );
+                (None, true)
+            }
+        },
+        None => (None, false),
     };
     Ok(Json(TuningView {
         advice,
+        read_failed,
         enabled: state.tuning.is_some()
             && settings.ai.enabled
             && !settings.ai.model_id.trim().is_empty(),
@@ -146,5 +153,6 @@ pub async fn post_tuning(
         enabled: true,
         can_generate: true,
         model_id: settings.ai.model_id,
+        read_failed: false,
     }))
 }

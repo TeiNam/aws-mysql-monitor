@@ -125,44 +125,97 @@ impl MetricFetcher {
                 );
             }
 
-            let res = req.send().await.map_err(map_cw_err)?;
-            for r in res.metric_data_results() {
-                // `label` 이 없으면 짝지을 수 없다 — 버리고 로그를 남긴다. 조용히
-                // 빈 값으로 두면 화면이 "데이터 없음" 으로 표시해 원인을 가린다.
-                let Some(key) = r.label().map(str::to_string) else {
-                    tracing::warn!("GetMetricData 결과에 label 이 없다 — 짝지을 수 없다");
-                    continue;
-                };
-                out.insert(
-                    key.clone(),
-                    Series {
-                        key,
-                        timestamps_ms: r
-                            .timestamps()
-                            .iter()
-                            .map(|t| t.to_millis().unwrap_or(0))
-                            .collect(),
-                        values: r.values().to_vec(),
-                    },
-                );
-            }
-            // **부분 실패를 삼키지 않는다.** 메시지가 있으면 남긴다(잘못된 period,
-            // 없는 메트릭 등이 여기로 온다).
-            for m in res.messages() {
-                tracing::warn!(
-                    code = m.code().unwrap_or("?"),
-                    value = m.value().unwrap_or("?"),
-                    "GetMetricData 경고"
-                );
+            // **페이지를 끝까지 읽는다.**
+            //
+            // `GetMetricData` 는 `MaxDatapoints` 를 넘으면 `NextToken` 을 준다. 처음엔
+            // 첫 페이지만 읽었는데, 상세 화면(메트릭 27개 × 3시간/60초 = 4,860점)에서
+            // **뒤쪽 메트릭이 조용히 비었다** — 오류가 아니라 빈 계열로 보였다
+            // (교차 리뷰가 high 로 잡았다).
+            let mut next: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                let mut page_req = req.clone();
+                if let Some(token) = next.take() {
+                    page_req = page_req.next_token(token);
+                }
+                let res = page_req.send().await.map_err(map_cw_err)?;
+                pages += 1;
+                collect_page(&mut out, &res);
+                match res.next_token() {
+                    // 상한을 둔다 — 잘못된 파라미터로 무한 페이지가 오면 요청 하나가
+                    // 영원히 끝나지 않는다. 걸리면 시끄럽게 남긴다.
+                    Some(t) if pages < MAX_PAGES => next = Some(t.to_string()),
+                    Some(_) => {
+                        tracing::warn!(
+                            pages,
+                            "GetMetricData 페이지 상한에 걸렸다 — 뒤쪽 데이터가 빠진다"
+                        );
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
         Ok(out)
     }
 }
 
+/// 한 페이지의 결과를 맵에 넣는다. **같은 키가 다시 오면 이어 붙인다** —
+/// 페이지가 나뉘면 한 계열의 점들이 여러 페이지에 걸쳐 온다.
+fn collect_page(
+    out: &mut BTreeMap<String, Series>,
+    res: &aws_sdk_cloudwatch::operation::get_metric_data::GetMetricDataOutput,
+) {
+    {
+        for r in res.metric_data_results() {
+                // `label` 이 없으면 짝지을 수 없다 — 버리고 로그를 남긴다. 조용히
+                // 빈 값으로 두면 화면이 "데이터 없음" 으로 표시해 원인을 가린다.
+                let Some(key) = r.label().map(str::to_string) else {
+                    tracing::warn!("GetMetricData 결과에 label 이 없다 — 짝지을 수 없다");
+                    continue;
+                };
+                let timestamps: Vec<EpochMs> = r
+                    .timestamps()
+                    .iter()
+                    .map(|t| t.to_millis().unwrap_or(0))
+                    .collect();
+                let entry = out.entry(key.clone()).or_insert_with(|| Series {
+                    key,
+                    timestamps_ms: Vec::new(),
+                    values: Vec::new(),
+                });
+                entry.timestamps_ms.extend(timestamps);
+                entry.values.extend(r.values().iter().copied());
+            }
+        // **부분 실패를 삼키지 않는다.** 메시지가 있으면 남긴다(잘못된 period,
+        // 없는 메트릭 등이 여기로 온다).
+        for m in res.messages() {
+            tracing::warn!(
+                code = m.code().unwrap_or("?"),
+                value = m.value().unwrap_or("?"),
+                "GetMetricData 경고"
+            );
+        }
+    }
+}
+
+/// 한 요청이 따라갈 페이지 수 상한. 무한 페이지 방어다.
+const MAX_PAGES: usize = 20;
+
 /// 응답을 되돌려 짝지을 키. `label` 로 왕복한다.
 pub fn series_key(target: &Target, spec: &MetricSpec) -> String {
     format!("{}|{}", target.identifier, spec.name)
+}
+
+/// **리전을 포함한** 계열 키. 여러 리전의 응답을 한 맵에 합칠 때 쓴다.
+///
+/// # 왜 필요한가
+///
+/// 인스턴스 식별자는 **리전 안에서만** 고유하다. `orders-01` 이 서울과 버지니아에 각각
+/// 있으면 [`series_key`] 만으로는 같은 키가 되고, 한 리전의 값이 다른 리전의 값으로
+/// 보인다 — CPU 90% 를 엉뚱한 인스턴스에 붙이는 종류의 오류다.
+pub fn regional_series_key(region: &str, target: &Target, spec: &MetricSpec) -> String {
+    format!("{region}|{}", series_key(target, spec))
 }
 
 fn to_aws_time(ms: EpochMs) -> aws_sdk_cloudwatch::primitives::DateTime {

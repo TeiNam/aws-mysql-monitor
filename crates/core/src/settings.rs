@@ -238,6 +238,17 @@ impl DiscoverySettings {
         out
     }
 
+    /// 이 계정에서 맡을 역할 이름. 우리 계정이거나 목록에 없으면 `None`.
+    ///
+    /// **꺼진 계정도 답한다** — 토글을 끈 뒤에도 이미 등록된 인스턴스의 메트릭은
+    /// 보여야 하고, 그 조회에는 여전히 그 계정의 역할이 필요하다.
+    pub fn role_for(&self, account_id: &str) -> Option<&str> {
+        self.accounts
+            .iter()
+            .find(|a| a.account_id == account_id)
+            .map(|a| a.role_name.as_str())
+    }
+
     /// 화면이 리전 선택에 쓸 목록. 탐색하는 리전 전부의 합집합이다.
     pub fn known_regions(&self, fallback: &[String]) -> Vec<String> {
         let mut v: Vec<String> = self
@@ -401,6 +412,51 @@ fn problem(field: &str, message: impl Into<String>) -> SettingsProblem {
     }
 }
 
+/// Secrets Manager 참조처럼 생겼는가 — 이름(`dbmon/channel/slack`) 또는 ARN.
+///
+/// **허용 목록 방식이다.** 값 자체(URL·토큰)가 들어오는 것을 막는 것이 목적이고,
+/// 금지어 방식은 형식이 바뀔 때마다 뚫린다.
+///
+/// AWS 시크릿 이름 규칙: 영숫자와 `/_+=.@-`. ARN 은 그 앞에 `arn:…:secret:` 이 붙는다.
+pub fn looks_like_secret_ref(s: &str) -> bool {
+    if s.is_empty() || s.len() > 512 {
+        return false;
+    }
+    // URL 의 특징을 먼저 배제한다 — 이름 규칙만으로는 `https:` 가 통과할 수 있다.
+    if s.contains("//") || s.contains('@') || s.contains(' ') {
+        return false;
+    }
+    // **Slack 토큰 접두어는 따로 막는다.**
+    //
+    // `xoxb-…` 는 AWS 시크릿 **이름 규칙을 만족한다**(영숫자 + `-`). 그래서 모양만으로는
+    // 구분할 수 없고, 이 검사가 흔한 실수(토큰을 그대로 붙여넣기)를 잡는다.
+    // 보안 경계는 위의 모양 검사이고, 이건 사용성 방어다 — 새 접두어가 나오면 뚫리지만
+    // 그때도 값이 URL 이 아니면 "이름" 으로는 유효하므로 최악이 아니다.
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("xox") || lower.starts_with("xapp-") {
+        return false;
+    }
+    let body = match s.strip_prefix("arn:") {
+        // ARN 이면 `secret:` 조각이 반드시 있어야 한다.
+        Some(rest) => {
+            if !rest.contains(":secret:") {
+                return false;
+            }
+            rest
+        }
+        None => {
+            // 이름 형태에는 콜론이 없다. 있으면 `scheme:` 이거나 잘린 ARN 이다.
+            if s.contains(':') {
+                return false;
+            }
+            s
+        }
+    };
+    body
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/_+=.@-:".contains(c))
+}
+
 /// 리전 코드처럼 생겼는가 — `ap-northeast-2`, `us-east-1`, `il-central-1`.
 ///
 /// 허용 목록을 두지 않는다: AWS 가 리전을 추가할 때마다 코드를 고쳐야 하고, 빠뜨리면
@@ -457,13 +513,20 @@ impl AppSettings {
                 ),
             ));
         }
-        // **비밀이 섞여 들어오는 것을 막는다.** 실수로 URL·토큰을 붙여넣으면
-        // 설정 항목이 곧 비밀 저장소가 된다.
+        // **비밀이 섞여 들어오는 것을 막는다.**
+        //
+        // 처음에는 `http`·`xoxb-` 접두어만 걸렀다(denylist). 그건 Slack 이 토큰 형식을
+        // 바꾸거나(`xapp-`·`xoxe-`), 사용자가 URL 을 다른 형태로 붙여넣으면 통과한다 —
+        // 그리고 통과한 값은 **viewer 도 읽는 설정 항목에 평문으로 남는다**.
+        //
+        // 그래서 **허용 형태를 정한다**: Secrets Manager 의 이름 또는 ARN 처럼 생긴
+        // 것만 받는다. 그 문법에 콜론·슬래시가 나오지만 공백·`?`·`#` 는 없고, URL 의
+        // `//` 나 `@` 도 없다.
         let secret = self.notify.slack_secret.trim();
-        if secret.starts_with("http") || secret.starts_with("xoxb-") {
+        if !secret.is_empty() && !looks_like_secret_ref(secret) {
             p.push(problem(
                 "notify.slack_secret",
-                "웹훅 URL·봇 토큰 자체가 들어왔다 — Secrets Manager 에 넣고 그 이름/ARN 을 적는다",
+                "Secrets Manager 의 **이름 또는 ARN** 이어야 한다 — 웹훅 URL·봇 토큰 자체를 여기 적지 않는다",
             ));
         }
 
@@ -740,21 +803,52 @@ mod tests {
         assert_eq!(out, "[prd] 지연 — {mystery}");
     }
 
+    /// **허용 형태만 받는다.** 금지어 방식은 토큰 형식이 바뀌면 뚫리고, 통과한 값은
+    /// viewer 도 읽는 설정에 평문으로 남는다(교차 리뷰가 medium 으로 잡았다).
+    #[test]
+    fn only_secret_references_are_accepted() {
+        for ok in [
+            "dbmon/channel/slack",
+            "dbmon-channel-slack",
+            "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/channel/slack-AbCd",
+        ] {
+            assert!(looks_like_secret_ref(ok), "정상 참조를 거부했다: {ok}");
+        }
+        for bad in [
+            "https://hooks.slack.com/services/T000/B000/xxxx",
+            "http://hooks.slack.com/x",
+            "xoxb-1234-5678-abcdef",
+            "xapp-1-A0-1-abc",           // 형식이 바뀐 토큰도 막힌다
+            "slack.com/webhook?x=1",
+            "arn:aws:s3:::bucket/key",   // secret ARN 이 아니다
+            "some name with spaces",
+        ] {
+            assert!(!looks_like_secret_ref(bad), "값 자체를 통과시켰다: {bad}");
+        }
+    }
+
     #[test]
     fn validation_catches_a_pasted_secret() {
-        let s = AppSettings {
-            notify: NotifySettings {
-                slack_enabled: true,
-                slack_secret: "https://hooks.slack.com/services/T000/B000/xxxx".into(),
+        for pasted in [
+            "https://hooks.slack.com/services/T000/B000/xxxx",
+            "xoxb-1234-5678-abcdef",
+            "xapp-1-A0-1-abc",
+        ] {
+            let s = AppSettings {
+                notify: NotifySettings {
+                    slack_enabled: true,
+                    slack_secret: pasted.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let p = s.validate();
-        assert!(
-            p.iter().any(|x| x.field == "notify.slack_secret" && x.message.contains("Secrets Manager")),
-            "{p:#?}"
-        );
+            };
+            let p = s.validate();
+            assert!(
+                p.iter()
+                    .any(|x| x.field == "notify.slack_secret" && x.message.contains("Secrets Manager")),
+                "{pasted} 를 통과시켰다: {p:#?}"
+            );
+        }
     }
 
     #[test]

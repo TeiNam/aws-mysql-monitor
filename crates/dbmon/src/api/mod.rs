@@ -260,18 +260,39 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// `Authorization: Bearer …` 에서 토큰을 뽑고 인증한다.
-pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
-    // **인증을 끈 배포**는 여기서 끝난다 (`api.allow_auth_disable` + `auth.mode = off`).
-    //
-    // `cached()` 를 쓴다 — 요청 경로에서 설정 저장소를 때리지 않는다. 캐시가 비어
-    // 있으면(기동 직후, 아직 아무도 안 읽었다) 기본값 `token` 이므로 **인증이 켜진
-    // 쪽으로 떨어진다.** 방향이 이래야 한다: 캐시 미스가 문을 열어서는 안 된다.
-    if effective_auth_mode(state, &state.settings.cached())
-        == dbmon_core::settings::AuthModeSetting::Off
-    {
+/// 토큰 하나로 인증 문맥을 만든다. **HTTP 와 WS 가 같은 함수를 쓴다.**
+///
+/// # 왜 한 곳이어야 하는가
+///
+/// 처음에는 HTTP 만 운영 설정의 "인증 없음" 을 봤다. 그러면 인증을 끈 배포에서
+/// **화면은 열리는데 실시간 스트림만 죽는다** — WS 는 `authenticate` 를 직접 불러
+/// 토큰을 요구했기 때문이다. 반쯤 동작하는 상태가 가장 나쁘다.
+///
+/// # 캐시는 **신선할 때만** 문을 연다
+///
+/// 요청 경로에서 설정 저장소를 때리지 않으므로 캐시를 본다. 그런데 `cached()` 는 조회
+/// 실패 때 마지막 값을 유지한다 — 그건 탐색 범위에는 맞지만 **인증에는 위험하다**:
+/// `off` 가 캐시된 워커에서 인증을 다시 켠 뒤 저장소가 죽으면 익명 admin 접근이
+/// 무기한 계속된다(교차 리뷰가 critical 로 잡았다).
+///
+/// 그래서 [`SettingsState::cached_fresh`] 를 쓴다. 캐시가 비었거나(기동 직후) TTL 이
+/// 지났으면 **인증이 켜진 쪽으로 떨어진다.** 방향이 이래야 한다: 모르면 닫는다.
+pub(crate) fn context_from_token(
+    state: &ApiState,
+    token: Option<&str>,
+) -> Result<AuthContext, auth::AuthError> {
+    let fresh = state.settings.cached_fresh(SystemClock.now_ms());
+    let off = fresh.is_some_and(|s| {
+        effective_auth_mode(state, &s) == dbmon_core::settings::AuthModeSetting::Off
+    });
+    if off {
         return Ok(auth::no_auth_context());
     }
+    authenticate(&state.policy, token)
+}
+
+/// `Authorization: Bearer …` 에서 토큰을 뽑고 인증한다.
+pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -279,7 +300,7 @@ pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthCo
         .map(str::trim)
         .filter(|t| !t.is_empty());
 
-    authenticate(&state.policy, bearer).map_err(|e| ApiError::new(e.status(), "unauthorized"))
+    context_from_token(state, bearer).map_err(|e| ApiError::new(e.status(), "unauthorized"))
 }
 
 /// 프론트가 로그인 방식을 알기 위한 엔드포인트.
@@ -289,17 +310,34 @@ pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthCo
 async fn auth_config(State(state): State<ApiState>) -> Json<serde_json::Value> {
     // **토큰 값을 담지 않는다.** 인증 전에 답하는 엔드포인트이므로 여기에
     // 토큰을 실으면 인증이 없는 것과 같다. 화면은 URL 이나 로그에서 받는다.
-    let mode = if state.policy.allows_local_bypass() {
-        "local-dev"
-    } else if state.policy.dev_token.is_some() {
-        "local-token"
-    } else {
-        "cognito"
+    //
+    // **운영 설정을 반영한다.** 인증을 끈 배포에서 화면이 "토큰을 넣어라" 를 보여주면
+    // 사용자는 있지도 않은 토큰을 찾는다.
+    let settings = state.settings.load(SystemClock.now_ms()).await;
+    let effective = effective_auth_mode(&state, &settings);
+    let mode = match effective {
+        dbmon_core::settings::AuthModeSetting::Off => "off",
+        dbmon_core::settings::AuthModeSetting::Cognito => "cognito",
+        dbmon_core::settings::AuthModeSetting::Token => {
+            if state.policy.allows_local_bypass() {
+                "local-dev"
+            } else {
+                "local-token"
+            }
+        }
     };
+    let c = &settings.auth.cognito;
     Json(serde_json::json!({
-        // Cognito 가 배선되면 issuer·client_id·authorize_url 이 여기 온다.
         "mode": mode,
-        "cognito_configured": false,
+        // 검증기가 배선됐고 설정도 완전한가. **둘 다여야 참이다.**
+        "cognito_configured": auth::COGNITO_READY && c.is_complete(),
+        // 로그인 화면을 만들 재료. **공개 값이다** — 브라우저가 로그인 전에 알아야 한다.
+        "cognito": {
+            "user_pool_id": c.user_pool_id,
+            "client_id": c.client_id,
+            "region": c.effective_region(),
+            "domain": c.domain,
+        },
         "deployment_env": state.policy.deployment_env.as_str(),
     }))
 }
@@ -1417,6 +1455,11 @@ async fn collector_resume(
 #[derive(Debug, serde::Serialize)]
 struct FleetMetricsResponse {
     rows: Vec<crate::api::metrics::FleetRow>,
+    /// **조회가 실패한 `계정/리전`.** 비어 있으면 전부 성공했다.
+    ///
+    /// 값 `null` 과 조회 실패는 화면에서 구분돼야 한다 — 실패를 빈 값으로만 두면
+    /// 모니터링 장애가 "데이터 없음" 으로 읽힌다.
+    failed_scopes: Vec<String>,
     /// 이 값들의 조회 주기(초). 화면이 "15분마다 갱신" 을 말할 수 있어야 한다.
     period_secs: i64,
     /// **CloudWatch 는 1~3분 지연된다.** 자체 수집 지표와 나란히 놓으면 값이 어긋나
@@ -1449,9 +1492,16 @@ async fn metrics_fleet(
         .filter(|i| ctx.is_env_allowed(i.env.effective))
         .collect();
 
-    let rows = svc.fleet(&visible, SystemClock.now_ms()).await;
+    let now_ms = SystemClock.now_ms();
+    // 크로스 계정 인스턴스의 메트릭은 **그 계정에서** 읽어야 한다 — 역할 이름이
+    // 설정에 있다.
+    let discovery = state.settings.load(now_ms).await.discovery;
+    let outcome = svc.fleet(&visible, &discovery, now_ms).await;
     Ok(Json(FleetMetricsResponse {
-        rows,
+        rows: outcome.rows,
+        // **조회 실패를 값 없음과 구분해 알린다.** 빈 값으로만 두면 모니터링 장애가
+        // "데이터 없음" 으로 읽힌다.
+        failed_scopes: outcome.failed_scopes,
         period_secs: dbmon_core::cw_metrics::FLEET_PERIOD_SECS,
         lag_note: "CloudWatch 는 1~3분 지연된다. 실시간 값은 자체 수집 열을 본다",
     }))
@@ -1510,8 +1560,9 @@ async fn metrics_instance(
     let from_ms = params.from_ms.unwrap_or(to_ms - 3 * 3_600_000);
     let range = checked_range(from_ms, to_ms)?;
 
+    let discovery = state.settings.load(now).await.discovery;
     let (series, choice) = svc
-        .detail(&found, range.from_ms(), range.to_ms(), now)
+        .detail(&found, &discovery, range.from_ms(), range.to_ms(), now)
         .await;
     Ok(Json(InstanceMetricsResponse {
         instance_id: found.id.as_str().to_string(),

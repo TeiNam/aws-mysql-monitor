@@ -311,7 +311,9 @@ fn model_safe_sql(record: &SlowQuery) -> (String, bool) {
         );
         return (String::new(), false);
     }
-    (normalized.canonical, false)
+    // **힌트·주석을 지운다.** 정규화는 리터럴만 바꾸고 `/*+ QB_NAME(…) */` 안은
+    // 그대로 두므로, 그 이름에 비밀이나 지시문이 있으면 모델로 나간다.
+    (tuning::strip_hints_and_comments(&normalized.canonical), false)
 }
 
 fn build_context(
@@ -404,6 +406,19 @@ mod tests {
         assert!(!ctx.sql.contains("42"), "숫자 리터럴이 남았다: {}", ctx.sql);
         assert!(ctx.sql.contains("orders"), "테이블 이름은 남아야 한다: {}", ctx.sql);
         assert!(!ctx.sql_has_literals);
+    }
+
+    /// **옵티마이저 힌트도 지운다.** 정규화가 힌트 안을 건드리지 않으므로 그 이름에
+    /// 비밀이나 지시문이 있으면 모델로 나간다(교차 리뷰가 high 로 잡았다).
+    #[test]
+    fn optimizer_hints_do_not_reach_the_model() {
+        let mut q = record(&["shop.orders"], Some("shop"));
+        q.sql_text =
+            Some("SELECT /*+ QB_NAME(sk_live_abcdef) */ * FROM orders WHERE id = 1".into());
+        let ctx = build_context(&q, None, Vec::new());
+        assert!(!ctx.sql.contains("sk_live"), "힌트 안의 문자열이 새어 나갔다: {}", ctx.sql);
+        assert!(!ctx.sql.contains("QB_NAME"), "{}", ctx.sql);
+        assert!(ctx.sql.contains("orders"), "{}", ctx.sql);
     }
 
     /// 마스킹을 신뢰할 수 없으면(인용부호 미종료) **SQL 을 통째로 버린다.**

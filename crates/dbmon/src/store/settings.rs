@@ -13,8 +13,14 @@
 //!
 //! 1. 조건부 쓰기(`ConditionExpression`)가 속성으로 비교해야 한다 — JSON 안의 값은
 //!    DynamoDB 가 읽지 못한다.
-//! 2. **문서가 깨져도 버전은 읽을 수 있다.** 파싱 실패 시 기본값으로 화면을 열고
-//!    그 위에 저장해 복구할 수 있다 — 문서만 있으면 설정 화면이 영구히 500 이 된다.
+//! 2. **문서가 깨져도 버전은 읽을 수 있다.** 오류 메시지가 어느 버전이 깨졌는지
+//!    말할 수 있고, 복구 저장(같은 버전으로 덮어쓰기)의 조건도 성립한다.
+//!
+//! # 손상된 문서는 오류다
+//!
+//! 처음에는 기본값으로 접었다(자기 치유 의도). 그건 캐시가 그 기본값을 "성공한 조회" 로
+//! 기록해 마지막 값 보호를 우회하고, 화면이 빈 설정을 정상으로 보여주므로 관리자가
+//! **저장을 누르면 실제 설정이 지워진다.** 오류로 올리면 화면이 사유를 표시한다.
 //!
 //! # 3계층 병합은 아직 없다
 //!
@@ -75,21 +81,35 @@ impl SettingsStore for DynamoSettingsStore {
             .unwrap_or(0);
         let doc = item.get("doc").and_then(|v| v.as_s().ok());
 
+        // **항목이 있는데 읽을 수 없으면 오류다.** 기본값으로 접지 않는다.
+        //
+        // 처음에는 기본값을 돌려줬다(자기 치유 의도). 그건 두 가지로 나쁘다
+        // (교차 리뷰가 high 로 잡았다):
+        //
+        // 1. 캐시가 그 기본값을 "성공한 조회" 로 기록해 **마지막 값 보호를 우회**한다 —
+        //    탐색 범위가 자기 리전 하나로 줄고, 인증이 토큰으로 되돌아간다.
+        // 2. 화면이 빈 설정을 정상으로 보여주므로 관리자가 그 위에 **저장을 누르면
+        //    실제 설정이 지워진다.**
+        //
+        // 오류로 올리면 화면이 사유를 표시하고, 워커는 마지막으로 읽은 값을 유지한다.
         let mut settings = match doc {
-            Some(json) => match serde_json::from_str::<AppSettings>(json) {
-                Ok(s) => s,
-                Err(e) => {
-                    // 문서가 깨졌다. **기본값으로 화면을 연다** — 500 을 내면 고칠
-                    // 방법이 없어진다. 대신 큰 소리로 남긴다.
-                    tracing::error!(
-                        error = %crate::telemetry::Scrubbed(&e),
-                        version,
-                        "설정 문서를 읽지 못했다 — 기본값으로 진행한다(저장하면 덮어쓴다)"
-                    );
-                    AppSettings::default()
-                }
-            },
-            None => AppSettings::default(),
+            Some(json) => serde_json::from_str::<AppSettings>(json).map_err(|e| {
+                tracing::error!(
+                    error = %crate::telemetry::Scrubbed(&e),
+                    version,
+                    "설정 문서를 읽지 못했다 — 기본값으로 접지 않는다"
+                );
+                DomainError::Internal(format!(
+                    "설정 문서(version {version})를 읽을 수 없다 — 손상됐거나 형식이 바뀌었다"
+                ))
+            })?,
+            None => {
+                // 속성만 있고 문서가 없다. 이것도 정상 상태가 아니다.
+                tracing::error!(version, "설정 항목에 doc 속성이 없다");
+                return Err(DomainError::Internal(
+                    "설정 항목에 문서가 없다".to_string(),
+                ));
+            }
         };
         // 문서 안의 버전보다 **속성이 권위값**이다. 조건부 쓰기가 그걸 보기 때문이다.
         settings.version = version;

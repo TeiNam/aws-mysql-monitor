@@ -216,24 +216,14 @@ struct Stores {
 /// 메트릭이 조용히 꺼졌다. 자격증명이 없으면 조회가 실패하고 그때 **빈 값 + 경고 로그**로
 /// 나타난다 — 그게 화면이 503 을 받는 것보다 낫다(다른 값은 계속 보인다).
 ///
-/// ⚠ **리전별로 만들어야 한다.** 메트릭은 대상 인스턴스의 리전에 있다 — 배포 리전
-/// 클라이언트로 다른 리전을 물으면 빈 값이 오면서 과금된다(탐색·슬로우로그와 같은 함정).
-/// 지금은 `target_regions` 의 첫 리전만 쓴다. 멀티 리전 대상이 생기면 리전별 맵으로
-/// 바꿔야 한다 — 그때까지는 이 주석이 그 사실을 남긴다.
-async fn build_metrics(config: &Config) -> Arc<dbmon::api::metrics::MetricsService> {
-    use aws_config::BehaviorVersion;
-    let region = config
-        .target_regions()
-        .first()
-        .cloned()
-        .unwrap_or_else(|| config.aws.region.clone());
-    let sdk = aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.clone()))
-        .load()
-        .await;
-    tracing::info!(%region, "CloudWatch 메트릭 준비");
+/// **클라이언트는 리전마다 필요하고, 리전 목록은 런타임에 늘어난다**(운영 설정).
+/// 그래서 여기서 만들지 않고 [`MetricFetchers`](dbmon::aws::cw_fetchers::MetricFetchers)
+/// 가 처음 필요할 때 만들어 들고 있는다 — 기동 시 고정하면 나중에 추가한 리전의 값이
+/// 오류 없이 빈 값으로 온다.
+fn build_metrics(config: &Config) -> Arc<dbmon::api::metrics::MetricsService> {
     Arc::new(dbmon::api::metrics::MetricsService::new(Arc::new(
-        dbmon::aws::cloudwatch::MetricFetcher::new(aws_sdk_cloudwatch::Client::new(&sdk)),
+        // 우리 계정을 알려 준다 — 이 계정이면 역할을 맡지 않는다.
+        dbmon::aws::cw_fetchers::MetricFetchers::new(config.aws.account_id.clone()),
     )))
 }
 
@@ -638,6 +628,14 @@ async fn discover(
         InstanceId::new(account, region, identifier)
             .ok()
             .map(|id| id.as_str().to_string())
+    }
+
+    // **이번 라운드의 시야를 먼저 기록한다.** 조회가 실패해도 "무엇을 보려 했는가" 는
+    // 남아야 한다 — 재조정이 시야 밖 인스턴스를 건드리지 않는 근거다.
+    for source in fleet.sources.iter() {
+        outcome
+            .scanned_scope
+            .insert(dbmon::discovery::scope_key(source.account_id(), source.region()));
     }
 
     for source in fleet.sources.iter() {
@@ -1956,7 +1954,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 // **파일 설정만이 인증 끄기를 허용할 수 있다.** 화면에서 두 번째
                 // 허용을 눌러야 실제로 꺼진다.
                 allow_auth_disable: config.http.allow_auth_disable,
-                metrics: build_metrics(&config).await,
+                metrics: build_metrics(&config),
                 worker_id: worker_id.clone(),
                 // 이 프로세스가 수집 루프를 도는가. `role=api` 워커는 제어를 받지
                 // 않는다 — 플래그가 프로세스 원자값이라 수집 워커가 모른다.

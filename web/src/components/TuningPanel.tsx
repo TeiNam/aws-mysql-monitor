@@ -48,8 +48,10 @@ export function TuningPanel({ advice }: { advice: TuningAdvice }) {
         <div className="mt-4">
           <h4 className="mb-1 text-xs font-bold tracking-wide text-gray-700 uppercase">관찰</h4>
           <ul className="space-y-1.5">
-            {advice.findings.map((f) => (
-              <li key={f.title} className="text-sm text-gray-800">
+            {/* **인덱스를 키에 넣는다.** 제목만 쓰면 모델이 같은 제목을 두 번 낼 때
+                하나가 사라진다 — 모델 출력은 유일성을 보장하지 않는다. */}
+            {advice.findings.map((f, n) => (
+              <li key={`${n}:${f.title}`} className="text-sm text-gray-800">
                 <strong>{f.title}</strong>
                 {f.evidence === "" ? null : <> — {f.evidence}</>}
                 {f.impact === "" ? null : (
@@ -66,8 +68,8 @@ export function TuningPanel({ advice }: { advice: TuningAdvice }) {
           <h4 className="mb-1 text-xs font-bold tracking-wide text-gray-700 uppercase">
             인덱스 제안
           </h4>
-          {advice.indexes.map((i) => (
-            <div key={`${i.table}:${i.columns.join(",")}`} className="mb-3">
+          {advice.indexes.map((i, n) => (
+            <div key={`${n}:${i.table}`} className="mb-3">
               <div className="text-sm text-gray-800">
                 <span className={MONO}>{i.table}</span> ({i.columns.join(", ")})
                 {i.covering ? (
@@ -110,8 +112,8 @@ export function TuningPanel({ advice }: { advice: TuningAdvice }) {
             검증 방법
           </h4>
           <ol className="list-inside list-decimal space-y-0.5 text-sm text-gray-800">
-            {advice.verification.map((v) => (
-              <li key={v}>{v}</li>
+            {advice.verification.map((v, n) => (
+              <li key={`${n}:${v}`}>{v}</li>
             ))}
           </ol>
         </div>
@@ -123,8 +125,8 @@ export function TuningPanel({ advice }: { advice: TuningAdvice }) {
             <AlertTriangle className="h-3.5 w-3.5" /> 주의
           </h4>
           <ul className="list-inside list-disc space-y-0.5 text-xs text-amber-900">
-            {advice.caveats.map((c) => (
-              <li key={c}>{c}</li>
+            {advice.caveats.map((c, n) => (
+              <li key={`${n}:${c}`}>{c}</li>
             ))}
           </ul>
         </div>

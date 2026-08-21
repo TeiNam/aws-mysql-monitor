@@ -31,7 +31,8 @@ use dbmon_core::cw_metrics::{
 use dbmon_core::instance::Instance;
 use dbmon_core::time::EpochMs;
 
-use crate::aws::cloudwatch::{MetricFetcher, Series, Target, series_key};
+use crate::aws::cloudwatch::{Series, Target, regional_series_key, series_key};
+use crate::aws::cw_fetchers::MetricFetchers;
 
 /// 상세 조회의 데이터포인트 상한. 응답 크기를 묶는다.
 const MAX_DATAPOINTS: i32 = 1_440;
@@ -50,7 +51,9 @@ struct Cache {
 }
 
 pub struct MetricsService {
-    fetcher: Arc<MetricFetcher>,
+    /// **리전별** 클라이언트. 메트릭은 대상 인스턴스의 리전에 있다 — 하나로 돌리면
+    /// 다른 리전은 오류 없이 빈 값이 오고 화면에는 `—` 로 보인다.
+    fetchers: Arc<MetricFetchers>,
     cache: Mutex<Cache>,
 }
 
@@ -64,6 +67,15 @@ pub struct MetricPoint {
     /// **없을 수 있다.** 방금 뜬 인스턴스나 CloudWatch 지연 구간이다 — `0` 으로 접으면
     /// "CPU 0%" 라는 거짓을 표시한다.
     pub value: Option<f64>,
+}
+
+/// 플릿 조회 결과. **실패한 범위를 함께 준다** — 빈 값과 조회 실패는 화면에서
+/// 구분돼야 한다.
+#[derive(Debug, Clone, Default)]
+pub struct FleetOutcome {
+    pub rows: Vec<FleetRow>,
+    /// 조회가 실패한 `계정/리전`. 비어 있으면 전부 성공했다.
+    pub failed_scopes: Vec<String>,
 }
 
 /// 인스턴스 한 대의 플릿 행.
@@ -85,51 +97,83 @@ pub struct MetricSeries {
 }
 
 impl MetricsService {
-    pub fn new(fetcher: Arc<MetricFetcher>) -> Self {
+    pub fn new(fetchers: Arc<MetricFetchers>) -> Self {
         Self {
-            fetcher,
+            fetchers,
             cache: Mutex::new(Cache::default()),
         }
     }
 
     /// 플릿 표. **엔진별 최소 세트만** 15분 창으로 가져온다.
-    pub async fn fleet(&self, instances: &[Instance], now_ms: EpochMs) -> Vec<FleetRow> {
+    pub async fn fleet(
+        &self,
+        instances: &[Instance],
+        discovery: &dbmon_core::settings::DiscoverySettings,
+        now_ms: EpochMs,
+    ) -> FleetOutcome {
         let window = align(now_ms, FLEET_PERIOD_SECS);
         let cache_key = format!("fleet@{window}");
         if let Some(hit) = self.cached(&cache_key) {
-            return rows_from(instances, &hit);
+            return FleetOutcome {
+                rows: rows_from(instances, &hit),
+                failed_scopes: Vec::new(),
+            };
         }
 
-        let pairs = fleet_pairs(instances);
-        if pairs.is_empty() {
-            return Vec::new();
-        }
         let from = now_ms - FLEET_PERIOD_SECS * FLEET_LOOKBACK_MULT * 1000;
-        // ⚠ **`MaxDatapoints` 는 쿼리별이 아니라 응답 전체 상한이다.**
-        //
-        // 처음에 `3` 을 넣었더니(창 3개니까) 인스턴스 9대 중 **1대만 값이 왔다** — 첫
-        // 쿼리가 3점을 다 써버린 것이다. 오류도 경고도 없이 나머지가 빈 값이었다.
-        // 그래서 쌍 수 × 창 수로 잡는다.
-        let cap = (pairs.len() as i32).saturating_mul(FLEET_LOOKBACK_MULT as i32);
-        match self
-            .fetcher
-            .fetch(&pairs, FLEET_PERIOD_SECS, from, now_ms, cap.max(3))
-            .await
-        {
-            Ok(series) => {
-                self.store(cache_key, series.clone());
-                rows_from(instances, &series)
+        let mut merged: BTreeMap<String, Series> = BTreeMap::new();
+        let mut failed_scopes: Vec<String> = Vec::new();
+
+        // **계정·리전마다 따로 조회한다.** `GetMetricData` 는 클라이언트의 계정·리전만
+        // 본다 — 하나로 돌리면 다른 계정·리전은 오류 없이 빈 값이 온다.
+        for ((account, region), region_instances) in by_scope(instances) {
+            let pairs = fleet_pairs(&region_instances);
+            if pairs.is_empty() {
+                continue;
             }
-            Err(e) => {
-                // **빈 표를 내보낸다.** 값이 없는 것과 조회 실패는 화면에서 구분돼야
-                // 하는데, 그 구분은 HTTP 오류가 아니라 값 `null` 로 한다 — 메트릭이
-                // 없어도 인스턴스 목록은 보여야 한다.
-                tracing::warn!(
-                    error = %crate::telemetry::Scrubbed(&e),
-                    "플릿 메트릭 조회 실패 — 값 없이 표를 낸다"
-                );
-                rows_from(instances, &BTreeMap::new())
+            // ⚠ **`MaxDatapoints` 는 쿼리별이 아니라 응답 전체 상한이다.**
+            //
+            // 처음에 `3` 을 넣었더니(창 3개니까) 인스턴스 9대 중 **1대만 값이 왔다** — 첫
+            // 쿼리가 3점을 다 써버린 것이다. 오류도 경고도 없이 나머지가 빈 값이었다.
+            // 그래서 쌍 수 × 창 수로 잡는다.
+            let cap = (pairs.len() as i32).saturating_mul(FLEET_LOOKBACK_MULT as i32);
+            let fetcher = self
+                .fetchers
+                .for_target(&account, &region, discovery.role_for(&account))
+                .await;
+            match fetcher
+                .fetch(&pairs, FLEET_PERIOD_SECS, from, now_ms, cap.max(3))
+                .await
+            {
+                Ok(series) => {
+                    // **키에 리전을 붙여 합친다.** 식별자는 리전 안에서만 고유하므로
+                    // 그냥 합치면 같은 이름의 인스턴스가 서로의 값을 덮는다.
+                    for (key, value) in series {
+                        merged.insert(format!("{region}|{key}"), value);
+                    }
+                }
+                Err(e) => {
+                    // **한 범위의 실패가 다른 범위를 막지 않는다.** 다만 조용히 넘기지
+                    // 않는다 — 실패를 빈 값으로만 두면 화면이 "데이터 없음" 으로 보여
+                    // 모니터링 장애가 정상으로 읽힌다(교차 리뷰가 medium 으로 잡았다).
+                    tracing::warn!(
+                        %account, %region,
+                        error = %crate::telemetry::Scrubbed(&e),
+                        "플릿 메트릭 조회 실패 — 이 범위는 값 없이 표를 낸다"
+                    );
+                    failed_scopes.push(format!("{account}/{region}"));
+                }
             }
+        }
+
+        // **실패한 범위가 있으면 캐시하지 않는다.** 캐시하면 다음 15분 동안 빈 값이
+        // 고정되고, 그 사이 복구돼도 화면은 계속 비어 있다.
+        if failed_scopes.is_empty() {
+            self.store(cache_key, merged.clone());
+        }
+        FleetOutcome {
+            rows: rows_from(instances, &merged),
+            failed_scopes,
         }
     }
 
@@ -137,15 +181,25 @@ impl MetricsService {
     pub async fn detail(
         &self,
         instance: &Instance,
+        discovery: &dbmon_core::settings::DiscoverySettings,
         from_ms: EpochMs,
         to_ms: EpochMs,
         now_ms: EpochMs,
     ) -> (Vec<MetricSeries>, PeriodChoice) {
         let choice = period_for(now_ms, from_ms, to_ms);
+        // **시간 범위를 해상도 경계로 맞춘다.**
+        //
+        // 화면은 `Date.now()` 로 ms 단위 범위를 보낸다. 그걸 그대로 키에 넣으면 두
+        // 사용자가 같은 분에 같은 인스턴스를 열어도 키가 달라 **각자 CloudWatch 를
+        // 부른다**(교차 리뷰가 medium 으로 잡았다). period 로 내림하면 같은 창을 보는
+        // 사람들이 같은 키를 쓴다 — 데이터 자체도 그 경계로 집계되므로 잃는 것이 없다.
+        let bucket = choice.period_secs * 1000;
+        let from_bucket = (from_ms / bucket) * bucket;
+        let to_bucket = (to_ms / bucket) * bucket;
         // **정렬된 창으로 캐시한다.** 60초 안에 여러 번 열어도 1회만 호출한다.
         let window = align(now_ms, DETAIL_CACHE_SECS);
         let cache_key = format!(
-            "detail@{window}|{}|{from_ms}|{to_ms}|{}",
+            "detail@{window}|{}|{from_bucket}|{to_bucket}|{}",
             instance.id.as_str(),
             choice.period_secs
         );
@@ -155,8 +209,17 @@ impl MetricsService {
             Some(hit) => hit,
             None => {
                 let pairs = detail_pairs(instance, &specs);
-                match self
-                    .fetcher
+                // **이 인스턴스의 계정·리전**으로 묻는다. 우리 계정·배포 리전으로
+                // 물으면 오류 없이 빈 값이 온다.
+                let fetcher = self
+                    .fetchers
+                    .for_target(
+                        instance.id.account(),
+                        instance.id.region(),
+                        discovery.role_for(instance.id.account()),
+                    )
+                    .await;
+                match fetcher
                     .fetch(&pairs, choice.period_secs, from_ms, to_ms, MAX_DATAPOINTS)
                     .await
                 {
@@ -237,6 +300,17 @@ fn target_for(instance: &Instance, spec: &MetricSpec) -> Target {
     }
 }
 
+/// 인스턴스를 `(계정, 리전)` 별로 나눈다. **정렬된 맵**이라 로그가 안정적이다.
+fn by_scope(instances: &[Instance]) -> BTreeMap<(String, String), Vec<Instance>> {
+    let mut out: BTreeMap<(String, String), Vec<Instance>> = BTreeMap::new();
+    for i in instances {
+        out.entry((i.id.account().to_string(), i.id.region().to_string()))
+            .or_default()
+            .push(i.clone());
+    }
+    out
+}
+
 /// 플릿 요청 쌍. **클러스터 메트릭은 클러스터당 1회로 접는다.**
 fn fleet_pairs(instances: &[Instance]) -> Vec<(Target, MetricSpec)> {
     let mut seen = std::collections::BTreeSet::new();
@@ -280,7 +354,7 @@ fn rows_from(instances: &[Instance], series: &BTreeMap<String, Series>) -> Vec<F
                     unit: spec.unit.as_str(),
                     stat: spec.stat.as_str(),
                     value: series
-                        .get(&series_key(&target_for(i, spec), spec))
+                        .get(&regional_series_key(i.id.region(), &target_for(i, spec), spec))
                         .and_then(Series::latest),
                 })
                 .collect(),
@@ -300,6 +374,15 @@ mod tests {
     use dbmon_core::instance::Engine;
 
     fn instance(name: &str, engine: Engine, cluster: Option<&str>) -> Instance {
+        instance_in("ap-northeast-2", name, engine, cluster)
+    }
+
+    fn instance_in(
+        region: &str,
+        name: &str,
+        engine: Engine,
+        cluster: Option<&str>,
+    ) -> Instance {
         let raw = crate::aws::discovery::RawDbInstance {
             identifier: name.into(),
             engine: match engine {
@@ -310,7 +393,7 @@ mod tests {
                 Engine::Mysql => "8.4.6".into(),
                 Engine::AuroraMysql => "8.0.mysql_aurora.3.08.0".into(),
             },
-            region: "ap-northeast-2".into(),
+            region: region.to_string(),
             endpoint_address: Some(format!("{name}.rds.amazonaws.com")),
             endpoint_port: Some(3306),
             cluster_identifier: cluster.map(str::to_string),
@@ -385,6 +468,55 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].metrics.iter().all(|m| m.value.is_none()));
         assert_eq!(rows[0].metrics.len(), 3);
+    }
+
+    /// **같은 이름의 인스턴스가 두 리전에 있으면 값이 섞여서는 안 된다.**
+    ///
+    /// 식별자는 리전 안에서만 고유하다. 계열 키에 리전이 없으면 한 리전의 CPU 가
+    /// 다른 리전 인스턴스의 값으로 보인다 — 90% 를 엉뚱한 곳에 붙이는 종류의 오류다.
+    #[test]
+    fn same_name_in_two_regions_does_not_share_values() {
+        let seoul = instance_in("ap-northeast-2", "orders-01", Engine::Mysql, None);
+        let virginia = instance_in("us-east-1", "orders-01", Engine::Mysql, None);
+        assert_ne!(seoul.id.as_str(), virginia.id.as_str());
+
+        // 서울 CPU 만 담은 응답.
+        let spec = fleet_metrics(Engine::Mysql)[0];
+        let mut series = BTreeMap::new();
+        series.insert(
+            crate::aws::cloudwatch::regional_series_key(
+                "ap-northeast-2",
+                &target_for(&seoul, &spec),
+                &spec,
+            ),
+            Series {
+                key: crate::aws::cloudwatch::series_key(&target_for(&seoul, &spec), &spec),
+                timestamps_ms: vec![1_000],
+                values: vec![42.0],
+            },
+        );
+
+        let rows = rows_from(&[seoul, virginia], &series);
+        assert_eq!(rows[0].metrics[0].value, Some(42.0), "서울 값이 없다");
+        assert_eq!(
+            rows[1].metrics[0].value, None,
+            "버지니아 인스턴스가 서울 값을 가져갔다"
+        );
+    }
+
+    /// **계정·리전별로 나눠 조회한다.** 그룹화가 어긋나면 한 범위만 조회되고 나머지는
+    /// 오류 없이 빈 값이 된다.
+    #[test]
+    fn instances_are_grouped_by_account_and_region() {
+        let groups = by_scope(&[
+            instance_in("ap-northeast-2", "a", Engine::Mysql, None),
+            instance_in("us-east-1", "b", Engine::Mysql, None),
+            instance_in("ap-northeast-2", "c", Engine::Mysql, None),
+        ]);
+        assert_eq!(groups.len(), 2);
+        let account = "123456789012".to_string();
+        assert_eq!(groups[&(account.clone(), "ap-northeast-2".into())].len(), 2);
+        assert_eq!(groups[&(account, "us-east-1".into())].len(), 1);
     }
 
     /// 캐시 키는 **창으로 정렬**된다 — 같은 창 안의 여러 요청이 1회로 접힌다.
