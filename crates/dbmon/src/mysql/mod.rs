@@ -287,6 +287,61 @@ impl TargetMysql {
         }
     }
 
+    /// 재실행 경로. **기본 스키마를 먼저 지정하고** 같은 커넥션에서 `EXPLAIN` 한다.
+    ///
+    /// # 왜 같은 커넥션이어야 하는가
+    ///
+    /// `USE` 는 세션 상태다. 다른 커넥션에서 걸면 아무 효과가 없고, 그러면 1046 이
+    /// 그대로 남는다 — "고쳤는데 안 고쳐진" 종류의 결함이다.
+    ///
+    /// # 1142 를 여기서는 다르게 읽는다
+    ///
+    /// `plan_query` 는 **항상 `SELECT` 를 만든다**(DML 은 조건절만 뽑아 SELECT 로 바꾼다).
+    /// 그래서 이 경로의 1142 는 "DML 권한 없음" 이 아니라 **대상 테이블 `SELECT` 권한
+    /// 없음** 이다 — 운영자가 `GRANT SELECT ON <schema>.*` 로 고칠 수 있는 유일한 종류다.
+    /// `FOR CONNECTION` 경로의 1142(원문 DML 을 explain)와 구분해야 조치가 달라진다.
+    async fn explain_rerun_in(&self, stmt: String, schema: Option<&str>) -> Result<ExplainOutcome> {
+        let mut conn = self.hot_conn().await?;
+
+        if let Some(use_stmt) = schema.and_then(sql::use_schema) {
+            let fut = conn.query_drop(use_stmt);
+            match tokio::time::timeout(self.timeouts.query, fut).await {
+                Ok(Ok(())) => {}
+                // 스키마 자체에 접근 권한이 없으면 1044 다. 그 사실이 결과다 —
+                // 이어서 EXPLAIN 을 보내면 1046 으로 덮여 원인이 사라진다.
+                Ok(Err(e)) => match server_error_code(&e) {
+                    Some(code) => {
+                        return Ok(ExplainOutcome::Failed(PlanFailure::from_mysql_error_code(
+                            code,
+                        )));
+                    }
+                    None => return Err(self.map_err(e)),
+                },
+                Err(_) => {
+                    drop(conn);
+                    return Ok(ExplainOutcome::Failed(PlanFailure::Timeout));
+                }
+            }
+        }
+
+        let fut = conn.query_first::<String, _>(stmt);
+        match tokio::time::timeout(self.timeouts.query, fut).await {
+            Ok(Ok(Some(plan))) => Ok(ExplainOutcome::Plan(plan)),
+            Ok(Ok(None)) => Ok(ExplainOutcome::Failed(PlanFailure::NoStatement)),
+            Ok(Err(e)) => match server_error_code(&e) {
+                Some(1142) => Ok(ExplainOutcome::Failed(PlanFailure::SchemaPrivilegeMissing)),
+                Some(code) => Ok(ExplainOutcome::Failed(PlanFailure::from_mysql_error_code(
+                    code,
+                ))),
+                None => Err(self.map_err(e)),
+            },
+            Err(_) => {
+                drop(conn);
+                Ok(ExplainOutcome::Failed(PlanFailure::Timeout))
+            }
+        }
+    }
+
     pub async fn disconnect(self) {
         let _ = self.hot.disconnect().await;
         let _ = self.bulk.disconnect().await;
@@ -473,14 +528,14 @@ impl TargetDb for TargetMysql {
         .await
     }
 
-    async fn explain_rerun(&self, sql_text: &str) -> Result<ExplainOutcome> {
-        self.explain(sql::explain_rerun(sql_text, ExplainFormat::Json))
+    async fn explain_rerun(&self, sql_text: &str, schema: Option<&str>) -> Result<ExplainOutcome> {
+        self.explain_rerun_in(sql::explain_rerun(sql_text, ExplainFormat::Json), schema)
             .await
     }
 
-    async fn explain_tree(&self, sql_text: &str) -> Result<Option<String>> {
+    async fn explain_tree(&self, sql_text: &str, schema: Option<&str>) -> Result<Option<String>> {
         match self
-            .explain(sql::explain_rerun(sql_text, ExplainFormat::Tree))
+            .explain_rerun_in(sql::explain_rerun(sql_text, ExplainFormat::Tree), schema)
             .await?
         {
             ExplainOutcome::Plan(p) => Ok(Some(p)),

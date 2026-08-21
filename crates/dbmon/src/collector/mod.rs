@@ -596,7 +596,16 @@ where
             return PlanResult::failed(PlanFailure::NotExplainable);
         };
 
-        match self.db.explain_rerun(&pq.sql).await {
+        // **그 문장이 돌던 기본 스키마를 함께 넘긴다.**
+        //
+        // 애플리케이션은 보통 스키마를 잡고 접속하므로 SQL 원문에 스키마가 없다
+        // (`FROM orders`). 그대로 재실행하면 1046 `No database selected` 이고, 실측에서
+        // 로컬에 쌓인 플랜이 전부 테이블 없는 쿼리(`SELECT sleep(…)`)뿐이었던 이유다.
+        // 처리목록의 `db` 를 먼저 쓰고, 없으면 `events_statements_current` 의 현재 스키마.
+        let schema = full
+            .and_then(|r| r.db.as_deref())
+            .or_else(|| stmt.and_then(|s| s.current_schema.as_deref()));
+        match self.db.explain_rerun(&pq.sql, schema).await {
             Ok(ExplainOutcome::Plan(json)) => {
                 // **어휘 발산이 있으면 정확하다고 표시할 수 없다.** 앱과 우리가 같은
                 // 문자열을 다르게 파싱하므로, 얻은 플랜은 다른 쿼리의 플랜이다.

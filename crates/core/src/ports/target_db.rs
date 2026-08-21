@@ -135,6 +135,22 @@ pub enum PlanFailure {
     /// 1142 `ER_TABLEACCESS_DENIED_ERROR` — 읽기 전용 계정으로 DML 을 `EXPLAIN` 했다.
     /// → `RerunAsSelect`(DML 을 SELECT 로 변환) 경로로 전환한다.
     DmlPrivilegeMissing,
+    /// 1046 `ER_NO_DB_ERROR` — **기본 스키마 없이** `EXPLAIN` 을 보냈다.
+    ///
+    /// 애플리케이션은 보통 기본 스키마를 잡고 접속하므로 SQL 원문에 스키마가 없다
+    /// (`FROM orders`). 그 문장을 우리 커넥션에서 그대로 재실행하면 이 오류다 —
+    /// **권한 문제가 아니다.** 실측으로 갈랐다: 같은 계정이 `USE shop` 뒤에는 성공하고
+    /// (1046 없음), 스키마 권한이 없는 계정은 `USE` 를 해도 1142 다.
+    ///
+    /// 레코드에 처리목록에서 받은 `schema_name` 이 있으므로 재실행 전에 그것을 지정한다.
+    /// 이 값이 없는 경우(스키마 없이 접속한 세션)에만 남는 실패다.
+    NoSchemaSelected,
+    /// 1046 이 아니라 **대상 스키마에 대한 `SELECT` 권한이 없다** (1142 를 `USE` 이후에
+    /// 만났다). 운영자가 고칠 수 있는 유일한 종류다 — `GRANT SELECT ON <schema>.*`.
+    ///
+    /// `DmlPrivilegeMissing` 과 코드가 같아서(1142) 문장 종류로 구분한다: `SELECT` 를
+    /// explain 하다 1142 면 스키마 권한, DML 이면 그쪽이다.
+    SchemaPrivilegeMissing,
     /// `EXPLAIN` 은 성공했지만 결과가 비어 있다 (유휴 커넥션이었다).
     ///
     /// 실측: 유휴 커넥션에 `FOR CONNECTION` 을 걸면 **에러가 아니라 빈 결과**다.
@@ -153,6 +169,7 @@ impl PlanFailure {
         match code {
             1094 => Self::ThreadGone,
             3012 => Self::NotExplainable,
+            1046 => Self::NoSchemaSelected,
             1142 => Self::DmlPrivilegeMissing,
             1044 | 1045 | 1227 => Self::Denied,
             other => Self::Other(other),
@@ -166,6 +183,8 @@ impl PlanFailure {
             Self::NotExplainable => "not_explainable".into(),
             Self::Denied => "denied".into(),
             Self::DmlPrivilegeMissing => "dml_privilege_missing".into(),
+            Self::NoSchemaSelected => "no_schema_selected".into(),
+            Self::SchemaPrivilegeMissing => "schema_privilege_missing".into(),
             Self::NoStatement => "no_statement".into(),
             Self::Timeout => "timeout".into(),
             Self::Other(c) => format!("other:{c}"),
@@ -177,13 +196,29 @@ impl PlanFailure {
     /// `Denied` 도 포함한다 — 타인 커넥션 explain 권한이 없어도 **우리 커넥션에서
     /// 재실행**하는 것은 `SELECT` 권한만으로 된다(M1-4b).
     /// `NotExplainable` 은 재실행해도 같은 결과다.
+    ///
+    /// 스키마 관련 실패도 제외한다 — 같은 커넥션에서 같은 문장을 다시 보내면 같은
+    /// 오류이고, 그걸 시도 횟수로 세면 고칠 수 있는 실패(권한)가 **재시도 소진으로
+    /// 덮인다.**
     pub fn allows_rerun_fallback(&self) -> bool {
-        !matches!(self, Self::NotExplainable | Self::NoStatement)
+        !matches!(
+            self,
+            Self::NotExplainable
+                | Self::NoStatement
+                | Self::NoSchemaSelected
+                | Self::SchemaPrivilegeMissing
+        )
     }
 
     /// DML 을 `SELECT` 로 변환해 근사 플랜을 얻어야 하는가.
     pub fn requires_select_conversion(&self) -> bool {
         *self == Self::DmlPrivilegeMissing
+    }
+
+    /// **운영자가 조치할 수 있는 실패인가.** 화면·로그가 이걸 구분해야 "권한을 주면
+    /// 된다" 와 "구조적으로 안 된다"(RDS 의 `Denied`)가 섞이지 않는다.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, Self::SchemaPrivilegeMissing | Self::NoSchemaSelected)
     }
 
     /// 자가진단 실패로 승격해야 하는가.
@@ -254,10 +289,17 @@ pub trait TargetDb: Send + Sync {
     ///
     /// 호출자는 `dbmon_normalize::plan_query()` 로 만든 문장을 넘긴다 — DML 이면
     /// 조건절이 `SELECT` 로 변환돼 있다. `EXPLAIN` 은 문장을 실행하지 않는다.
-    async fn explain_rerun(&self, sql: &str) -> Result<ExplainOutcome>;
+    /// 문장을 `EXPLAIN FORMAT=JSON` 으로 재실행한다.
+    ///
+    /// `schema` 는 **그 문장이 실행됐던 기본 스키마**다(처리목록의 `db`). 애플리케이션은
+    /// 보통 스키마를 잡고 접속하므로 SQL 원문에 스키마가 없고(`FROM orders`), 그걸 우리
+    /// 커넥션에서 그대로 재실행하면 **1046 `No database selected`** 다 — 실측으로
+    /// 확인했고 로컬에 쌓인 플랜이 전부 테이블 없는 쿼리(`SELECT sleep(…)`)뿐이었던
+    /// 이유다. 값이 있으면 재실행 전에 그 스키마를 지정한다.
+    async fn explain_rerun(&self, sql: &str, schema: Option<&str>) -> Result<ExplainOutcome>;
 
     /// `FORMAT=TREE` 텍스트. 사람이 읽기 쉬워 UI 가치가 크다. 미지원이면 `None`.
-    async fn explain_tree(&self, sql: &str) -> Result<Option<String>>;
+    async fn explain_tree(&self, sql: &str, schema: Option<&str>) -> Result<Option<String>>;
 
     /// 다이제스트 스냅샷 (지표 컬럼만). `last_seen_gte_ms` 로 활성 다이제스트만 받는다.
     async fn digest_snapshot(&self, last_seen_gte_ms: Option<EpochMs>) -> Result<DigestSnapshot>;

@@ -235,6 +235,21 @@ pub fn explain_rerun(sql: &str, format: ExplainFormat) -> String {
     format!("/* dbmon:planrerun */ EXPLAIN {} {sql}", format.clause())
 }
 
+/// 기본 스키마를 지정하는 문장. **식별자를 엄격히 검증한다.**
+///
+/// 스키마 이름은 **대상 DB 에서 온 값**이다(처리목록의 `db` 열) — L1 위협 모델에서
+/// 공격자 통제 하에 있을 수 있으므로 값으로 신뢰하지 않는다. MySQL 식별자 규칙보다
+/// 더 좁게 `[A-Za-z0-9_$]` 와 64자로 제한하고, 벗어나면 **문장을 만들지 않는다**
+/// (`None`). 백틱 이스케이프에 기대는 대신 애초에 통과시키지 않는 쪽이다.
+pub fn use_schema(schema: &str) -> Option<String> {
+    let ok = !schema.is_empty()
+        && schema.len() <= 64
+        && schema
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$');
+    ok.then(|| format!("/* dbmon:useschema */ USE `{schema}`"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplainFormat {
     Json,
@@ -370,6 +385,29 @@ mod tests {
         assert!(q.ends_with("FOR CONNECTION 8842119"), "{q}");
         assert!(q.contains("FORMAT=JSON"));
         assert!(explain_for_connection(1, ExplainFormat::Tree).contains("FORMAT=TREE"));
+    }
+
+    /// **스키마 이름은 대상 DB 에서 온 값이다.** 식별자로 쓸 수 없는 값이 오면
+    /// 문장을 만들지 않는다 — 백틱 이스케이프의 정확성에 기대지 않는다.
+    #[test]
+    fn use_schema_rejects_anything_that_is_not_a_plain_identifier() {
+        assert_eq!(
+            use_schema("shop").as_deref(),
+            Some("/* dbmon:useschema */ USE `shop`")
+        );
+        assert!(use_schema("app_1$").is_some());
+        for bad in [
+            "",
+            "shop`; DROP DATABASE x; --",
+            "shop-1",
+            "shop schema",
+            "샵",
+            "shop.orders",
+            "`shop`",
+            &"x".repeat(65),
+        ] {
+            assert!(use_schema(bad).is_none(), "거부해야 한다: {bad}");
+        }
     }
 
     #[test]

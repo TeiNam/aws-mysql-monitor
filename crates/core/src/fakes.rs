@@ -747,7 +747,7 @@ impl TargetDb for FakeTargetDb {
         Ok(ExplainOutcome::Failed(PlanFailure::Denied))
     }
 
-    async fn explain_rerun(&self, _sql: &str) -> Result<ExplainOutcome> {
+    async fn explain_rerun(&self, _sql: &str, _schema: Option<&str>) -> Result<ExplainOutcome> {
         self.explain_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .explain
@@ -757,7 +757,7 @@ impl TargetDb for FakeTargetDb {
             .unwrap_or(ExplainOutcome::Failed(PlanFailure::NotExplainable)))
     }
 
-    async fn explain_tree(&self, _sql: &str) -> Result<Option<String>> {
+    async fn explain_tree(&self, _sql: &str, _schema: Option<&str>) -> Result<Option<String>> {
         Ok(None)
     }
 
