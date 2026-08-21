@@ -12,7 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import type { ReactNode } from "react";
 import { ApiError, fetchAuthConfig, isUnauthorized, queryKeys } from "../lib/api";
-import { BTN_GHOST } from "./ui";
+import { BTN_GHOST, CELL_X } from "./ui";
 
 const MESSAGES: Record<string, string> = {
   unauthorized: "접속 토큰이 없거나 만료됐다.",
@@ -103,7 +103,7 @@ function TokenNotice() {
 /** 로딩. 스켈레톤을 만들지 않는다 — 한 줄이면 위치가 충분히 전달된다. */
 export function Pending({ label }: { label: string }) {
   return (
-    <p className="px-3 py-6 text-sm text-gray-600" aria-live="polite">
+    <p className={`${CELL_X} py-6 text-sm text-gray-600`} aria-live="polite">
       {label}
     </p>
   );
@@ -113,7 +113,7 @@ export function Pending({ label }: { label: string }) {
 export function EmptyRow({ colSpan, children }: { colSpan: number; children: ReactNode }) {
   return (
     <tr>
-      <td className="px-3 py-6 text-sm text-gray-600" colSpan={colSpan}>
+      <td className={`${CELL_X} py-6 text-sm text-gray-600`} colSpan={colSpan}>
         {children}
       </td>
     </tr>

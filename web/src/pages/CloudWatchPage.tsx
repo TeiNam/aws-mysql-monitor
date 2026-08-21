@@ -9,6 +9,7 @@ import { EnvChip } from "../components/Shell";
 import { SqlModal } from "../components/SqlModal";
 import {
   CELL_ICON,
+  CELL_X,
   COL_GROW,
   COL_TIGHT,
   COL_TIGHT_CAPPED,
@@ -215,7 +216,7 @@ export function CloudWatchPage() {
                             ? EMPTY
                             : fmtInt(Math.round(row.avg_rows_examined))}
                         </td>
-                        <td className={`${COL_GROW} max-w-0 px-3 py-2 text-sm text-gray-700`}>
+                        <td className={`${COL_GROW} ${CELL_X} max-w-0 py-2 text-sm text-gray-700`}>
                           <div className={`truncate ${MONO}`}>
                             {/* **"미저장" 으로 뭉개지 않는다.** 권한이 없어 가려진 것과
                                 애초에 저장하지 않은 것은 운영자가 할 일이 다르다. */}

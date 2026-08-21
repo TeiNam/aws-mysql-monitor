@@ -30,6 +30,7 @@ import { StateBadge } from "../components/StateBadge";
 import {
   BTN_GHOST,
   CELL_ICON,
+  CELL_X,
   COL_GROW,
   COL_TIGHT,
   COL_TIGHT_CAPPED,
@@ -303,7 +304,7 @@ export function MySQLMonitorPage() {
                         </td>
                         {/* 남는 폭을 전부 받는다. `max-w-0` 가 있어야 긴 SQL 이 표를
                             밀어내지 않고 잘린다. */}
-                        <td className={`${COL_GROW} max-w-0 px-3 py-2 text-sm text-gray-700`}>
+                        <td className={`${COL_GROW} ${CELL_X} max-w-0 py-2 text-sm text-gray-700`}>
                           <div className="truncate font-mono text-xs">
                             {q.sql_text ??
                               (q.sql_redacted_reason === "insufficient_role"

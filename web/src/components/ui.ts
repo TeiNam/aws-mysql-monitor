@@ -22,6 +22,17 @@ export const PAGE_TITLE = "text-3xl font-bold tracking-tight text-gray-900";
 export const TABLE = "min-w-full divide-y divide-gray-200";
 
 /**
+ * 표 셀의 좌우 여백.
+ *
+ * **`px-3`(12px)에서 15px 로 올렸다.** 열을 내용 폭으로 좁히고 나니 이웃 열의 값이
+ * 붙어 보여 표가 복잡해졌다(사용자 지적). 이 값은 열 **경계마다 6px** 을 더 벌린다 —
+ * 셀마다 3px 씩 양쪽이 만나기 때문이다.
+ *
+ * 한 곳에 두는 이유: 머리·몸·빈 상태·긴 SQL 셀이 **같은 값을 써야** 열이 어긋나지 않는다.
+ */
+export const CELL_X = "px-[15px]";
+
+/**
  * **내용만큼만 차지하는 열.** 머리와 몸에 함께 붙인다.
  *
  * `min-w-full` 표는 남는 폭을 열마다 나눠 주므로, 짧은 값(스레드 번호·시각)이 든 열이
@@ -50,14 +61,14 @@ export const COL_TIGHT_CAPPED = `${COL_TIGHT} max-w-[16rem] truncate`;
  */
 export const COL_GROW = "w-full min-w-[22rem]";
 export const TH =
-  "px-3 py-2 bg-gray-50 text-left text-xs font-medium text-gray-600 uppercase tracking-wider whitespace-nowrap";
+  `${CELL_X} py-2 bg-gray-50 text-left text-xs font-medium text-gray-600 uppercase tracking-wider whitespace-nowrap`;
 export const TH_NUM = `${TH} text-right`;
 export const TBODY = "bg-white divide-y divide-gray-200";
 export const TR = "hover:bg-gray-50";
-export const TD = "px-3 py-2 whitespace-nowrap text-sm text-gray-800";
+export const TD = `${CELL_X} py-2 whitespace-nowrap text-sm text-gray-800`;
 /** 숫자 열. `tabular-nums` 가 없으면 자리수가 흔들려 표가 읽히지 않는다. */
 export const TD_NUM = `${TD} text-right tabular-nums`;
-export const TD_MUTED = "px-3 py-2 text-sm text-gray-600";
+export const TD_MUTED = `${CELL_X} py-2 text-sm text-gray-600`;
 
 export const SELECT =
   "block rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900 shadow-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40 focus:outline-none";

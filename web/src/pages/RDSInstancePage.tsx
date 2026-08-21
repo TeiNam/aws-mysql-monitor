@@ -5,6 +5,7 @@ import { CollectorControls } from "../components/CollectorControls";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { EnvChip } from "../components/Shell";
 import {
+  CELL_X,
   BTN_GHOST,
   CELL_ICON,
   MONO,
@@ -142,7 +143,7 @@ export function RDSInstancePage() {
                           {i.endpoint === null ? EMPTY : `${i.endpoint}:${i.port}`}
                         </td>
                         <td className={TD}>{i.instance_class ?? EMPTY}</td>
-                        <td className="max-w-[320px] px-3 py-2 text-sm">
+                        <td className={`${CELL_X} max-w-[320px] py-2 text-sm`}>
                           <Tags tags={i.tags} />
                         </td>
                         <td className={`${TD_NUM} text-gray-600`}>
