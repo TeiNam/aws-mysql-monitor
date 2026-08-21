@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
-import { BarChart3, Clock, Database, Filter, User } from "lucide-react";
+import { BarChart3, Clock, Database, User } from "lucide-react";
 import { useMemo } from "react";
 import { useSearchParams } from "react-router";
 import { Card } from "../components/Card";
+import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending, TruncatedNote } from "../components/Notices";
 import { EnvChip } from "../components/Shell";
 import {
@@ -39,11 +40,19 @@ export function StatisticsPage() {
   const [params, setParams] = useSearchParams();
   const month = params.get("month") ?? monthKey(new Date());
   const instance = params.get("instance") ?? "";
+  const env = params.get("env") ?? "";
+  const instanceLike = params.get("instance_like") ?? "";
 
   const months = useMemo(() => recentMonths(new Date(), 12), []);
+  // **필터는 조회 키에 들어간다.** 안 넣으면 필터를 바꿔도 캐시된 앞 결과가 그려진다.
   const statParams = useMemo(
-    () => ({ month, ...(instance === "" ? {} : { instance }) }),
-    [month, instance],
+    () => ({
+      month,
+      ...(instance === "" ? {} : { instance }),
+      ...(env === "" ? {} : { env }),
+      ...(instanceLike === "" ? {} : { instance_like: instanceLike }),
+    }),
+    [month, instance, env, instanceLike],
   );
 
   const stats = useQuery({
@@ -71,6 +80,17 @@ export function StatisticsPage() {
     setParams(next, { replace: true });
   }
 
+  /** 여러 값을 **한 번에** 바꾼다 — env 를 바꾸며 인스턴스를 지울 때 두 번 쓰면
+   *  중간 상태(새 env + 옛 인스턴스)로 한 번 조회가 나간다. */
+  function updateMany(patch: Record<string, string>) {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === "") next.delete(key);
+      else next.set(key, value);
+    }
+    setParams(next, { replace: true });
+  }
+
   const filters = (
     <>
       <label className={LABEL}>
@@ -88,22 +108,31 @@ export function StatisticsPage() {
           ))}
         </select>
       </label>
-      <label className={LABEL}>
-        <Filter className="h-4 w-4 text-gray-500" />
-        <select
-          className={SELECT}
-          value={instance}
-          onChange={(e) => update("instance", e.target.value)}
-          aria-label="인스턴스 선택"
-        >
-          <option value="">All Instances</option>
-          {(instances.data ?? []).map((i) => (
-            <option key={i.id} value={i.id}>
-              {i.name}
-            </option>
-          ))}
-        </select>
-      </label>
+      <EnvFilter
+        instances={instances.data ?? []}
+        env={env}
+        instance={instance}
+        instanceLike={instanceLike}
+        onChange={(patch) =>
+          updateMany({
+            ...(patch.env === undefined ? {} : { env: patch.env }),
+            ...(patch.instance === undefined ? {} : { instance: patch.instance }),
+          })
+        }
+      />
+      <InstanceFilter
+        instances={instances.data ?? []}
+        env={env}
+        instance={instance}
+        instanceLike={instanceLike}
+        onChange={(patch) => update("instance", patch.instance ?? "")}
+      />
+      <InstanceSearch
+        instances={instances.data ?? []}
+        env={env}
+        value={instanceLike}
+        onChange={(like) => update("instance_like", like)}
+      />
     </>
   );
 

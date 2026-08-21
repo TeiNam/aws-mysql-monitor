@@ -217,6 +217,8 @@ pub struct ListParams {
     cursor: Option<String>,
     /// 인스턴스 id. 없으면 등록부 전체를 훑는다.
     instance: Option<String>,
+    /// 인스턴스 **이름 조각**. 여러 대를 한 묶음으로 본다(`orders` → `orders-*`).
+    instance_like: Option<String>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     env: Option<String>,
@@ -252,6 +254,9 @@ async fn list_slow_queries(
     // 커서에 담긴 필터를 그대로 쓰면 위 스코프 검사가 건너뛰어진다.
     let filters = cursor::filters_hash(&[
         ("instance", p.instance.as_deref().unwrap_or("")),
+        // **필터가 바뀌면 커서는 무효다.** 빠뜨리면 `orders` 로 만든 커서를 다른
+        // 이름 조각에 그대로 쓸 수 있고, 그러면 위치가 다른 집합을 가리킨다.
+        ("instance_like", p.instance_like.as_deref().unwrap_or("")),
         ("from", &from_ms.to_string()),
         ("to", &to_ms.to_string()),
         ("env", p.env.as_deref().unwrap_or("")),
@@ -272,8 +277,11 @@ async fn list_slow_queries(
     let got = collect_views(
         &state,
         &ctx,
-        &allowed_envs,
-        p.instance.as_deref(),
+        &ReadFilter {
+            allowed: &allowed_envs,
+            instance: p.instance.as_deref(),
+            instance_like: p.instance_like.as_deref(),
+        },
         range,
         // 하나 더 읽어 "더 있다" 를 정확히 판정한다. `>` 만 쓰면 정확히 상한일 때
         // `has_more=false` 가 되어 마지막 페이지가 끝인 것처럼 보인다.
@@ -407,14 +415,37 @@ async fn list_instances(
 async fn self_instances(
     state: &ApiState,
     requested: Option<&str>,
+    name_like: Option<&str>,
 ) -> Result<Vec<dbmon_core::instance::Instance>, ApiError> {
     let all = dbmon_core::ports::InstanceRegistry::list(&*state.registry)
         .await
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
-    match requested {
-        Some(want) => Ok(all.into_iter().filter(|i| i.id.as_str() == want).collect()),
-        None => Ok(all),
-    }
+    let like = name_like.map(str::trim).filter(|s| !s.is_empty());
+    Ok(all
+        .into_iter()
+        .filter(|i| requested.is_none_or(|want| i.id.as_str() == want))
+        .filter(|i| like.is_none_or(|pat| name_matches(i.id.identifier(), pat)))
+        .collect())
+}
+
+/// 인스턴스 **이름**에 패턴이 들어 있나 (대소문자 무시).
+///
+/// # 왜 서버에서 거르는가
+///
+/// 화면에서 이름 조각으로 여러 인스턴스를 묶어 보려면 그 집합이 **읽기 상한을
+/// 나눠 갖는 단위**여야 한다. 클라이언트에서 걸러내면 서버는 등록부 전체에 몫을
+/// 뿌리므로, `orders-*` 5대를 보려는데 상한은 500대에 나뉘어 정작 그 5대의 최근
+/// 데이터가 빠진다([`collect_views`] 의 균등 분배).
+///
+/// # 왜 이름만 보는가
+///
+/// `InstanceId` 는 `계정/리전/이름` 이다. 전체를 매칭하면 `ap-northeast-2` 같은 조각이
+/// 모든 인스턴스에 걸려 필터가 아무 일도 하지 않는다.
+fn name_matches(identifier: &str, pattern: &str) -> bool {
+    // ASCII 소문자 비교로 충분하다 — RDS 식별자는 `[a-z0-9-]` 다.
+    identifier
+        .to_ascii_lowercase()
+        .contains(&pattern.to_ascii_lowercase())
 }
 
 fn parse_env(s: &str) -> Option<Env> {
@@ -451,6 +482,8 @@ pub struct AggregateParams {
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     instance: Option<String>,
+    /// 인스턴스 **이름 조각**. 여러 대를 한 묶음으로 집계한다(`orders` → `orders-*`).
+    instance_like: Option<String>,
     env: Option<String>,
     /// **접을 레코드 수의 상한이다** — 반환 행 수가 아니다.
     ///
@@ -539,13 +572,13 @@ fn aggregate_range(p: &AggregateParams, now_ms: i64) -> Result<TimeRange, ApiErr
 async fn collect_views(
     state: &ApiState,
     ctx: &AuthContext,
-    allowed: &[Env],
-    instance: Option<&str>,
+    filter: &ReadFilter<'_>,
     range: TimeRange,
     per_instance: usize,
     ceiling: usize,
 ) -> Result<Collected, ApiError> {
-    let instances = self_instances(state, instance).await?;
+    let allowed = filter.allowed;
+    let instances = self_instances(state, filter.instance, filter.instance_like).await?;
     if instances.is_empty() {
         return Ok(Collected {
             views: Vec::new(),
@@ -632,6 +665,21 @@ async fn collect_views(
         truncated,
         range,
     })
+}
+
+/// 어디를 읽을지 정하는 필터.
+///
+/// 인자 수를 줄이려는 것만이 아니다 — **세 값은 함께 움직인다.** 환경 스코프를 좁히면
+/// 인스턴스 집합이 바뀌고, 이름 조각은 그 집합을 다시 좁힌다. 따로 넘기면 호출부가
+/// 하나를 빼먹어도 컴파일이 통과한다(실제로 `env` 만 넘기고 `instance_like` 를 잊는
+/// 실수를 이 구조가 막는다).
+struct ReadFilter<'a> {
+    /// `사용자 스코프 ∩ 요청 env`. 레코드마다 이 집합으로 검사한다.
+    allowed: &'a [Env],
+    /// 정확한 인스턴스 id.
+    instance: Option<&'a str>,
+    /// 인스턴스 **이름 조각** — 여러 대를 한 묶음으로 본다.
+    instance_like: Option<&'a str>,
 }
 
 /// 읽기 결과. **좁힌 구간을 함께 돌려준다** — 이게 없으면 8일치 표본을 화면이
@@ -760,8 +808,11 @@ async fn collect_for_aggregate(
     collect_views(
         state,
         ctx,
-        &allowed,
-        p.instance.as_deref(),
+        &ReadFilter {
+            allowed: &allowed,
+            instance: p.instance.as_deref(),
+            instance_like: p.instance_like.as_deref(),
+        },
         range,
         AGGREGATE_PAGE,
         ceiling,
@@ -1217,6 +1268,28 @@ mod tests {
         let (kept, clipped) = clip_to_partition_budget(day, 500);
         assert!(!clipped);
         assert_eq!(kept.from_ms(), day.from_ms());
+    }
+
+    /// **이름 조각으로 여러 대를 묶는다.** 계정·리전 조각에는 걸리지 않아야 한다.
+    ///
+    /// 전체 `InstanceId`(`계정/리전/이름`)를 매칭하면 `ap-northeast-2` 같은 조각이 모든
+    /// 인스턴스에 걸려 필터가 아무 일도 하지 않는다 — 그건 필터가 있다고 믿게 만드는
+    /// 쪽이 더 나쁘다.
+    #[test]
+    fn a_name_fragment_groups_instances_without_matching_account_or_region() {
+        assert!(name_matches("orders-prd-01", "orders"));
+        assert!(name_matches("orders-prd-02", "orders"));
+        assert!(
+            name_matches("ORDERS-PRD-01", "orders"),
+            "대소문자를 무시한다"
+        );
+        assert!(name_matches("orders-prd-01", "PRD"));
+        assert!(!name_matches("billing-prd-01", "orders"));
+        // 이름 안의 조각이면 어디든 걸린다(접두만이 아니다).
+        assert!(name_matches("api-orders-01", "orders"));
+        // 계정·리전은 `identifier()` 에 없으므로 애초에 매칭 대상이 아니다.
+        assert!(!name_matches("orders-prd-01", "ap-northeast-2"));
+        assert!(!name_matches("orders-prd-01", "123456789012"));
     }
 
     #[test]

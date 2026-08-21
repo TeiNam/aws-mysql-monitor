@@ -5,13 +5,13 @@ import {
   Database,
   Download,
   FileJson,
-  Filter,
   Hash,
   Share2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
 import { Card } from "../components/Card";
+import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { PlanGraph } from "../components/PlanGraph";
 import { StateBadge } from "../components/StateBadge";
@@ -23,10 +23,8 @@ import {
   COL_GROW,
   COL_TIGHT,
   COL_TIGHT_CAPPED,
-  LABEL,
   MONO,
   PAGE_TITLE,
-  SELECT,
   TABLE,
   TBODY,
   TD,
@@ -47,12 +45,19 @@ import type { SlowQueryView } from "../lib/types";
 export function PlanVisualizationPage() {
   const [params, setParams] = useSearchParams();
   const instance = params.get("instance") ?? "";
+  const env = params.get("env") ?? "";
+  const instanceLike = params.get("instance_like") ?? "";
   const tz: Timezone = params.get("tz") === "UTC" ? "UTC" : "KST";
   const selected = params.get("record") ?? "";
 
+  // **필터는 조회 키에 들어간다.** 안 넣으면 필터를 바꿔도 캐시된 앞 결과가 그려진다.
   const listParams = useMemo(
-    () => ({ ...(instance === "" ? {} : { instance }) }),
-    [instance],
+    () => ({
+      ...(instance === "" ? {} : { instance }),
+      ...(env === "" ? {} : { env }),
+      ...(instanceLike === "" ? {} : { instance_like: instanceLike }),
+    }),
+    [instance, env, instanceLike],
   );
   const plans = useQuery({
     queryKey: queryKeys.plans(listParams),
@@ -62,6 +67,17 @@ export function PlanVisualizationPage() {
     queryKey: queryKeys.instances,
     queryFn: ({ signal }) => fetchInstances(signal),
   });
+
+  /** 여러 값을 **한 번에** 바꾼다 — env 를 바꾸며 인스턴스를 지울 때 두 번 쓰면
+   *  중간 상태(새 env + 옛 인스턴스)로 한 번 조회가 나간다. */
+  function updateMany(patch: Record<string, string>) {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === "") next.delete(key);
+      else next.set(key, value);
+    }
+    setParams(next, { replace: true });
+  }
 
   function update(key: string, value: string) {
     const next = new URLSearchParams(params);
@@ -90,22 +106,33 @@ export function PlanVisualizationPage() {
           </>
         }
         actions={
-          <label className={LABEL}>
-            <Filter className="h-4 w-4 text-gray-500" />
-            <select
-              className={SELECT}
-              value={instance}
-              onChange={(e) => update("instance", e.target.value)}
-              aria-label="인스턴스 선택"
-            >
-              <option value="">All Instances</option>
-              {(instances.data ?? []).map((i) => (
-                <option key={i.id} value={i.id}>
-                  {i.name}
-                </option>
-              ))}
-            </select>
-          </label>
+<>
+            <EnvFilter
+              instances={instances.data ?? []}
+              env={env}
+              instance={instance}
+              instanceLike={instanceLike}
+              onChange={(patch) =>
+                updateMany({
+                  ...(patch.env === undefined ? {} : { env: patch.env }),
+                  ...(patch.instance === undefined ? {} : { instance: patch.instance }),
+                })
+              }
+            />
+            <InstanceFilter
+              instances={instances.data ?? []}
+              env={env}
+              instance={instance}
+              instanceLike={instanceLike}
+              onChange={(patch) => update("instance", patch.instance ?? "")}
+            />
+            <InstanceSearch
+              instances={instances.data ?? []}
+              env={env}
+              value={instanceLike}
+              onChange={(like) => update("instance_like", like)}
+            />
+          </>
         }
         note={
           <>

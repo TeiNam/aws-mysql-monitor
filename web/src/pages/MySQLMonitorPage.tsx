@@ -4,7 +4,6 @@ import {
   Calendar,
   Clock,
   Database,
-  Filter,
   Globe,
   Hash,
   Pause,
@@ -21,6 +20,7 @@ import {
   CollectorFacts,
   useCollectorStatus,
 } from "../components/CollectorControls";
+import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { EnvChip } from "../components/Shell";
@@ -68,6 +68,8 @@ const WINDOW = 500;
 export function MySQLMonitorPage() {
   const [params, setParams] = useSearchParams();
   const instance = params.get("instance") ?? "";
+  const env = params.get("env") ?? "";
+  const instanceLike = params.get("instance_like") ?? "";
   const tz: Timezone = params.get("tz") === "UTC" ? "UTC" : "KST";
   const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
 
@@ -77,9 +79,15 @@ export function MySQLMonitorPage() {
   const [openSql, setOpenSql] = useState<SlowQueryView | null>(null);
 
   const queryClient = useQueryClient();
+  // **필터는 조회 키에 들어간다.** 안 넣으면 필터를 바꿔도 캐시된 앞 결과가 그려진다.
   const listParams = useMemo(
-    () => ({ limit: WINDOW, ...(instance === "" ? {} : { instance }) }),
-    [instance],
+    () => ({
+      limit: WINDOW,
+      ...(instance === "" ? {} : { instance }),
+      ...(env === "" ? {} : { env }),
+      ...(instanceLike === "" ? {} : { instance_like: instanceLike }),
+    }),
+    [instance, env, instanceLike],
   );
 
   const list = useQuery({
@@ -119,11 +127,19 @@ export function MySQLMonitorPage() {
   }, [slowqSeen, missedCount, queryClient]);
 
   function update(key: string, value: string) {
+    updateMany({ [key]: value });
+  }
+
+  /** 여러 값을 **한 번에** 바꾼다 — env 를 바꾸며 인스턴스를 지울 때 두 번 쓰면
+   *  중간 상태(새 env + 옛 인스턴스)로 한 번 조회가 나간다. */
+  function updateMany(patch: Record<string, string>) {
     const next = new URLSearchParams(params);
-    if (value === "") next.delete(key);
-    else next.set(key, value);
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === "") next.delete(key);
+      else next.set(key, value);
+    }
     // 필터가 바뀌면 첫 페이지로. 3페이지를 보다 필터를 바꾸면 빈 페이지가 된다.
-    if (key !== "page") next.delete("page");
+    if (!Object.keys(patch).every((k) => k === "page")) next.delete("page");
     setParams(next, { replace: true });
   }
 
@@ -150,22 +166,31 @@ export function MySQLMonitorPage() {
         }
         actions={
           <>
-            <label className={LABEL}>
-              <Filter className="h-4 w-4 text-gray-500" />
-              <select
-                className={SELECT}
-                value={instance}
-                onChange={(e) => update("instance", e.target.value)}
-                aria-label="인스턴스 선택"
-              >
-                <option value="">All Instances</option>
-                {(instances.data ?? []).map((i) => (
-                  <option key={i.id} value={i.id}>
-                    {i.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <EnvFilter
+              instances={instances.data ?? []}
+              env={env}
+              instance={instance}
+              instanceLike={instanceLike}
+              onChange={(patch) =>
+                updateMany({
+                  ...(patch.env === undefined ? {} : { env: patch.env }),
+                  ...(patch.instance === undefined ? {} : { instance: patch.instance }),
+                })
+              }
+            />
+            <InstanceFilter
+              instances={instances.data ?? []}
+              env={env}
+              instance={instance}
+              instanceLike={instanceLike}
+              onChange={(patch) => update("instance", patch.instance ?? "")}
+            />
+            <InstanceSearch
+              instances={instances.data ?? []}
+              env={env}
+              value={instanceLike}
+              onChange={(like) => update("instance_like", like)}
+            />
             <label className={LABEL}>
               <Globe className="h-4 w-4 text-gray-500" />
               <select
