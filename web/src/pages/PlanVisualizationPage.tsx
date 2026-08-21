@@ -386,9 +386,10 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
  * 원본 JSON 은 탭 아래에 그대로 남긴다 — 두 뷰가 못 읽는 형식이 오면 그게 유일한 근거다.
  */
 function PlanTabs({ json }: { json: string }) {
-  const [tab, setTab] = useState<"graph" | "plan">("graph");
+  // **표가 기본이다.** "무엇이 제일 비싼가" 를 먼저 보고, 모양이 궁금할 때 그래프로 간다.
+  const [tab, setTab] = useState<"plan" | "graph">("plan");
 
-  const button = (id: "graph" | "plan", label: string) => (
+  const button = (id: "plan" | "graph", label: string) => (
     <button
       type="button"
       onClick={() => setTab(id)}
@@ -408,8 +409,8 @@ function PlanTabs({ json }: { json: string }) {
   return (
     <div>
       <div className="mb-3 flex gap-1 border-b border-gray-200" role="tablist" aria-label="계획 보기 방식">
-        {button("graph", "그래프")}
         {button("plan", "plan")}
+        {button("graph", "그래프")}
       </div>
       {/* **양쪽을 항상 마운트하지 않는다.** 큰 계획에서 두 배로 그리게 되고, 그래프는
           SVG 를 노드 수만큼 만든다. 탭을 바꿀 때 다시 파싱하는 비용은 순수 함수라 작다. */}
