@@ -1,0 +1,188 @@
+# 이미지 발행 — 푸시하면 ECS 가 끌어갈 수 있는 이미지가 만들어진다.
+#
+# # 왜 CI 와 나누는가
+#
+# `ci.yml` 은 **검증**이다(빌드·스모크·`push: false`). 발행은 부수효과가 있고 실패의
+# 성격도 다르다 — 레지스트리 권한, 태그 충돌, 매니페스트 병합. 한 워크플로에 섞으면
+# 검증이 통과했는데 발행이 실패했을 때 "CI 가 빨간색" 이 무엇을 뜻하는지 흐려진다.
+#
+# # 두 레지스트리
+#
+# | 대상 | 언제 | 필요한 것 |
+# |---|---|---|
+# | GHCR (`ghcr.io/<owner>/<repo>`) | **항상** | 없음 (`GITHUB_TOKEN`) |
+# | ECR (계정 안) | `vars.AWS_ROLE_ARN` 이 있을 때만 | OIDC 역할 + 리포지토리 |
+#
+# GHCR 를 기본으로 두는 이유: 포크한 사람이 아무 설정 없이 이미지를 얻을 수 있다.
+# ECS 는 보통 ECR 에서 끌지만(같은 VPC·IAM), GHCR 도 퍼블릭 이미지면 끌 수 있다.
+# ECR 경로는 **설정이 있을 때만** 돈다 — 없는 계정에서 빨간 실패로 남지 않는다.
+#
+# # 아키텍처
+#
+# arm64(Graviton)와 amd64 를 **각자 네이티브 러너**에서 빌드해 매니페스트로 합친다.
+# QEMU 로 교차 빌드하면 `aws-lc-rs` 가 cmake 로 풀빌드되어 수십 분이 된다(ci.yml 주석).
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # 태그를 안 붙이고 지금 이미지를 원할 때.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  # ECR 경로의 OIDC. 역할이 설정되지 않으면 쓰이지 않는다.
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 소문자여야 한다 — GHCR 는 대문자 경로를 거부한다.
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ── 아키텍처별 빌드 → 다이제스트만 남긴다 ──────────────────────────────────
+  #
+  # 태그를 각 아키텍처에 붙이지 않는다. 붙이면 나중에 밀어 넣는 쪽이 이기고
+  # 매니페스트가 한 아키텍처만 가리킨다.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - platform: linux/amd64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: GHCR 로그인
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 빌드·푸시 (다이제스트만)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # 다이제스트로만 올린다. 태그는 병합 잡이 붙인다.
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          # **provenance 를 끈다.** OCI attestation 매니페스트가 붙으면 일부
+          # 레지스트리·풀러(구 ECS 에이전트 포함)가 매니페스트 목록을 해석하지 못한다.
+          provenance: false
+
+      - name: 다이제스트 기록
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          # `linux/arm64` → `linux-arm64` (파일명에 `/` 를 쓸 수 없다)
+          name=$(echo '${{ matrix.platform }}' | tr / -)
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # ── 매니페스트 병합 + 태그 ────────────────────────────────────────────────
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: GHCR 로그인
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 태그 계산
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 매니페스트 만들고 태그 붙이기
+        run: |
+          set -euo pipefail
+          digests=$(for f in /tmp/digests/*; do echo "${GHCR_IMAGE}@$(cat "$f")"; done)
+          echo "합칠 다이제스트:"; echo "$digests"
+          # `metadata-action` 이 준 태그 전부에 같은 매니페스트를 붙인다.
+          tags=$(echo '${{ steps.meta.outputs.tags }}' | while read -r t; do [ -n "$t" ] && printf -- '-t %s ' "$t"; done)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $tags $digests
+
+      - name: 확인
+        run: docker buildx imagetools inspect "${GHCR_IMAGE}:sha-${GITHUB_SHA}"
+
+  # ── ECR 미러 (선택) ───────────────────────────────────────────────────────
+  #
+  # `vars.AWS_ROLE_ARN` 과 `vars.ECR_REPOSITORY` 를 설정한 저장소에서만 돈다.
+  # 없으면 잡이 **건너뛰기**로 끝난다 — 설정하지 않은 사람에게 빨간 실패를 주지 않는다.
+  ecr:
+    needs: publish
+    if: vars.AWS_ROLE_ARN != '' && vars.ECR_REPOSITORY != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: AWS 자격증명 (OIDC — 장기 키를 쓰지 않는다)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-northeast-2' }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: GHCR 로그인 (원본을 읽는다)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: GHCR → ECR 복사 (다시 빌드하지 않는다)
+        run: |
+          set -euo pipefail
+          src="${GHCR_IMAGE}:sha-${GITHUB_SHA}"
+          dst="${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}"
+          # **재빌드하지 않는다.** 같은 다이제스트를 옮기므로 검증한 것과 배포되는 것이
+          # 같은 바이트다. 재빌드하면 그 보장이 없다.
+          docker buildx imagetools create \
+            -t "${dst}:sha-${GITHUB_SHA}" \
+            -t "${dst}:latest" \
+            "$src"
+          docker buildx imagetools inspect "${dst}:sha-${GITHUB_SHA}"
