@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { BarChart3, Clock, Database, User } from "lucide-react";
 import { useMemo } from "react";
 import { useSearchParams } from "react-router";
+import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending, TruncatedNote } from "../components/Notices";
@@ -9,7 +10,6 @@ import { EnvChip } from "../components/Shell";
 import {
   CELL_ICON,
   LABEL,
-  PAGE_TITLE,
   SELECT,
   TABLE,
   TBODY,
@@ -138,7 +138,7 @@ export function StatisticsPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className={PAGE_TITLE}>SQL Statistics</h1>
+      <PageHeader title="SQL Statistics" />
 
       <Card
         title={

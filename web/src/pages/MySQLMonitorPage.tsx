@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
+import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import {
   CollectorControls,
@@ -35,7 +36,6 @@ import {
   COL_TIGHT,
   COL_TIGHT_CAPPED,
   LABEL,
-  PAGE_TITLE,
   SELECT,
   TABLE,
   TBODY,
@@ -153,8 +153,10 @@ export function MySQLMonitorPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className={PAGE_TITLE}>MySQL Real-time Slow Query Monitor</h1>
-      <p className="-mt-4 text-sm text-gray-600 italic">= AWS Aurora for MySQL &amp; RDS =</p>
+      <PageHeader
+        title="MySQL Real-time Slow Query Monitor"
+        subtitle="= AWS Aurora for MySQL & RDS ="
+      />
 
       <ScraperStatus instances={instances.data ?? []} tz={tz} />
 

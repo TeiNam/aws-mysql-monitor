@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
+import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
@@ -25,7 +26,6 @@ import {
   COL_TIGHT,
   COL_TIGHT_CAPPED,
   MONO,
-  PAGE_TITLE,
   TABLE,
   TBODY,
   TD,
@@ -98,7 +98,7 @@ export function PlanVisualizationPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className={PAGE_TITLE}>Query Plan Visualization</h1>
+      <PageHeader title="Query Plan Visualization" />
 
       <Card
         title={

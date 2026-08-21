@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, CloudCog, Database, Search, User } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
+import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { BackfillButton } from "../components/CollectorControls";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
@@ -16,7 +17,6 @@ import {
   COL_TIGHT_CAPPED,
   LABEL,
   MONO,
-  PAGE_TITLE,
   SELECT,
   TABLE,
   TBODY,
@@ -104,7 +104,7 @@ export function CloudWatchPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className={PAGE_TITLE}>CloudWatch Slow Query Monitor</h1>
+      <PageHeader title="CloudWatch Slow Query Monitor" />
 
       <Card
         title={

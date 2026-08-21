@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, Clock, Database, RefreshCw, Server, X } from "lucide-react";
+import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { CollectorControls } from "../components/CollectorControls";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
@@ -9,7 +10,6 @@ import {
   BTN_GHOST,
   CELL_ICON,
   MONO,
-  PAGE_TITLE,
   TABLE,
   TBODY,
   TD,
@@ -39,7 +39,7 @@ export function RDSInstancePage() {
 
   return (
     <div className="space-y-6">
-      <h1 className={PAGE_TITLE}>RDS Instance Management</h1>
+      <PageHeader title="RDS Instance Management" />
 
       <Card
         title={

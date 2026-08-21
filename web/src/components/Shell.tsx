@@ -1,12 +1,43 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, CloudCog, Database, ExternalLink, Server, Share2 } from "lucide-react";
 import { useEffect } from "react";
-import { NavLink, Outlet } from "react-router";
+import { NavLink, Outlet, useLocation } from "react-router";
 import { useLive } from "../hooks/useLive";
 import { fetchAwsInfo, queryKeys } from "../lib/api";
 import { liveClient } from "../lib/live";
 import type { ConnState } from "../lib/live-reduce";
 import { PAGE } from "./ui";
+
+/**
+ * 탭을 바꾸면 **화면 맨 위에서 시작한다.**
+ *
+ * # 왜 필요한가 (실측)
+ *
+ * 라우터는 스크롤을 건드리지 않는다. 그래서 시작 위치가 **그 화면을 전에 본 적이
+ * 있는지에 따라 달라졌다**:
+ *
+ * | 상황 | 결과 |
+ * |---|---|
+ * | 첫 방문 (데이터 로딩 중 = 짧은 화면) | 브라우저가 스크롤을 0 으로 조인다 |
+ * | 다시 방문 (조회 캐시가 있어 즉시 전체 높이) | **이전 스크롤 600px 이 그대로 유지** |
+ *
+ * 즉 같은 탭을 눌러도 어떤 때는 맨 위, 어떤 때는 중간에서 시작한다.
+ *
+ * # `pathname` 만 본다
+ *
+ * 검색 파라미터(필터·월·선택한 레코드)까지 보면 **필터를 만질 때마다 화면이 위로
+ * 튄다** — 이름 조각을 한 글자 칠 때마다 점프하는 셈이다. 그건 지금 문제보다 나쁘다.
+ *
+ * 대가: 뒤로 가기에서도 맨 위로 간다(브라우저의 위치 복원을 덮는다). 5탭 도구에서는
+ * "항상 같은 자리에서 시작" 이 더 중요하다고 판단했다.
+ */
+function useScrollToTopOnTabChange() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    // 즉시 이동한다. `smooth` 는 탭 전환에서 굼벵이처럼 느껴진다.
+    window.scrollTo(0, 0);
+  }, [pathname]);
+}
 
 /** 참조 대시보드와 같은 5탭. 순서까지 같다 — 손이 기억하는 위치다. */
 const NAV = [
@@ -24,6 +55,8 @@ const NAV = [
  * `<Outlet />` 아래 화면 전체가 리렌더된다. 실시간 값이 필요한 조각만 잎에서 본다.
  */
 export function Shell() {
+  useScrollToTopOnTabChange();
+
   return (
     <div className="flex min-h-screen flex-col bg-gray-100">
       <header className="bg-white shadow-md">
