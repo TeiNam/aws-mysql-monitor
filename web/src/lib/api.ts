@@ -17,6 +17,7 @@
 import { authHeaders, clearToken } from "./auth";
 import type {
   AggregateEnvelope,
+  AppSettings,
   AuthConfig,
   AwsInfo,
   CollectorStatus,
@@ -27,6 +28,8 @@ import type {
   InstanceView,
   ListResponse,
   PlanView,
+  SettingsProblem,
+  SettingsView,
   SlowQueryView,
   UserStats,
 } from "./types";
@@ -245,6 +248,67 @@ export const resumeCollector = (scope: string) => postStatus("/api/collector/res
 export const runDiscovery = () => postStatus("/api/discovery/run");
 export const runBackfill = () => postStatus("/api/backfill/run");
 
+export function fetchSettings(signal: AbortSignal | null): Promise<SettingsView> {
+  return apiGet<SettingsView>("/api/settings", signal);
+}
+
+/**
+ * 저장 실패 중 **검증 실패만** 필드별 사유를 갖는다. 화면이 그 자리에 표시해야
+ * 하므로 오류 코드가 아니라 이 타입으로 꺼낸다.
+ */
+export class SettingsInvalid extends Error {
+  constructor(readonly problems: SettingsProblem[]) {
+    super("invalid_settings");
+    this.name = "SettingsInvalid";
+  }
+}
+
+/**
+ * 설정을 저장한다. `expected_version` 은 **읽은 값 그대로** 보낸다 —
+ * 그 사이 다른 관리자가 저장했으면 409 이고, 화면은 다시 읽어야 한다.
+ */
+export async function saveSettings(
+  expectedVersion: number,
+  settings: AppSettings,
+): Promise<SettingsView> {
+  const res = await fetch("/api/settings", {
+    method: "PUT",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "x-dbmon-control": "1",
+      ...authHeaders(),
+    },
+    body: JSON.stringify({ expected_version: expectedVersion, settings }),
+    cache: "no-store",
+  });
+  if (res.status === 401) {
+    clearToken();
+    throw new ApiError(401, await errorCodeOf(res));
+  }
+  if (res.status === 400) {
+    // 검증 실패는 `{error, problems}` 다. 본문을 못 읽으면 일반 오류로 떨어진다.
+    const problems = await problemsOf(res);
+    if (problems.length > 0) throw new SettingsInvalid(problems);
+    throw new ApiError(400, "invalid_settings");
+  }
+  if (!res.ok) throw new ApiError(res.status, await errorCodeOf(res));
+  return (await res.json()) as SettingsView;
+}
+
+async function problemsOf(res: Response): Promise<SettingsProblem[]> {
+  try {
+    const body: unknown = await res.json();
+    if (body !== null && typeof body === "object" && "problems" in body) {
+      const list = (body as { problems: unknown }).problems;
+      if (Array.isArray(list)) return list as SettingsProblem[];
+    }
+  } catch {
+    // 본문이 JSON 이 아니다 — 호출부가 일반 오류로 처리한다.
+  }
+  return [];
+}
+
 /** 마크다운은 JSON 이 아니다 — 텍스트로 받아 브라우저 다운로드로 넘긴다. */
 export async function fetchMarkdown(recordId: string): Promise<string> {
   const res = await request(`/api/queries/${encodeURIComponent(recordId)}/markdown`, null);
@@ -291,6 +355,7 @@ export const queryKeys = {
   statistics: (p: QueryParams) => ["statistics", p] as const,
   userStatistics: (p: QueryParams) => ["user-statistics", p] as const,
   fleetMetrics: ["fleet-metrics"] as const,
+  settings: ["settings"] as const,
   /** 범위가 키에 들어간다 — 안 넣으면 범위를 바꿔도 앞 결과가 그려진다. */
   instanceMetrics: (id: string, rangeMs: number) => ["instance-metrics", id, rangeMs] as const,
 };

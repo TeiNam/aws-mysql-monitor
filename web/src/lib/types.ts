@@ -320,6 +320,92 @@ export interface FleetMetricsResponse {
   lag_note: string;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 운영 설정 (`crates/core/src/settings.rs`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type SlackMode = "webhook" | "bot_token";
+
+export interface NotifySettings {
+  slack_enabled: boolean;
+  slack_mode: SlackMode;
+  slack_channel: string;
+  /**
+   * **Secrets Manager 참조**(ARN 또는 이름). 값 자체가 아니다.
+   *
+   * 서버는 가려서 보낸다(`••••abcd`). 그 문자열을 그대로 되돌려 보내면 서버가
+   * 기존 값을 유지한다 — 새 값을 넣을 때만 실제 문자열을 보낸다.
+   */
+  slack_secret: string;
+  message_template: string;
+}
+
+export interface AccountTarget {
+  account_id: string;
+  role_name: string;
+  regions: string[];
+  enabled: boolean;
+  label: string;
+}
+
+export interface DiscoverySettings {
+  /** 비어 있으면 서버가 배포 설정의 리전을 쓴다(`own_region`). */
+  regions: string[];
+  multi_account_enabled: boolean;
+  accounts: AccountTarget[];
+}
+
+export type AuthModeSetting = "off" | "token" | "cognito";
+
+export interface CognitoSettings {
+  user_pool_id: string;
+  client_id: string;
+  region: string;
+  domain: string;
+}
+
+export interface AuthSettings {
+  mode: AuthModeSetting;
+  cognito: CognitoSettings;
+}
+
+export interface AiSettings {
+  enabled: boolean;
+  model_id: string;
+  region: string;
+  max_output_tokens: number;
+}
+
+export interface AppSettings {
+  /** 낙관적 잠금. 저장할 때 **읽은 값을 그대로** 돌려보낸다. */
+  version: number;
+  notify: NotifySettings;
+  discovery: DiscoverySettings;
+  auth: AuthSettings;
+  ai: AiSettings;
+  updated_at_ms: number;
+  updated_by: string;
+}
+
+/** 어느 필드가 왜 틀렸는가. `field` 는 `notify.slack_secret` 처럼 점으로 이은 경로다. */
+export interface SettingsProblem {
+  field: string;
+  message: string;
+}
+
+export interface SettingsView {
+  settings: AppSettings;
+  problems: SettingsProblem[];
+  can_edit: boolean;
+  /** 파일 설정이 인증 끄기를 허용하는가. 거짓이면 그 선택이 잠긴다. */
+  allow_auth_disable: boolean;
+  /** Cognito 검증기가 배선돼 있는가. 거짓이면 골라도 적용되지 않는다. */
+  cognito_ready: boolean;
+  effective_auth_mode: AuthModeSetting;
+  own_region: string;
+  known_regions: string[];
+}
+
 export interface MetricSeries {
   name: string;
   label: string;

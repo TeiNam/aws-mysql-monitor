@@ -6,13 +6,13 @@ import { visibleEnvs } from "./Filters";
 import { BTN_GHOST, BTN_GREEN, BTN_RED, LABEL, SELECT } from "./ui";
 import {
   fetchCollectorStatus,
-  fetchInstances,
   pauseCollector,
   queryKeys,
   resumeCollector,
   runBackfill,
   runDiscovery,
 } from "../lib/api";
+import { useInstances } from "../hooks/useInstances";
 import { EMPTY, fmtListTime } from "../lib/format";
 import {
   ALL_SCOPE,
@@ -112,10 +112,9 @@ export function CollectorControls() {
   // **인스턴스 목록을 여기서 읽는다.** 같은 `queryKey` 라 화면이 이미 읽었으면
   // 요청이 한 번 더 나가지 않는다(react-query 캐시). 프롭으로 받으면 이 컴포넌트를
   // 쓰는 화면마다 배선이 늘어난다. 칩 이름(인스턴스 → 사람이 읽는 이름)에 필요하다.
-  const instanceQuery = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instanceQuery = useInstances();
   const instances: readonly InstanceView[] = instanceQuery.data ?? [];
   const queryClient = useQueryClient();
   const [scope, setScope] = useState(ALL_SCOPE);

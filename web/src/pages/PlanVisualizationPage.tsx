@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
+import { useInstances } from "../hooks/useInstances";
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters";
@@ -35,7 +36,7 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
-import { fetchInstances, fetchMarkdown, fetchPlan, fetchPlans, queryKeys } from "../lib/api";
+import { fetchMarkdown, fetchPlan, fetchPlans, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
 import { downloadText, formatMarkdown, formatSql } from "../lib/sql";
 import type { SlowQueryView } from "../lib/types";
@@ -75,10 +76,9 @@ export function PlanVisualizationPage() {
     queryKey: queryKeys.plans(listParams),
     queryFn: ({ signal }) => fetchPlans(listParams, signal),
   });
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
 
   /**
    * 조회 대상을 좁히는 키들. **이게 바뀌면 첫 페이지로 돌아간다** — 3페이지를 보다

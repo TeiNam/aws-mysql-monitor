@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, CloudCog, Database, Search, User } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
+import { useInstances } from "../hooks/useInstances";
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { BackfillButton } from "../components/CollectorControls";
@@ -26,7 +27,7 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
-import { fetchDigests, fetchInstances, queryKeys } from "../lib/api";
+import { fetchDigests, queryKeys } from "../lib/api";
 import {
   EMPTY,
   fmtDateTime,
@@ -74,10 +75,9 @@ export function CloudWatchPage() {
     queryKey: queryKeys.digests(digestParams),
     queryFn: ({ signal }) => fetchDigests(digestParams, signal),
   });
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
   const envOf = useMemo(() => {
     const map = new Map<string, string>();
     for (const i of instances.data ?? []) map.set(i.id, i.env);

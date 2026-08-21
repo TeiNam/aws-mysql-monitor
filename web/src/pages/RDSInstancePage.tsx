@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
 import { Check, Clock, Database, Pause, Play, RefreshCw, Server, X } from "lucide-react";
+import { useInstances } from "../hooks/useInstances";
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -24,7 +24,7 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
-import { fetchInstances, queryKeys, startInstance } from "../lib/api";
+import { queryKeys, startInstance } from "../lib/api";
 import { EMPTY, fmtDateTime } from "../lib/format";
 import {
   canControlScope,
@@ -46,10 +46,12 @@ import type { CollectorStatus, InstanceView } from "../lib/types";
  * 위해). 그래서 버튼 대신 마지막 관측 시각을 보여준다.
  */
 export function RDSInstancePage() {
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
+  // **`instances.data` 는 로딩 중 `undefined` 다.** 분기로 좁혀도 타입은 그대로이므로
+  // 표에서 쓰는 이름을 하나 둔다.
+  const rows = instances.data ?? [];
   // 표의 "수집" 열과 행 버튼이 정지를 반영해야 한다 — 같은 `queryKey` 라 요청은 늘지 않는다.
   const status = useCollectorStatus();
   const pausedScopes = status.data?.paused_scopes ?? [];
@@ -110,13 +112,13 @@ export function RDSInstancePage() {
                   </tr>
                 </thead>
                 <tbody className={TBODY}>
-                  {instances.data.length === 0 ? (
+                  {rows.length === 0 ? (
                     <EmptyRow colSpan={11}>
                       등록된 인스턴스가 없다. 탐색이 아직 돌지 않았거나, 필터(VPC·이름 규칙)가
                       전부 제외했다.
                     </EmptyRow>
                   ) : (
-                    instances.data.map((i) => (
+                    rows.map((i) => (
                       <tr key={i.id} className={TR}>
                         <td className={TD} title={i.id}>
                           <span className="flex items-center">

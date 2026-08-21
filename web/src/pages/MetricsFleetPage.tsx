@@ -19,8 +19,9 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
+import { useInstances } from "../hooks/useInstances";
 import { useLive, useLiveTopics } from "../hooks/useLive";
-import { fetchFleetMetrics, fetchInstances, queryKeys } from "../lib/api";
+import { fetchFleetMetrics, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtRate } from "../lib/format";
 import { MAX_TOPICS } from "../lib/live-reduce";
 import {
@@ -56,10 +57,9 @@ import {
 export function MetricsFleetPage() {
   const navigate = useNavigate();
   const live = useLive();
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
   const fleet = useQuery({
     queryKey: queryKeys.fleetMetrics,
     queryFn: ({ signal }) => fetchFleetMetrics(signal),

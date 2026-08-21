@@ -44,8 +44,9 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
+import { useInstances } from "../hooks/useInstances";
 import { useLive, useLiveMissed, useLiveSlowqSeen, useLiveTopics } from "../hooks/useLive";
-import { fetchInstances, fetchSlowQueries, queryKeys } from "../lib/api";
+import { fetchSlowQueries, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
 import type { InstanceView, SlowQueryView } from "../lib/types";
 
@@ -92,10 +93,9 @@ export function MySQLMonitorPage() {
     queryKey: queryKeys.slowQueries(listParams),
     queryFn: ({ signal }) => fetchSlowQueries(listParams, signal),
   });
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
 
   // ── 자동 새로고침 ──────────────────────────────────────────────────────────
   // 참조 구현과 같은 카운트다운. **`refetch` 가 아니라 무효화**를 쓴다 — 필터를

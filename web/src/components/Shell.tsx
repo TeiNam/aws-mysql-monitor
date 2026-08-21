@@ -5,17 +5,21 @@ import {
   Database,
   ExternalLink,
   Gauge,
+  Globe,
   LineChart,
   Server,
   Settings,
   Share2,
 } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
+import { useInstances } from "../hooks/useInstances";
 import { useLive } from "../hooks/useLive";
 import { fetchAwsInfo, queryKeys } from "../lib/api";
 import { liveClient } from "../lib/live";
 import type { ConnState } from "../lib/live-reduce";
+import { ALL_REGIONS, regionOfInstanceId, useRegionPicker } from "../lib/region-scope";
+import { regionLabel } from "../lib/regions";
 import { PAGE } from "./ui";
 
 /**
@@ -108,11 +112,14 @@ export function Shell() {
                 것이 이 도구에서 가장 자주 하는 동작이고, 표 머리글을 굵게 키운 뒤로는
                 탭이 표보다 작아 보였다.
 
-                탭 사이 28px 은 **아이콘–라벨 간격(6px)의 네 배**다. "무엇이 한 탭인가" 를
+                탭 사이 24px 은 **아이콘–라벨 간격(6px)의 네 배**다. "무엇이 한 탭인가" 를
                 간격만으로 읽을 수 있어야 한다 — 안쪽이 좁고 바깥쪽이 넓다.
-                1280px 창을 넘기면 마지막 탭이 계정 배지 아래로 들어가므로(실측) 이
-                간격이 상한이다. */}
-            <nav aria-label="주요 화면" className="flex gap-7">
+
+                28px 까지 벌렸다가 24px 로 되돌렸다: 머리말에 리전 이름
+                (`ap-northeast-2 (서울)`)이 들어오면서 마지막 탭과 계정 배지 사이가
+                7px 밖에 남지 않았고, 그러면 탭과 배지가 한 덩이로 읽힌다(실측).
+                1280px 가 최소 폭이므로 그 폭에서 성립해야 한다. */}
+            <nav aria-label="주요 화면" className="flex gap-6">
               {NAV.map(({ to, label, Icon }) => (
                 <NavLink
                   key={to}
@@ -216,17 +223,72 @@ function AwsBadge() {
   return (
     <span className="text-sm text-gray-700">
       <span title="AWS 계정">{account_id}</span>
-      <span className="mx-1.5 text-gray-300">|</span>
-      <span title="리전">{region}</span>
+      <span className="mx-1 text-gray-300">|</span>
+      {/* **리전 선택기**. 탐색 범위가 여러 리전일 때만 고를 수 있게 된다 —
+          하나뿐이면 고를 것이 없고, 선택기가 있으면 "다른 리전이 있나" 를 헷갈리게
+          한다. 리전 코드 옆에 이름을 붙이는 것은 `ap-northeast-1` 과 `-2` 를 눈으로
+          구분하기 위해서다(계정 착각과 같은 부류의 실수다). */}
+      <RegionPicker deploymentRegion={region} />
       {loudEnv ? (
         <>
-          <span className="mx-1.5 text-gray-300">|</span>
+          <span className="mx-1 text-gray-300">|</span>
           <span title="이 대시보드의 배포 환경">
             <EnvChip env={deployment_env} />
           </span>
         </>
       ) : null}
     </span>
+  );
+}
+
+/**
+ * 보고 있는 리전. 탐색 범위가 **여러 리전이면 고를 수 있다.**
+ *
+ * # 목록은 등록부에서 얻는다
+ *
+ * 설정(`/api/settings`)에도 리전 목록이 있지만 그건 "탐색하기로 한 곳" 이고, 이 선택기가
+ * 필터하는 대상은 "실제로 등록된 인스턴스" 다. 설정에 리전을 추가하고 탐색이 아직 돌지
+ * 않았으면 그 리전에는 아무것도 없으므로, **고를 수 있게 해 두면 빈 화면이 나온다.**
+ *
+ * 등록부가 비어 있으면(첫 기동) 배포 리전 하나를 보여준다 — 선택기가 사라지는 것보다
+ * "지금 여기를 본다" 가 보이는 편이 낫다.
+ */
+function RegionPicker({ deploymentRegion }: { deploymentRegion: string }) {
+  const { all } = useInstances();
+  const known = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of all ?? []) {
+      const r = regionOfInstanceId(i.id);
+      if (r !== null) set.add(r);
+    }
+    if (set.size === 0) set.add(deploymentRegion);
+    return [...set].sort();
+  }, [all, deploymentRegion]);
+  const { region, setRegion } = useRegionPicker(known);
+
+  if (known.length < 2) {
+    // 리전이 하나면 고를 것이 없다. 이름은 그래도 보여준다.
+    return <span title="리전">{regionLabel(known[0] ?? deploymentRegion)}</span>;
+  }
+  return (
+    <label className="inline-flex items-center gap-1" title="보고 있는 리전">
+      <Globe className="h-4 w-4 text-gray-500" aria-hidden="true" />
+      <select
+        aria-label="리전 선택"
+        className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-sm text-gray-800"
+        value={region}
+        onChange={(e) => setRegion(e.target.value)}
+      >
+        {/* **"전체" 가 기본이다.** 여러 리전을 모니터링하는 사람의 첫 질문은
+            "어디에 문제가 있나" 이고, 그건 전부를 봐야 답이 나온다. */}
+        <option value={ALL_REGIONS}>전체 ({known.length}개 리전)</option>
+        {known.map((r) => (
+          <option key={r} value={r}>
+            {regionLabel(r)}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

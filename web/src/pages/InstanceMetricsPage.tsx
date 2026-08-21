@@ -1,13 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { Clock, Gauge } from "lucide-react";
 import { useSearchParams } from "react-router";
+import { useInstances } from "../hooks/useInstances";
 import { Card } from "../components/Card";
 import { ErrorNotice, Note, Pending } from "../components/Notices";
 import { PageHeader } from "../components/PageHeader";
 import { EnvChip } from "../components/Shell";
 import { Sparkline } from "../components/Sparkline";
 import { LABEL, SELECT } from "../components/ui";
-import { fetchInstanceMetrics, fetchInstances, queryKeys } from "../lib/api";
+import { fetchInstanceMetrics, queryKeys } from "../lib/api";
 import { fmtListTime } from "../lib/format";
 import { formatMetric } from "../lib/metrics";
 import type { MetricSeries } from "../lib/types";
@@ -41,10 +42,9 @@ export function InstanceMetricsPage() {
   const selected = params.get("instance") ?? "";
   const rangeMs = Number.parseInt(params.get("range") ?? "", 10) || RANGES[1].ms;
 
-  const instances = useQuery({
-    queryKey: queryKeys.instances,
-    queryFn: ({ signal }) => fetchInstances(signal),
-  });
+  // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
+  // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
+  const instances = useInstances();
   const list = instances.data ?? [];
   // 고른 것이 없으면 첫 인스턴스를 본다. **없는 id 를 다른 것으로 갈아치우지 않는다** —
   // 오래된 링크로 들어왔을 때 엉뚱한 인스턴스의 메트릭을 보여주면 안 된다.
