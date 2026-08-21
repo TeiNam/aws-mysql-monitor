@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Calendar,
   Clock,
@@ -7,6 +7,7 @@ import {
   FileJson,
   Hash,
   Share2,
+  Sparkles,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
@@ -18,6 +19,7 @@ import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { PlanGraph } from "../components/PlanGraph";
 import { PlanTable } from "../components/PlanTable";
+import { TuningPanel } from "../components/TuningPanel";
 import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
 import {
@@ -36,10 +38,18 @@ import {
   TH_NUM,
   TR,
 } from "../components/ui";
-import { fetchMarkdown, fetchPlan, fetchPlans, queryKeys } from "../lib/api";
+import {
+  ApiError,
+  fetchMarkdown,
+  fetchPlan,
+  fetchPlans,
+  fetchTuning,
+  generateTuning,
+  queryKeys,
+} from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
 import { downloadText, formatMarkdown, formatSql } from "../lib/sql";
-import type { SlowQueryView } from "../lib/types";
+import type { SlowQueryView, TuningView } from "../lib/types";
 
 /**
  * 한 페이지에 보여줄 플랜 수.
@@ -278,9 +288,20 @@ export function PlanVisualizationPage() {
 
 function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
   const [downloading, setDownloading] = useState(false);
+  const queryClient = useQueryClient();
   const plan = useQuery({
     queryKey: queryKeys.plan(query.record_id),
     queryFn: ({ signal }) => fetchPlan(query.record_id, signal),
+  });
+  // **저장된 권고를 먼저 읽는다.** 조회는 만들지 않는다 — 화면을 열 때마다 모델을
+  // 부르면 청구서가 방문 수에 비례한다.
+  const tuning = useQuery({
+    queryKey: queryKeys.tuning(query.record_id),
+    queryFn: ({ signal }) => fetchTuning(query.record_id, signal),
+  });
+  const generate = useMutation({
+    mutationFn: () => generateTuning(query.record_id),
+    onSuccess: (view) => queryClient.setQueryData(queryKeys.tuning(query.record_id), view),
   });
 
   async function download() {
@@ -358,6 +379,14 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
             <FileJson className="h-5 w-5 text-gray-500" /> Query Execution Plan
           </>
         }
+        actions={
+          <TuningButton
+            view={tuning.data}
+            pending={generate.isPending}
+            error={generate.error}
+            onRun={() => generate.mutate()}
+          />
+        }
       >
         {plan.error !== null ? (
           <ErrorNotice error={plan.error} onRetry={() => void plan.refetch()} />
@@ -406,6 +435,14 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
               </details>
             )}
           </>
+        )}
+
+        {/* **권고는 계획 아래에 둔다.** 계획이 근거이고 권고가 해석이므로 읽는
+            순서가 그렇다. 생성 중에는 자리를 미리 잡아 화면이 튀지 않게 한다. */}
+        {generate.isPending ? (
+          <Pending label="스키마를 읽고 모델에 묻는 중… (수십 초 걸릴 수 있다)" />
+        ) : tuning.data?.advice === null || tuning.data?.advice === undefined ? null : (
+          <TuningPanel advice={tuning.data.advice} />
         )}
       </Card>
     </>
@@ -472,4 +509,68 @@ function Item({ label, children }: { label: string; children: React.ReactNode })
       <dd className="mt-0.5 text-sm text-gray-800">{children}</dd>
     </div>
   );
+}
+
+/**
+ * Tuning 버튼. **왜 못 누르는지 말한다** — 숨기면 "이 기능이 없다" 로 읽힌다.
+ *
+ * | 상태 | 표시 |
+ * |---|---|
+ * | 설정이 꺼졌다 | 비활성 + "설정에서 켠다" |
+ * | 권한이 없다 | 비활성 + "operator 이상" |
+ * | 이미 있다 | "다시 분석" (덮어쓴다) |
+ */
+function TuningButton({
+  view,
+  pending,
+  error,
+  onRun,
+}: {
+  view: TuningView | undefined;
+  pending: boolean;
+  error: unknown;
+  onRun: () => void;
+}) {
+  if (view === undefined) return null;
+  const reason = !view.enabled
+    ? "설정 화면에서 AI 튜닝을 켜고 모델을 지정한다"
+    : !view.can_generate
+      ? "생성은 operator 이상만 할 수 있다 (모델 호출 비용이 든다)"
+      : view.model_id;
+  const label = pending ? "분석 중…" : view.advice === null ? "Tuning" : "다시 분석";
+
+  return (
+    <span className="flex items-center gap-2">
+      {error === null ? null : (
+        <span className="text-xs font-medium text-red-700">{tuningErrorText(error)}</span>
+      )}
+      <button
+        type="button"
+        className={BTN_GHOST}
+        title={reason}
+        disabled={pending || !view.enabled || !view.can_generate}
+        onClick={onRun}
+      >
+        <Sparkles className="h-4 w-4" />
+        {label}
+      </button>
+    </span>
+  );
+}
+
+/** 실패 사유를 사람 말로. **"실패했다" 만 주면 무엇을 고칠지 알 수 없다.** */
+function tuningErrorText(error: unknown): string {
+  if (!(error instanceof ApiError)) return "분석에 실패했다";
+  switch (error.code) {
+    case "ai_disabled":
+      return "설정에서 AI 튜닝이 꺼져 있다";
+    case "model_failed":
+      return "모델 호출이 실패했다 — 모델 ID·리전·권한을 확인한다";
+    case "operator_required":
+      return "권한이 없다 (operator 이상)";
+    case "tuning_unavailable":
+      return "이 워커에서 분석할 수 없다";
+    default:
+      return `분석에 실패했다 (${error.code})`;
+  }
 }

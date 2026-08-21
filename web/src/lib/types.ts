@@ -406,6 +406,60 @@ export interface SettingsView {
   known_regions: string[];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AI 튜닝 권고 (`crates/core/src/tuning.rs`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type Confidence = "high" | "medium" | "low";
+
+export interface TuningFinding {
+  title: string;
+  evidence: string;
+  impact: string;
+}
+
+export interface TuningIndexAdvice {
+  /** `스키마.테이블`. 서버가 **컨텍스트에 있던 테이블인지 검증**한 뒤 남긴 것이다. */
+  table: string;
+  columns: string[];
+  /** 복사용 DDL. **이 도구는 실행하지 않는다** (FR-AI-09). */
+  ddl: string;
+  rationale: string;
+  covering: boolean;
+}
+
+export interface TuningRewrite {
+  sql: string;
+  rationale: string;
+}
+
+export interface TuningAdvice {
+  summary: string;
+  findings: TuningFinding[];
+  indexes: TuningIndexAdvice[];
+  rewrite: TuningRewrite | null;
+  verification: string[];
+  /** 한계·주의. **서버가 버린 제안도 여기 남는다.** */
+  caveats: string[];
+  confidence: Confidence;
+  model_id: string;
+  prompt_version: number;
+  created_at_ms: number;
+  schema_fingerprint: string;
+  /** 0 이면 스키마 없이 실행계획만으로 분석했다는 뜻이다. */
+  tables_analyzed: number;
+}
+
+export interface TuningView {
+  /** `null` 이면 **아직 만들지 않았다** — "권고가 비어 있다" 와 다르다. */
+  advice: TuningAdvice | null;
+  /** 이 배포에서 생성이 가능한가(설정이 켜져 있고 모델이 지정됐는가). */
+  enabled: boolean;
+  /** 이 사용자가 생성할 수 있는가(operator 이상). */
+  can_generate: boolean;
+  model_id: string;
+}
+
 export interface MetricSeries {
   name: string;
   label: string;

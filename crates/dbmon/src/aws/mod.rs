@@ -5,6 +5,7 @@
 //! 하나라도 통과시키면 그걸로 끝이므로 위험은 호출이 아니라 판정에 있다.
 
 pub mod auth_token;
+pub mod bedrock;
 pub mod cloudwatch;
 pub mod discovery;
 pub mod filter;

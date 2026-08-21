@@ -434,6 +434,139 @@ fn unix_seconds_to_ms(v: Option<f64>) -> Option<EpochMs> {
     v.map(|s| (s * 1000.0).round() as EpochMs)
 }
 
+/// 튜닝 컨텍스트 수집 — **트레이트가 아니라 고유 메서드다.**
+///
+/// # 왜 포트에 넣지 않았는가
+///
+/// `TargetDb` 는 수집 루프가 쓰는 계약이고, 구현이 넷(실제·가짜 셋)이다. 사람이 버튼을
+/// 눌렀을 때만 도는 경로를 그 계약에 넣으면 **모든 가짜가 이 메서드를 흉내내야** 하고,
+/// 그 흉내는 아무것도 검증하지 않는다. 튜닝 서비스는 어댑터 계층에 있으므로
+/// `TargetMysql` 을 직접 알아도 된다.
+impl TargetMysql {
+    /// 참조 테이블의 명세 — 메타 + 인덱스 + DDL.
+    ///
+    /// **쿼리 세 종류를 쓴다**: 메타 1회, 인덱스 1회, `SHOW CREATE TABLE` 은 테이블마다
+    /// 1회(구문상 묶을 수 없다). 테이블 10개면 12회이고, 사람이 누를 때만 돈다.
+    ///
+    /// 실패는 **부분 결과로 처리한다.** DDL 하나를 못 읽었다고 전체를 포기하면
+    /// 인덱스 정보만으로도 가능한 분석을 잃는다.
+    pub async fn table_specs(
+        &self,
+        tables: &[dbmon_core::tuning::QualifiedTable],
+    ) -> Result<Vec<dbmon_core::tuning::TableSpec>> {
+        use dbmon_core::tuning::{IndexColumn, IndexSpec, QualifiedTable, TableSpec};
+        use std::collections::BTreeMap;
+
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pairs: Vec<Value> = tables
+            .iter()
+            .flat_map(|t| [Value::from(t.schema.as_str()), Value::from(t.name.as_str())])
+            .collect();
+
+        // ① 메타
+        let meta_rows: Vec<Row> = self
+            .query_bulk(sql::table_meta(tables.len()), pairs.clone())
+            .await?;
+        let mut specs: BTreeMap<(String, String), TableSpec> = BTreeMap::new();
+        for r in &meta_rows {
+            let schema: String = opt(r, 0).unwrap_or_default();
+            let name: String = opt(r, 1).unwrap_or_default();
+            let updated: String = opt(r, 6).unwrap_or_default();
+            specs.insert(
+                (schema.clone(), name.clone()),
+                TableSpec {
+                    table: QualifiedTable::new(schema, name),
+                    engine: opt(r, 2),
+                    create_ddl: None,
+                    table_rows: opt(r, 3),
+                    data_bytes: opt(r, 4),
+                    index_bytes: opt(r, 5),
+                    // 빈 문자열은 "모른다" 다 — `UPDATE_TIME` 은 InnoDB 에서 흔히 NULL 이다.
+                    stats_updated_at: (!updated.is_empty()).then_some(updated),
+                    indexes: Vec::new(),
+                },
+            );
+        }
+
+        // ② 인덱스. **행이 컬럼 단위로 오므로 인덱스별로 접는다.**
+        let idx_rows: Vec<Row> = self
+            .query_bulk(sql::table_indexes(tables.len()), pairs)
+            .await?;
+        for r in &idx_rows {
+            let key = (
+                opt::<String>(r, 0).unwrap_or_default(),
+                opt::<String>(r, 1).unwrap_or_default(),
+            );
+            let Some(spec) = specs.get_mut(&key) else {
+                continue;
+            };
+            let index_name: String = opt(r, 2).unwrap_or_default();
+            let non_unique: i64 = num(r, 3);
+            let column: String = opt(r, 5).unwrap_or_default();
+            let visible: String = opt(r, 9).unwrap_or_else(|| "YES".to_string());
+            let col = IndexColumn {
+                name: column,
+                sub_part: opt(r, 6),
+                cardinality: opt(r, 7),
+            };
+            match spec.indexes.iter_mut().find(|i| i.name == index_name) {
+                // 같은 인덱스의 다음 컬럼. `SEQ_IN_INDEX` 로 정렬돼 오므로 순서가 맞다.
+                Some(existing) => existing.columns.push(col),
+                None => spec.indexes.push(IndexSpec {
+                    name: index_name,
+                    unique: non_unique == 0,
+                    visible: visible.eq_ignore_ascii_case("YES"),
+                    index_type: opt(r, 8).unwrap_or_default(),
+                    columns: vec![col],
+                }),
+            }
+        }
+
+        // ③ DDL. **없는 테이블은 여기서 걸러진다** — 메타에 없으면 권한이 없거나
+        //    존재하지 않으므로 굳이 `SHOW CREATE` 를 던지지 않는다.
+        for spec in specs.values_mut() {
+            let Some(stmt) = sql::show_create_table(&spec.table.schema, &spec.table.name) else {
+                tracing::warn!(
+                    table = %spec.table.qualified(),
+                    "식별자를 인용할 수 없다 — DDL 없이 진행한다"
+                );
+                continue;
+            };
+            match self.query_bulk::<Row>(stmt, Vec::new()).await {
+                // `SHOW CREATE TABLE` 은 `(Table, Create Table)` 두 컬럼이다.
+                Ok(rows) => {
+                    if let Some(ddl) = rows.first().and_then(|r| opt::<String>(r, 1)) {
+                        let clean = dbmon_core::tuning::neutralize_ddl(&ddl);
+                        spec.create_ddl = Some(truncate_chars(
+                            &clean,
+                            dbmon_core::tuning::MAX_DDL_CHARS,
+                        ));
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    table = %spec.table.qualified(),
+                    error = %crate::telemetry::Scrubbed(&e),
+                    "DDL 을 읽지 못했다 — 인덱스 정보만으로 진행한다"
+                ),
+            }
+        }
+
+        Ok(specs.into_values().collect())
+    }
+}
+
+/// 문자 경계에서 자른다. **바이트로 자르면 UTF-8 이 깨진다**(한글 주석·컬럼명).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("\n-- (이하 생략: DDL 이 상한을 넘었다)");
+    out
+}
+
 #[async_trait::async_trait]
 impl TargetDb for TargetMysql {
     async fn probe(&self, threshold_secs: u32, excludes: &Excludes) -> Result<ProbeResult> {

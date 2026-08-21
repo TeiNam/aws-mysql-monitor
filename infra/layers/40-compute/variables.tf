@@ -263,3 +263,68 @@ variable "slowlog_log_group_arns" {
     error_message = "prd 가 아니면 slowlog_log_group_arns 를 명시해야 한다."
   }
 }
+
+# ── 크로스 계정 탐색 ─────────────────────────────────────────────────────────
+
+variable "discovery_account_ids" {
+  description = <<-EOT
+    다른 계정의 RDS 도 탐색할 때 그 계정 번호들.
+
+    비어 있으면 `sts:AssumeRole` 정책을 **만들지 않는다** — 멀티 계정을 쓰지 않는
+    배포가 기본이고, 쓰지 않는 권한을 두지 않는다.
+
+    화면 설정(`설정 → 탐색 범위`)의 계정 목록과 **같아야 한다.** 여기 없는 계정을
+    화면에 넣으면 탐색이 AccessDenied 로 실패하고 목록에 뜨지 않는다.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.discovery_account_ids : can(regex("^[0-9]{12}$", id))])
+    error_message = "계정 번호는 숫자 12자리다."
+  }
+}
+
+variable "discovery_role_name" {
+  description = "대상 계정에서 맡을 역할 이름. 계정마다 같은 이름으로 만든다."
+  type        = string
+  default     = "dbmon-discovery"
+}
+
+# ── AI 튜닝 ─────────────────────────────────────────────────────────────────
+
+variable "enable_ai_tuning" {
+  description = "Bedrock 호출 권한을 붙이는가. 화면 설정(`설정 → AI 튜닝`)과 함께 켜야 동작한다."
+  type        = bool
+  default     = false
+}
+
+variable "bedrock_model_ids" {
+  description = <<-EOT
+    허용할 모델·추론 프로파일 ID.
+
+    **열거한다.** `*` 로 열면 계정의 모든 모델(단가가 전혀 다른 이미지·비디오 모델
+    포함)을 부를 수 있다. 화면에서 고른 모델이 여기 없으면 호출이 AccessDenied 다.
+  EOT
+  type        = list(string)
+  default     = ["global.anthropic.claude-sonnet-5"]
+}
+
+# ── 알림 채널 ───────────────────────────────────────────────────────────────
+
+variable "enable_notifications" {
+  description = "알림 채널 비밀 읽기 권한을 붙이는가."
+  type        = bool
+  default     = false
+}
+
+variable "channel_secret_prefix" {
+  description = <<-EOT
+    알림 채널 비밀의 이름 접두어([10 §3.4] 의 `dbmon/channel/`).
+
+    접두어로 좁히는 이유: `*` 로 열면 이 태스크가 **DB 마스터 암호를 포함해** 계정의
+    모든 비밀을 읽을 수 있다.
+  EOT
+  type        = string
+  default     = "dbmon/channel/"
+}

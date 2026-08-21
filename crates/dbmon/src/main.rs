@@ -16,7 +16,7 @@ use dbmon::config::{Config, Role};
 use dbmon::health::{Readiness, healthz, readyz};
 use dbmon::shutdown::{Shutdown, run_stages, stage, wait_for_signal};
 use dbmon::telemetry;
-use dbmon_core::ports::{AuthTokenProvider, InstanceRegistry};
+use dbmon_core::ports::InstanceRegistry;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -180,10 +180,16 @@ async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Re
         )),
         settings: Arc::new(dbmon::settings_state::SettingsState::new(Arc::new(
             dbmon::store::settings::DynamoSettingsStore::new(
-                client,
+                client.clone(),
                 config.storage.config_table.clone(),
             ),
         ))),
+        // 튜닝 권고는 **데이터 테이블**이다 — 레코드에 딸린 산출물이므로 TTL 로
+        // 함께 사라져야 한다.
+        advice: Arc::new(dbmon::store::tuning::DynamoTuningStore::new(
+            client,
+            config.storage.data_table.clone(),
+        )),
     })
 }
 
@@ -199,6 +205,8 @@ struct Stores {
     checkpoint: Arc<dbmon::store::checkpoint::DynamoCheckpointStore>,
     /// 운영 설정(탐색 범위·알림·인증·모델). config 테이블의 `CFG/GLOBAL`.
     settings: Arc<dbmon::settings_state::SettingsState>,
+    /// AI 튜닝 권고 저장소.
+    advice: Arc<dbmon::store::tuning::DynamoTuningStore>,
 }
 
 /// CloudWatch 메트릭 서비스를 만든다.
@@ -691,82 +699,6 @@ async fn discover(
     outcome
 }
 
-/// 대상 접속 비밀을 발급하는 주체를 **리전별로** 만든다.
-///
-/// # 왜 리전별인가
-///
-/// IAM DB Auth 토큰은 **대상 인스턴스의 리전**으로 서명해야 한다([07 §3.1]).
-/// 배포 리전으로 서명하면 `Access denied` 가 되고, 원인이 IAM 정책처럼 보여 추적이
-/// 오래 걸린다. `target_regions` 가 여러 개면 공급자도 여러 개다.
-///
-/// 처음에는 `config.aws.region` 하나로 만들었다 — 크로스 리전 대상이 전부 거부되는
-/// 배선이었다.
-///
-/// # dev 폴백
-///
-/// **`dev` + 환경변수가 있을 때만 고정 비밀번호를 쓴다.** 두 조건이 모두 필요하다 —
-/// 환경변수만 보면 prd 태스크에 그 변수가 새어 들어갔을 때 IAM 대신 비밀번호로
-/// 붙으려 하고, 실패 원인이 "인증 실패" 로만 보인다.
-async fn build_auth(config: &Config) -> TargetAuth {
-    use aws_config::BehaviorVersion;
-    use dbmon::aws::auth_token::{IamAuthTokenProvider, StaticPasswordProvider};
-
-    if config.deployment_env == dbmon_core::env::Env::Dev {
-        if let Some(p) = StaticPasswordProvider::from_env() {
-            tracing::info!("대상 인증: 고정 비밀번호 (dev 폴백)");
-            return TargetAuth::Shared(Arc::new(p));
-        }
-    }
-
-    let mut by_region: std::collections::BTreeMap<String, Arc<dyn AuthTokenProvider>> =
-        std::collections::BTreeMap::new();
-    for region in config.target_regions() {
-        // **저장소용 SDK 설정을 재사용하지 않는다.** 로컬 개발 경로에서 그쪽은
-        // 더미 자격증명(`local`/`local`)을 들고 있어 토큰이 조용히 무효해진다.
-        let sdk = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.clone()))
-            .load()
-            .await;
-        match sdk.credentials_provider() {
-            Some(creds) => {
-                by_region.insert(
-                    region.clone(),
-                    Arc::new(IamAuthTokenProvider::new(creds.clone(), region.clone())),
-                );
-            }
-            // 여기서 패닉하지 않는다 — 기동은 되고 `/readyz` 와 로그가 사유를 보고한다.
-            None => tracing::error!(
-                %region,
-                "자격증명 공급자가 없다 — 이 리전의 대상에 접속할 수 없다"
-            ),
-        }
-    }
-    tracing::info!(regions = ?by_region.keys().collect::<Vec<_>>(), "대상 인증: IAM DB Auth");
-    TargetAuth::PerRegion(by_region)
-}
-
-/// 대상 인증 공급자 묶음.
-#[derive(Clone)]
-enum TargetAuth {
-    /// dev 폴백 — 리전과 무관하다.
-    Shared(Arc<dyn AuthTokenProvider>),
-    /// IAM DB Auth — **리전마다 다른 공급자.**
-    PerRegion(std::collections::BTreeMap<String, Arc<dyn AuthTokenProvider>>),
-}
-
-impl TargetAuth {
-    /// 이 인스턴스의 리전에 맞는 공급자.
-    ///
-    /// 없으면 `None` 이다 — **다른 리전 공급자로 대신하지 않는다.** 그러면 서명이
-    /// 틀린 토큰으로 접속을 시도하고 실패 원인이 IAM 정책처럼 보인다.
-    fn for_region(&self, region: &str) -> Option<Arc<dyn AuthTokenProvider>> {
-        match self {
-            Self::Shared(p) => Some(Arc::clone(p)),
-            Self::PerRegion(m) => m.get(region).cloned(),
-        }
-    }
-}
-
 /// 인스턴스별 수집 태스크 집합.
 struct CollectTasks {
     handles: std::collections::BTreeMap<String, tokio::task::JoinHandle<()>>,
@@ -917,7 +849,7 @@ struct CollectDeps {
     /// 실시간 지표 방송. 슬로우 쿼리는 저장소 래퍼가 방송하지만 지표는
     /// 저장하지 않으므로(휘발성) 여기서 직접 넣는다.
     hub: dbmon::api::hub::Hub,
-    auth: TargetAuth,
+    auth: dbmon::aws::auth_token::TargetAuth,
     config: Arc<Config>,
     worker_id: String,
     /// **인스턴스별** 마지막 성공 시각 (FR-OPS-09 `CollectStaleness`).
@@ -1268,7 +1200,7 @@ fn spawn_leader_loop(
     config: &Config,
     worker_id: String,
     stores: Stores,
-    auth: TargetAuth,
+    auth: dbmon::aws::auth_token::TargetAuth,
     wiring: LoopWiring,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let LoopWiring {
@@ -2011,6 +1943,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 controls: Arc::clone(&controls),
                 pause: Arc::clone(&stores.pause),
                 settings: Arc::clone(&stores.settings),
+                // **API 워커도 대상 DB 에 붙는다** — 튜닝 컨텍스트(테이블 명세)를
+                // 사람이 누를 때 모으기 때문이다. 자격증명이 없으면 `None` 이 되고
+                // 화면이 사유를 표시한다(조용히 빈 권고를 만들지 않는다).
+                tuning: Some(Arc::new(dbmon::tuning::TuningService {
+                    registry: Arc::clone(&stores.registry),
+                    advice: Arc::clone(&stores.advice),
+                    settings: Arc::clone(&stores.settings),
+                    auth: Arc::new(dbmon::aws::auth_token::build_target_auth(&config).await),
+                    config: Arc::new(config.clone()),
+                })),
                 // **파일 설정만이 인증 끄기를 허용할 수 있다.** 화면에서 두 번째
                 // 허용을 눌러야 실제로 꺼진다.
                 allow_auth_disable: config.http.allow_auth_disable,
@@ -2022,7 +1964,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             });
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
-            let auth = build_auth(&config).await;
+            let auth = dbmon::aws::auth_token::build_target_auth(&config).await;
             spawn_leader_loop(
                 &config,
                 worker_id,

@@ -25,6 +25,7 @@ pub mod lease;
 pub mod pause;
 pub mod registry;
 pub mod settings;
+pub mod tuning;
 
 use std::collections::HashMap;
 

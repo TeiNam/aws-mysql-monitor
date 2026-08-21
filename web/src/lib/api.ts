@@ -30,6 +30,7 @@ import type {
   PlanView,
   SettingsProblem,
   SettingsView,
+  TuningView,
   SlowQueryView,
   UserStats,
 } from "./types";
@@ -309,6 +310,18 @@ async function problemsOf(res: Response): Promise<SettingsProblem[]> {
   return [];
 }
 
+export function fetchTuning(recordId: string, signal: AbortSignal | null): Promise<TuningView> {
+  return apiGet<TuningView>(`/api/queries/${encodeURIComponent(recordId)}/tuning`, signal);
+}
+
+/**
+ * 튜닝 권고를 **새로 만든다.** 모델 호출이라 수십 초 걸릴 수 있다.
+ *
+ * `operator` 이상만 통과한다 — 대상 DB 에 쿼리를 던지고 토큰을 쓰는 조작이다.
+ */
+export const generateTuning = (recordId: string) =>
+  post<TuningView>(`/api/queries/${encodeURIComponent(recordId)}/tuning`);
+
 /** 마크다운은 JSON 이 아니다 — 텍스트로 받아 브라우저 다운로드로 넘긴다. */
 export async function fetchMarkdown(recordId: string): Promise<string> {
   const res = await request(`/api/queries/${encodeURIComponent(recordId)}/markdown`, null);
@@ -356,6 +369,7 @@ export const queryKeys = {
   userStatistics: (p: QueryParams) => ["user-statistics", p] as const,
   fleetMetrics: ["fleet-metrics"] as const,
   settings: ["settings"] as const,
+  tuning: (id: string) => ["tuning", id] as const,
   /** 범위가 키에 들어간다 — 안 넣으면 범위를 바꿔도 앞 결과가 그려진다. */
   instanceMetrics: (id: string, rangeMs: number) => ["instance-metrics", id, rangeMs] as const,
 };

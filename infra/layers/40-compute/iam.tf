@@ -250,3 +250,88 @@ resource "aws_iam_role_policy" "task_exec_channel" {
     }]
   })
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 크로스 계정 탐색 (`settings.discovery.accounts`)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# **역할 이름으로 좁힌다.** `sts:AssumeRole` 을 `*` 로 열면 이 태스크가 신뢰 정책만
+# 맞는 아무 역할이나 맡을 수 있고, 그건 계정 경계를 무의미하게 만든다.
+#
+# 목록이 비어 있으면 정책 자체를 만들지 않는다 — 쓰지 않는 권한을 두지 않는다
+# (멀티 계정을 쓰지 않는 배포가 기본이다).
+#
+# 대상 계정 쪽에는 같은 이름의 역할이 있어야 하고, 그 신뢰 정책이 이 태스크 롤만
+# 허용해야 한다. 권한은 `rds:Describe*` + `rds:ListTagsForResource` +
+# `cloudwatch:GetMetricData` 로 충분하다 — **DB 접속은 별 경로**(rds-db:connect)다.
+resource "aws_iam_role_policy" "task_cross_account" {
+  count = length(var.discovery_account_ids) > 0 ? 1 : 0
+  name  = "dbmon-cross-account-discovery"
+  role  = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "AssumeDiscoveryRole"
+      Effect = "Allow"
+      Action = ["sts:AssumeRole"]
+      Resource = [
+        for id in var.discovery_account_ids :
+        "arn:aws:iam::${id}:role/${var.discovery_role_name}"
+      ]
+    }]
+  })
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI 튜닝 (Bedrock) + 알림 채널 비밀
+# ─────────────────────────────────────────────────────────────────────────────
+
+# **모델을 열거한다.** `bedrock:InvokeModel` 을 `*` 로 열면 이 태스크가 계정의 모든
+# 모델을 부를 수 있고, 그중에는 이미지·비디오 모델처럼 비용 단가가 전혀 다른 것도 있다.
+#
+# 교차 리전 추론 프로파일(`global.*`·`apac.*`)은 **프로파일 ARN 과 그것이 라우팅하는
+# 기반 모델 ARN 둘 다** 필요하다 — 프로파일만 허용하면 호출 시점에 AccessDenied 다.
+resource "aws_iam_role_policy" "task_bedrock" {
+  count = var.enable_ai_tuning ? 1 : 0
+  name  = "dbmon-bedrock"
+  role  = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "InvokeTuningModel"
+      Effect = "Allow"
+      Action = ["bedrock:InvokeModel"]
+      Resource = concat(
+        [
+          for id in var.bedrock_model_ids :
+          "arn:aws:bedrock:${var.region}:${local.account_id}:inference-profile/${id}"
+        ],
+        [
+          # 프로파일이 라우팅하는 기반 모델. 리전을 `*` 로 두는 이유가 교차 리전이다 —
+          # 프로파일이 어느 리전으로 보낼지는 AWS 가 정한다.
+          for id in var.bedrock_model_ids :
+          "arn:aws:bedrock:*::foundation-model/${replace(replace(replace(id, "global.", ""), "apac.", ""), "us.", "")}"
+        ]
+      )
+    }]
+  })
+}
+
+# 알림 채널 비밀 (`settings.notify.slack_secret`).
+#
+# **값을 설정에 담지 않는 대가**로 이 권한이 필요하다([10 §3.4]). 접두어로 좁힌다 —
+# `*` 로 열면 이 태스크가 계정의 모든 비밀(DB 마스터 암호 포함)을 읽을 수 있다.
+resource "aws_iam_role_policy" "task_channel_secrets" {
+  count = var.enable_notifications ? 1 : 0
+  name  = "dbmon-channel-secrets"
+  role  = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "ReadChannelSecret"
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = ["arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:${var.channel_secret_prefix}*"]
+    }]
+  })
+}

@@ -22,6 +22,7 @@ pub mod shutdown;
 pub mod slowlog;
 pub mod store;
 pub mod telemetry;
+pub mod tuning;
 pub mod worker;
 
 pub use config::{Config, Role};

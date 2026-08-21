@@ -26,6 +26,7 @@ pub mod hub;
 pub mod metrics;
 pub mod settings;
 pub mod topic;
+pub mod tuning;
 pub mod view;
 pub mod ws;
 
@@ -141,6 +142,9 @@ pub struct ApiState {
     /// **화면이 이 값을 알아야 한다** — 설정이 비어 있을 때 "그럼 어디를 보고 있나" 의
     /// 답이 이것이고, 리전 선택기의 항목도 여기서 나온다.
     pub discovery_fallback_regions: Vec<String>,
+    /// AI 튜닝 서비스. **`None` 이면 이 워커가 대상 DB·모델에 닿을 수 없는 구성이다**
+    /// (자격증명이 없다) — 그때는 422 로 거부하고 화면이 사유를 말한다.
+    pub tuning: Option<Arc<crate::tuning::TuningService>>,
     /// 파일 설정이 **인증 끄기**를 허용하는가 (`api.allow_auth_disable`).
     ///
     /// 두 곳의 명시적 허용이 필요하다: 이 값과 운영 설정(`auth.mode = off`).
@@ -185,6 +189,10 @@ pub fn router(state: ApiState) -> axum::Router {
             "/api/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
+        .route(
+            "/api/queries/{id}/tuning",
+            get(tuning::get_tuning).post(tuning::post_tuning),
+        )
         .route("/api/ws", get(ws::handler))
         .with_state(state)
 }
@@ -218,7 +226,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str) -> Self {
         Self {
             status,
             code,
@@ -226,7 +234,7 @@ impl ApiError {
         }
     }
 
-    fn with_body(status: StatusCode, code: &'static str, detail: serde_json::Value) -> Self {
+    pub(crate) fn with_body(status: StatusCode, code: &'static str, detail: serde_json::Value) -> Self {
         Self {
             status,
             code,
@@ -253,7 +261,7 @@ impl IntoResponse for ApiError {
 }
 
 /// `Authorization: Bearer …` 에서 토큰을 뽑고 인증한다.
-fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
     // **인증을 끈 배포**는 여기서 끝난다 (`api.allow_auth_disable` + `auth.mode = off`).
     //
     // `cached()` 를 쓴다 — 요청 경로에서 설정 저장소를 때리지 않는다. 캐시가 비어
@@ -1006,7 +1014,7 @@ async fn list_plans(
 }
 
 /// 레코드 하나를 읽고 환경 스코프를 검사한다. 상세·플랜·마크다운이 공유한다.
-async fn record_for(
+pub(crate) async fn record_for(
     state: &ApiState,
     ctx: &AuthContext,
     id: String,
@@ -1118,6 +1126,23 @@ async fn get_query_markdown(
         );
     } else if plan.error.is_none() {
         let _ = writeln!(md, "> 저장된 계획이 없다.");
+    }
+
+    // **저장된 AI 권고를 문서 끝에 붙인다.** 없으면 아무것도 붙이지 않는다 —
+    // "권고가 없다" 는 문장을 넣으면 티켓에 붙인 문서마다 그 줄이 남는다.
+    if let Some(svc) = state.tuning.as_ref() {
+        match svc.stored(&found.record_id).await {
+            Ok(Some(advice)) => {
+                let _ = writeln!(md);
+                md.push_str(&dbmon_core::tuning::render_markdown(&advice));
+            }
+            Ok(None) => {}
+            // 다운로드를 실패시키지 않는다 — 본문은 이미 완성돼 있다.
+            Err(e) => tracing::warn!(
+                error = %crate::telemetry::Scrubbed(&e),
+                "마크다운에 붙일 튜닝 권고를 읽지 못했다"
+            ),
+        }
     }
 
     Ok((
@@ -1232,7 +1257,7 @@ async fn require_scope_control(
 ///
 /// 커스텀 헤더는 크로스 오리진에서 **preflight 를 통과해야** 보낼 수 있고, 우리는
 /// CORS 를 열지 않으므로 preflight 가 실패한다. 그래서 이 헤더 하나가 방어가 된다.
-fn require_control_header(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn require_control_header(headers: &HeaderMap) -> Result<(), ApiError> {
     if headers.get("x-dbmon-control").is_some() {
         Ok(())
     } else {

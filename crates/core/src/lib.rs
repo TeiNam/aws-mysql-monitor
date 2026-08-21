@@ -52,6 +52,7 @@ pub mod secret;
 pub mod settings;
 pub mod slow_query;
 pub mod time;
+pub mod tuning;
 
 pub use clock_offset::{ClockOffset, OffsetSeverity};
 pub use error::{DomainError, Result};

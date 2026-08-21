@@ -143,6 +143,75 @@ WHERE DIGEST IN ({})",
     )
 }
 
+/// 튜닝 컨텍스트 ① — 테이블 메타 (`information_schema.TABLES`).
+///
+/// **`(schema, name)` 쌍으로 묻는다.** 스키마를 무시하고 이름만 맞추면 같은 이름의
+/// 다른 스키마 테이블 통계를 섞어 온다 — 행수가 열 배 다른 표로 인덱스를 판단하게 된다.
+///
+/// `TABLE_ROWS` 는 InnoDB 에서 **추정값**이다. 프롬프트가 그 사실을 함께 적는다.
+pub fn table_meta(count: usize) -> String {
+    format!(
+        "/* dbmon:tablemeta */
+SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH,
+       IFNULL(DATE_FORMAT(UPDATE_TIME, '%Y-%m-%d %H:%i:%s'), '') AS UPDATE_TIME
+FROM information_schema.TABLES
+WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({})",
+        pair_placeholders(count)
+    )
+}
+
+/// 튜닝 컨텍스트 ② — 인덱스 구성과 카디널리티 (`information_schema.STATISTICS`).
+///
+/// **`SEQ_IN_INDEX` 로 정렬한다.** 복합 인덱스는 컬럼 순서가 곧 성능이고, 순서를 잃으면
+/// 프롬프트가 `(b, a)` 를 `(a, b)` 로 적어 모델이 엉뚱한 근거를 만든다.
+pub fn table_indexes(count: usize) -> String {
+    format!(
+        "/* dbmon:tableindex */
+SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME,
+       SUB_PART, CARDINALITY, INDEX_TYPE, IFNULL(IS_VISIBLE, 'YES') AS IS_VISIBLE
+FROM information_schema.STATISTICS
+WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({})
+ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+        pair_placeholders(count)
+    )
+}
+
+/// `SHOW CREATE TABLE`.
+///
+/// # 왜 식별자를 문자열로 넣는가
+///
+/// `SHOW CREATE TABLE` 은 **식별자를 파라미터로 받지 못한다**(구문상 자리표시자가 올 수
+/// 없다). 그래서 호출부가 [`quote_ident`] 로 인용하고, 그 함수는 백틱을 이중화하고
+/// 제어문자를 거부한다 — 인용 규칙을 한 곳에만 두는 것이 이 함수의 존재 이유다.
+pub fn show_create_table(schema: &str, name: &str) -> Option<String> {
+    Some(format!(
+        "/* dbmon:showcreate */ SHOW CREATE TABLE {}.{}",
+        quote_ident(schema)?,
+        quote_ident(name)?
+    ))
+}
+
+/// MySQL 식별자 인용. **백틱을 이중화하고, 제어문자·개행이 있으면 거부한다.**
+///
+/// 거부가 중요하다: 백틱만 이중화하면 개행이 든 이름으로 주석(`/* … */`)을 닫고 다른
+/// 문장을 붙일 수 있다. RDS 식별자 규칙에 그런 이름은 없으므로 잃는 것이 없다.
+pub fn quote_ident(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > 64 {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(format!("`{}`", raw.replace('`', "``")))
+}
+
+/// `(?, ?)` 쌍 자리표시자 — `(스키마, 이름) IN (…)` 용.
+fn pair_placeholders(count: usize) -> String {
+    std::iter::repeat_n("(?, ?)", count.max(1))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 다이제스트 테이블 오버플로 감지. `DIGEST IS NULL` 집계 행이 있으면 한도에 찼다.
 pub const DIGEST_OVERFLOW: &str = "/* dbmon:digestoverflow */
 SELECT COUNT_STAR FROM performance_schema.events_statements_summary_by_digest
@@ -335,7 +404,11 @@ mod tests {
             if code.starts_with("//") || code.starts_with("///") || code.starts_with("*") {
                 continue;
             }
-            let upper = code.to_uppercase();
+            // **`SHOW CREATE TABLE` 은 읽기다.** 이름에 `CREATE TABLE` 이 들어 있어
+            // 금지어에 걸리는데, 실제로는 DDL 을 실행하지 않고 정의를 돌려준다
+            // (튜닝 컨텍스트 수집이 쓴다). 이름만으로 판정하는 이 테스트의 한계라
+            // 그 형태만 지운 뒤 검사한다 — 목록을 느슨하게 하지 않는다.
+            let upper = code.to_uppercase().replace("SHOW CREATE TABLE", "SHOW <read-only>");
             for f in forbidden {
                 assert!(
                     !upper.contains(f),

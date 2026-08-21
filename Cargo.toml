@@ -56,6 +56,7 @@ aws-sdk-dynamodb = "1"
 aws-sdk-rds = "1"
 aws-sdk-cloudwatch = "1"
 aws-sdk-cloudwatchlogs = "1"
+aws-sdk-bedrockruntime = "1"
 aws-sigv4 = { version = "1", features = ["http1"] }
 percent-encoding = "2"
 aws-credential-types = "1"
