@@ -248,8 +248,12 @@ mod tests {
     fn shard_hash_is_stable_across_builds() {
         // 이 값이 바뀌면 배포 시 전 인스턴스가 재할당된다.
         // `DefaultHasher` 를 쓰면 릴리스마다 값이 달라져 이 테스트가 존재할 수 없다.
-        assert_eq!(shard_of(&inst("orders-prd-01")), 23);
-        assert_eq!(shard_of(&inst("orders-prd-02")), 10);
+        //
+        // ⚠ **입력 문자열이 바뀌면 이 값도 바뀐다** — `instance_id` 전체를 해싱하므로
+        // 계정 번호가 들어간다. 공개 저장소로 옮기며 예시 계정으로 바꿀 때 실제로
+        // 깨졌고, 그게 이 테스트가 잡아야 하는 부류(알고리즘 변경)와 구분돼야 한다.
+        assert_eq!(shard_of(&inst("orders-prd-01")), 32);
+        assert_eq!(shard_of(&inst("orders-prd-02")), 57);
     }
 
     #[test]

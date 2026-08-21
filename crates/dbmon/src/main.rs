@@ -540,6 +540,20 @@ async fn backfill_round(
         }
         let chunk = match fetcher.fetch(&instance.id, since_ms).await {
             Ok(c) => c,
+            // **원천이 없는 것과 장애를 구분한다.**
+            //
+            // 슬로우로그 그룹이 없으면(로그가 아직 안 쓰였거나 내보내기가 꺼졌다) 그건
+            // 환경 사실이고 재시도로 해결되지 않는다. 매 주기 `warn` 으로 쌓으면
+            // 진짜 장애가 그 소음에 묻힌다 — 대신 사유를 한 번 말하고 세어 둔다.
+            Err(dbmon_core::error::DomainError::Unsupported { reason, .. }) => {
+                total.no_source += 1;
+                tracing::info!(
+                    instance = %instance.id.as_str(),
+                    %reason,
+                    "슬로우로그 원천이 없다 — 이 인스턴스는 정확 지표가 비어 있다(장애가 아니다)"
+                );
+                continue;
+            }
             Err(e) => {
                 // **`debug` 가 아니라 세고 보고한다.** 조용히 건너뛰면 "이 인스턴스는
                 // 정확 지표가 영구히 없다" 를 아무도 모른다.
@@ -1710,12 +1724,16 @@ fn spawn_leader_loop(
                                 Default::default()
                             }
                         };
+                        // **`no_source` 만으로는 로그를 내지 않는다.** 슬로우로그가
+                        // 꺼진 인스턴스가 있는 배포에서는 그 값이 매 주기 같으므로,
+                        // 그것만 보고 줄을 쌓으면 로그가 그 사실로 도배된다.
                         if s.merged > 0 || s.errors > 0 || s.fetch_errors > 0 || s.incomplete > 0 {
                             tracing::info!(
                                 merged = s.merged,
                                 unnormalizable = s.unnormalizable,
                                 masking_degraded = s.masking_degraded,
                                 fetch_errors = s.fetch_errors,
+                                no_source = s.no_source,
                                 incomplete = s.incomplete,
                                 errors = s.errors,
                                 "슬로우로그 백필"

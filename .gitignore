@@ -30,5 +30,9 @@ local/logs/
 .playwright-mcp/
 dbmon-ui.png
 
+# 개발 중 확인용 스크린샷 전부. 문서에 넣은 그림만 예외로 둔다.
+*.png
+!docs/**/*.png
+
 # Client VPN 프로파일 — 클라이언트 개인키가 들어 있다
 *.ovpn
