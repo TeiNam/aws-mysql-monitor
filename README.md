@@ -1,171 +1,556 @@
-# aws-mysql-monitor
+# dbmon — MySQL slow query monitor for AWS RDS / Aurora
 
-AWS RDS/Aurora MySQL 슬로우 쿼리 캡처 · 실행계획 수집 · 성능 분석 플랫폼.
+Real-time slow query capture, execution plans, CloudWatch metrics, and AI tuning advice for
+RDS MySQL and Aurora MySQL — in one Rust binary with an embedded React UI.
 
-기존 PoC 2종(`../my_slow_query_scraper`, `../my_slow_query_dashboard`)의 운영 경험을 반영한
-2세대 재설계입니다. 이 저장소는 현재 **설계 단계**이며, 아래 문서가 산출물입니다.
+> **한국어**: [README.ko.md](README.ko.md) · 설계 문서는 [`docs/`](docs/) (26편, 한국어)
 
-## 한 줄 요약
-
-RDS를 자동 탐색해 환경(prd/stg/dev)별로 분류하고, MySQL 워크로드를 3중 소스로 수집해
-다이제스트 단위로 묶어 보여주며, 실행계획·카디널리티·스키마를 근거로 Bedrock이 개선안을
-제시하고, 월간/개선 리포트를 자동 생성한다.
-
-## 확정된 기술 선택
-
-| 영역 | 선택 | 근거 |
-|---|---|---|
-| 백엔드 | Rust (axum + tokio), 단일 바이너리 | [ADR-001](docs/03-decisions.md), [ADR-002](docs/03-decisions.md) |
-| 프론트 | React 19 + TS + Vite, 차트는 uPlot 단독 | [ADR-013](docs/03-decisions.md) |
-| 핫 저장소 | DynamoDB 31일 (단일 진실 원천) | [ADR-003](docs/03-decisions.md) |
-| 콜드 저장소 | S3 Tables(Iceberg) 1년. 적재는 DDB 증분 내보내기 → Athena `MERGE INTO` | [ADR-004](docs/03-decisions.md) |
-| 조회 엔진 | Athena 단독. Spark 미도입 | [ADR-020](docs/03-decisions.md) |
-| 인증 | Cognito OIDC (PKCE) + 서버측 RBAC | [ADR-012](docs/03-decisions.md) |
-| DB 계정 | IAM DB Auth (비밀번호 없음) | [ADR-007](docs/03-decisions.md) |
-| 배포 | **ECS Fargate (ARM64)** — active 1 + standby 1 | [ADR-022](docs/03-decisions.md), [14](docs/14-infrastructure.md) |
-| IaC | **Terraform 7개 레이어, 레이어별 독립 state** — 앱 코드와 무관하게 apply 가능 | [14 §1](docs/14-infrastructure.md) |
-| 개발계 | 계정 `123456789012` / ap-northeast-2. **네트워크 비용 $0** (SSM 포트 포워딩) | [18-dev-environment.md](docs/18-dev-environment.md) |
-| 지원 버전 | RDS MySQL 8.4+, Aurora MySQL 3.05+ | [ADR-019](docs/03-decisions.md) |
-
-## 설계 문서
-
-| # | 문서 | 내용 |
-|---|---|---|
-| 01 | [요구사항](docs/01-requirements.md) | 기능(FR)·비기능(NFR) 요구사항, 범위, 제약, 가정 |
-| 02 | [시스템 아키텍처](docs/02-architecture.md) | 컴포넌트 경계, 데이터 흐름, 배치 구조, 실패 모드 |
-| 03 | [기술 결정 기록(ADR)](docs/03-decisions.md) | 22개 결정의 근거·대가·재검토 조건 |
-| 04 | [데이터 모델](docs/04-data-model.md) | DynamoDB 단일테이블, Iceberg 스키마, 증분 적재 SQL |
-| 05 | [수집기 설계](docs/05-collector.md) | 3중 소스 캡처, 사용 SQL 전량, 정규화, 샤딩 |
-| 06 | [RDS 탐색 & 메트릭](docs/06-discovery-metrics.md) | 자동 탐색, 환경 분류, CloudWatch 비용 통제 |
-| 07 | [자격증명 부트스트랩](docs/07-credentials-bootstrap.md) | 마스터 계정 소스, 모니터링 계정 생성, IAM DB Auth |
-| 08 | [보안 & 인증](docs/08-security-auth.md) | 위협 모델 39개, Cognito, RBAC, IAM 정책, 감사 |
-| 09 | [프론트엔드 설계](docs/09-frontend.md) | 화면 명세, 실시간 렌더링, 플랜 시각화 |
-| 10 | [알림](docs/10-alerting.md) | 규칙 모델, 평가/발송 분리, Slack/Telegram/인앱 |
-| 11 | [AI 어드바이저](docs/11-ai-advisor.md) | 규칙 엔진 + Bedrock, 응답 검증, 인젝션 방어 |
-| 12 | [리포팅](docs/12-reporting.md) | 월간·개선 리포트, typed template, 스냅샷 고정 |
-| 13 | [API 명세](docs/13-api-spec.md) | REST/WS 엔드포인트, 권한, 커서, 에러 |
-| 14 | [인프라 & 운영](docs/14-infrastructure.md) | Terraform, 배포, 관측성, 런북, 재해복구 |
-| 15 | [테스트 전략](docs/15-testing.md) | 골든 코퍼스, 계약 테스트, 부하, 회귀 대장 53개 |
-| 16 | [비용 모델](docs/16-cost.md) | 100/500대 월비용, 비용 폭발 시나리오와 방어 |
-| 17 | [로드맵 & 할일 목록](docs/17-roadmap-tasks.md) | M0~M12, 태스크 300여 개, 수용 기준 |
-| 18 | [개발계(dev) 배포 설계](docs/18-dev-environment.md) | **실제 계정 실측 기반.** Terraform 레이어, dev 접근 모델, prd 혼재 격리, 시드 MySQL, dev 비용 |
-| 19 | [M1 검증 스파이크 실측 결과](docs/19-m1-findings.md) | **실제 MySQL 8.4.11/8.0.46 측정.** ADR-006 무효화, 정규화 규칙 11건 정정, 절단 상한 |
-| — | [미해결 이슈](docs/OPEN-QUESTIONS.md) | 검증 필요 + 결정 대기 21건 (3건 실측으로 해소) |
-
-## 개발 시작하기
-
-**AWS 없이 전부 돌아간다.** SSO 세션이 만료돼도 개발이 멈추지 않는다.
-
-```bash
-docker compose up -d                 # MySQL 8.4 / 8.4-wide / 8.0 / DynamoDB Local
-cargo test --workspace               # 단위 + 통합 테스트 302건
-./local/loadgen.sh all               # 검증 시나리오 9종 생성
-cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+```
+┌──────────────┐   discover (RDS API)    ┌───────────────┐
+│  ECS task    │────────────────────────▶│  RDS / Aurora │
+│  (dbmon)     │   collect (IAM auth)    │  MySQL 8.0+   │
+│              │────────────────────────▶│               │
+│  ┌────────┐  │   slow log (CW Logs)    └───────────────┘
+│  │ React  │  │◀────────────────────────
+│  │  UI    │  │   metrics (CloudWatch)
+│  └────────┘  │◀────────────────────────
+└──────┬───────┘
+       │ DynamoDB (records + settings) · S3 (large plans) · Bedrock (tuning)
+       ▼
 ```
 
-[`just`](https://github.com/casey/just) 가 있으면 `just dev` · `just test` · `just check` ·
-`just spike` 로 줄여 쓸 수 있다([justfile](justfile) 에 전 명령이 있다). 없어도 된다.
+## What it does
 
-| 확인하고 싶은 것 | 명령 |
+| Capability | How |
 |---|---|
-| M1 실측 수치 재현 | `cargo test -p dbmon --test m1_digest -- --nocapture --test-threads=1` |
-| 캡처 파이프라인 E2E | `cargo test -p dbmon --test it_collector -- --nocapture` |
-| 컨테이너 스모크 | `docker build --platform linux/arm64 -t dbmon:dev . && docker run --rm dbmon:dev --version` |
-| Terraform 전 레이어 | `for d in infra/layers/*/; do (cd $d && terraform init -backend=false >/dev/null && terraform validate); done` |
-| 문서 링크 | `./scripts/check-docs.py` |
+| **Slow query capture** | 1-second `performance_schema` polling for in-flight queries + CloudWatch Logs slow-log backfill for exact metrics. The two are **merged** into one record, so you get "caught it while running" *and* "exact rows examined". |
+| **Execution plans** | `EXPLAIN FORMAT=JSON` re-run (works with `SELECT` privileges alone). Literals are masked at collection time. Rendered as a table **and** a graph. |
+| **Fleet metrics** | CloudWatch (CPU / memory / storage, 15-min) side by side with self-collected metrics (connections / QPS / threads / locks, 5-sec). Cost-designed: 3 metrics per engine, aligned-window cache. |
+| **AI tuning advice** | One button on a plan → reads table specs + index cardinality from the target DB → Amazon Bedrock → index and rewrite proposals with evidence, appended to the Markdown export. |
+| **Discovery** | Tag-based env classification (`dev`/`stg`/`prd`), multi-region, multi-account via `sts:AssumeRole`. Instances register as *stopped*; a human presses **Start**. |
+| **Alert channel config** | Slack webhook / bot settings + message template (delivery engine is not wired yet — see [Status](#status)). |
 
-## 읽는 순서
+Design principles that shaped the code, in one line each:
 
-- **처음 보는 사람**: 01 → 02 → 03 → 17
-- **구현 시작하는 사람**: 17(할일) → 담당 영역 문서 → 13(API) → 15(테스트)
-- **인프라 담당**: **18(개발계)** → 14 → 07 → 08 → 16
-- **리뷰어**: 03(결정 근거) → [OPEN-QUESTIONS](docs/OPEN-QUESTIONS.md)
+- **Loud failures over silent ones.** A failed CloudWatch read is reported as "couldn't read",
+  never as an empty value that looks like "no data".
+- **No secrets stored.** IAM database authentication only; channel credentials live in Secrets
+  Manager and settings hold the *reference*.
+- **Literals never leave.** Query literals are masked before they reach plans, alerts, or Bedrock.
+- **Nothing destructive is automated.** No DDL execution, no `ANALYZE TABLE`, no auto-start of
+  collection.
 
-## 구현 전에 반드시 해야 할 것
+## Status
 
-**M1 검증 스파이크**([17](docs/17-roadmap-tasks.md#m1-검증-스파이크-매우-중요))를 건너뛰면
-M4~M7에서 재작업이 발생한다. 설계가 전제하는 17가지 동작을 실측으로 확인한다.
-특히 다음 4개는 실패 시 설계가 바뀐다.
-
-| 항목 | 실패 시 |
+| Area | State |
 |---|---|
-| ~~`information_schema.PROCESSLIST.INFO` 비절단~~ → **해소**. 65,535바이트 상한 확인 ([19 §A](docs/19-m1-findings.md)) | 해당 없음 |
-| Athena `MERGE INTO` 멱등성 ([OPEN-Q-03](docs/OPEN-QUESTIONS.md)) | 플레인 S3 Parquet + 자체 컴팩션으로 전환 |
-| 워커 1대가 500대를 커버 ([OPEN-Q-01](docs/OPEN-QUESTIONS.md)) | 펜싱 토큰·팬아웃이 M12가 아니라 선행 조건이 된다 |
+| Discovery, capture, plans, metrics, settings, AI tuning | **Working** (verified against real RDS/Aurora) |
+| Cognito login | Settings only — the JWKS verifier is not wired (`COGNITO_READY = false`) |
+| Alert delivery | Channel + template are stored; rule evaluation / sending is a later milestone |
+| Cold-tier archive (Athena/Iceberg) | Withdrawn — DynamoDB retention is 35 days and Markdown export covers the rest |
 
-**실측으로 해소된 것** (2026-08-19, 계정 123456789012)
+This is a personal project developed against a real AWS account. The design docs in `docs/`
+are the source of truth and record *why* each decision was made, including the ones that were
+reversed.
 
-| 항목 | 결과 |
+---
+
+# Deploying on ECS
+
+The full path: **container image → DynamoDB tables → IAM → networking → ECS service →
+per-database account → screen settings.**
+
+Everything below assumes `ap-northeast-2` and account `123456789012`; substitute your own.
+Terraform for all of it lives in [`infra/layers/`](infra/) — the manual steps are spelled out
+so you can audit what the Terraform does.
+
+## 1. Image
+
+`.github/workflows/release.yml` publishes on every push to `main`:
+
+```
+ghcr.io/<owner>/<repo>:latest          # multi-arch (arm64 + amd64)
+ghcr.io/<owner>/<repo>:sha-<commit>    # immutable — use this in task definitions
+```
+
+To mirror into your own ECR (recommended for ECS: same-account pulls, no egress, VPC endpoint
+support), set two **repository variables** and the `ecr` job starts running:
+
+| Variable | Example |
 |---|---|
-| S3 Tables 리전 가용성 + Glue 카탈로그 형식 | **사용 가능.** `"s3tablescatalog/<bucket>"."<ns>"."<table>"` 확정. Athena engine v3 |
-| 플릿 능력 인벤토리 (M1-12) | **전 리전 RDS 0개** → 8.4+ 고정이 업그레이드 프로젝트가 될 위험 없음. 시드 인스턴스를 만들면 된다 |
-| 크로스 리전 요구 ([OPEN-Q-02](docs/OPEN-QUESTIONS.md)) | 타 리전 RDS 0개 → 현재 불필요. 코드 경로만 유지 |
-| Bedrock 모델 가용성 | Claude 다수 + `global`/`apac` 추론 프로파일 |
+| `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/github-oidc-ecr-push` |
+| `ECR_REPOSITORY` | `dbmon` |
+| `AWS_REGION` | `ap-northeast-2` (optional, defaults to this) |
 
-**⚠ 개발계 계정에 프로덕션 워크로드가 함께 있다** — `prd-lla-vpc`(10.3.0.0/16)에 실행 중
-EC2 1대. VPC 피어링·TGW가 없어 네트워크는 격리되어 있지만, 우리 IAM 설계의
-`rds:DescribeDBInstances` `Resource:"*"`와 `rds-db:connect` on `dbuser:*/dbmon`는
-prd 인스턴스까지 커버한다(T-37). 3중 격리를 [18 §6](docs/18-dev-environment.md)에 설계했다.
+The OIDC role that GitHub assumes:
 
-**사용자 결정이 필요한 것**: prd 리터럴 저장 정책([OPEN-Q-15](docs/OPEN-QUESTIONS.md)).
-이 결정이 "복사해서 바로 실행할 수 있는 샘플 쿼리" 기능이 prd에서 켜지는지를 정한다.
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:*" }
+    }
+  }]
+}
+```
 
-## 1세대에서 이어받는 것 / 버리는 것
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    { "Effect": "Allow",
+      "Action": ["ecr:BatchGetImage", "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload",
+                 "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"],
+      "Resource": "arn:aws:ecr:ap-northeast-2:123456789012:repository/dbmon" }
+  ]
+}
+```
 
-| 항목 | 1세대 | 2세대 | 이유 |
+The image is **arm64-first** (Graviton: same performance, ~20% cheaper). It runs as UID 10001,
+contains no compiler or shell utilities, and ships a `HEALTHCHECK` that calls the binary's own
+`healthcheck` subcommand — so no `curl` in the runtime layer.
+
+Build locally:
+
+```bash
+docker build -t dbmon:dev .
+docker run --rm dbmon:dev --version
+```
+
+## 2. Storage (DynamoDB + S3)
+
+Two tables. **They must exist before the task starts** — the app does not create them
+(creating tables needs `dynamodb:CreateTable`, and a monitoring task should not hold that).
+
+| Table | Keys | Notes |
+|---|---|---|
+| `dbmon-data` | PK `S`, SK `S` | Slow queries, digests, rollups, instances, checkpoints, tuning advice. TTL attribute `ttl` (35 days). |
+| `dbmon-config` | PK `S`, SK `S` | Settings (`CFG/GLOBAL`), pause scopes, leases. No TTL. |
+
+`dbmon-data` needs two GSIs:
+
+| Index | PK | SK | Used for |
 |---|---|---|---|
-| 캡처 소스 | `performance_schema.processlist` | PS 탐지 + `information_schema.PROCESSLIST` 타깃 조회 + PS 다이제스트 + CW 슬로우로그 | PS `processlist.INFO`는 1024바이트 절단 ([ADR-005](docs/03-decisions.md)) |
-| 실행계획 (SELECT) | 사후 `EXPLAIN` 재실행 | **사후 재실행 (같다)** | `FOR CONNECTION` 이 RDS 에서 불가 ([19 §B](docs/19-m1-findings.md)) |
-| 실행계획 (DML) | 없음 | 조건절을 SELECT 로 바꾼 **근사** 플랜 | `EXPLAIN UPDATE` 는 DML 권한 필요(1142) |
-| 워크로드 전수조사 | 없음 (1초 미만 쿼리 미관측) | 다이제스트 델타 스냅샷 + 시간 롤업 | sub-second 워크로드 커버 ([ADR-010](docs/03-decisions.md)) |
-| 저장소 | MongoDB | DynamoDB(31일) + S3 Tables/Iceberg(1년) | 운영 부담 제거, 장기 SQL 집계 |
-| 백엔드 | Python/FastAPI | Rust/axum | 단일 바이너리·메모리 예측성·팀 역량 |
-| 인증 | 없음 | Cognito OIDC + RBAC + 감사 | 접근 통제 |
-| DB 계정 | 전 인스턴스 공통 비밀번호 | IAM DB Auth (비밀번호 없음) | 상시 자격증명 제거 |
-| 계정별 통계 | 있었음 | **유지 + 확장** (`sys.user_summary_*`) | 1세대 대비 회귀 방지 ([ADR-021](docs/03-decisions.md)) |
-| 환경 필터 | `env=prd` 태그 고정, 리전 1개 | 멀티 리전 + prd/stg/dev 분류 + 수동 오버라이드 | |
-| 프론트 | React18/Vite/Recharts | React19 유지 + uPlot | 자산 재사용, 밀집 시계열 성능 |
+| `GSI1` | `GSI1PK` | `GSI1SK` | digest → recent samples, and the sparse in-flight sweep |
+| `GSI2` | `GSI2PK` | `GSI2SK` | duration-bucket queries |
 
-## 설계 리뷰 이력
+Point-in-time recovery on both is advised. `terraform -chdir=infra/layers/10-storage apply`
+creates them with the right key schema (provider 6.x renamed `hash_key` inside GSIs — that is
+why the lock file is committed).
 
-초안 작성 후 독립 리뷰를 거쳐 개정했다. **완료된 리뷰**와 **진행/미실시**를 구분해 적는다.
+Large plans (>300 KB) are offloaded to S3. The bucket is optional; without it those plans are
+dropped with a logged reason.
 
-| 리뷰 관점 | 상태 | 발견 | 주요 반영 |
-|---|---|---|---|
-| MySQL/AWS 기술 사실 검증 | 완료 | 24건 | 증분 내보내기 포맷(`NewImage`), `sys.innodb_lock_waits` 컬럼명·64자 절단, `@@GLOBAL.uptime` 부재, Aurora 버전 비교 불가, CloudWatch period 규칙, `COLUMN_STATISTICS` 공백 |
-| 보안 설계 | 완료 | 25건 | **플랜 JSON 리터럴 유출**(T-16), Athena 경로 RBAC 우회(T-17), `monitor_user` 인젝션(T-18), 감사 로그 변조(T-21), WS 마스킹 우회(T-22), 리포트 XSS(T-24) |
-| 인프라·비용 현실성 | 완료 | 25건 | **EMF 커스텀 메트릭 월 $2,100**, EC2 단가 2.5배 과소, `MERGE INTO` 전량 스캔, NAT 시간당 요금, 크로스 AZ 양방향, 침묵 감지 알람 부재 |
-| 요구사항 완결성 (원 요청 대비) | 완료 | 21건 | 첫 admin 부트스트랩 순환, prd `masked` 기본값이 핵심 기능 무력화, `in_flight` 미방송, Spark ADR 부재, 1세대 계정별 통계 회귀 |
-| Codex 독립 비판 (교차 모델) | 완료 | 19건 | **`/* dbmon: */` 주석 자기식별 불가**(다이제스트가 주석 제거), 시간창 P95 계산 불가, 펜싱 토큰 부재, WS 팬아웃 모순, tool-use 자동검증 부재 |
-| 문서 간 수치·설정값 일관성 | 완료 | 22건 | 다이제스트 영속화 조건이 `OR` vs `hard cap`으로 **정반대**, ADR-009 EMF 수치 stale, `dbmon-batch` 쿼리당 한도(100GB) > 일 한도(50GB) **도달 불가 설정**, 샤드 재할당 60초 vs 80초, 리스 루프 10초 vs 20초, 회귀 게이트가 R1~R20만 |
-| 논리적 공백·아키텍처 결함 | 완료 | 31건 | **active 1대 불변식이 샤드 리스로 강제되지 않음**(F1), **`in_flight` 선행 저장이 마스킹 이전**(F2), **개선 리포트 p95 계산 불가**(F3), 고아 `in_flight` 유령 쿼리(F4), 3소스 병합 비대칭(F5), 커버리지 분모 결함(F6), 연결 풀 3개 vs 루프 5개(F7), 맵 JSON 저장으로 lost update(F8) |
+## 3. IAM — task role
 
-자체 발견(리뷰 대기 중 직접 찾은 것): 다이제스트 스냅샷 페이로드 100배 문제(`LAST_SEEN` 필터
-부재), EMF 메트릭 수 과소 계산(150 → 228), 비용 문서 절 제목과 소계 불일치, 첫 admin 부트스트랩
-순환, 스키마 마이그레이션 절차 부재, 인스턴스 이름 변경 시 데이터 연결 끊김, 리포트 월 경계
-시간대, 알림 평가/발송 분리.
+The task role is the only identity the app uses. Nine statements, each narrowed on purpose;
+`infra/layers/40-compute/iam.tf` is the authoritative version.
 
-리뷰에서 나온 사실 오류와 비용 오류는 문서 본문에 **"초기 설계는 ~였다"** 형태로 정정 이력을
-남겼다. 같은 함정을 다시 밟지 않기 위한 것이다.
+### 3.1 Storage
 
-**리뷰가 정정한 제 오류 중 가장 위험했던 것 3개**
+```json
+{ "Sid": "DynamoDbData", "Effect": "Allow",
+  "Action": ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:UpdateItem","dynamodb:DeleteItem",
+             "dynamodb:Query","dynamodb:BatchWriteItem","dynamodb:BatchGetItem"],
+  "Resource": ["arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data",
+               "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data/index/*",
+               "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-config"] }
+```
 
-1. **`/* dbmon: */` 주석으로 자기 쿼리를 식별**하려 했다. MySQL 다이제스트는 주석을 제거하므로
-   작동하지 않는다. 그리고 자기 관측 제외가 실패하면 1초 주기 쿼리가 상위 N 후보·`_other`·
-   커버리지·계정 롤업을 전부 오염시킨다. ADR-005에서 고친 뒤에도 수집기 문서와 런북에
-   그대로 남아 있었다.
-2. **ASG desired=2인데 샤드 리스에 리더 게이트가 없어**, ADR-018이 "펜싱 토큰 없이는 절대
-   하지 말라"고 한 다중 active 상태가 1단계 기본값으로 발생했다. `/readyz` 503은 ALB
-   라우팅만 막고 수집 소유권과 무관하다.
-3. **`in_flight` 선행 저장이 마스킹보다 앞**에 있어, `masked` 정책 인스턴스에서도 원문이
-   DynamoDB에 들어갔다. 고아 레코드는 마스킹되지 않은 채 35일 남고 그 사이 아카이브로 간다.
+```json
+{ "Sid": "DenyScan", "Effect": "Deny", "Action": ["dynamodb:Scan"], "Resource": "*" }
+```
 
-## 구현 착수 전 마지막 결정
+The explicit `Deny` on `Scan` is deliberate: a single accidental scan over a 500-instance table
+is both a cost event and a latency event. The code never scans; this makes that structural.
 
-**`instance_id`에 계정 ID를 포함할 것인가** ([OPEN-Q-20](docs/OPEN-QUESTIONS.md)).
-이 값은 모든 파티션 키에 들어가므로, 나중에 멀티 계정으로 확장하려면 **키 포맷 변경 + 전
-데이터 마이그레이션**이 필요하다(`account_id` 파라미터를 추가하는 문제가 아니다).
-지금 `<account>/<region>/<identifier>`로 정하면 비용은 "키가 13자 길어진다"뿐이고 나중 비용이
-0이 된다. **이 결정 이후에는 바꿀 수 없다 — `InstanceId::parse` 가 2성분을 거부한다.**
+### 3.2 Discovery (RDS)
 
-- [docs/20-review-log.md](docs/20-review-log.md) — 2way 리뷰 기록
+```json
+{ "Sid": "DiscoveryReadOnly", "Effect": "Allow",
+  "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters","rds:DescribeDBEngineVersions",
+             "rds:DescribeDBParameters","rds:DescribeDBParameterGroups",
+             "rds:DescribePendingMaintenanceActions","rds:ListTagsForResource"],
+  "Resource": "*" }
+```
+
+`Resource: "*"` is required — `rds:Describe*` does not support resource-level permissions.
+Scope is enforced in configuration instead (`discovery.allowed_vpc_ids`,
+`denied_name_substrings`, `reject_production_tags`).
+
+### 3.3 Database connection (IAM auth — no passwords)
+
+```json
+{ "Effect": "Allow", "Action": ["rds-db:connect"],
+  "Resource": "arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:*/dbmon" }
+```
+
+`dbuser:*/dbmon` means "the `dbmon` account on any instance". In non-production accounts,
+enumerate `db-XXXX` resource IDs instead (`var.db_auth_resource_ids`) so a dev deployment
+cannot reach production instances.
+
+> The resource ID is the **`DbiResourceId`** (`db-ABC123…`), not the instance name.
+> `aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'`
+
+### 3.4 Metrics and slow logs
+
+```json
+{ "Sid": "Metrics", "Effect": "Allow",
+  "Action": ["cloudwatch:GetMetricData","cloudwatch:ListMetrics"], "Resource": "*",
+  "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
+```
+
+```json
+{ "Sid": "SlowLogRead", "Effect": "Allow", "Action": ["logs:FilterLogEvents"],
+  "Resource": ["arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery:*",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery"] }
+```
+
+Slow logs contain **query literals**. `/aws/rds/instance/*/slowquery` is far narrower than
+`/aws/rds/*`, which would include the audit log — that logs every statement.
+
+If a group does not exist yet (slow log never written, or log export disabled) the app reports
+`슬로우로그 원천이 없다 … (장애가 아니다)` once per round at info level and keeps going — a
+missing group is an environment fact, not an outage.
+
+### 3.5 Multi-region
+
+No extra IAM. The same task role works in every region; the app creates a client per region.
+Set the regions in **Settings → Discovery scope** (or `aws.target_regions` in the file config).
+There is no "all regions" option on purpose: each region costs a `DescribeDBInstances` call per
+discovery round, and most accounts have RDS in one or two.
+
+Everything the app reads per region needs to exist there: slow-log groups are regional, and
+CloudWatch metrics live in the instance's region (the app keys its CloudWatch clients by
+`(account, region)` for exactly this reason).
+
+### 3.6 Multi-account
+
+Management account task role:
+
+```json
+{ "Sid": "AssumeDiscoveryRole", "Effect": "Allow", "Action": ["sts:AssumeRole"],
+  "Resource": ["arn:aws:iam::111122223333:role/dbmon-discovery"] }
+```
+
+Target account role `dbmon-discovery` — trust policy:
+
+```json
+{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::123456789012:role/dbmon-task" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "dbmon" } } }] }
+```
+
+Permissions:
+
+```json
+{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow",
+    "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters","rds:ListTagsForResource",
+               "cloudwatch:GetMetricData"],
+    "Resource": "*" }] }
+```
+
+**Listing is an API call — it needs no network path.** VPC peering or Transit Gateway is only
+required for the *next* step, connecting to the database. So "appears in the list but
+`unreachable`" is a normal state, and the UI distinguishes it.
+
+For cross-account *collection* you also need `rds-db:connect` in the target account (attach it
+to the same `dbmon-discovery` role) and a network path plus security-group rule.
+
+Enter the account list in **Settings → Discovery scope**; it must match
+`var.discovery_account_ids`, otherwise discovery fails with `AccessDenied` and those instances
+never appear.
+
+### 3.7 Bedrock (AI tuning)
+
+```json
+{ "Sid": "InvokeTuningModel", "Effect": "Allow", "Action": ["bedrock:InvokeModel"],
+  "Resource": [
+    "arn:aws:bedrock:ap-northeast-2:123456789012:inference-profile/global.anthropic.claude-sonnet-5",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5"
+  ] }
+```
+
+Two ARNs are needed for cross-region inference profiles: **the profile and the foundation
+model it routes to.** Allowing only the profile fails at call time with `AccessDenied`.
+
+Enumerate models rather than using `*` — an account's model list includes image and video
+models whose per-call price is orders of magnitude different.
+
+Check what your account can use:
+
+```bash
+aws bedrock list-inference-profiles \
+  --query 'inferenceProfileSummaries[?contains(inferenceProfileId,`claude`)].inferenceProfileId'
+```
+
+Model must also be enabled in the Bedrock console (model access) for the region.
+
+Measured behaviour worth knowing:
+
+- `temperature` is rejected by Claude 5 models (`ValidationException: temperature is
+  deprecated for this model`), so the app sends only `maxTokens`.
+- A query containing `SLEEP()` can be blocked by some models (`stop_reason=content_filtered`,
+  empty output) because it looks like a time-based SQL injection payload. Opus 5 blocks it;
+  Sonnet 5 does not. The UI shows that reason verbatim so you can switch models.
+- Opus models are verbose — raise **output token limit** to 8000 if answers get truncated.
+
+### 3.8 Alert channel secret
+
+```json
+{ "Sid": "ReadChannelSecret", "Effect": "Allow", "Action": ["secretsmanager:GetSecretValue"],
+  "Resource": ["arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/channel/*"] }
+```
+
+Prefix-scoped, because `*` would let the monitoring task read every secret in the account —
+including RDS master passwords.
+
+### 3.9 Execution role (separate from the task role)
+
+The ECS **execution** role pulls the image and writes container logs:
+`AmazonECSTaskExecutionRolePolicy`, plus `kms:Decrypt` if your ECR or log group uses a CMK.
+Keep it separate from the task role — the app must never be able to pull or push images.
+
+## 4. Networking
+
+| Direction | Rule |
+|---|---|
+| Task → RDS | DB security group: allow **TCP 3306 from the task security group** (not a CIDR). Security-group references survive IP changes. |
+| Task → AWS APIs | NAT gateway, or interface VPC endpoints for `dynamodb` (gateway), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, `s3`. Endpoints avoid NAT data charges and keep traffic off the internet. |
+| ALB → Task | Target group on 8080, health check path `/healthz`. |
+| Task inbound | Only from the ALB security group. Nothing else. |
+
+**ALB idle timeout must be ≥ 300 seconds.** The WebSocket carries live metrics, and the AI
+tuning request can run ~30–100 seconds. At the default 60 s the UI reconnects constantly and
+the tuning button returns 504 — which says nothing about the cause.
+
+Aurora: the app connects to the **writer** endpoint of each instance it discovers (instance
+endpoints, not the cluster endpoint) so `performance_schema` reads are attributed correctly.
+
+## 5. Task definition
+
+```jsonc
+{
+  "family": "dbmon",
+  "cpu": "512", "memory": "1024",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "taskRoleArn": "arn:aws:iam::123456789012:role/dbmon-task",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/dbmon-exec",
+  "containerDefinitions": [{
+    "name": "dbmon",
+    "image": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/dbmon:sha-<commit>",
+    "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
+    "environment": [
+      { "name": "DBMON__DEPLOYMENT_ENV",           "value": "prd" },
+      { "name": "DBMON__AWS__REGION",              "value": "ap-northeast-2" },
+      { "name": "DBMON__AWS__ACCOUNT_ID",          "value": "123456789012" },
+      { "name": "DBMON__STORAGE__DATA_TABLE",      "value": "dbmon-data" },
+      { "name": "DBMON__STORAGE__CONFIG_TABLE",    "value": "dbmon-config" },
+      { "name": "DBMON__COLLECTOR__MONITOR_DB_USER", "value": "dbmon" },
+      { "name": "DBMON__DISCOVERY__ALLOWED_VPC_IDS", "value": "vpc-0123456789abcdef0" }
+    ],
+    "stopTimeout": 60,
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": { "awslogs-group": "/ecs/dbmon", "awslogs-region": "ap-northeast-2",
+                   "awslogs-stream-prefix": "dbmon" }
+    }
+  }]
+}
+```
+
+`stopTimeout` must exceed `http.shutdown_grace_secs` (default 45) or SIGKILL arrives first and
+in-flight records are lost.
+
+### Configuration reference
+
+Environment variables override the TOML file; `__` separates levels
+(`DBMON__COLLECTOR__SLOW_THRESHOLD_SECS`). Startup **fails fast** on invalid config — a
+half-working process that collects but cannot store is worse than one that refuses to boot.
+
+**Required**
+
+| Key | Meaning |
+|---|---|
+| `deployment_env` | `dev` / `stg` / `prd`. In `dev`, discovery filters become mandatory. |
+| `aws.region` | Deployment region. |
+| `aws.account_id` | Goes into every `instance_id` — **cannot be changed later**. |
+| `storage.data_table`, `storage.config_table` | DynamoDB table names. |
+
+**Frequently set**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `role` | `all` | `all` / `api` / `collector` / `control`. Split when you scale out. |
+| `http.bind`, `http.port` | `0.0.0.0`, `8080` | |
+| `http.shutdown_grace_secs` | `45` | Must be < ECS `stopTimeout`. |
+| `http.deregistration_wait_secs` | `20` | Set `0` without a load balancer. |
+| `http.allow_auth_disable` | `false` | Permits the "no authentication" setting. Two opt-ins required. |
+| `aws.target_regions` | `[region]` | Fallback when Settings has no region list. |
+| `collector.slow_threshold_secs` | `2` | What counts as slow for detection. |
+| `collector.monitor_db_user` | `dbmon` | Also the self-exclusion key. |
+| `collector.literal_policy` | `masked` | `masked` / `full` / `full_restricted` / `off`. See below. |
+| `collector.backfill_secs` | `60` | Slow-log backfill period. |
+| `discovery.allowed_vpc_ids` | `[]` | Required in `dev`. |
+| `discovery.collect_production_targets` | `false` | Gate for `prd`-tagged instances. |
+| `storage.plan_bucket` | none | S3 bucket for plans > 300 KB. |
+
+**Literal policy** decides whether stored SQL keeps its values:
+
+| Value | Stored SQL | Copy-and-run sample? |
+|---|---|---|
+| `masked` (default) | `WHERE id = ?` | No |
+| `full_restricted` | original | Yes, visible to `operator`+ |
+| `full` | original | Yes, subject to `can_see_literals` |
+| `off` | not stored | No |
+
+Masking is **one-way**: switching to `masked` later does not remove literals already stored,
+and switching away does not recover masked ones. It applies to newly stored records only.
+Execution-plan JSON is masked regardless of this setting.
+
+## 6. Database account (per instance)
+
+No passwords are stored anywhere. The app authenticates with a 15-minute IAM token, so the
+database account must use `AWSAuthenticationPlugin`.
+
+Prerequisites on the instance:
+
+1. **IAM DB authentication enabled** —
+   `aws rds modify-db-instance --db-instance-identifier X --enable-iam-database-authentication`
+   (Aurora: on the cluster).
+2. **Slow query log on, exported to CloudWatch Logs** — parameter group
+   `slow_query_log=1`, `long_query_time=1` (or your threshold), `log_output=FILE`, and
+   `EnableCloudwatchLogsExports=["slowquery"]`.
+3. `performance_schema=1` (default on `db.t3.medium` and larger).
+
+Then, connected as the master user:
+
+```sql
+-- The host pattern must match where the task connects FROM.
+-- Use the ECS subnet CIDR, not the task IP: tasks get new IPs on every deploy.
+CREATE USER IF NOT EXISTS 'dbmon'@'10.1.%'
+  IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'
+  REQUIRE SSL;
+
+-- Detection, replica status, schema listing.
+GRANT PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
+
+-- Metrics and digests.
+GRANT SELECT ON `performance_schema`.* TO 'dbmon'@'10.1.%';
+GRANT SELECT ON `sys`.*                TO 'dbmon'@'10.1.%';
+
+-- Plans and tuning context need SELECT on the monitored schemas.
+-- Least privilege: enumerate them. Broad: GRANT SELECT ON *.* (gives cardinality for every table).
+GRANT SELECT ON `shop`.* TO 'dbmon'@'10.1.%';
+
+SHOW GRANTS FOR 'dbmon'@'10.1.%';
+```
+
+Notes that cost time if you miss them:
+
+- **Read replicas (`-ro`)**: create the user on the **source**. A replica is read-only, so
+  `CREATE USER` fails there; the account arrives by replication.
+- **Aurora**: create on the writer; it propagates to readers.
+- **`REQUIRE SSL`** is not optional for IAM auth — the token travels as the password.
+- The IAM token is signed for the **real endpoint**. If you tunnel through SSM for local
+  development, sign for the endpoint and only redirect the TCP address
+  (`collector.target_endpoint_overrides`, dev + loopback only).
+- Client VPN performs source NAT: the database sees the *subnet ENI* address, not the VPN
+  client CIDR. Grant the subnet pattern (e.g. `10.1.%`), which then covers both ECS tasks and
+  your laptop.
+
+`docs/22-onboarding-a-db.md` walks the whole path, including privilege modes and verification.
+
+## 7. Screen settings
+
+After the service is healthy, open the UI and finish in **Options** (gear, top right):
+
+| Section | What to set |
+|---|---|
+| **Discovery scope** | Regions to scan; accounts (12-digit ID + role *name*, not ARN) when management-account mode is on. |
+| **Login** | `token` (shared token) / `cognito` (settings only for now) / `off` (requires `http.allow_auth_disable`). |
+| **AI tuning** | Enable, model ID, Bedrock region, output token limit. |
+| **Notifications** | Slack mode, channel, Secrets Manager **reference**, message template with preview. |
+
+Settings are stored in DynamoDB (`CFG/GLOBAL`) and applied within 30 seconds across all
+workers, with optimistic locking so two administrators cannot silently overwrite each other.
+Details and failure semantics: [`docs/23-settings.md`](docs/23-settings.md).
+
+Then go to the **RDS** tab and press **Start collection** on each instance. Registration is
+automatic; starting is not — collection begins querying the target database every second, and
+that should be a human decision.
+
+## 8. Verify
+
+```bash
+# Health
+curl -s http://<alb>/healthz && curl -s http://<alb>/readyz
+
+# Discovery found the instances
+curl -s http://<alb>/api/instances | jq 'length, .[0].state'
+
+# Fleet metrics (failed_scopes must be empty)
+curl -s http://<alb>/api/metrics/fleet | jq '.failed_scopes, (.rows | length)'
+
+# Collector is leading and ticking
+curl -s http://<alb>/api/collector/status | jq '{is_leader, collecting, last_tick_ms}'
+```
+
+Common first failures:
+
+| Symptom | Cause |
+|---|---|
+| Instances stay `pending` | Nobody pressed **Start collection** (by design). |
+| `unreachable` | Security group, or the `dbmon` account / IAM auth is missing on that instance. |
+| Metrics columns all `—` with `failed_scopes` set | CloudWatch permission, or a cross-account role without `cloudwatch:GetMetricData`. |
+| Empty slow query list but instances are `collecting` | Slow log not exported to CloudWatch Logs, or `long_query_time` above your traffic. |
+| Tuning button says `model_failed` | The reason is printed next to the button — wrong model ID, model not enabled in the region, or a content filter. |
+
+## Local development
+
+No AWS account required for the core loops:
+
+```bash
+docker compose up -d          # MySQL 8.0 / 8.4 + DynamoDB Local
+just local-init               # create local tables
+cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve
+npm --prefix web run dev      # or use the embedded UI at :8080
+```
+
+Against real AWS (SSO + VPN, private seed databases):
+
+```bash
+aws sso login --profile <profile>
+cargo run -p dbmon -- --config local/dbmon-aws.toml --log-pretty serve
+```
+
+Tests: `cargo test` (617 unit + integration, MySQL containers for the integration set) and
+`npm --prefix web test`. `cargo clippy --all-targets -- -D warnings` is clean and CI enforces it.
+
+## Repository layout
+
+```
+crates/core        domain: no AWS, no MySQL, no HTTP. Ports (traits) live here.
+crates/normalize   SQL normalization + literal masking + digests
+crates/planparse   EXPLAIN JSON → nodes, warnings, literal masking (T-16)
+crates/dbmon       adapters (AWS, MySQL, HTTP) + collector loops + binary
+web                React 19 + Tailwind 4 UI, embedded into the binary
+infra/layers       Terraform: 00-bootstrap → 10-storage → 40-compute → 60-seed
+docs               26 design documents (Korean) — requirements, ADRs, data model, security
+```
+
+## License
+
+Not yet licensed. Until a `LICENSE` file lands, all rights reserved — usable for reading and
+evaluation, not redistribution.
