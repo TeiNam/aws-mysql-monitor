@@ -216,6 +216,17 @@ pub fn session_init(query_timeout_ms: u64) -> String {
     )
 }
 
+/// 계획 JSON 형식을 v2 로 올린다 (MySQL 8.3+).
+///
+/// # 왜 세션 초기화에 넣지 않는가
+///
+/// `session_init` 은 한 문장에 여러 변수를 세운다. 거기에 이 변수를 넣으면 8.3 미만에서
+/// **초기화 전체가 1193 으로 실패**해 그 인스턴스의 모든 연결이 죽는다. 버전 판정이
+/// 틀리는 경우(관리형 엔진이 커뮤니티 버전만 8.4 로 보고하는 등)까지 감당하려면
+/// 재실행 직전에 **따로** 보내고 실패는 v1 로 흘려야 한다.
+pub const EXPLAIN_JSON_V2: &str =
+    "/* dbmon:explainv2 */ SET SESSION explain_json_format_version = 2";
+
 /// `EXPLAIN ... FOR CONNECTION <id>`.
 ///
 /// **연결 ID 를 파라미터 바인딩할 수 없다** — 실측에서 `FOR CONNECTION CONNECTION_ID()` 가

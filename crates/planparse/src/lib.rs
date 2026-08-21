@@ -148,10 +148,26 @@ pub fn parse(plan_json: &str, default_schema: Option<&str>) -> Result<ParsedPlan
     })
 }
 
+/// 형식 판정.
+///
+/// # v2 루트는 **계획 노드 자신**이다 (8.4.11 실측)
+///
+/// 처음 판은 `query_plan` 래퍼를 가정했다. 실제 출력에는 그 래퍼가 없다:
+///
+/// ```json
+/// { "query": "select …", "inputs": [ { "operation": "Nested loop inner join", … } ] }
+/// ```
+///
+/// 그래서 실제 v2 계획이 `Unknown` 으로 분류됐다 — 저장 레코드의 `format_version` 이
+/// "unknown" 이 되고, 테이블이 없는 v2 계획(`SELECT 1`)은 `NotAPlan` 으로 **버려진다.**
+/// 래퍼 형태도 계속 받아들인다(있어서 손해 볼 것이 없다).
 fn detect_format(v: &serde_json::Value) -> PlanFormat {
     if v.get("query_block").is_some() {
         PlanFormat::JsonV1
-    } else if v.get("query_plan").is_some() {
+    } else if v.get("query_plan").is_some()
+        || v.get("inputs").is_some()
+        || v.get("operation").is_some()
+    {
         PlanFormat::JsonV2
     } else {
         PlanFormat::Unknown
@@ -441,8 +457,48 @@ mod tests {
 
     #[test]
     fn json_v2_root_detected() {
-        let v2 = r#"{"query_plan": {"operation": "Table scan on o", "table_name": "o", "access_type": "ALL"}}"#;
-        assert_eq!(parse(v2, None).unwrap().format, PlanFormat::JsonV2);
+        let wrapped = r#"{"query_plan": {"operation": "Table scan on o", "table_name": "o", "access_type": "ALL"}}"#;
+        assert_eq!(parse(wrapped, None).unwrap().format, PlanFormat::JsonV2);
+    }
+
+    /// **실제 v2 출력에는 `query_plan` 래퍼가 없다** (8.4.11 실측). 루트가 계획 노드다.
+    ///
+    /// 래퍼를 가정한 판정은 실제 계획을 `Unknown` 으로 분류했다 — 저장 레코드의
+    /// `format_version` 이 "unknown" 이 되고, **테이블 없는 v2 계획은 `NotAPlan` 으로
+    /// 버려졌다.** 가정으로 쓴 위 테스트는 통과하면서 실제만 틀린 상태였다.
+    #[test]
+    fn real_v2_output_without_a_wrapper_is_detected() {
+        let real = r#"{
+          "query": "/* select#1 */ select count(0) from `shop`.`orders`",
+          "inputs": [{
+            "operation": "Aggregate: count(0)",
+            "access_type": "aggregate",
+            "estimated_rows": 1.0,
+            "estimated_total_cost": 6074.55,
+            "inputs": [{
+              "alias": "orders", "table_name": "orders", "schema_name": "shop",
+              "operation": "Table scan on orders", "access_type": "table",
+              "estimated_rows": 60023.0, "estimated_total_cost": 6074.55
+            }]
+          }]
+        }"#;
+        let p = parse(real, Some("shop")).unwrap();
+        assert_eq!(p.format, PlanFormat::JsonV2);
+        // 노드 수집은 `table_name` 을 찾아 트리를 훑으므로 루트 모양과 무관하다.
+        assert_eq!(p.referenced_tables, vec!["shop.orders"]);
+        // 비용은 루트에서 읽는다 — v2 는 `cost_info` 를 쓰지 않는다.
+        assert_eq!(p.query_cost, Some(6074.55));
+    }
+
+    /// 테이블이 없는 v2 계획도 **계획이다.** 예전 판정에서는 노드가 0개 + `Unknown` 이라
+    /// `NotAPlan` 으로 버려졌다 — `SELECT 1` 같은 쿼리의 계획이 통째로 사라진다.
+    #[test]
+    fn a_v2_plan_without_tables_is_still_a_plan() {
+        let no_tables = r#"{"query": "select 1", "operation": "Rows fetched before execution",
+                            "access_type": "rows_fetched_before_execution"}"#;
+        let p = parse(no_tables, None).expect("계획으로 받아야 한다");
+        assert_eq!(p.format, PlanFormat::JsonV2);
+        assert!(p.nodes.is_empty());
     }
 
     #[test]

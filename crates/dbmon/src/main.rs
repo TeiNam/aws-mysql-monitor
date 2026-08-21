@@ -905,11 +905,12 @@ fn spawn_instance_collector(
                 secret.expose(),
                 deps.config.deployment_env,
             )?;
-            Ok(TargetMysql::from_config(
-                opts,
-                &deps.config.collector,
-                label.clone(),
-            )?)
+            // **계획 JSON 형식을 버전으로 가른다.** 8.3+ 는 v2, 그 미만(Aurora 3.x 포함)은
+            // v1. 판정이 틀려도 v1 로 흘러가므로 최악이 "예전과 같은 형식" 이다.
+            Ok(
+                TargetMysql::from_config(opts, &deps.config.collector, label.clone())?
+                    .with_explain_json_v2(instance.engine_version.supports_explain_json_v2()),
+            )
         };
         let db = match make_db(&secret) {
             Ok(db) => db,

@@ -53,6 +53,12 @@ pub const MIN_AURORA: (u32, u32, u32) = (3, 5, 0);
 /// `SHOW BINARY LOG STATUS` 가 도입된 버전. 그 미만은 구 문장을 써야 한다.
 const BINLOG_STATUS_RENAMED_AT: (u32, u32, u32) = (8, 4, 0);
 
+/// `explain_json_format_version` 이 도입된 버전 (MySQL 8.3.0).
+///
+/// 그 미만에서 이 변수를 세우면 **1193 `Unknown system variable`** 이다 —
+/// 8.0.46 으로 실측했다. Aurora MySQL 3.x 는 8.0 호환이므로 **Aurora 에서는 쓸 수 없다.**
+const EXPLAIN_JSON_V2_AT: (u32, u32, u32) = (8, 3, 0);
+
 impl EngineVersion {
     /// `8.4.5` / `8.0.39` / `8.0.mysql_aurora.3.05.2` / `5.7.mysql_aurora.2.11.4` 를 해석한다.
     pub fn parse(raw: &str) -> Option<Self> {
@@ -90,6 +96,20 @@ impl EngineVersion {
     ///
     /// 8.4 에서 구 문장이 제거되었다. 아래 문자열은 MySQL 문법 토큰을 그대로 인용한 것이며
     /// 우리가 고른 이름이 아니다.
+    /// v2 계획 형식(`explain_json_format_version=2`)을 쓸 수 있는가.
+    ///
+    /// # 왜 버전으로 갈라야 하는가
+    ///
+    /// 8.3 미만에서 그 세션 변수를 세우면 1193 으로 실패한다(8.0.46 실측). 매번 시도해
+    /// 보고 실패를 세는 방식은 **정상 상태에서 실패 카운터가 계속 오르는** 결과가 되고,
+    /// 그러면 "실패" 가 신호로서 쓸모없어진다.
+    ///
+    /// **커뮤니티 버전으로 판정한다** — Aurora 3.x 는 자체 버전이 3.x 여도 커뮤니티
+    /// 호환은 8.0 이라 v2 가 없다.
+    pub fn supports_explain_json_v2(&self) -> bool {
+        self.community >= EXPLAIN_JSON_V2_AT
+    }
+
     pub fn binary_log_status_stmt(&self) -> &'static str {
         if self.community >= BINLOG_STATUS_RENAMED_AT {
             "SHOW BINARY LOG STATUS"
@@ -237,6 +257,30 @@ pub fn should_mark_deleted(missing_count_after: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **v2 는 8.3+ 에서만 된다.** 8.0 에서 세션 변수를 세우면 1193 이다(실측).
+    /// Aurora 3.x 는 자체 버전이 3.x 여도 커뮤니티 호환이 8.0 이라 v2 가 없다 —
+    /// Aurora 버전으로 판정하면 3.5 > 8.3 비교가 성립하지 않아 조용히 틀린다.
+    #[test]
+    fn explain_json_v2_is_gated_by_the_community_version() {
+        let v84 = EngineVersion::parse("8.4.5").expect("8.4");
+        assert!(v84.supports_explain_json_v2());
+        assert!(
+            EngineVersion::parse("8.3.0")
+                .expect("8.3")
+                .supports_explain_json_v2()
+        );
+
+        let v80 = EngineVersion::parse("8.0.46").expect("8.0");
+        assert!(!v80.supports_explain_json_v2());
+
+        // Aurora MySQL 3.05 = 커뮤니티 8.0.32 → v2 없음.
+        let aurora3 = EngineVersion::parse("8.0.mysql_aurora.3.05.2").expect("aurora3");
+        assert!(!aurora3.supports_explain_json_v2());
+        // 커뮤니티가 8.4 인 Aurora 는 된다.
+        let aurora84 = EngineVersion::parse("8.4.mysql_aurora.3.10.0").expect("aurora84");
+        assert!(aurora84.supports_explain_json_v2());
+    }
     use super::*;
 
     #[test]

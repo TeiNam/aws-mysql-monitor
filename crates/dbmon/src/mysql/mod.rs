@@ -121,6 +121,12 @@ pub struct TargetMysql {
     detect_limit: u64,
     /// 진단 로그에 쓰는 라벨. 엔드포인트를 그대로 쓰지 않는다(호스트명이 사업 정보일 수 있다).
     label: String,
+    /// 이 서버에서 계획 JSON v2 를 요청할까 (8.3+).
+    ///
+    /// **버전으로 정한다** — 8.3 미만에서 세션 변수를 세우면 1193 이고(8.0.46 실측),
+    /// 매번 시도하면 정상 상태에서 실패가 계속 쌓인다. 판정이 틀려도 v1 로 흘러가도록
+    /// 실패를 삼키므로(`explain_rerun_in`) 최악이 "예전과 같은 형식" 이다.
+    explain_json_v2: bool,
 }
 
 impl TargetMysql {
@@ -169,6 +175,9 @@ impl TargetMysql {
             timeouts,
             detect_limit,
             label: label.into(),
+            // **기본은 v1 이다.** 조립부가 인스턴스 버전을 보고 켠다
+            // (`with_explain_json_v2`) — 모르면 예전과 같은 형식으로 받는 쪽이 안전하다.
+            explain_json_v2: false,
         })
     }
 
@@ -303,6 +312,19 @@ impl TargetMysql {
     async fn explain_rerun_in(&self, stmt: String, schema: Option<&str>) -> Result<ExplainOutcome> {
         let mut conn = self.hot_conn().await?;
 
+        // **형식은 세션 상태다.** 같은 커넥션에서 먼저 올려야 다음 `EXPLAIN` 에 적용된다.
+        // 실패해도 계획 수집을 포기하지 않는다 — v1 로 받으면 되고, 어느 형식으로
+        // 받았는지는 저장 레코드의 `format_version` 이 말한다.
+        if self.explain_json_v2 {
+            if let Err(e) = conn.query_drop(sql::EXPLAIN_JSON_V2).await {
+                tracing::debug!(
+                    instance = %self.label,
+                    code = ?server_error_code(&e),
+                    "계획 JSON v2 를 켤 수 없다 — v1 로 받는다"
+                );
+            }
+        }
+
         if let Some(use_stmt) = schema.and_then(sql::use_schema) {
             let fut = conn.query_drop(use_stmt);
             match tokio::time::timeout(self.timeouts.query, fut).await {
@@ -340,6 +362,12 @@ impl TargetMysql {
                 Ok(ExplainOutcome::Failed(PlanFailure::Timeout))
             }
         }
+    }
+
+    /// 계획 JSON v2 를 요청할지 지정한다. 조립부가 인스턴스 버전으로 정한다.
+    pub fn with_explain_json_v2(mut self, yes: bool) -> Self {
+        self.explain_json_v2 = yes;
+        self
     }
 
     pub async fn disconnect(self) {
