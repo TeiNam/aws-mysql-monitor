@@ -42,6 +42,17 @@ use crate::store::tuning::DynamoTuningStore;
 /// 계속 시도하면 토큰만 쓴다.
 const FORMAT_RETRIES: usize = 1;
 
+/// 모델 호출 상한 (시도당).
+///
+/// # 왜 우리가 상한을 두는가
+///
+/// 실측 30초, 재시도까지 60초다. 상한이 없으면 모델이 응답하지 않을 때 요청이
+/// **ALB 유휴 타임아웃(300초)까지 매달려** 있고, 그동안 커넥션과 대상 DB 연결을 잡고
+/// 있다. 우리가 먼저 끊으면 화면이 사유를 받는다 — 504 는 아무것도 말해 주지 않는다.
+///
+/// 재시도를 포함한 전체는 이 값의 2배까지다(형식 위반 1회 재시도).
+const MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub struct TuningService {
     pub registry: Arc<crate::store::registry::DynamoInstanceRegistry>,
     pub advice: Arc<DynamoTuningStore>,
@@ -200,14 +211,26 @@ impl TuningService {
     ) -> Result<Generated> {
         let mut last_error = String::new();
         for attempt in 0..=FORMAT_RETRIES {
-            let reply = client
-                .converse(
-                    &ai.model_id,
-                    tuning::SYSTEM_PROMPT,
-                    prompt,
-                    ai.max_output_tokens,
-                )
-                .await?;
+            let call = client.converse(
+                &ai.model_id,
+                tuning::SYSTEM_PROMPT,
+                prompt,
+                ai.max_output_tokens,
+            );
+            // **우리가 먼저 끊는다.** 매달려 있으면 ALB 가 504 를 주고, 그건 사유를
+            // 말해 주지 않는다.
+            let reply = match tokio::time::timeout(MODEL_TIMEOUT, call).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(DomainError::Unavailable {
+                        dependency: "bedrock",
+                        reason: format!(
+                            "모델이 {}초 안에 응답하지 않았다 — 출력 상한을 줄이거나 다른 모델을 쓴다",
+                            MODEL_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+            };
 
             let raw = tuning::extract_json(&reply.text)
                 .ok_or_else(|| "응답에 JSON 객체가 없다".to_string())

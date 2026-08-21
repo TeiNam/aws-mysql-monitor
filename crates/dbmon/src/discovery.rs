@@ -73,6 +73,10 @@ pub struct RoundOutcome {
     /// 시야 밖 인스턴스를 건드리지 않는다.
     ///
     /// 비어 있으면 "시야를 알 수 없다" 는 뜻이고, 그때는 판정을 하지 않는다.
+    ///
+    /// **성공적으로 끝까지 읽은 범위만** 들어간다. 조회가 실패했거나 목록이 잘린
+    /// 범위는 빠지므로, 그 범위의 인스턴스는 "보지 않은 것" 으로 취급된다 — 계정
+    /// 하나의 실패가 다른 계정의 삭제 감지를 막지 않는다.
     pub scanned_scope: BTreeSet<String>,
 }
 
@@ -368,6 +372,30 @@ mod tests {
         let s = reconcile(Arc::clone(&r), outcome, NOW + 1_000).await.expect("재조정");
         assert_eq!(s.missing, 1, "시야 안에서 사라진 것을 놓쳤다: {s:?}");
         assert_eq!(s.out_of_scope, 2);
+    }
+
+    /// **한 범위의 실패가 다른 범위의 삭제 감지를 막지 않는다.**
+    ///
+    /// 계정 B 의 조회가 실패했을 때 전체를 부분 결과로 처리하면, 계정 A 에서 정말
+    /// 사라진 인스턴스도 판정되지 않아 삭제 감지가 영구히 멈춘다.
+    #[tokio::test]
+    async fn one_scopes_failure_does_not_block_another() {
+        let a_gone = inst_in("111111111111", "ap-northeast-2", "a-gone");
+        let b_unseen = inst_in("222222222222", "ap-northeast-2", "b-unseen");
+        let r = registry(&[a_gone.clone(), b_unseen.clone()]);
+
+        // A 는 성공적으로 훑었고 결과가 비었다(정말 사라졌다). B 는 조회가 실패해
+        // 시야에 없다.
+        let outcome = RoundOutcome {
+            discovered: vec![],
+            scanned_scope: [scope_key("111111111111", "ap-northeast-2")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let s = reconcile(Arc::clone(&r), outcome, NOW).await.expect("재조정");
+        assert_eq!(s.missing, 1, "성공한 범위의 삭제 감지가 막혔다: {s:?}");
+        assert_eq!(s.out_of_scope, 1, "실패한 범위를 건드렸다: {s:?}");
     }
 
     /// 시야를 알 수 없으면(빈 집합) **판정을 그대로 한다** — 옛 호출부가 이 필드를

@@ -35,11 +35,18 @@ import type {
   UserStats,
 } from "./types";
 
-/** 백엔드가 답한 오류. `code` 는 `{"error": …}` 의 값이다. */
+/**
+ * 백엔드가 답한 오류. `code` 는 `{"error": …}` 의 값이다.
+ *
+ * `detail` 은 서버가 함께 준 사람이 읽을 사유다(`{"reason": …}`). **코드만 보여주면
+ * 사용자가 무엇을 고칠지 알 수 없는 경우**가 있다 — 모델 호출 실패가 그렇다:
+ * 모델 ID 오타·리전에 없는 모델·콘텐츠 필터가 전부 같은 코드로 온다.
+ */
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    readonly detail?: string,
   ) {
     super(`${status} ${code}`);
     this.name = "ApiError";
@@ -49,6 +56,23 @@ export class ApiError extends Error {
 /** 인증 실패인가. 화면이 "토큰이 필요하다" 안내로 갈아탈 신호다. */
 export function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
+}
+
+/** 오류 본문의 `reason`. 없으면 `undefined`. */
+async function errorOf(res: Response): Promise<{ code: string; reason?: string }> {
+  try {
+    const body: unknown = await res.json();
+    if (body !== null && typeof body === "object") {
+      const obj = body as { error?: unknown; reason?: unknown };
+      return {
+        code: typeof obj.error === "string" ? obj.error : `http_${res.status}`,
+        ...(typeof obj.reason === "string" ? { reason: obj.reason } : {}),
+      };
+    }
+  } catch {
+    // 본문이 JSON 이 아니다 — 상태 코드로라도 알린다.
+  }
+  return { code: `http_${res.status}` };
 }
 
 async function errorCodeOf(res: Response): Promise<string> {
@@ -224,7 +248,11 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
     clearToken();
     throw new ApiError(401, await errorCodeOf(res));
   }
-  if (!res.ok) throw new ApiError(res.status, await errorCodeOf(res));
+  if (!res.ok) {
+    // **사유를 함께 들고 온다.** 코드만으로는 무엇을 고칠지 모르는 실패가 있다.
+    const { code, reason } = await errorOf(res);
+    throw new ApiError(res.status, code, reason);
+  }
   return (await res.json()) as T;
 }
 

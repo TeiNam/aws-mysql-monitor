@@ -1515,6 +1515,8 @@ pub struct MetricRangeParams {
 
 #[derive(Debug, serde::Serialize)]
 struct InstanceMetricsResponse {
+    /// 페이지 상한에 걸려 **뒤쪽 데이터를 못 읽었는가.**
+    truncated: bool,
     instance_id: String,
     engine: String,
     series: Vec<crate::api::metrics::MetricSeries>,
@@ -1561,7 +1563,7 @@ async fn metrics_instance(
     let range = checked_range(from_ms, to_ms)?;
 
     let discovery = state.settings.load(now).await.discovery;
-    let (series, choice) = svc
+    let (series, choice, truncated) = svc
         .detail(&found, &discovery, range.from_ms(), range.to_ms(), now)
         .await;
     Ok(Json(InstanceMetricsResponse {
@@ -1570,6 +1572,9 @@ async fn metrics_instance(
         series,
         period_secs: choice.period_secs,
         period_adjusted: choice.adjusted,
+        // **다 읽지 못했으면 말한다.** 긴 구간(400일 × 27메트릭)은 페이지 상한에
+        // 걸릴 수 있고, 그때 뒤쪽은 "값이 없는 것" 이 아니라 "안 읽은 것" 이다.
+        truncated,
         from_ms: range.from_ms(),
         to_ms: range.to_ms(),
     }))

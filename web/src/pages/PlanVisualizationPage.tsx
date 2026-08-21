@@ -549,7 +549,10 @@ function TuningButton({
   return (
     <span className="flex items-center gap-2">
       {error === null ? null : (
-        <span className="text-xs font-medium text-red-700">{tuningErrorText(error)}</span>
+        // 사유가 길다(모델이 왜 막았는지까지 말한다). 폭을 제한하고 줄바꿈을 허용한다.
+        <span className="max-w-md text-xs font-medium text-red-700">
+          {tuningErrorText(error)}
+        </span>
       )}
       <button
         type="button"
@@ -565,9 +568,16 @@ function TuningButton({
   );
 }
 
-/** 실패 사유를 사람 말로. **"실패했다" 만 주면 무엇을 고칠지 알 수 없다.** */
+/**
+ * 실패 사유를 사람 말로.
+ *
+ * **서버가 준 사유를 우선한다.** 모델 호출 실패는 코드가 하나인데 원인이 여럿이다 —
+ * 모델 ID 오타, 리전에 없는 모델, 출력 상한, 콘텐츠 필터(예: `SLEEP()` 이 든 쿼리를
+ * 공격 페이로드로 읽는 모델). 코드만 보여주면 아무도 원인을 찾지 못한다.
+ */
 function tuningErrorText(error: unknown): string {
   if (!(error instanceof ApiError)) return "분석에 실패했다";
+  if (error.detail !== undefined && error.detail !== "") return error.detail;
   switch (error.code) {
     case "ai_disabled":
       return "설정에서 AI 튜닝이 꺼져 있다";

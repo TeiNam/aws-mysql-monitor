@@ -499,6 +499,13 @@ export interface MetricSeries {
 }
 
 export interface InstanceMetricsResponse {
+  /**
+   * 페이지 상한에 걸려 **뒤쪽 데이터를 못 읽었다.**
+   *
+   * 긴 구간 × 메트릭 27개는 CloudWatch 응답이 여러 페이지로 나뉜다. 상한에 걸리면
+   * 뒤쪽 계열이 비는데, 그건 "값이 없다" 와 다르다.
+   */
+  truncated: boolean;
   instance_id: string;
   engine: string;
   series: MetricSeries[];

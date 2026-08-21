@@ -210,34 +210,194 @@ pub enum AdviceProblem {
     EmptySummary,
 }
 
+/// MySQL 문장을 훑는 **최소 렉서**.
+///
+/// # 왜 필요한가 (교차 리뷰가 두 번 잡았다)
+///
+/// 문자열을 `contains` 로 판정하면 인용 상태를 몰라서 양방향으로 틀린다:
+///
+/// | 입력 | 잘못된 결과 |
+/// |---|---|
+/// | ``CREATE TABLE `odd'name` (`t` varchar DEFAULT 'sk-live-…')`` | 백틱 안의 `'` 가 인용을 열어 **뒤의 비밀이 남는다** |
+/// | ``ALTER TABLE t ADD INDEX `ix#safe` (id), DROP COLUMN payload`` | 백틱 안의 `#` 가 주석을 열어 **`DROP COLUMN` 이 지워진 뒤 통과한다** |
+/// | ``CREATE INDEX `ix;2026` ON t (id)`` | 인용 안의 `;` 를 문장 구분자로 봐서 **정상 문장을 거부한다** |
+///
+/// 그래서 인용 상태(`'`, `"`, `` ` ``)와 괄호 깊이를 들고 한 번 훑는다. 완전한 파서가
+/// 아니다 — 목적은 **판정에 필요한 만큼만** 정확해지는 것이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+    Backtick,
+}
+
+impl Quote {
+    fn of(c: char) -> Option<Self> {
+        match c {
+            '\'' => Some(Self::Single),
+            '"' => Some(Self::Double),
+            '`' => Some(Self::Backtick),
+            _ => None,
+        }
+    }
+
+    fn ch(self) -> char {
+        match self {
+            Self::Single => '\'',
+            Self::Double => '"',
+            Self::Backtick => '`',
+            Self::None => '\0',
+        }
+    }
+}
+
+/// 훑은 결과. 판정에 필요한 사실만 담는다.
+struct Scanned {
+    /// 주석을 지운 문장(인용 안은 그대로).
+    without_comments: String,
+    /// **인용 밖** 세미콜론이 문장 끝이 아닌 자리에 있는가 = 여러 문장이다.
+    multi_statement: bool,
+    /// **인용·괄호 밖** 쉼표가 있는가 = `ALTER` 의 동작이 여럿이다.
+    top_level_comma: bool,
+    /// 실행 주석(`/*! … */`). MySQL 이 **실행하는** 주석이라 지우면 안 되고 거부한다.
+    executable_comment: bool,
+}
+
+fn scan(sql: &str) -> Scanned {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut quote = Quote::None;
+    let mut depth: i32 = 0;
+    let mut multi = false;
+    let mut comma = false;
+    let mut exec_comment = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if quote != Quote::None {
+            // 인용 안이다. 이스케이프와 이중 인용부호만 본다.
+            out.push(c);
+            if c == '\\' && quote != Quote::Backtick && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == quote.ch() {
+                if chars.get(i + 1) == Some(&quote.ch()) {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                quote = Quote::None;
+            }
+            i += 1;
+            continue;
+        }
+        // 인용 밖.
+        if let Some(q) = Quote::of(c) {
+            quote = q;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                if chars.get(i + 2) == Some(&'!') {
+                    exec_comment = true;
+                }
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                // 주석 자리에 공백을 남긴다 — 토큰이 붙어 버리면 안 된다.
+                out.push(' ');
+            }
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            _ => {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth <= 0 => comma = true,
+                    // 뒤에 공백·세미콜론 말고 무언가 있으면 두 번째 문장이다.
+                    ';' if chars[i + 1..]
+                        .iter()
+                        .any(|c| !c.is_whitespace() && *c != ';') =>
+                    {
+                        multi = true;
+                    }
+                    _ => {}
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Scanned {
+        without_comments: out,
+        multi_statement: multi,
+        top_level_comma: comma,
+        executable_comment: exec_comment,
+    }
+}
+
 /// 모델이 준 DDL 이 **인덱스를 하나 만드는 문장인가.**
 ///
 /// # 왜 금지어 목록이 아닌가 (교차 리뷰가 high 로 잡았다)
 ///
-/// 처음에는 `DROP `·`TRUNCATE` 같은 금지어를 찾았다. 그건 두 가지로 뚫린다:
+/// 처음에는 `DROP `·`TRUNCATE` 같은 금지어를 찾았다. 그건 여러 방향으로 뚫린다:
 ///
 /// | 우회 | 왜 통과했나 |
 /// |---|---|
 /// | `DROP\nTABLE t` | `"DROP "` 은 **공백 하나**를 요구한다 — 개행이면 안 걸린다 |
 /// | `CREATE INDEX …; DROP TABLE t` | 한 문장인지 보지 않았다 |
-/// | `CREATE INDEX … /* DROP */ …` | 주석 안의 글자에 걸려 정상 문장이 버려진다 |
+/// | ``ADD INDEX `ix#safe` (id), DROP COLUMN x`` | 백틱 안의 `#` 가 주석을 열어 뒷부분이 지워졌다 |
+/// | `/*!80000 , DROP COLUMN x */` | MySQL 이 **실행하는** 주석인데 주석으로 지웠다 |
 ///
-/// 그래서 **허용 형태를 정한다**(allowlist): 주석을 지우고 공백을 정규화한 뒤,
-/// 문장이 하나이고 `CREATE [UNIQUE] INDEX` 또는 `ALTER TABLE … ADD [UNIQUE] {INDEX|KEY}`
-/// 로 시작해야 한다. 그 밖은 전부 거부한다 — 모델이 실행 가능한 문장을 내는 곳이므로
-/// "모르는 형태" 는 허용하지 않는다.
+/// 그래서 **허용 형태를 정한다**(allowlist): 인용을 아는 렉서로 훑은 뒤
+///
+/// 1. 실행 주석(`/*!`)이 있으면 거부 — 우리가 지운 것을 MySQL 은 실행한다
+/// 2. 문장이 하나여야 한다 (인용 밖 `;` 뒤에 내용이 없어야 한다)
+/// 3. `CREATE [UNIQUE|FULLTEXT|SPATIAL] INDEX` 또는
+///    `ALTER TABLE … ADD [UNIQUE] {INDEX|KEY}` 로 시작해야 한다
+/// 4. `ALTER` 는 **동작이 하나여야 한다** — 괄호 밖 쉼표가 있으면 거부
+///    (`ADD INDEX ix (a), DROP COLUMN x`)
 ///
 /// 완전한 파서가 아니다. 목적은 **우리가 화면에 붙이는 문장의 형태를 좁히는 것**이고,
 /// 실행은 사람이 검토한 뒤에 한다(FR-AI-09).
 pub fn is_index_creation_ddl(ddl: &str) -> bool {
-    let sql = strip_sql_comments(ddl);
-    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = flat.trim().trim_end_matches(';').trim();
-    if trimmed.is_empty() {
+    let scanned = scan(ddl);
+    // ① 실행 주석은 거부한다. 우리는 주석으로 보고 지웠지만 MySQL 은 실행한다.
+    if scanned.executable_comment {
         return false;
     }
-    // **문장이 하나여야 한다.** 뒤에 `;` 로 이어 붙인 두 번째 문장을 막는다.
-    if trimmed.contains(';') {
+    // ② 문장이 하나여야 한다.
+    if scanned.multi_statement {
+        return false;
+    }
+    let flat = scanned
+        .without_comments
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = flat.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
         return false;
     }
     let up = trimmed.to_ascii_uppercase();
@@ -253,52 +413,10 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
             || up.contains(" ADD UNIQUE KEY ")
             || up.contains(" ADD FULLTEXT ")
             || up.contains(" ADD SPATIAL "))
-        // `ADD INDEX … , DROP INDEX …` 같은 복합 변경을 막는다.
-        && !up.contains(" DROP ");
+        // ③ 동작이 하나여야 한다. 괄호 밖 쉼표는 두 번째 동작이다
+        //    (`ADD INDEX ix (a), DROP COLUMN x` / `…, RENAME TO other`).
+        && !scanned.top_level_comma;
     create || alter
-}
-
-/// SQL 주석을 지운다 — `/* … */`, `-- …`, `#…`.
-///
-/// 주석 안의 글자로 검사를 속이거나(`CREATE INDEX /* ; DROP */ …`) 반대로 정상 문장이
-/// 금지어에 걸리는 것을 막는다.
-fn strip_sql_comments(sql: &str) -> String {
-    let chars: Vec<char> = sql.chars().collect();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '/' if chars.get(i + 1) == Some(&'*') => {
-                i += 2;
-                while i < chars.len() {
-                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                // 주석 자리에 공백을 남긴다 — `INDEX/*x*/ix` 가 붙어 버리면 안 된다.
-                out.push(' ');
-            }
-            '-' if chars.get(i + 1) == Some(&'-') => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-                out.push(' ');
-            }
-            '#' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-                out.push(' ');
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// 모델 응답을 검증해 저장 가능한 권고로 만든다.
@@ -319,15 +437,18 @@ pub fn validate(
     let mut indexes = Vec::new();
 
     for adv in raw.indexes {
-        let table = adv.table.trim().to_string();
-        // **없는 테이블에 인덱스를 걸라는 권고는 버린다.** 모델이 이름을 지어내면
-        // 그 DDL 은 실행되지 않고, 실행되지 않는 문장을 권고로 두면 신뢰가 깨진다.
-        if !table_is_known(&table, &known) {
+        // **정규 형태로 해석한다.** 모델이 `orders` 라고만 적어도 컨텍스트의
+        // `shop.orders` 로 바꿔 둔다 — 그러지 않으면 뒤의 컬럼 대조가 명세를 찾지 못해
+        // **검사를 건너뛴다**(2차 교차 리뷰가 medium 으로 잡았다).
+        let Some(table) = resolve_table(adv.table.trim(), &known) else {
+            // **없는 테이블에 인덱스를 걸라는 권고는 버린다.** 모델이 이름을 지어내면
+            // 그 DDL 은 실행되지 않고, 실행되지 않는 문장을 권고로 두면 신뢰가 깨진다.
             caveats.push(format!(
-                "모델이 컨텍스트에 없는 테이블 `{table}` 에 인덱스를 제안해 제외했다"
+                "모델이 컨텍스트에 없는(또는 모호한) 테이블 `{}` 에 인덱스를 제안해 제외했다",
+                adv.table.trim()
             ));
             continue;
-        }
+        };
         if adv.columns.is_empty() {
             caveats.push(format!("`{table}` 인덱스 제안에 컬럼이 없어 제외했다"));
             continue;
@@ -345,6 +466,18 @@ pub fn validate(
         if let Some(unknown) = unknown_column(&table, &adv.columns, context) {
             caveats.push(format!(
                 "`{table}` 에 없는 컬럼 `{unknown}` 을 쓰는 인덱스 제안을 제외했다"
+            ));
+            continue;
+        }
+        // **DDL 과 메타데이터가 같은 것을 말해야 한다.**
+        //
+        // 모델이 `table`·`columns` 는 맞게 적고 DDL 에는 다른 테이블·컬럼을 쓸 수 있다
+        // (2차 교차 리뷰가 medium 으로 잡았다). 그러면 화면이 "이 테이블에 이 인덱스" 로
+        // 보여주는데 복사한 문장은 다른 것을 만든다.
+        if let Some(mismatch) = ddl_mismatch(&table, &adv.columns, &adv.ddl) {
+            caveats.push(format!(
+                "제안 DDL 이 설명과 어긋나 제외했다 — {mismatch}: `{}`",
+                first_line(&adv.ddl)
             ));
             continue;
         }
@@ -380,26 +513,44 @@ pub fn validate(
     })
 }
 
-/// 모델이 적은 테이블 이름이 컨텍스트에 있는가.
-///
-/// **스키마 한정자를 관대하게 본다** — 모델이 `orders` 라고만 적어도 컨텍스트에
-/// `shop.orders` 하나뿐이면 그것으로 본다. 같은 이름이 두 스키마에 있으면 모호하므로
-/// 거부한다(어느 쪽인지 우리가 정할 수 없다).
-fn table_is_known(name: &str, known: &[String]) -> bool {
-    if known.iter().any(|k| k.eq_ignore_ascii_case(name)) {
-        return true;
+/// 모델이 적은 이름을 **컨텍스트의 정규 이름으로** 바꾼다. 없거나 모호하면 `None`.
+fn resolve_table(name: &str, known: &[String]) -> Option<String> {
+    if let Some(exact) = known.iter().find(|k| k.eq_ignore_ascii_case(name)) {
+        return Some(exact.clone());
     }
     let bare = name.rsplit('.').next().unwrap_or(name);
-    let matches = known
-        .iter()
-        .filter(|k| {
-            k.rsplit('.')
-                .next()
-                .unwrap_or(k)
-                .eq_ignore_ascii_case(bare)
-        })
-        .count();
-    matches == 1
+    let mut matches = known.iter().filter(|k| {
+        k.rsplit('.')
+            .next()
+            .unwrap_or(k)
+            .eq_ignore_ascii_case(bare)
+    });
+    let first = matches.next()?;
+    // 같은 이름이 두 스키마에 있으면 어느 쪽인지 정할 수 없다 — 거부한다.
+    matches.next().is_none().then(|| first.clone())
+}
+
+/// DDL 이 설명(`table`·`columns`)과 어긋나는가. 어긋나면 사유를 준다.
+///
+/// **완전한 파서가 아니다.** DDL 안에 그 테이블 이름과 컬럼 이름이 나오는지만 본다 —
+/// 목적은 "설명과 문장이 다른 것을 말하는" 경우를 잡는 것이다.
+fn ddl_mismatch(table: &str, columns: &[String], ddl: &str) -> Option<String> {
+    let up = ddl.to_ascii_uppercase();
+    let bare = table.rsplit('.').next().unwrap_or(table).to_ascii_uppercase();
+    if !up.contains(&bare) {
+        return Some(format!("DDL 에 테이블 `{bare}` 가 없다"));
+    }
+    for c in columns {
+        let name = c.trim().trim_matches('`');
+        let name = name.split('(').next().unwrap_or(name).trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !up.contains(&name.to_ascii_uppercase()) {
+            return Some(format!("DDL 에 컬럼 `{name}` 이 없다"));
+        }
+    }
+    None
 }
 
 /// 이 테이블의 명세에 없는 컬럼. 명세가 없으면(스키마 조회 실패) `None` —
@@ -650,16 +801,41 @@ pub fn build_prompt(context: &TuningContext) -> String {
 /// 스키마를 쓰는 사람은 애플리케이션 개발자이고, 그 값이 모델 프롬프트로 나간다.
 /// **비밀(기본값에 박힌 토큰)과 지시문 둘 다 위험**하므로 값 전체를 비운다.
 ///
+/// # 백틱을 먼저 안다
+///
+/// 두 번째 교차 리뷰가 잡은 우회: ``CREATE TABLE `odd'name` (`t` varchar DEFAULT 'sk-…')``
+/// 에서 백틱 안의 `'` 를 문자열 시작으로 읽으면 **인용 상태가 뒤집혀 뒤의 비밀이 남는다.**
+/// 식별자는 값이 아니므로 **그대로 남기고**, 그 안의 문자는 해석하지 않는다.
+///
 /// # 구조는 남긴다
 ///
 /// 인덱스 판단에 필요한 것은 컬럼·타입·인덱스·제약의 **모양**이다.
 /// `enum('','','')` 처럼 **항목 수는 보존**한다 — 카디널리티 추정의 근거이기 때문이다.
 pub fn neutralize_ddl(ddl: &str) -> String {
-    let mut out = String::with_capacity(ddl.len());
     let chars: Vec<char> = ddl.chars().collect();
+    let mut out = String::with_capacity(ddl.len());
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
+            // 백틱 식별자. **내용을 그대로 옮긴다** — 값이 아니라 이름이다.
+            '`' => {
+                out.push('`');
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == '`' {
+                        // ``` `` ``` 는 이스케이프된 백틱이다.
+                        if chars.get(i + 1) == Some(&'`') {
+                            out.push('`');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
             // 문자열 리터럴. 내용을 버리고 빈 문자열만 남긴다.
             '\'' => {
                 i = skip_quoted(&chars, i, '\'');
@@ -724,6 +900,28 @@ fn skip_quoted(chars: &[char], open_at: usize, quote: char) -> usize {
         i += 1;
     }
     i
+}
+
+/// 모델에 보낼 SQL 에서 **옵티마이저 힌트와 주석을 지운다.**
+///
+/// # 왜 (교차 리뷰가 high 로 잡았다)
+///
+/// 정규화는 리터럴을 `?` 로 바꾸지만 **힌트 안은 건드리지 않는다** — 그게 문법적으로
+/// 식별자이기 때문이다. 그래서 이런 SQL 이 그대로 모델로 나간다:
+///
+/// ```sql
+/// SELECT /*+ QB_NAME(sk_live_abcdef) */ * FROM orders WHERE id = ?
+/// ```
+///
+/// 힌트 이름은 애플리케이션이 자유롭게 정하는 문자열이고, 거기에 비밀이나 지시문을
+/// 넣을 수 있다. **인덱스 판단에 힌트가 필요하지 않으므로** 지운다 — 힌트가 있다는
+/// 사실 자체가 중요하면 실행계획에 그 결과가 이미 반영돼 있다.
+pub fn strip_hints_and_comments(sql: &str) -> String {
+    scan(sql)
+        .without_comments
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -799,26 +997,6 @@ pub fn render_markdown(advice: &TuningAdvice) -> String {
         out.push('\n');
     }
     out
-}
-
-/// 모델에 보낼 SQL 에서 **옵티마이저 힌트와 주석을 지운다.**
-///
-/// # 왜 (교차 리뷰가 high 로 잡았다)
-///
-/// 정규화는 리터럴을 `?` 로 바꾸지만 **힌트 안은 건드리지 않는다** — 그게 문법적으로
-/// 식별자이기 때문이다. 그래서 이런 SQL 이 그대로 모델로 나간다:
-///
-/// ```sql
-/// SELECT /*+ QB_NAME(sk_live_abcdef) */ * FROM orders WHERE id = ?
-/// ```
-///
-/// 힌트 이름은 애플리케이션이 자유롭게 정하는 문자열이고, 거기에 비밀이나 지시문을
-/// 넣을 수 있다. **인덱스 판단에 힌트가 필요하지 않으므로** 지운다 — 힌트가 있다는
-/// 사실 자체가 중요하면 실행계획에 그 결과가 이미 반영돼 있다.
-pub fn strip_hints_and_comments(sql: &str) -> String {
-    let stripped = strip_sql_comments(sql);
-    // 주석을 지우면 힌트(`/*+ … */`)도 함께 사라진다. 남는 것은 공백 정리다.
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 모델 응답에서 JSON 을 꺼낸다.
@@ -918,20 +1096,108 @@ mod tests {
         );
     }
 
+    /// **DDL 과 설명이 다른 것을 말하면 버린다.**
+    ///
+    /// 모델이 `table`·`columns` 는 맞게 적고 DDL 에는 다른 테이블·컬럼을 쓰면, 화면은
+    /// "이 테이블에 이 인덱스" 로 보여주는데 복사한 문장은 다른 것을 만든다
+    /// (2차 교차 리뷰가 medium 으로 잡았다).
+    #[test]
+    fn the_ddl_must_match_the_description() {
+        let mut with_ddl = spec("shop", "orders");
+        with_ddl.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let mut payments = spec("shop", "payments");
+        payments.create_ddl = Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
+
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![
+                // 설명은 orders.status 인데 DDL 은 payments.secret 을 만든다.
+                IndexAdvice {
+                    table: "shop.orders".into(),
+                    columns: vec!["status".into()],
+                    ddl: "CREATE INDEX ix ON payments (secret)".into(),
+                    ..Default::default()
+                },
+                // 컬럼이 DDL 에 없다.
+                IndexAdvice {
+                    table: "shop.orders".into(),
+                    columns: vec!["status".into()],
+                    ddl: "CREATE INDEX ix ON orders (id)".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![with_ddl, payments]), "m", 1).expect("검증");
+        assert!(advice.indexes.is_empty(), "{:?}", advice.indexes);
+        assert_eq!(advice.caveats.len(), 2, "{:?}", advice.caveats);
+        assert!(advice.caveats.iter().all(|c| c.contains("어긋나")), "{:?}", advice.caveats);
+    }
+
+    /// **모델이 스키마 없이 적어도 컬럼 대조가 돌아야 한다.** 정규 이름으로 해석하지
+    /// 않으면 명세를 못 찾아 검사를 건너뛴다.
+    #[test]
+    fn bare_table_names_still_get_column_checked() {
+        let mut with_ddl = spec("shop", "orders");
+        with_ddl.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                // 스키마 없이 `orders` 라고만 적었다.
+                table: "orders".into(),
+                columns: vec!["ghost".into()],
+                ddl: "CREATE INDEX ix ON orders (ghost)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![with_ddl]), "m", 1).expect("검증");
+        assert!(advice.indexes.is_empty(), "컬럼 대조를 건너뛰었다");
+        assert!(advice.caveats.iter().any(|c| c.contains("ghost")), "{:?}", advice.caveats);
+    }
+
+    /// 정규 이름으로 **바꿔서 저장한다** — 화면이 어느 스키마인지 알 수 있어야 한다.
+    #[test]
+    fn resolved_tables_are_stored_qualified() {
+        let mut with_ddl = spec("shop", "orders");
+        with_ddl.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
+        let raw = RawAdvice {
+            summary: "s".into(),
+            indexes: vec![IndexAdvice {
+                table: "orders".into(),
+                columns: vec!["status".into()],
+                ddl: "CREATE INDEX ix ON orders (status)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let advice = validate(raw, &context(vec![with_ddl]), "m", 1).expect("검증");
+        assert_eq!(advice.indexes.len(), 1, "{:?}", advice.caveats);
+        assert_eq!(advice.indexes[0].table, "shop.orders");
+    }
+
     /// 스키마 한정자를 관대하게 본다. 단 **모호하면 거부한다.**
     #[test]
     fn bare_table_names_resolve_only_when_unambiguous() {
         let known = vec!["shop.orders".to_string()];
-        assert!(table_is_known("orders", &known));
-        assert!(table_is_known("SHOP.ORDERS", &known));
-        assert!(!table_is_known("users", &known));
+        assert_eq!(resolve_table("orders", &known).as_deref(), Some("shop.orders"));
+        assert_eq!(
+            resolve_table("SHOP.ORDERS", &known).as_deref(),
+            Some("shop.orders"),
+            "대소문자가 달라도 같은 테이블이다"
+        );
+        assert_eq!(resolve_table("users", &known), None);
 
         let ambiguous = vec!["shop.orders".to_string(), "archive.orders".to_string()];
-        assert!(
-            !table_is_known("orders", &ambiguous),
+        assert_eq!(
+            resolve_table("orders", &ambiguous),
+            None,
             "두 스키마에 같은 이름이 있는데 하나로 단정했다"
         );
-        assert!(table_is_known("shop.orders", &ambiguous));
+        assert_eq!(
+            resolve_table("shop.orders", &ambiguous).as_deref(),
+            Some("shop.orders")
+        );
     }
 
     /// **인덱스 생성문만 허용한다** (allowlist). 금지어 목록은 뚫린다:
@@ -963,6 +1229,61 @@ mod tests {
         ] {
             assert!(!is_index_creation_ddl(bad), "위험한 문장을 통과시켰다: {bad:?}");
         }
+    }
+
+    /// **2차 교차 리뷰가 찾은 우회들.** 백틱 안의 문자로 렉서 상태를 흔들거나,
+    /// MySQL 이 실행하는 주석으로 동작을 숨기거나, 복합 ALTER 로 파괴적 동작을 끼워
+    /// 넣는 경로다.
+    #[test]
+    fn quote_aware_scanning_closes_the_bypasses() {
+        // ① 백틱 안의 `#` 로 뒷부분을 주석 처리해 `DROP COLUMN` 을 숨긴다.
+        assert!(
+            !is_index_creation_ddl("ALTER TABLE orders ADD INDEX `ix#safe` (id), DROP COLUMN payload"),
+            "백틱 안의 `#` 로 DROP COLUMN 이 숨었다"
+        );
+        // ② 복합 ALTER — 인덱스 추가 + 다른 동작.
+        assert!(!is_index_creation_ddl(
+            "ALTER TABLE orders ADD INDEX ix (id), RENAME TO orders_old"
+        ));
+        assert!(!is_index_creation_ddl(
+            "ALTER TABLE orders ADD INDEX ix (id), DROP COLUMN payload"
+        ));
+        // ③ 실행 주석(`/*! … */`) — 우리는 주석으로 지우지만 MySQL 은 실행한다.
+        assert!(!is_index_creation_ddl(
+            "ALTER TABLE orders ADD INDEX ix (id) /*!80000 , DROP COLUMN payload */"
+        ));
+        assert!(!is_index_creation_ddl(
+            "CREATE INDEX ix ON orders (id) /*!50000 ; DROP TABLE orders */"
+        ));
+        // ④ 인용 안의 `;` 는 문장 구분자가 아니다 — 정상 문장을 거부하면 안 된다.
+        assert!(
+            is_index_creation_ddl("CREATE INDEX `ix;2026` ON orders (id)"),
+            "인용 안의 세미콜론을 문장 구분자로 봤다"
+        );
+        // ⑤ 괄호 안의 쉼표는 컬럼 구분자다.
+        assert!(is_index_creation_ddl(
+            "ALTER TABLE orders ADD INDEX ix (status, created_at)"
+        ));
+    }
+
+    /// **백틱 식별자가 리터럴 중화를 우회하면 안 된다.**
+    ///
+    /// ``CREATE TABLE `odd'name` (…)`` 의 `'` 를 문자열 시작으로 읽으면 인용 상태가
+    /// 뒤집혀 **뒤의 비밀이 그대로 남는다**(2차 교차 리뷰가 high 로 잡았다).
+    #[test]
+    fn backticked_identifiers_do_not_flip_the_lexer() {
+        let ddl = "CREATE TABLE `odd'name` (`token` varchar(64) DEFAULT 'sk-live-abcdef')";
+        let out = neutralize_ddl(ddl);
+        assert!(!out.contains("sk-live"), "비밀이 남았다: {out}");
+        // 식별자는 **그대로** 남아야 한다 — 이름은 값이 아니다.
+        assert!(out.contains("`odd'name`"), "식별자를 훼손했다: {out}");
+        assert!(out.contains("`token` varchar(64) DEFAULT ''"), "{out}");
+
+        // 백틱 안의 `#` 가 구조를 지우지 않는다.
+        let hashy = "CREATE TABLE `t` (`a#b` int, `c` int COMMENT 'x')";
+        let out = neutralize_ddl(hashy);
+        assert!(out.contains("`a#b` int"), "{out}");
+        assert!(out.contains("`c` int"), "백틱 안의 `#` 가 뒤 구조를 지웠다: {out}");
     }
 
     /// 주석으로 검사를 속이지 못한다 — 지운 뒤에 본다.

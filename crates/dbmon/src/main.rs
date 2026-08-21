@@ -227,6 +227,40 @@ fn build_metrics(config: &Config) -> Arc<dbmon::api::metrics::MetricsService> {
     )))
 }
 
+/// 운영 설정을 주기적으로 갱신한다.
+///
+/// # 왜 별 태스크인가
+///
+/// 설정을 읽는 세 곳(탐색 루프·인증 계층·화면)의 주기가 전부 다르다. 탐색은 5분,
+/// 화면은 사람이 열 때, **인증은 요청마다**다. 인증 판정은 I/O 를 할 수 없으므로
+/// (요청 경로에서 저장소를 때리면 안 된다) 캐시가 항상 신선해야 하고, 그걸 유지하는
+/// 책임은 아무 요청에도 매달릴 수 없다.
+///
+/// 주기는 캐시 TTL 의 1/3 이다 — 한 번 실패해도 다음 두 번의 기회 안에 신선함을
+/// 회복한다(리스 갱신과 같은 계산).
+fn spawn_settings_poller(
+    settings: Arc<dbmon::settings_state::SettingsState>,
+    shutdown: Arc<dbmon::shutdown::Shutdown>,
+) {
+    use dbmon_core::time::Clock as _;
+    let interval = Duration::from_millis(
+        (dbmon::settings_state::CACHE_TTL_MS / 3).max(1_000) as u64,
+    );
+    tokio::spawn(async move {
+        // 기동 직후 한 번 읽는다 — 첫 요청이 캐시 미스로 인증을 조이지 않게.
+        settings.refresh(dbmon_core::time::SystemClock.now_ms()).await;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    settings.refresh(dbmon_core::time::SystemClock.now_ms()).await;
+                }
+                _ = shutdown.wait() => break,
+            }
+        }
+        tracing::debug!("설정 폴러 종료");
+    });
+}
+
 /// 탐색 대상(리전 × 계정)별 RDS 탐색기.
 ///
 /// **DynamoDB 와 달리 `endpoint_url` 을 적용하지 않는다.** RDS 를 로컬로 흉내낼 방법이
@@ -630,30 +664,35 @@ async fn discover(
             .map(|id| id.as_str().to_string())
     }
 
-    // **이번 라운드의 시야를 먼저 기록한다.** 조회가 실패해도 "무엇을 보려 했는가" 는
-    // 남아야 한다 — 재조정이 시야 밖 인스턴스를 건드리지 않는 근거다.
-    for source in fleet.sources.iter() {
-        outcome
-            .scanned_scope
-            .insert(dbmon::discovery::scope_key(source.account_id(), source.region()));
-    }
-
     for source in fleet.sources.iter() {
         // **계정은 탐색기가 안다.** 배포 설정의 계정 번호를 쓰면 크로스 계정
         // 인스턴스가 우리 계정 키로 등록되고, 같은 이름의 DB 가 두 계정에 있을 때
         // 하나가 다른 하나를 덮어쓴다(`InstanceId` 가 계정을 포함하는 이유다).
         let account_id = source.account_id();
+        let scope = dbmon::discovery::scope_key(account_id, source.region());
         let page = match source.describe().await {
             Ok(p) => p,
             Err(e) => {
-                // **한 리전이라도 실패하면 전체를 부분 결과로 본다.** 리전별로 나눠
-                // 판정하면 실패한 리전의 인스턴스가 "사라졌다" 로 판정된다.
-                tracing::warn!(error = %telemetry::Scrubbed(&e), "리전 탐색 실패");
-                outcome.truncated = true;
+                // **실패한 범위만 시야에서 뺀다.**
+                //
+                // 처음엔 전체를 부분 결과(`truncated`)로 처리했다. 그러면 계정 B 하나가
+                // 실패할 때 **계정 A 에서 정말 사라진 인스턴스도 판정되지 않는다** —
+                // 삭제 감지가 영구히 멈춘다(2차 교차 리뷰가 medium 으로 잡았다).
+                // 시야에서 빼면 B 는 건드리지 않고 A 는 정상 판정된다.
+                tracing::warn!(
+                    %scope,
+                    error = %telemetry::Scrubbed(&e),
+                    "이 범위의 탐색이 실패했다 — 시야에서 뺀다(다른 범위는 판정한다)"
+                );
                 continue;
             }
         };
-        outcome.truncated |= page.truncated;
+        if page.truncated {
+            // 페이지네이션이 끊겼다 — 이 범위는 **부분 목록**이므로 판정하지 않는다.
+            tracing::warn!(%scope, "이 범위의 목록이 잘렸다 — 시야에서 뺀다");
+        } else {
+            outcome.scanned_scope.insert(scope);
+        }
 
         for raw in &page.instances {
             let verdict = filter.judge(&raw.candidate());
@@ -1960,6 +1999,21 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 // 않는다 — 플래그가 프로세스 원자값이라 수집 워커가 모른다.
                 runs_collector: config.role.runs_collector(),
             });
+
+            // **설정 폴러.** 이게 없으면 인증 판정이 굶는다.
+            //
+            // 인증은 신선한 설정만 믿는다(`cached_fresh`, TTL 30초) — 오래된 `off` 를
+            // 믿으면 인증을 다시 켜도 전파되지 않기 때문이다. 그런데 요청 경로는 캐시만
+            // 보고, 탐색 루프는 5분에 한 번이며 `role=api` 워커에는 그 루프가 아예 없다.
+            // 그래서 갱신하는 것이 아무도 없으면 **`auth.mode = off` 배포가 30초 뒤
+            // 잠긴다**(2차 교차 리뷰가 high 로 잡았다).
+            //
+            // TTL 의 1/3 주기로 돌려 항상 신선하게 유지한다. 조회가 실패하면 캐시가
+            // 낡고, 그때는 인증이 켜진 쪽으로 떨어진다 — 그게 옳은 방향이다.
+            spawn_settings_poller(
+                Arc::clone(&stores.settings),
+                Arc::clone(&shutdown),
+            );
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
             let auth = dbmon::aws::auth_token::build_target_auth(&config).await;

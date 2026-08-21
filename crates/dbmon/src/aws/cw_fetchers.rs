@@ -31,9 +31,13 @@ use tokio::sync::Mutex;
 
 use super::cloudwatch::MetricFetcher;
 
-/// `(계정, 리전)` → 클라이언트. 처음 쓸 때 만든다.
+/// `(계정, 리전, 역할)` → 클라이언트. 처음 쓸 때 만든다.
+///
+/// **역할도 키다.** 설정에서 역할 이름을 바꿨는데 캐시가 옛 역할의 클라이언트를 계속
+/// 주면, 바꾼 이유(권한 축소·역할 교체)가 반영되지 않는다(2차 교차 리뷰가 medium 으로
+/// 잡았다). 옛 항목은 그대로 남지만 쓰이지 않고, 항목 하나는 몇 KB 다.
 pub struct MetricFetchers {
-    cache: Mutex<BTreeMap<(String, String), Arc<MetricFetcher>>>,
+    cache: Mutex<BTreeMap<(String, String, String), Arc<MetricFetcher>>>,
     /// 우리 계정. 이 계정이면 역할을 맡지 않는다.
     own_account: String,
 }
@@ -57,7 +61,11 @@ impl MetricFetchers {
         region: &str,
         role_name: Option<&str>,
     ) -> Arc<MetricFetcher> {
-        let key = (account.to_string(), region.to_string());
+        let key = (
+            account.to_string(),
+            region.to_string(),
+            role_name.unwrap_or("").to_string(),
+        );
         // **락을 잡은 채 SDK 를 만든다.** 같은 대상에 동시 요청이 오면 클라이언트가
         // 둘 만들어지는 것을 막는다 — 만드는 비용은 ms 단위라 이 직렬화가 싸다.
         let mut cache = self.cache.lock().await;

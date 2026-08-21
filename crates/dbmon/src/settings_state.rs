@@ -127,7 +127,11 @@ impl SettingsState {
     fn fresh(&self, now_ms: EpochMs) -> Option<AppSettings> {
         let c = self.cache.lock().expect("settings cache");
         let loaded = c.loaded_ms?;
-        (now_ms - loaded < CACHE_TTL_MS).then(|| c.settings.clone())
+        // **시계가 뒤로 가면 신선하지 않다고 본다.** `now < loaded` 면 차이가 음수라
+        // TTL 비교를 그냥 통과하고, 그건 오래된 `off` 를 신선한 것으로 만든다
+        // (2차 교차 리뷰가 low 로 잡았다 — NTP 보정·컨테이너 시각 점프에서 실제로 난다).
+        let age = now_ms.checked_sub(loaded)?;
+        (0..CACHE_TTL_MS).contains(&age).then(|| c.settings.clone())
     }
 
     /// 저장하고 **캐시를 갱신한다.** 저장한 사람의 다음 조회가 옛 값을 보면
@@ -265,6 +269,12 @@ mod tests {
         assert!(
             st.cached_fresh(1_000 + CACHE_TTL_MS).is_none(),
             "TTL 이 지난 값을 인증 판정에 내줬다 — 인증이 무기한 꺼진다"
+        );
+        // **시계가 뒤로 갔을 때도 신선하다고 하지 않는다.** 음수 차이는 TTL 비교를
+        // 통과해 오래된 `off` 를 되살린다.
+        assert!(
+            st.cached_fresh(0).is_none(),
+            "시계가 뒤로 간 상황에서 오래된 값을 신선하다고 했다"
         );
         // 반면 탐색 범위용 접근자는 마지막 값을 계속 준다(범위가 사라지면 안 된다).
         assert_eq!(

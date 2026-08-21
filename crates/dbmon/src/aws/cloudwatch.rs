@@ -83,8 +83,9 @@ impl MetricFetcher {
         from_ms: EpochMs,
         to_ms: EpochMs,
         max_datapoints: i32,
-    ) -> Result<BTreeMap<String, Series>> {
+    ) -> Result<Fetched> {
         let mut out = BTreeMap::new();
+        let mut truncated = false;
         // **500개씩 나눈다.** 넘으면 API 가 거부한다.
         for chunk in pairs.chunks(MAX_QUERIES_PER_CALL) {
             let mut req = self
@@ -146,18 +147,34 @@ impl MetricFetcher {
                     // 영원히 끝나지 않는다. 걸리면 시끄럽게 남긴다.
                     Some(t) if pages < MAX_PAGES => next = Some(t.to_string()),
                     Some(_) => {
+                        // **조용히 자르지 않는다.** 호출부가 응답에 표시해 화면이
+                        // "여기부터는 데이터가 없는 게 아니라 안 읽은 것" 을 말한다.
                         tracing::warn!(
                             pages,
                             "GetMetricData 페이지 상한에 걸렸다 — 뒤쪽 데이터가 빠진다"
                         );
+                        truncated = true;
                         break;
                     }
                     None => break,
                 }
             }
         }
-        Ok(out)
+        Ok(Fetched {
+            series: out,
+            truncated,
+        })
     }
+}
+
+/// 조회 결과 + **다 읽었는가.**
+///
+/// 페이지 상한에 걸리면 뒤쪽 데이터가 빠진다. 그 사실을 값으로 들고 다녀야 화면이
+/// "없다" 와 "안 읽었다" 를 구분해 말할 수 있다.
+#[derive(Debug, Default)]
+pub struct Fetched {
+    pub series: BTreeMap<String, Series>,
+    pub truncated: bool,
 }
 
 /// 한 페이지의 결과를 맵에 넣는다. **같은 키가 다시 오면 이어 붙인다** —

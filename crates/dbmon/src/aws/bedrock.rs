@@ -140,9 +140,34 @@ impl BedrockClient {
             .unwrap_or_default();
 
         if text.trim().is_empty() {
+            // **빈 응답의 사유를 사람 말로 옮긴다.**
+            //
+            // 실측: `SELECT sleep(?)` 이 들어간 쿼리를 Opus 5 에 보내면
+            // `stop_reason=content_filtered` 로 **빈 응답**이 온다 — `SLEEP()` 은
+            // 시간지연 SQL 인젝션의 시그니처라 모델의 안전 계층이 공격 페이로드로 읽는다.
+            // 같은 프롬프트를 Sonnet 5 는 정상 처리한다.
+            //
+            // 이건 설정 오류가 아니라 **모델의 판단**이므로 "모델 호출 실패" 로만
+            // 말하면 아무도 원인을 찾지 못한다. 우리가 대신 다른 모델로 갈아타지도
+            // 않는다 — 권고를 어느 모델이 냈는지가 흐려진다.
+            let stop = out.stop_reason().as_str().to_string();
+            let reason = match stop.as_str() {
+                // 한 줄로 둔다 — Rust 의 줄 이음(`\` + 개행)은 다음 줄 들여쓰기를
+                // 문자열에 남겨서 화면에 공백 뭉치가 나온다(실측).
+                "content_filtered" => concat!(
+                    "모델이 응답을 차단했다 (content_filtered) — 쿼리에 `SLEEP()` 처럼 ",
+                    "공격 시그니처로 읽히는 함수가 있으면 일부 모델이 막는다. ",
+                    "설정에서 다른 모델(예: Sonnet)로 바꾼다"
+                )
+                .to_string(),
+                "max_tokens" => format!(
+                    "모델이 출력 상한({max_tokens})에 걸려 아무것도 내지 못했다 — 설정에서 출력 토큰 상한을 올린다"
+                ),
+                other => format!("모델이 빈 응답을 줬다 (stop_reason={other})"),
+            };
             return Err(DomainError::Unavailable {
                 dependency: "bedrock",
-                reason: format!("모델이 빈 응답을 줬다 (stop_reason={})", out.stop_reason().as_str()),
+                reason,
             });
         }
         Ok(ModelReply {

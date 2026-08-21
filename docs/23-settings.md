@@ -242,6 +242,9 @@ allow_auth_disable = true
 - 생성은 `operator` 이상이다. 대상 DB 에 쿼리 12회(테이블 10개 기준)를 던지고
   토큰을 쓰는 조작이다.
 - 결과는 레코드에 딸려 **35일 뒤 함께 사라진다**(TTL).
+- 호출은 실측 30초다. 서버가 **시도당 120초**에서 끊고(재시도 포함 최대 두 번) 사유를
+  화면에 준다. ALB 유휴 타임아웃은 300초여야 한다(WebSocket 때문에 이미 그 값이다) —
+  60초로 낮추면 이 버튼이 504 를 받고, 504 는 아무것도 말해 주지 않는다.
 
 ### 5.4 모델
 
@@ -270,6 +273,14 @@ aws bedrock list-inference-profiles \
 - **`temperature` 를 보내지 않는다.** Claude 5 계열이 그 파라미터를 거부한다
   (`ValidationException: temperature is deprecated for this model`). 모델 ID 가 설정으로
   바뀌므로 "어떤 모델이 무엇을 받는가" 를 코드가 알 수 없어, 공통으로 받는 것만 보낸다.
+- **모델이 응답을 차단할 수 있다.** 실측: `SELECT sleep(?)` 이 든 쿼리를
+  `global.anthropic.claude-opus-5` 에 보내면 `stop_reason=content_filtered` 로 **빈
+  응답**이 온다 — `SLEEP()` 은 시간지연 SQL 인젝션의 시그니처라 모델의 안전 계층이
+  공격 페이로드로 읽는다. 같은 프롬프트를 `claude-sonnet-5` 는 정상 처리한다.
+  화면이 그 사유를 그대로 보여주므로 모델을 바꾸면 된다. **우리가 대신 다른 모델로
+  갈아타지 않는다** — 권고를 어느 모델이 냈는지가 흐려진다.
+- **Opus 계열은 출력이 길다.** 작은 프롬프트에서도 2,000 토큰을 넘겼다. 상한에 걸리면
+  화면이 "출력 토큰 상한을 올린다" 를 말한다(기본 4,000).
 - **인덱스가 없는 컬럼의 카디널리티는 얻을 수 없다.** `information_schema.STATISTICS` 는
   인덱스 컬럼만 담는다. `SELECT COUNT(DISTINCT col)` 은 대상 DB 풀스캔이라 하지 않는다 —
   모델이 그 한계를 주의사항에 적는다(실측으로 그렇게 나왔다).

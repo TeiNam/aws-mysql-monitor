@@ -157,6 +157,7 @@ impl MetricsService {
             match fetcher
                 .fetch(&pairs, FLEET_PERIOD_SECS, from, now_ms, cap.max(3))
                 .await
+                .map(|f| f.series)
             {
                 Ok(series) => {
                     // **키에 리전을 붙여 합친다.** 식별자는 리전 안에서만 고유하므로
@@ -202,7 +203,7 @@ impl MetricsService {
         from_ms: EpochMs,
         to_ms: EpochMs,
         now_ms: EpochMs,
-    ) -> (Vec<MetricSeries>, PeriodChoice) {
+    ) -> (Vec<MetricSeries>, PeriodChoice, bool) {
         let choice = period_for(now_ms, from_ms, to_ms);
         // **시간 범위를 해상도 경계로 맞춘다.**
         //
@@ -222,6 +223,7 @@ impl MetricsService {
         );
 
         let specs = detail_metrics(instance.engine);
+        let mut truncated = false;
         let series = match self.cached(&cache_key) {
             Some(hit) => hit,
             None => {
@@ -240,9 +242,15 @@ impl MetricsService {
                     .fetch(&pairs, choice.period_secs, from_ms, to_ms, MAX_DATAPOINTS)
                     .await
                 {
-                    Ok(s) => {
-                        self.store(cache_key, s.clone());
-                        s
+                    Ok(f) => {
+                        if f.truncated {
+                            // **잘렸으면 캐시하지 않는다.** 잘린 결과를 60초 고정하면
+                            // 그 창 동안 뒤쪽이 영구히 비어 보인다.
+                            truncated = true;
+                        } else {
+                            self.store(cache_key, f.series.clone());
+                        }
+                        f.series
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -277,7 +285,7 @@ impl MetricsService {
                 }
             })
             .collect();
-        (out, choice)
+        (out, choice, truncated)
     }
 
     fn cached(&self, key: &str) -> Option<BTreeMap<String, Series>> {

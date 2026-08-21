@@ -128,6 +128,12 @@ export function InstanceMetricsPage() {
               ) : null}
               . 마지막 갱신{" "}
               {fmtListTime(metrics.data.to_ms, "KST", Date.now())}
+              {metrics.data.truncated ? (
+                <span className="ml-2 font-medium text-amber-700">
+                  ⚠ 응답이 페이지 상한에 걸려 뒤쪽 구간을 다 읽지 못했다 — 빈 구간은 값이
+                  없는 것이 아니다. 조회 범위를 좁힌다.
+                </span>
+              ) : null}
             </>
           )
         }
