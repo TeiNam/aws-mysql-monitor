@@ -2,6 +2,60 @@ import { describe, expect, it } from "vitest";
 import { layoutPlan, parsePlan } from "./plan-graph";
 import { costShare, planRows } from "./plan-rows";
 
+/** MySQL 8.4.11 의 `EXPLAIN ANALYZE FORMAT=JSON` 실제 출력(값 그대로, 일부만). */
+const V2_ANALYZE = {
+  "limit": 3,
+  "query": "select `c`.`id`,count(0) from `shop`.`orders` `o` join `shop`.`customers` `c` ...",
+  "operation": "Limit: 3 row(s)",
+  "actual_rows": 3.0,
+  "actual_loops": 1,
+  "actual_last_row_ms": 0.2,
+  "estimated_total_cost": 4919.65,
+  "inputs": [
+    {
+      "operation": "Nested loop inner join",
+      "access_type": "join",
+      "actual_rows": 10.0,
+      "actual_loops": 1,
+      "estimated_rows": 3.02,
+      "actual_last_row_ms": 0.046457,
+      "estimated_total_cost": 4919.64565465911,
+      "inputs": [
+        {
+          "alias": "c",
+          "covering": true,
+          "operation": "Covering index scan on c using PRIMARY",
+          "index_name": "PRIMARY",
+          "table_name": "customers",
+          "access_type": "index",
+          "actual_rows": 4.0,
+          "schema_name": "shop",
+          "actual_loops": 1,
+          "estimated_rows": 1.0,
+          "index_access_type": "index_scan",
+          "actual_last_row_ms": 0.020458999999999998,
+          "estimated_total_cost": 0.0020586734693877552
+        },
+        {
+          "alias": "o",
+          "covering": true,
+          "operation": "Covering index lookup on o using idx_orders_customer (customer_id=c.id)",
+          "index_name": "idx_orders_customer",
+          "table_name": "orders",
+          "access_type": "index",
+          "actual_rows": 2.5,
+          "schema_name": "shop",
+          "actual_loops": 4,
+          "estimated_rows": 3.024895429611206,
+          "lookup_condition": "customer_id=c.id",
+          "actual_last_row_ms": 0.00597975,
+          "estimated_total_cost": 0.25100222428498165
+        }
+      ]
+    }
+  ]
+};
+
 /**
  * 참조 대시보드는 노드 좌표를 **라벨 문자열로** 정했다(`case 'Nested_Loop#2'`).
  * 그래서 테이블이 셋 이상이거나 `grouping_operation` 이 끼면 노드가 같은 자리에
@@ -65,45 +119,48 @@ describe("실행계획 파싱", () => {
   });
 
   /**
-   * v2(`explain_json_format_version=2`, MySQL 8.3+)는 키 이름이 완전히 다르다.
-   * v1 만 읽으면 노드 하나짜리 그래프가 나와 **그럴싸하게 비어 있다.**
+   * v2(`explain_json_format_version=2`, MySQL 8.3+) — **8.4.11 실측 출력**이다.
+   *
+   * 첫 판은 루트를 `{ query_plan: … }` 로, 시간을 `actual_total_time_ms` 로 가정했는데
+   * 둘 다 틀렸다. 진짜 루트는 계획 노드 자신이고 시간은 `actual_last_row_ms` 다.
+   * 가정으로 쓴 테스트는 통과하면서 **실제 계획을 노드 하나로 그렸다.**
    */
-  it("v2 (query_plan 루트) 트리도 읽는다", () => {
-    const json = JSON.stringify({
-      query_plan: {
-        operation: "Sort: c DESC",
-        estimated_total_cost: 1234.5,
-        estimated_rows: 5,
-        inputs: [
-          {
-            operation: "Aggregate using temporary table",
-            inputs: [
-              {
-                operation: "Nested loop inner join",
-                inputs: [
-                  { table_name: "o", access_type: "table_scan", estimated_rows: 3113305 },
-                  { table_name: "i", access_type: "index_lookup", covering_index: "idx_order" },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-    });
+  it("v2 (EXPLAIN ANALYZE FORMAT=JSON) 실측 출력을 읽는다", () => {
+    const json = JSON.stringify(V2_ANALYZE);
     const graph = parsePlan(json)!;
     expect(graph.nodes.map((n) => n.label)).toEqual([
-      "Sort: c DESC",
-      "Aggregate using temporary table",
+      "Limit: 3 row(s)",
       "Nested loop inner join",
-      "o (table_scan)",
-      "i (index_lookup)",
+      "Covering index scan on c using PRIMARY",
+      "Covering index lookup on o using idx_orders_customer (customer_id=c.id)",
     ]);
-    // 테이블은 테이블 색으로, 연산은 연산 색으로.
+    // 테이블 접근은 테이블 색, 연산은 연산 색.
     expect(graph.nodes.filter((n) => n.kind === "table")).toHaveLength(2);
-    expect(graph.nodes[0]?.details).toContain("Cost: 1,234.5");
-    expect(graph.nodes[4]?.details).toContain("Key: idx_order");
-    // 깊이가 실제 트리를 따라간다 — 배치가 겹치지 않게 하는 근거다.
-    expect(graph.nodes[3]?.depth).toBe(3);
+
+    // **루프를 곱한다.** `o` 는 4번 돌며 매번 2.5행 → 10행이다. 곱하지 않으면
+    // "2.5행" 으로 보이고, 그 노드가 싼 줄로 읽힌다.
+    const o = graph.nodes.find((n) => n.entity?.startsWith("orders"))!;
+    expect(o.rows).toBe(10);
+    expect(o.timeMs).toBeCloseTo(0.00597975 * 4);
+    // 별칭을 함께 보여준다 — 같은 테이블이 두 번 나오면 별칭만이 구분이다.
+    expect(o.entity).toBe("orders (o)");
+    expect(o.key).toBe("idx_orders_customer");
+    expect(o.condition).toBe("customer_id=c.id");
+  });
+
+  it("v2 에 실측이 없으면(ANALYZE 아님) 시간은 비어 있다", () => {
+    const noAnalyze = {
+      operation: "Table scan on orders",
+      table_name: "orders",
+      access_type: "table",
+      estimated_rows: 60023,
+      estimated_total_cost: 6074.55,
+    };
+    const graph = parsePlan(JSON.stringify(noAnalyze))!;
+    expect(graph.nodes).toHaveLength(1);
+    expect(graph.nodes[0]!.timeMs).toBeUndefined();
+    expect(graph.nodes[0]!.rows).toBe(60023);
+    expect(graph.nodes[0]!.cost).toBeCloseTo(6074.55);
   });
 
   it("깨진 JSON 은 null 이다 — 빈 그래프와 구분된다", () => {
@@ -243,19 +300,11 @@ describe("표(Simple) 행", () => {
   });
 
   it("v2 의 실측 시간·행 수는 표에 그대로 온다", () => {
-    const json = JSON.stringify({
-      query_plan: {
-        operation: "Nested loop inner join",
-        estimated_total_cost: 1234.5,
-        estimated_rows: 5,
-        actual_rows: 7,
-        actual_total_time_ms: 12.5,
-        inputs: [{ table_name: "o", access_type: "table_scan", estimated_rows: 3113305 }],
-      },
-    });
-    const rows = planRows(parsePlan(json)!, new Set());
-    expect(rows[0]!.node.timeMs).toBe(12.5);
-    expect(rows[0]!.node.rows).toBe(7);
-    expect(rows[1]!.node.entity).toBe("o");
+    const rows = planRows(parsePlan(JSON.stringify(V2_ANALYZE))!, new Set());
+    // 루트(Limit) → 조인 → 두 테이블 접근.
+    expect(rows.map((r) => r.indent)).toEqual([0, 1, 2, 2]);
+    expect(rows[1]!.node.timeMs).toBeCloseTo(0.046457);
+    expect(rows[1]!.node.rows).toBe(10);
+    expect(rows[3]!.node.entity).toBe("orders (o)");
   });
 });

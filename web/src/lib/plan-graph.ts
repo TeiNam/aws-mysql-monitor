@@ -260,39 +260,66 @@ export function parsePlan(json: string): PlanGraph | null {
    *
    * v1 과 **키 이름이 완전히 다르다** — `operation`·`inputs`·`estimated_*`. v1 만
    * 읽으면 v2 계획이 노드 하나짜리 그래프로 그려져 **그럴싸하게 비어 있다.**
-   * 백엔드가 v2 를 지원하므로(`planparse::PlanFormat::JsonV2`) 여기서도 읽는다.
+   *
+   * # 실제 출력으로 고쳤다 (8.4.11 실측)
+   *
+   * 처음 판은 루트를 `{ query_plan: … }` 로, 시간을 `actual_total_time_ms` 로 가정했다.
+   * 둘 다 **실제 출력과 다르다.** 진짜 루트는 계획 노드 자신이고
+   * (`{ query, inputs, operation, … }`), 시간은 `actual_last_row_ms` 다:
+   *
+   * ```json
+   * { "query": "select …", "inputs": [ { "operation": "Nested loop inner join",
+   *   "actual_rows": 10.0, "actual_loops": 1, "actual_last_row_ms": 0.046,
+   *   "estimated_total_cost": 4919.6, "inputs": [ … ] } ] }
+   * ```
+   *
+   * # 루프를 곱한다
+   *
+   * `actual_rows`·`actual_last_row_ms` 는 **루프 1회 평균**이다(`actual_loops` 가 횟수).
+   * 표에는 그 노드가 실제로 다룬 총량이 나와야 하므로 곱한다 — 안 그러면 4번 돌며
+   * 매번 2.5행을 읽은 노드가 "2.5행" 으로 보인다.
    */
   const walkV2 = (node: Record<string, unknown>, depth: number): string => {
     const operation = str(node.operation);
     const table = str(node.table_name);
+    const alias = str(node.alias);
     const access = str(node.access_type);
     const label =
       operation ??
       (table === null ? "Operation" : access === null ? table : `${table} (${access})`);
 
     const details: string[] = [];
-    const rows = num(node.estimated_rows);
+    const estRows = num(node.estimated_rows);
+    const loops = num(node.actual_loops) ?? 1;
+    const actualRows = num(node.actual_rows);
+    // 루프 평균 × 루프 수 = 그 노드가 실제로 다룬 행.
+    const rows = actualRows === null ? estRows : actualRows * loops;
     if (rows !== null) details.push(`Rows: ${INT.format(rows)}`);
     const cost = num(node.estimated_total_cost);
     if (cost !== null) details.push(`Cost: ${COST.format(cost)}`);
     if (table !== null && operation !== null) details.push(`Table: ${table}`);
-    const key = str(node.covering_index) ?? str(node.index_name) ?? str(node.key);
+    const key = str(node.index_name) ?? str(node.covering_index) ?? str(node.key);
     if (key !== null) details.push(`Key: ${key}`);
+    // **`EXPLAIN ANALYZE` 만 시간을 준다.** 없으면 비워 둔다 — 비용으로 시간을
+    // 추정해 채우면 운영자가 측정값으로 읽는다.
+    const lastRowMs = num(node.actual_last_row_ms);
+    const timeMs = lastRowMs === null ? null : lastRowMs * loops;
+    if (timeMs !== null) {
+      details.push(loops > 1 ? `Time: ${COST.format(timeMs)}ms (${loops}회)` : `Time: ${COST.format(timeMs)}ms`);
+    }
+    const condition = str(node.lookup_condition) ?? str(node.condition);
 
-    // 테이블 접근인지 연산인지로 색을 나눈다.
-    const kind: NodeKind = table !== null && operation === null ? "table" : "operation";
-    // **v2 는 `EXPLAIN ANALYZE` 의 실측값을 담을 수 있다.** 있으면 표의 Time 열에 낸다 —
-    // 없으면 비워 둔다(추정 시간을 실측처럼 보여주지 않는다).
-    const actualMs = num(node.actual_total_time_ms);
-    const actualRows = num(node.actual_rows);
-    // 실측 행 수가 있으면 그쪽이 진실이다.
-    const rowsForTable = actualRows ?? rows;
+    // 테이블 접근인지 연산인지로 색을 나눈다. v2 는 테이블 접근에도 `operation` 이
+    // 있으므로(`Covering index scan on c using PRIMARY`) **테이블 이름 유무**로 본다.
+    const kind: NodeKind = table === null ? "operation" : "table";
     const id = add(kind, label, details, depth, {
-      ...(table === null ? {} : { entity: table }),
+      // 별칭이 있으면 그걸 보여준다 — 조인에서 같은 테이블이 두 번 나오면 별칭만이 구분이다.
+      ...(table === null ? {} : { entity: alias === null ? table : `${table} (${alias})` }),
       ...(cost === null ? {} : { cost }),
-      ...(rowsForTable === null ? {} : { rows: rowsForTable }),
-      ...(actualMs === null ? {} : { timeMs: actualMs }),
+      ...(rows === null ? {} : { rows }),
+      ...(timeMs === null ? {} : { timeMs }),
       ...(key === null ? {} : { key }),
+      ...(condition === null ? {} : { condition }),
     });
 
     if (Array.isArray(node.inputs)) {
@@ -302,6 +329,13 @@ export function parsePlan(json: string): PlanGraph | null {
     }
     return id;
   };
+
+  // **v2 판정: 루트가 계획 노드다.** `query_plan` 래퍼는 없다(8.4 실측).
+  // `inputs` 나 `operation` 이 있으면 v2 로 읽는다 — v1 에는 그 키가 없다.
+  if (Array.isArray(root.inputs) || typeof root.operation === "string") {
+    walkV2(root, 0);
+    return { nodes, edges };
+  }
 
   if (isRecord(root.query_plan)) {
     walkV2(root.query_plan, 0);
