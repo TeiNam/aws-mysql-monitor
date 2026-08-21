@@ -5,18 +5,32 @@
 
 > **English**: [README.md](README.md) · 설계 문서: [`docs/`](docs/) 26편
 
-```
-┌──────────────┐   탐색 (RDS API)        ┌───────────────┐
-│  ECS 태스크  │────────────────────────▶│  RDS / Aurora │
-│  (dbmon)     │   수집 (IAM 인증)       │  MySQL 8.0+   │
-│              │────────────────────────▶│               │
-│  ┌────────┐  │   슬로우로그 (CW Logs)  └───────────────┘
-│  │ React  │  │◀────────────────────────
-│  │  UI    │  │   메트릭 (CloudWatch)
-│  └────────┘  │◀────────────────────────
-└──────┬───────┘
-       │ DynamoDB (기록·설정) · S3 (큰 실행계획) · Bedrock (튜닝)
-       ▼
+```mermaid
+flowchart LR
+    subgraph task["ECS 태스크 — 바이너리 하나"]
+        ui["React UI<br/><i>내장</i>"]
+        app["수집기 · API"]
+        ui --- app
+    end
+
+    db[("RDS / Aurora<br/>MySQL 8.0+")]
+    cw["CloudWatch<br/>Logs · Metrics"]
+    ddb[("DynamoDB<br/>기록 · 설정")]
+    s3[("S3<br/>큰 실행계획")]
+    br["Bedrock<br/>튜닝 권고"]
+
+    app -->|"탐색 — RDS API"| db
+    app -->|"수집 — IAM 인증, 1초"| db
+    cw  -->|"슬로우로그 백필"| app
+    cw  -->|"CPU · 메모리 · 스토리지, 15분"| app
+    app --> ddb
+    app --> s3
+    app -->|"버튼을 누를 때만"| br
+
+    classDef aws fill:#fff3e0,stroke:#e8871a,color:#7a4a00
+    classDef own fill:#e8f1fb,stroke:#2f6fb5,color:#123a63
+    class db,cw,ddb,s3,br aws
+    class ui,app own
 ```
 
 ## 무엇을 하는가
@@ -39,6 +53,72 @@
 - **리터럴은 나가지 않는다.** 실행계획·알림·Bedrock 에 닿기 전에 마스킹한다.
 - **파괴적인 것은 자동화하지 않는다.** DDL 실행 없음, `ANALYZE TABLE` 없음, 수집 자동
   시작 없음.
+
+## 화면
+
+실제 RDS·Aurora 를 상대로 찍었다. 머리말의 계정 번호만 0 으로 바꿨고, 지표값·계획
+비용·튜닝 권고는 도구가 실제로 낸 것이다. 데이터는 합성 시드다 — 누군가의 운영
+트래픽이 아니다.
+
+### RDS — 탐색과 수집 제어
+
+![RDS 인스턴스 관리](docs/images/rds-management.png)
+
+탐색은 인스턴스를 자동으로 등록하고 **멈춘 상태**로 둔다. 수집은 사람이 버튼을 눌러야
+시작하고, 정지 스코프는 전체·환경별·인스턴스별로 나뉜다.
+
+### Metrics — 두 출처를 한 줄에
+
+![플릿 메트릭](docs/images/metrics-fleet.png)
+
+CloudWatch(CPU·여유 메모리·스토리지, 15분) 옆에 자체 수집(연결·스레드·락·QPS·Slow/s,
+5초)이 붙는다. `10 / 90` 은 현재 연결 / `max_connections` 다 — 모수 없는 "10" 은 아무
+것도 말해 주지 않는다.
+
+### Instance — 한 대를 자세히
+
+![인스턴스 메트릭](docs/images/instance-detail.png)
+
+### Slow Query — 무엇이 잡혔는가
+
+![슬로우 쿼리 목록](docs/images/slow-queries.png)
+
+**진행 중**은 지금까지의 실행시간이고, **추적 끊김**은 하한이다 — 시작은 알지만 끝을
+모른다. 아직 돌고 있을 수 있는 쿼리에 "4.0초" 를 박으면 그건 거짓이다.
+
+### Plan — 저장된 실행계획
+
+![최근 실행계획 목록](docs/images/plan-list.png)
+
+![실행계획 표](docs/images/plan-table.png)
+
+계획은 수집 시점에 마스킹되므로 리터럴 정책과 무관하게 이 화면에 리터럴이 없다.
+같은 계획을 그래프로 — 4,550만 행 해시 조인이 이 쿼리의 전부다:
+
+![실행계획 그래프](docs/images/plan-graph.png)
+
+### AI 튜닝 권고
+
+![AI 튜닝 권고](docs/images/ai-tuning.png)
+
+버튼을 누를 때 생성된다. 계획에 더해 대상 DB 에서 읽은 테이블 명세와 인덱스
+카디널리티를 함께 보낸다. 주장마다 근거가 된 계획 노드나 스키마 값을 인용하고, DDL 은
+보여주되 실행하지 않고, 모델이 알 수 없었던 것은 추측하지 않고 적어 둔다.
+
+### Slow Log — CloudWatch 원천
+
+![CloudWatch 슬로우로그](docs/images/slow-log.png)
+
+### Statistics — 다이제스트 추이
+
+![다이제스트 통계](docs/images/statistics.png)
+
+### Options — 운영 설정
+
+![설정](docs/images/settings.png)
+
+알림, 탐색 범위, 로그인, Bedrock 모델. DynamoDB 에 저장되고 30초 안에 모든 워커에
+반영된다.
 
 ## 상태
 

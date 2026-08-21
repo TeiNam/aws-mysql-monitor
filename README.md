@@ -5,18 +5,32 @@ RDS MySQL and Aurora MySQL — in one Rust binary with an embedded React UI.
 
 > **한국어**: [README.ko.md](README.ko.md) · 설계 문서는 [`docs/`](docs/) (26편, 한국어)
 
-```
-┌──────────────┐   discover (RDS API)    ┌───────────────┐
-│  ECS task    │────────────────────────▶│  RDS / Aurora │
-│  (dbmon)     │   collect (IAM auth)    │  MySQL 8.0+   │
-│              │────────────────────────▶│               │
-│  ┌────────┐  │   slow log (CW Logs)    └───────────────┘
-│  │ React  │  │◀────────────────────────
-│  │  UI    │  │   metrics (CloudWatch)
-│  └────────┘  │◀────────────────────────
-└──────┬───────┘
-       │ DynamoDB (records + settings) · S3 (large plans) · Bedrock (tuning)
-       ▼
+```mermaid
+flowchart LR
+    subgraph task["ECS task — one binary"]
+        ui["React UI<br/><i>embedded</i>"]
+        app["collector · API"]
+        ui --- app
+    end
+
+    db[("RDS / Aurora<br/>MySQL 8.0+")]
+    cw["CloudWatch<br/>Logs · Metrics"]
+    ddb[("DynamoDB<br/>records · settings")]
+    s3[("S3<br/>large plans")]
+    br["Bedrock<br/>tuning advice"]
+
+    app -->|"discover — RDS API"| db
+    app -->|"collect — IAM auth, 1s"| db
+    cw  -->|"slow log backfill"| app
+    cw  -->|"CPU · mem · storage, 15m"| app
+    app --> ddb
+    app --> s3
+    app -->|"on button press only"| br
+
+    classDef aws fill:#fff3e0,stroke:#e8871a,color:#7a4a00
+    classDef own fill:#e8f1fb,stroke:#2f6fb5,color:#123a63
+    class db,cw,ddb,s3,br aws
+    class ui,app own
 ```
 
 ## What it does
@@ -39,6 +53,74 @@ Design principles that shaped the code, in one line each:
 - **Literals never leave.** Query literals are masked before they reach plans, alerts, or Bedrock.
 - **Nothing destructive is automated.** No DDL execution, no `ANALYZE TABLE`, no auto-start of
   collection.
+
+## Screens
+
+Captured against real RDS and Aurora instances. The account number in the header is replaced
+with zeros; everything else — metric values, plan costs, tuning advice — is what the tool
+actually produced. The data is synthetic seed data, not anyone's production traffic.
+
+### RDS — discovery and collection control
+
+![RDS instance management](docs/images/rds-management.png)
+
+Discovery registers instances automatically and leaves them **stopped**. Collection starts only
+when a human presses the button, and the pause scope can be the whole fleet, one environment,
+or one instance.
+
+### Metrics — two sources on one row
+
+![Fleet metrics](docs/images/metrics-fleet.png)
+
+CloudWatch (CPU / freeable memory / storage, 15-minute) sits next to self-collected values
+(connections, threads, locks, QPS, slow/s, 5-second). `10 / 90` is current connections over
+`max_connections` — a ratio, not a bare number, because 10 connections means nothing on its own.
+
+### Instance — one target in detail
+
+![Instance metrics](docs/images/instance-detail.png)
+
+### Slow Query — what was caught
+
+![Slow query list](docs/images/slow-queries.png)
+
+**In progress** rows show elapsed-so-far; **tracking lost** rows show a lower bound, because we
+know when it started but not when it ended. Saying "4.0s" for a query that may still be running
+would be a lie.
+
+### Plan — the stored execution plan
+
+![Recent explain plans](docs/images/plan-list.png)
+
+![Execution plan table](docs/images/plan-table.png)
+
+Plans are masked at collection time, so no literals reach this screen regardless of the literal
+policy. The same plan as a graph — the 45-million-row hash join is the whole story of this query:
+
+![Execution plan graph](docs/images/plan-graph.png)
+
+### AI tuning advice
+
+![AI tuning advice](docs/images/ai-tuning.png)
+
+Generated on button press, from the plan plus table specs and index cardinality read out of the
+target database. Every claim cites the plan node or the schema row it came from, DDL is shown but
+never executed, and what the model could not know is written down instead of guessed.
+
+### Slow Log — the CloudWatch source
+
+![CloudWatch slow log](docs/images/slow-log.png)
+
+### Statistics — digests over time
+
+![Digest statistics](docs/images/statistics.png)
+
+### Options — runtime settings
+
+![Settings](docs/images/settings.png)
+
+Notifications, discovery scope, login, and the Bedrock model. Saved to DynamoDB and applied
+within 30 seconds across every worker.
 
 ## Status
 
