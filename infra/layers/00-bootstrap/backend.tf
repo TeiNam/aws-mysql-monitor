@@ -5,10 +5,10 @@
 #
 # 이관하지 않으면 부트스트랩 state 가 **한 사람의 노트북에만** 존재한다
 # (`.gitignore` 가 `*.tfstate` 를 무시한다).
-# terraform {
-#   backend "s3" {
-#     key          = "00-bootstrap/terraform.tfstate"
-#     encrypt      = true
-#     use_lockfile = true
-#   }
-# }
+terraform {
+  backend "s3" {
+    key          = "00-bootstrap/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

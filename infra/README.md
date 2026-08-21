@@ -14,7 +14,7 @@
 | `30-identity` | Cognito User Pool·App Client·Groups | M5 (인증) | ✗ |
 | `40-compute` | **ECR + ECS Fargate** + (선택) ALB | M6 (상시 가동) | **✓ 이미지 필요** |
 | `50-observability` | CloudWatch 알람·대시보드·로그 그룹 | M2 이후 아무 때나 | ✗ |
-| `60-seed` | 시드 MySQL 8.4 + 파라미터 그룹 | **M1** (관측 대상 확보) | ✗ |
+| `60-seed` | 시드 MySQL 플릿: env(prd/dev) × {Aurora W+R, RDS P+R} + SSM 베스천 | **M1** (관측 대상 확보) | ✗ |
 
 **레이어별 독립 state.** `terraform_remote_state` 로 앞 레이어의 출력을 읽는다.
 한 레이어의 `destroy` 가 다른 레이어를 건드리지 않는다.
@@ -26,8 +26,30 @@ export AWS_PROFILE=teinam-primary-123456789012
 
 cd layers/00-bootstrap && terraform init && terraform apply   # 로컬 state → S3 로 이관
 cd ../10-foundation    && terraform init && terraform apply
-cd ../60-seed          && terraform init && terraform apply   # 관측 대상
+
+# 관측 대상 플릿: prd/dev × (Aurora writer+reader, RDS primary+replica)
+#              + prd Aurora 8.4 writer + 베스천
+cd ../60-seed
+terraform init -backend-config=../../backends/dev.hcl
+# RDS MySQL 마스터 비밀번호는 write-only 로 주입한다 (state 에 안 남는다.
+# RDS MySQL 은 관리형 시크릿 + 리드 리플리카가 양립 불가라서다 — variables.tf 참조).
+# **최초 1회만 필요하다** — 이후 apply 는 생략 (시크릿에서 ephemeral 로 읽는다).
+export TF_VAR_mysql_master_password=$(openssl rand -hex 16)
+terraform apply \
+  -var vpc_id=vpc-0123456789abcdef0 \
+  -var 'db_subnet_ids=["subnet-04669c82c04e56f49","subnet-063033553c53f6983"]' \
+  -var bastion_subnet_id=subnet-0f0805f3b0c916463
 # 여기까지면 로컬 `cargo run` 으로 실제 DynamoDB + 실제 MySQL 에 붙는다
+```
+
+**시드 DB 는 전부 프라이빗이다.** 접근은 베스천 SSM 포트 포워딩으로만 한다
+(SSH 키·퍼블릭 IP·인바운드 규칙 없음, 기존 SSM 인터페이스 엔드포인트 재사용이라
+NAT 비용 $0):
+
+```bash
+scripts/db-tunnel.sh --list               # 타깃과 기본 로컬 포트 (prd 1431x, dev 1432x)
+scripts/db-tunnel.sh prd-aurora-writer    # 터널 열기
+mysql -h127.0.0.1 -P14310 -udbmonadmin -p # 다른 셸에서 접속
 ```
 
 ## 기존 리소스는 `data` 로만 참조한다
