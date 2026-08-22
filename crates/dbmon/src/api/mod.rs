@@ -308,48 +308,80 @@ impl IntoResponse for ApiError {
 ///
 /// 그래서 [`SettingsState::cached_fresh`] 를 쓴다. 캐시가 비었거나(기동 직후) TTL 이
 /// 지났으면 **인증이 켜진 쪽으로 떨어진다.** 방향이 이래야 한다: 모르면 닫는다.
-/// # Cognito 는 왜 여기서 갈리는가
 ///
-/// 인증 수단이 셋이다: (1) 인증 없음 (2) 토큰(로컬·공유) (3) Cognito. **셋을 한 곳에서
-/// 고르지 않으면** 핸들러마다 다른 순서로 검사하게 되고, 순서가 다르면 어느 배포에서
-/// 어느 수단이 이기는지 알 수 없다.
+/// # 수단은 **모드가 고른다** — 순서대로 시도하지 않는다
 ///
-/// 순서는 이렇다:
+/// 인증 수단이 셋이다: (1) 인증 없음 (2) 토큰(로컬·공유) (3) Cognito.
 ///
-/// 1. 운영 설정이 `off` 이고 파일 설정이 허용하면 → 익명 admin
-/// 2. 토큰 수단(로컬 우회·발급 토큰·공유 토큰)이 맞으면 → 그 문맥
-/// 3. Cognito 검증기가 있고 설정이 완전하면 → JWT 검증 + `USER` 교집합
-/// 4. 아니면 거부
+/// 처음에는 "토큰을 먼저 시도하고 실패하면 Cognito" 로 썼다. 전환 중에 화면이 닫히지
+/// 않게 하려는 의도였는데, **그러면 전환이 끝나지 않는다**: `auth.mode = cognito` 로
+/// 바꿔도 배포 설정에 남아 있는 `http.auth_token` 이 여전히 전 환경 admin 으로
+/// 통과한다. 사람마다 권한을 나누려고 Cognito 를 붙였는데 옆문이 열려 있는 상태다
+/// (교차 리뷰가 두 번 critical 로 잡았다).
 ///
-/// **2번이 3번보다 앞이다.** 공유 토큰을 넣어 둔 배포에 Cognito 를 붙이는 중이라면
-/// 두 수단이 함께 살아 있어야 한다 — 앞의 것부터 시도하지 않으면 전환 중에 화면이
-/// 닫힌다. JWT 는 형태(`a.b.c`)로 구분되므로 오인할 여지가 없다.
+/// 그래서 **실효 모드가 수단을 하나로 정한다** ([`auth_by_mode`]):
+///
+/// | 실효 모드 | 받는 자격증명 |
+/// |---|---|
+/// | `off` | 없음 (익명 admin, 두 곳의 명시적 허용이 필요) |
+/// | `token` | 로컬 우회·발급 토큰·공유 토큰 |
+/// | `cognito` | Cognito 액세스 토큰 **only** |
+///
+/// [`effective_auth_mode`] 가 Cognito 설정이 불완전하거나 검증기가 없으면 이미
+/// `token` 으로 떨어뜨린다 — 즉 "Cognito 를 골랐는데 들어올 방법이 없다" 는 상태가
+/// 만들어지지 않는다. 전환은 설정을 되돌리면 즉시 풀린다.
 pub(crate) async fn context_from_token(
     state: &ApiState,
     token: Option<&str>,
 ) -> Result<AuthContext, auth::AuthError> {
     let now_ms = SystemClock.now_ms();
     let fresh = state.settings.cached_fresh(now_ms);
-    if fresh.as_ref().is_some_and(|s| {
-        effective_auth_mode(state, s) == dbmon_core::settings::AuthModeSetting::Off
-    }) {
-        return Ok(auth::no_auth_context());
-    }
+    // 캐시가 비었거나 낡았으면 **토큰 모드**로 본다.
+    //
+    // Cognito 로 가면 `iss`·`client_id` 를 모른 채 검증하게 되고(그건 인증이 아니다),
+    // `off` 로 가면 아무나 들어온다. 가운데가 안전한 기본값이다.
+    let mode = fresh
+        .as_ref()
+        .map(|s| effective_auth_mode(state, s))
+        .unwrap_or(dbmon_core::settings::AuthModeSetting::Token);
 
-    match authenticate(&state.policy, token) {
-        Ok(ctx) => Ok(ctx),
-        Err(token_err) => {
-            // 토큰 수단이 맞지 않았다. Cognito 를 시도한다.
-            let Some(verifier) = state.cognito.as_ref() else {
-                return Err(token_err);
+    auth_by_mode(state, token, mode, fresh.as_ref(), now_ms).await
+}
+
+/// 모드가 정한 **하나의** 수단으로 인증한다.
+///
+/// `context_from_token` 에서 분리한 이유는 **테스트 가능성**이다. 앞의 함수는
+/// `ApiState` 전체와 설정 캐시를 요구하지만, 이 함수는 모드를 인자로 받으므로
+/// "Cognito 모드에서 공유 토큰이 통과하는가" 를 직접 확인할 수 있다.
+///
+/// 그 확인이 없어서 이 결함이 **두 번** 살아남았다: 1차 교차 리뷰가 지적했고, 내가
+/// 고쳤다고 보고했지만 실제로는 편집이 반영되지 않았고, 그 위에 쓴 테스트는
+/// `effective_mode` 값만 봤기 때문에 통과했다. 2차 리뷰가 다시 잡았다.
+pub(crate) async fn auth_by_mode(
+    state: &ApiState,
+    token: Option<&str>,
+    mode: dbmon_core::settings::AuthModeSetting,
+    settings: Option<&dbmon_core::settings::AppSettings>,
+    now_ms: dbmon_core::time::EpochMs,
+) -> Result<AuthContext, auth::AuthError> {
+    use dbmon_core::settings::AuthModeSetting as M;
+    match mode {
+        M::Off => Ok(auth::no_auth_context()),
+        // **토큰 모드에서는 Cognito 를 시도하지 않는다.** 그 반대도 마찬가지다.
+        M::Token => authenticate(&state.policy, token),
+        M::Cognito => {
+            // 여기 왔다는 것은 검증기가 있고 설정이 완전하다는 뜻이다
+            // (`effective_auth_mode` 가 그렇지 않으면 `Token` 으로 떨어뜨린다).
+            // 그래도 단정하지 않는다 — 두 판정이 어긋나면 거부가 맞다.
+            let (Some(verifier), Some(settings)) = (state.cognito.as_ref(), settings) else {
+                return Err(auth::AuthError::NotConfigured);
             };
-            // **설정이 불완전하면 Cognito 를 쓰지 않는다.** 그 상태에서 통과시키면
-            // 발급자·클라이언트를 검증하지 않는 것이고, 그건 인증이 아니다.
-            let settings = fresh.ok_or(token_err.clone())?;
-            let verification = cognito::Verification::from_settings(&settings.auth.cognito)
-                .ok_or(token_err.clone())?;
+            let Some(verification) = cognito::Verification::from_settings(&settings.auth.cognito)
+            else {
+                return Err(auth::AuthError::NotConfigured);
+            };
             let Some(jwt) = token else {
-                return Err(token_err);
+                return Err(auth::AuthError::Missing);
             };
             verifier.authenticate(jwt, &verification, now_ms).await
         }

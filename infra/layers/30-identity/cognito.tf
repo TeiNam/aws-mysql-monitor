@@ -11,12 +11,18 @@
 #
 # ## Pre Token Generation Lambda 를 만들지 않는 이유
 #
-# 문서(08 §2.3)는 IdP 그룹을 `cognito:groups` 로 주입하는 Lambda 를 규정했다. 그런데
-# `AuthContext::intersect` 는 **토큰에 그룹이 없어도 서버 레코드만으로 동작한다** —
-# 그렇게 설계했다(`server_role_alone_is_enough` 테스트). 즉 Lambda 는 편의 기능이고
-# 권한의 근거가 아니다. 없는 Lambda 는 오작동하지 않으므로 만들지 않는다.
+# 문서(08 §2.3)는 IdP 그룹을 `cognito:groups` 로 주입하는 Lambda 를 규정했다.
 #
-# IdP 를 붙이는 조직은 Cognito 그룹에 사용자를 넣거나 `USER#<sub>` 레코드를 만든다.
+# **네이티브 Cognito 사용자에게는 필요 없다** — Cognito 가 그룹 멤버십을
+# `cognito:groups` 클레임에 자동으로 넣는다. 여기서 만드는 그룹 3개가 그대로 동작한다.
+#
+# ⚠ **IdP 페더레이션을 붙이면 필요해진다.** `AuthContext::intersect` 는 그룹 클레임이
+# 비면 권한을 주지 않으므로(fail-closed, `an_empty_group_claim_grants_nothing` 테스트),
+# 트리거 없이 IdP 로 들어온 사용자는 아무것도 못 본다. 그때 이 파일에 Lambda 를
+# 추가하거나 IdP 사용자를 Cognito 그룹에 직접 넣는다.
+#
+# 한동안 반대로 동작했다: 빈 그룹을 "정보 없음" 으로 읽어 서버 역할을 그대로 썼고,
+# 그러면 **Cognito 그룹에서 빼도 여전히 admin** 이었다(교차 리뷰 31라운드).
 
 locals {
   pool_name = "dbmon-${var.environment}"
@@ -149,8 +155,25 @@ resource "aws_cognito_user_pool_client" "spa" {
   # Hosted UI 에서만 입력한다.
   explicit_auth_flows = ["ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH"]
 
-  access_token_validity  = 60 # 분
-  id_token_validity      = 60
+  # **액세스 토큰을 15분으로 둔다** (문서 08 §2.2 는 60분을 적었다).
+  #
+  # # 왜 줄였나 (교차 리뷰 2차)
+  #
+  # 권한 변경이 기존 토큰에 즉시 반영되지 않는다. 두 수단이 있는데 둘 다 반쪽이다:
+  #
+  # | 수단 | 상태 |
+  # |---|---|
+  # | `claims_version` 대조 | Pre Token Generation 트리거가 없어 토큰이 버전을 주장하지 않는다 → 검사를 건너뛴다 |
+  # | `revoked_after_ms` | 동작하지만 **사람이 DynamoDB 에 직접 세워야 한다** (앱은 그 키에 쓰기 Deny 다) |
+  #
+  # 그래서 그룹에서 빼거나 비활성화해도 **기존 액세스 토큰은 만료까지 산다.**
+  # 60분이면 그 창이 한 시간이다. 15분으로 줄이면 4배 좁아지고, 프론트의 자동
+  # 갱신(`useTokenRefresh`, 만료 5분 전)이 그 주기를 흡수한다.
+  #
+  # 더 줄일 수도 있지만(Cognito 최소 5분) 갱신 호출이 그만큼 늘고, 갱신 자체가
+  # 실패 표면이다. 15분이 균형점이다.
+  access_token_validity  = 15 # 분
+  id_token_validity      = 15
   refresh_token_validity = var.refresh_token_hours
   token_validity_units {
     access_token  = "minutes"

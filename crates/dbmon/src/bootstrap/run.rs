@@ -319,6 +319,59 @@ impl Bootstrapper {
             }
         };
 
+        // ── 실행 직전 재확인 ──
+        //
+        // # 왜 한 번 더 읽는가 (교차 리뷰 2차가 잡은 경쟁 조건)
+        //
+        // 위의 `revalidate` 는 **한 번 읽은 스냅샷**을 검증한다. 그 사이에 대상 DB 에
+        // `ALTER USER` 권한이 있는 내부자가 계정의 비밀번호를 자기가 아는 값으로
+        // 바꾸면, 이어지는 `GRANT` 가 탈취된 계정에 적용된다 — T-28 의 잔여 창이다.
+        //
+        // 창을 0 으로 만들 수는 없다. MySQL 의 `GRANT` 는 트랜잭션이 아니고,
+        // 계정 상태에 대한 compare-and-swap 이 없다. 그래서 **창을 좁힌다**:
+        // 같은 연결에서 상태를 다시 읽고 지문을 비교한다. 남는 창은 그 쿼리 하나의
+        // 폭(수십 마이크로초)이고, 공격자가 관측할 수 없는 순간이다.
+        //
+        // 이걸 각 문장 사이마다 하지 않는 이유: 쿼리가 두 배가 되는데 창은
+        // 여전히 0 이 아니다. 비용/효과가 맞지 않는다. 실행 후 `after` 상태를 읽어
+        // 감사에 남기므로, 사후에는 무엇이 달라졌는지 알 수 있다.
+        let recheck = conn.introspect(&pending.desired, iam_auth_enabled).await;
+        match recheck {
+            Ok(now) if now.security_digest() == pending.state_digest => {}
+            other => {
+                conn.close().await;
+                let found = match &other {
+                    Ok(_) => "실행 직전에 계정 상태가 바뀌었다".to_string(),
+                    Err(e) => format!("실행 직전 상태를 읽을 수 없다: {e}"),
+                };
+                let record = AuditRecord {
+                    event: AuditEvent::BootstrapApply,
+                    actor: String::new(),
+                    at_ms: now_ms,
+                    instance_id: instance.id.as_str().to_string(),
+                    env: instance.env.effective,
+                    credential_source: Some(credentials.source),
+                    privilege_mode: pending.desired.mode.as_str(),
+                    monitor_user: pending.desired.user.clone(),
+                    monitor_host: pending.desired.host.clone(),
+                    actions: audit::actions_of(&plan, 0),
+                    before: StateSnapshot::of(&before),
+                    after: other.as_ref().ok().map(StateSnapshot::of),
+                    result: AuditResult::Blocked,
+                    confirmation_typed: pending.is_production,
+                    blockers: vec![found.clone()],
+                    excess_privileges: plan.excess.clone(),
+                };
+                return Ok(ApplyReport {
+                    record,
+                    result: Err(BootstrapError::Blocked(vec![Blocker::PlanStale {
+                        expected: "계획 시점의 계정 상태".into(),
+                        found,
+                    }])),
+                });
+            }
+        }
+
         // ── 실행 ──
         let statements: Vec<_> = plan.statements().cloned().collect();
         let total = statements.len();
