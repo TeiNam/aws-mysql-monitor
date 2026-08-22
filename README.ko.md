@@ -152,44 +152,42 @@ ghcr.io/<owner>/<repo>:latest          # 멀티 아키텍처 (arm64 + amd64)
 ghcr.io/<owner>/<repo>:sha-<commit>    # 불변 — 태스크 정의에는 이걸 쓴다
 ```
 
-자기 ECR 로 미러링하려면(ECS 에는 이쪽을 권한다 — 같은 계정 풀, 이그레스 없음, VPC
-엔드포인트) **저장소 변수** 두 개를 넣으면 `ecr` 잡이 돌기 시작한다.
+워크플로는 여기서 끝난다. AWS 자격증명을 들지 않는다 — 이미지를 발행하는 일과 배포하는
+일은 폭발 반경이 다르고, 계정에 쓸 수 있는 빌드 러너는 레지스트리에만 쓸 수 있는 러너보다
+훨씬 큰 표적이다.
 
-| 변수 | 예 |
-|---|---|
-| `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/github-oidc-ecr-push` |
-| `ECR_REPOSITORY` | `dbmon` |
-| `AWS_REGION` | `ap-northeast-2` (생략 시 이 값) |
+### 이미지를 ECS 로 가져가는 방법
 
-GitHub 이 맡을 OIDC 역할:
+GHCR 패키지가 **공개**면 ECS 가 설정 없이 끌어간다.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:*" }
-    }
-  }]
+**비공개**면(private 저장소의 기본값) 태스크의 **실행 롤**에 레지스트리 자격증명이 필요하다.
+`read:packages` 를 가진 GitHub 개인 액세스 토큰을 넣는다:
+
+```bash
+aws secretsmanager create-secret --name dbmon/ghcr \
+  --secret-string '{"username":"<github-user>","password":"<read:packages PAT>"}'
+```
+
+컨테이너 정의에서 참조하고, 그 ARN 에 대한 `secretsmanager:GetSecretValue` 를 **실행 롤**에
+준다(태스크 롤이 아니다 — 앱이 이미지를 끌 수 있어서는 안 된다):
+
+```jsonc
+"repositoryCredentials": {
+  "credentialsParameter": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/ghcr-AbCdEf"
 }
 ```
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
-    { "Effect": "Allow",
-      "Action": ["ecr:BatchGetImage", "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload",
-                 "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"],
-      "Resource": "arn:aws:ecr:ap-northeast-2:123456789012:repository/dbmon" }
-  ]
-}
+또는 릴리스마다 ECR 로 한 번 복사한다. 재빌드가 아니라 `imagetools create` 를 쓴다 —
+같은 다이제스트를 옮기므로 검증한 바이트와 도는 바이트가 같다:
+
+```bash
+docker buildx imagetools create \
+  -t 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/dbmon:sha-<commit> \
+  ghcr.io/<owner>/<repo>:sha-<commit>
 ```
+
+ECS 에는 보통 ECR 이 맞다 — 같은 계정 IAM, 이그레스 요금 없음, VPC 엔드포인트 —
+그리고 풀 자격증명 문제가 아예 없어진다.
 
 이미지는 **arm64 우선**이다(Graviton: 같은 성능에 약 20% 싸다). UID 10001 로 돌고,
 컴파일러나 셸 유틸리티가 들어 있지 않고, 바이너리 자신의 `healthcheck` 서브커맨드를
@@ -438,6 +436,10 @@ Aurora 는 발견한 인스턴스의 **라이터 엔드포인트**(클러스터 
       { "name": "DBMON__COLLECTOR__MONITOR_DB_USER", "value": "dbmon" },
       { "name": "DBMON__DISCOVERY__ALLOWED_VPC_IDS", "value": "vpc-0123456789abcdef0" }
     ],
+    "secrets": [
+      { "name": "DBMON__HTTP__AUTH_TOKEN",
+        "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/api-token" }
+    ],
     "stopTimeout": 60,
     "logConfiguration": {
       "logDriver": "awslogs",
@@ -475,6 +477,7 @@ Aurora 는 발견한 인스턴스의 **라이터 엔드포인트**(클러스터 
 | `http.shutdown_grace_secs` | `45` | ECS `stopTimeout` 보다 작아야 한다. |
 | `http.deregistration_wait_secs` | `20` | 로드밸런서가 없으면 `0`. |
 | `http.allow_auth_disable` | `false` | "인증 없음" 설정을 허용한다. 두 곳의 동의가 필요하다. |
+| `http.auth_token` | 없음 | **공유 접속 토큰.** 없고 `off` 도 아니면 모든 요청이 401 이다. 32자 이상·공백 없음, 아니면 기동 실패. |
 | `aws.target_regions` | `[region]` | 설정에 리전 목록이 없을 때의 폴백. |
 | `collector.slow_threshold_secs` | `2` | 무엇을 슬로우로 볼지. |
 | `collector.monitor_db_user` | `dbmon` | 자기 제외 키이기도 하다. |
@@ -557,7 +560,7 @@ SHOW GRANTS FOR 'dbmon'@'10.1.%';
 | 절 | 넣을 것 |
 |---|---|
 | **탐색 범위** | 조회할 리전, 그리고 mgmt 모드면 계정(12자리 ID + 역할 **이름**, ARN 아님). |
-| **로그인** | `token`(공유 토큰) / `cognito`(현재는 설정만) / `off`(`http.allow_auth_disable` 필요). |
+| **로그인** | `token` / `cognito`(현재는 설정만) / `off`(`http.allow_auth_disable` 필요). **토큰 값은 여기서 넣지 않는다** — 아래 참고. |
 | **AI 튜닝** | 활성화, 모델 ID, Bedrock 리전, 출력 토큰 상한. |
 | **알림** | Slack 방식, 채널, Secrets Manager **참조**, 미리보기가 붙은 문구 템플릿. |
 
@@ -567,6 +570,56 @@ SHOW GRANTS FOR 'dbmon'@'10.1.%';
 
 그 다음 **RDS** 탭에서 인스턴스마다 **수집 시작**을 누른다. 등록은 자동이고 시작은
 아니다 — 수집은 대상 DB 에 1초마다 쿼리를 던지는 일이고, 그건 사람이 결정해야 한다.
+
+### 인증, 구체적으로
+
+비밀번호로 로그인하는 화면은 없다. 들어오는 방법이 넷이고, 어느 것이 적용되는지는
+배포에서 유도된다 — `GET /api/auth/config` 가 그걸 알려주고 화면의 안내 문구가 따라간다.
+
+| 모드 | 자격증명 | 언제 |
+|---|---|---|
+| `local-dev` | 없음 | `dev` **이고** 루프백 바인드. 둘 다여야 하므로 `0.0.0.0` 으로 연 dev 배포는 공짜로 통과하지 않는다. |
+| `local-token` | 기동 로그에 찍히는 무작위 토큰 | `dev`, 비루프백, **비ECS**. 루프백 바인드가 불가능한 `docker run` 용. |
+| `shared-token` | 배포 설정의 `http.auth_token` | **ECS 경로가 이것이다.** |
+| `off` | 없음 — 누구나 admin | `http.allow_auth_disable = true` **이고** 설정에서 `auth.mode = off`. |
+
+실제 배포가 쓰는 것은 `shared-token` 이다:
+
+```bash
+openssl rand -hex 32
+```
+
+태스크 정의의 `secrets:` 로 `DBMON__HTTP__AUTH_TOKEN` 에 주입한다(§5). 그러면 정의에는
+Secrets Manager ARN 만 남는다. 32자 미만이거나 공백이 섞이면 **기동에서 실패한다** —
+약한 토큰은 인증이 있다는 착각을 만들어 없는 것보다 나쁘고, 공백은 헤더에서 잘려
+"맞는 토큰인데 401" 이 된다.
+
+화면은 `https://<alb>/?token=<토큰>` 으로 한 번 들어온다. 프런트가 즉시 `sessionStorage`
+로 옮기고 주소창에서 지우므로 히스토리·`Referer` 에 남지 않는다.
+
+**이 토큰은 admin 이다.** 토큰 하나에는 주체가 없어 역할을 나눌 근거가 없다 — 가진
+사람은 설정을 바꾸고 인증을 끌 수도 있다. 감사 로그에는 `subject=shared-token` 으로
+남아 `local-dev`·`anonymous` 와 구분된다. 사람별 역할은 Cognito 가 할 일이다.
+
+**토큰도 없고 `off` 도 아니면 모든 API 요청이 401 이다.** 기동 로그가 정확히 그 사실을
+경고한다 — 맨 `401` 은 "설정 한 줄이 없다" 를 말해 주지 못한다.
+
+### Cognito — 있는 것과 없는 것
+
+설정 화면은 풀 ID·클라이언트 ID·리전·호스팅 UI 도메인을 저장한다. 전부 로그인 전에
+브라우저가 알아야 하는 공개 값이고, 그래서 `/api/auth/config` 가 인증 없이 답한다.
+시크릿을 쓰는 앱 클라이언트는 넣지 않는다 — SPA 는 시크릿을 지킬 수 없다.
+
+**검증기가 배선되지 않았다**(`crates/dbmon/src/api/auth.rs` 의 `COGNITO_READY = false`).
+그래서 `cognito` 를 고르면 공유 토큰 경로로 떨어진다 — 토큰을 넣어 둔 배포는 계속
+동작하고, 넣지 않은 배포는 401 이다. 스텁으로 통과시키지 않는다. 그건 인증이 있는
+것처럼 보이면서 없는 상태다.
+
+남은 일, 순서대로:
+`https://cognito-idp.<리전>.amazonaws.com/<풀>/.well-known/jwks.json` 에서 JWKS 조회,
+`kid` 키 캐시, RS256 서명 검증과 `iss`·`aud`·`exp`·`token_use` 확인, 그리고
+`AuthContext::intersect` 로 클레임을 역할에 매핑(그룹 → 역할). `CognitoSettings` 는 그
+단계들이 필요한 값을 이미 다 담고 있으므로 남은 것은 설정이 아니라 코드다.
 
 ## 8. 확인
 

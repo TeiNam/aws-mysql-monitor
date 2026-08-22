@@ -155,44 +155,42 @@ ghcr.io/<owner>/<repo>:latest          # multi-arch (arm64 + amd64)
 ghcr.io/<owner>/<repo>:sha-<commit>    # immutable — use this in task definitions
 ```
 
-To mirror into your own ECR (recommended for ECS: same-account pulls, no egress, VPC endpoint
-support), set two **repository variables** and the `ecr` job starts running:
+That is where the workflow stops. It carries no AWS credentials — publishing an image and
+deploying it are different jobs with different blast radius, and a build runner that can write
+to your account is a much bigger target than one that can write to a registry.
 
-| Variable | Example |
-|---|---|
-| `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/github-oidc-ecr-push` |
-| `ECR_REPOSITORY` | `dbmon` |
-| `AWS_REGION` | `ap-northeast-2` (optional, defaults to this) |
+### Getting the image into ECS
 
-The OIDC role that GitHub assumes:
+If the GHCR package is **public**, ECS pulls it with no extra configuration.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:*" }
-    }
-  }]
+If it is **private** (the default for a private repository), the task's *execution* role needs
+registry credentials. Store a GitHub personal access token that has `read:packages`:
+
+```bash
+aws secretsmanager create-secret --name dbmon/ghcr \
+  --secret-string '{"username":"<github-user>","password":"<PAT with read:packages>"}'
+```
+
+Reference it in the container definition, and grant `secretsmanager:GetSecretValue` on that ARN
+to the **execution** role (not the task role — the app must never be able to pull images):
+
+```jsonc
+"repositoryCredentials": {
+  "credentialsParameter": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/ghcr-AbCdEf"
 }
 ```
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
-    { "Effect": "Allow",
-      "Action": ["ecr:BatchGetImage", "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload",
-                 "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart"],
-      "Resource": "arn:aws:ecr:ap-northeast-2:123456789012:repository/dbmon" }
-  ]
-}
+Or copy the image into ECR once per release. Use `imagetools create`, not a rebuild — it moves
+the same digest, so the bytes you tested are the bytes you run:
+
+```bash
+docker buildx imagetools create \
+  -t 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/dbmon:sha-<commit> \
+  ghcr.io/<owner>/<repo>:sha-<commit>
 ```
+
+ECR is the usual choice for ECS — same-account IAM, no egress charges, VPC endpoint support —
+and it removes the pull-credential problem entirely.
 
 The image is **arm64-first** (Graviton: same performance, ~20% cheaper). It runs as UID 10001,
 contains no compiler or shell utilities, and ships a `HEALTHCHECK` that calls the binary's own
@@ -442,6 +440,10 @@ endpoints, not the cluster endpoint) so `performance_schema` reads are attribute
       { "name": "DBMON__COLLECTOR__MONITOR_DB_USER", "value": "dbmon" },
       { "name": "DBMON__DISCOVERY__ALLOWED_VPC_IDS", "value": "vpc-0123456789abcdef0" }
     ],
+    "secrets": [
+      { "name": "DBMON__HTTP__AUTH_TOKEN",
+        "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:dbmon/api-token" }
+    ],
     "stopTimeout": 60,
     "logConfiguration": {
       "logDriver": "awslogs",
@@ -479,6 +481,7 @@ half-working process that collects but cannot store is worse than one that refus
 | `http.shutdown_grace_secs` | `45` | Must be < ECS `stopTimeout`. |
 | `http.deregistration_wait_secs` | `20` | Set `0` without a load balancer. |
 | `http.allow_auth_disable` | `false` | Permits the "no authentication" setting. Two opt-ins required. |
+| `http.auth_token` | none | **Shared bearer token.** Without it (and without `off`), every request 401s. ≥32 chars, no whitespace, or startup fails. |
 | `aws.target_regions` | `[region]` | Fallback when Settings has no region list. |
 | `collector.slow_threshold_secs` | `2` | What counts as slow for detection. |
 | `collector.monitor_db_user` | `dbmon` | Also the self-exclusion key. |
@@ -561,7 +564,7 @@ After the service is healthy, open the UI and finish in **Options** (gear, top r
 | Section | What to set |
 |---|---|
 | **Discovery scope** | Regions to scan; accounts (12-digit ID + role *name*, not ARN) when management-account mode is on. |
-| **Login** | `token` (shared token) / `cognito` (settings only for now) / `off` (requires `http.allow_auth_disable`). |
+| **Login** | `token` / `cognito` (settings only for now) / `off` (requires `http.allow_auth_disable`). **The token itself is not entered here** — see below. |
 | **AI tuning** | Enable, model ID, Bedrock region, output token limit. |
 | **Notifications** | Slack mode, channel, Secrets Manager **reference**, message template with preview. |
 
@@ -572,6 +575,57 @@ Details and failure semantics: [`docs/23-settings.md`](docs/23-settings.md).
 Then go to the **RDS** tab and press **Start collection** on each instance. Registration is
 automatic; starting is not — collection begins querying the target database every second, and
 that should be a human decision.
+
+### Authentication, concretely
+
+There is no "log in with a password" screen. Four ways in, and which one applies is derived from
+the deployment — `GET /api/auth/config` reports it, and the UI's notice text follows.
+
+| Mode | Credential | When |
+|---|---|---|
+| `local-dev` | none | `dev` **and** bound to loopback. Both, so a `dev` deployment on `0.0.0.0` does not get a free pass. |
+| `local-token` | random token printed to the startup log | `dev`, non-loopback, **not** on ECS. For `docker run`, where loopback binding is impossible. |
+| `shared-token` | `http.auth_token` from the deployment config | **This is the ECS path.** |
+| `off` | none — everyone is admin | `http.allow_auth_disable = true` **and** settings `auth.mode = off`. |
+
+`shared-token` is what a real deployment uses:
+
+```bash
+openssl rand -hex 32
+```
+
+Inject it as `DBMON__HTTP__AUTH_TOKEN` via the task definition's `secrets:` block (§5), so the
+definition holds only a Secrets Manager ARN. Shorter than 32 characters or containing whitespace
+and **startup fails** — a weak token is worse than none, because it looks like authentication;
+whitespace gets cut at the header and produces "the token is right but I get 401".
+
+Open the UI once at `https://<alb>/?token=<token>`. The frontend moves it to `sessionStorage` and
+strips it from the address bar, so it does not stay in history or a `Referer` header.
+
+**This token is admin.** One token has no subject, so there is nothing to base a role split on —
+whoever holds it can change settings and even turn authentication off. Audit logs record
+`subject=shared-token`, distinct from `local-dev` and `anonymous`. Per-person roles are what
+Cognito is for.
+
+**With no token and no `off`, every API request returns 401.** The startup log warns about
+exactly this, because a bare `401` cannot tell you that one config line is missing.
+
+### Cognito: what is and is not there
+
+The settings screen stores the pool ID, client ID, region, and hosted-UI domain — all public
+values a browser must know before login, which is why `/api/auth/config` serves them without
+authentication. Do not use an app client with a secret; an SPA cannot keep one.
+
+**The verifier is not wired** (`COGNITO_READY = false` in `crates/dbmon/src/api/auth.rs`).
+Selecting `cognito` therefore falls back to the shared-token path: a deployment with a token keeps
+working, one without it returns 401. Nothing is stubbed through — a stub would look like
+authentication while being none.
+
+Still missing, in order: JWKS fetch from
+`https://cognito-idp.<region>.amazonaws.com/<pool>/.well-known/jwks.json`, a `kid`-keyed key cache,
+RS256 signature plus `iss`/`aud`/`exp`/`token_use` checks, and mapping claims to an `AuthContext`
+via `AuthContext::intersect` so a group becomes a role. `CognitoSettings` already carries every
+field those steps need, so this is code, not configuration.
 
 ## 8. Verify
 

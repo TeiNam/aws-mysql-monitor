@@ -25,6 +25,7 @@ const realFetch = globalThis.fetch;
 
 /** 401 로 뒤집을 수 있는 가짜 백엔드. */
 let unauthorized = false;
+let authMode = "local-token";
 /** 서버가 조회 상한에 걸려 **0건**을 준 상황. */
 let emptyButTruncated = false;
 /** 설정을 읽지 못한 상황(손상된 문서·저장소 장애). */
@@ -63,7 +64,11 @@ const RECORD = {
 
 function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
-  if (unauthorized) {
+  // **`/api/auth/config` 는 401 이 되지 않는다.** 서버에서 인증 없이 답하는 세 경로 중
+  // 하나다(`/healthz`·`/readyz`·이것) — 로그인하기 전에 로그인 방법을 알아야 하기
+  // 때문이다. 이걸 막아 두면 토큰 안내가 `mode` 를 못 받아 **항상 기본 문구**로
+  // 떨어지고, 모드별 안내가 틀려도 테스트가 통과한다.
+  if (unauthorized && !url.startsWith("/api/auth/config")) {
     return Promise.resolve(
       new Response(JSON.stringify({ error: "unauthorized" }), {
         status: 401,
@@ -306,7 +311,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   if (url.startsWith("/api/auth/config")) {
     return Promise.resolve(
       json({
-        mode: "local-token",
+        mode: authMode,
         cognito_configured: false,
         cognito: { user_pool_id: "", client_id: "", region: null, domain: "" },
         deployment_env: "dev",
@@ -318,6 +323,7 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
 
 beforeEach(() => {
   unauthorized = false;
+  authMode = "local-token";
   emptyButTruncated = false;
   settingsLoadError = null;
   FakeSocket.install();
@@ -484,6 +490,35 @@ describe("인증 거부", () => {
     expect(screen.getByText("접속 토큰이 필요하다")).toBeDefined();
     // 거부된 토큰은 버려야 한다 — 남겨 두면 계속 401 을 만든다.
     expect(sessionStorage.getItem("dbmon.token")).toBeNull();
+  });
+
+  /**
+   * **안내가 모드마다 달라야 한다.**
+   *
+   * 배포에 공유 토큰이 있는데 "도커 로그를 보라" 를 말하면 운영자는 존재하지 않는
+   * 로그 줄을 찾는다. 토큰이 아예 없으면 찾을 것 자체가 없으므로 "설정에 넣어라" 를
+   * 말해야 한다. 셋을 한 문구로 묶었던 것이 이 테스트가 막는 회귀다.
+   */
+  it.each([
+    ["local-token", "docker compose logs dbmon | grep token=", "접속 토큰이 필요하다"],
+    ["shared-token", "/?token=<토큰>", "접속 토큰이 필요하다"],
+    [
+      "unconfigured",
+      "DBMON__HTTP__AUTH_TOKEN=$(openssl rand -hex 32)",
+      "이 배포에는 인증 수단이 없다",
+    ],
+  ])("%s 모드는 그 모드에 맞는 안내를 보여준다", async (mode, hint, heading) => {
+    authMode = mode;
+    await renderApp("/mysql");
+    unauthorized = true;
+    FakeSocket.latest().accept();
+    FakeSocket.latest().deliver({ t: "error", code: "unauthorized" });
+
+    // **힌트를 기다린다, 머리말이 아니다.** `local-token`·`shared-token`·모드 미도착이
+    // 같은 머리말을 쓰므로 머리말은 쿼리가 해결되기 전에도 통과한다 — 그 뒤의 동기
+    // 검사가 아직 기본 문구를 보고 실패했다.
+    expect(await screen.findByText((t) => t.includes(hint))).toBeDefined();
+    expect(screen.getByText(heading)).toBeDefined();
   });
 });
 

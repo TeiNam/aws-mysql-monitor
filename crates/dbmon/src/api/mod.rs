@@ -234,7 +234,11 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn with_body(status: StatusCode, code: &'static str, detail: serde_json::Value) -> Self {
+    pub(crate) fn with_body(
+        status: StatusCode,
+        code: &'static str,
+        detail: serde_json::Value,
+    ) -> Self {
         Self {
             status,
             code,
@@ -318,11 +322,20 @@ async fn auth_config(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let mode = match effective {
         dbmon_core::settings::AuthModeSetting::Off => "off",
         dbmon_core::settings::AuthModeSetting::Cognito => "cognito",
+        // **"토큰 방식" 안에 서로 다른 상황이 넷 있다.** 하나로 묶으면 화면이 틀린
+        // 안내를 한다 — ECS 배포에 "도커 로그에서 토큰을 찾아라" 를 말하는 식이다.
         dbmon_core::settings::AuthModeSetting::Token => {
-            if state.policy.allows_local_bypass() {
+            let p = &state.policy;
+            if p.allows_local_bypass() {
                 "local-dev"
-            } else {
+            } else if p.dev_token.is_some() {
                 "local-token"
+            } else if p.shared_token.is_some() {
+                "shared-token"
+            } else {
+                // 들어올 방법이 없다. 화면이 "토큰을 찾아라" 대신 "배포 설정에
+                // 넣어라" 를 말해야 한다 — 찾을 토큰이 존재하지 않는다.
+                "unconfigured"
             }
         }
     };

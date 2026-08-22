@@ -141,6 +141,31 @@ Pre Token Generation Lambda 트리거에서 매핑 규칙에 따라 `cognito:gro
 
 `AdminDeleteUser`는 부여하지 않는다. 비활성화만 허용한다(감사 추적 보존).
 
+## 2.9 지금 구현된 것 — Cognito 는 아직 아니다
+
+이 절 아래(§3)는 **설계**다. 실제 코드가 지금 하는 인증은 네 가지이고, 어느 것이
+적용되는지는 배포 사실에서 유도된다(`crates/dbmon/src/api/auth.rs`).
+
+| 모드 | 자격증명 | 조건 | `subject` |
+|---|---|---|---|
+| `local-dev` | 없음 | `dev` **∧** 루프백 바인드 | `local-dev` |
+| `local-token` | 기동 로그의 무작위 토큰 | `dev` ∧ 비루프백 ∧ 비ECS | `local-dev` |
+| `shared-token` | `http.auth_token` | 설정돼 있으면 어느 환경이든 | `shared-token` |
+| `off` | 없음 | `allow_auth_disable` **∧** `auth.mode=off` | `anonymous` |
+
+**전부 `admin` 이다.** 주체가 하나뿐인 자격증명으로 역할을 나눌 근거가 없다 — 아래 §5
+의 역할 표는 Cognito 가 들어온 뒤에야 의미를 갖는다. 그때까지 T-20(클레임 단독 승격)과
+T-33(폐기 반영)은 **적용 대상이 없다**: 나눌 역할도, 폐기할 세션도 없다.
+
+`shared-token` 이 없던 동안 `token` 모드는 이름만 있었다 — `authenticate` 가
+`dev_token` 만 비교했고 그건 dev 에서만 채워지므로, ECS 배포는 `off` 를 켜지 않는 한
+**모든 요청이 401** 이었다. 설정 화면이 제공하는 모드로 들어올 수단이 코드에 없었던
+것이고, 그게 이 절을 쓰게 만든 결함이다.
+
+남은 일은 §3 그대로다. `COGNITO_READY` 가 `true` 가 되는 조건: JWKS 조회 → `kid` 캐시 →
+RS256 서명 → 클레임 검증 → `AuthContext::intersect`. `CognitoSettings` 는 그 단계가
+필요한 값(풀 ID·클라이언트 ID·리전·도메인)을 이미 담고 있다.
+
 ## 3. 토큰 검증 (FR-AUT-07)
 
 ```

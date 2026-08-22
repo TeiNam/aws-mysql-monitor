@@ -69,17 +69,50 @@ function TokenNotice() {
     staleTime: Infinity,
   });
   const mode = config.data?.mode;
+  const heading =
+    mode === "cognito"
+      ? "이 환경은 아직 접속할 수 없다"
+      : mode === "unconfigured"
+        ? "이 배포에는 인증 수단이 없다"
+        : "접속 토큰이 필요하다";
 
   return (
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-4" role="alert">
-      <h2 className="text-sm font-medium text-amber-900">
-        {mode === "cognito" ? "이 환경은 아직 접속할 수 없다" : "접속 토큰이 필요하다"}
-      </h2>
+      <h2 className="text-sm font-medium text-amber-900">{heading}</h2>
       {mode === "cognito" ? (
         <p className="mt-2 text-sm text-amber-800">
           배포 환경({config.data?.deployment_env})은 Cognito JWT 검증이 아직 구현되지 않아
           <strong> fail closed</strong> 다 — 토큰을 만들어도 통과하지 못한다.
         </p>
+      ) : mode === "unconfigured" ? (
+        /* **찾을 토큰이 없다.** "로그를 보라" 를 말하면 없는 것을 찾게 만든다. */
+        <>
+          <p className="mt-2 text-sm text-amber-800">
+            공유 토큰이 설정되지 않았고 인증도 꺼져 있지 않다 — 그래서 모든 요청이 401 이다.
+            배포 설정에 토큰을 넣고 다시 띄운다.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded bg-white p-3 font-mono text-xs text-gray-800">
+            {"DBMON__HTTP__AUTH_TOKEN=$(openssl rand -hex 32)"}
+          </pre>
+          <p className="mt-2 text-xs text-amber-700">
+            ECS 에서는 태스크 정의의 <span className="font-mono">secrets:</span> 로 주입한다.
+            32자 미만이거나 공백이 섞이면 기동에서 거부한다.
+          </p>
+        </>
+      ) : mode === "shared-token" ? (
+        /* 토큰은 있다 — 운영자가 가지고 있고, 우리는 값을 모른다. */
+        <>
+          <p className="mt-2 text-sm text-amber-800">
+            이 배포는 공유 토큰을 쓴다. 아래 형태로 한 번 들어오면 토큰이 세션에 저장된다.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded bg-white p-3 font-mono text-xs text-gray-800">
+            {`${window.location.origin}/?token=<토큰>`}
+          </pre>
+          <p className="mt-2 text-xs text-amber-700">
+            토큰은 배포 설정(<span className="font-mono">http.auth_token</span>)에 있다 — 화면이나
+            로그에는 찍히지 않는다.
+          </p>
+        </>
       ) : (
         <>
           <p className="mt-2 text-sm text-amber-800">
