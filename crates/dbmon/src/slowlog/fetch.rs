@@ -414,13 +414,27 @@ fn is_bad_token<R>(
 /// 그래서 마지막 `# Time:` 앞에서 자른다. 그 엔트리 하나는 잃지만 **잘린 채 저장되지는
 /// 않는다** — 오염보다 결측이 낫다. 상한은 로그가 폭주할 때만 닿는다.
 ///
-/// 자를 곳이 없으면(청크 전체가 한 엔트리의 일부) 전부 버린다. 그 경우 남길 수 있는
-/// 완성 엔트리가 없다.
+/// # 마지막 엔트리가 완성돼 보이면 남긴다
+///
+/// 처음에는 마지막 `# Time:` 앞에서 무조건 잘랐다. 그러면 **완성된 엔트리 하나를 버린다** —
+/// 특히 청크에 엔트리가 하나뿐이고 그게 온전할 때(`rfind` 가 0) 전부 사라진다.
+/// 상한은 로그가 폭주할 때 닿으므로 그때마다 한 건씩 잃는 것은 작지 않다.
+///
+/// 완성 여부는 **세미콜론으로 본다.** MySQL 슬로우로그의 SQL 은 `;` 로 끝난다. 파서는
+/// 세미콜론이 없어도 받아 주므로(그게 절단을 저장하게 만든 경로다) 여기서 판정한다.
+///
+/// 자를 곳이 없고 완성돼 보이지도 않으면 전부 버린다 — 그 경우 남길 수 있는 완성 엔트리가
+/// 없고, 파서도 `# Time:` 없는 조각을 버린다.
 fn cut_at_last_entry_boundary(text: &str) -> &str {
-    match text.rfind("# Time:") {
-        Some(0) | None => "",
-        Some(i) => &text[..i],
+    let Some(i) = text.rfind("# Time:") else {
+        // 헤더가 아예 없다 — 파서가 어차피 버린다.
+        return "";
+    };
+    // 마지막 엔트리가 `;` 로 끝나면 온전한 것으로 본다.
+    if text[i..].trim_end().ends_with(';') {
+        return text;
     }
+    &text[..i]
 }
 
 /// 한 청크의 누적 크기 상한. 페이지 상한과 함께 메모리를 묶는다.
@@ -570,16 +584,25 @@ mod tests {
     #[test]
     fn a_capped_chunk_keeps_only_complete_entries() {
         let full = "# Time: A\nSELECT 1;\n# Time: B\nSELECT 2;\n";
-        // 마지막 엔트리가 잘린 형태.
+        // 마지막 엔트리가 잘린 형태 → 그 앞까지만.
         let partial = "# Time: A\nSELECT 1;\n# Time: B\nSELECT very_long_and_cut";
         assert_eq!(
             cut_at_last_entry_boundary(partial),
             "# Time: A\nSELECT 1;\n",
             "완성 엔트리까지 남기지 않았다"
         );
-        // 완성 엔트리가 둘이면 마지막 하나를 버린다(그게 잘렸을 수 있다).
-        assert_eq!(cut_at_last_entry_boundary(full), "# Time: A\nSELECT 1;\n");
-        // 청크 전체가 한 엔트리의 일부면 남길 것이 없다.
+
+        // **온전한 엔트리는 버리지 않는다.** 무조건 자르면 여기서 한 건을 잃는다 —
+        // 상한은 로그 폭주 때 닿으므로 그때마다 잃는 셈이다(자체 점검에서 잡았다).
+        assert_eq!(
+            cut_at_last_entry_boundary(full),
+            full,
+            "완성된 마지막 엔트리를 버렸다"
+        );
+        // 엔트리가 하나이고 온전하면 그대로 남는다 (`rfind` 가 0인 경우).
+        let one = "# Time: A\nSELECT 1;\n";
+        assert_eq!(cut_at_last_entry_boundary(one), one);
+        // 하나이고 잘렸으면 남길 것이 없다.
         assert_eq!(cut_at_last_entry_boundary("# Time: A\nSELECT cut"), "");
         assert_eq!(cut_at_last_entry_boundary("SELECT no_header"), "");
         assert_eq!(cut_at_last_entry_boundary(""), "");
