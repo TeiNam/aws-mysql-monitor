@@ -185,7 +185,8 @@ impl BootstrapService {
             )
             .await?;
 
-        record.actor = self.audit_actor(actor);
+        record.actor = actor.to_string();
+        record.worker_id = self.worker_id.clone();
         self.record(&record).await;
         Ok(outcome)
     }
@@ -218,7 +219,8 @@ impl BootstrapService {
 
         match result {
             Ok(mut report) => {
-                report.record.actor = self.audit_actor(actor);
+                report.record.actor = actor.to_string();
+                report.record.worker_id = self.worker_id.clone();
                 // **성공이든 실패든 먼저 쓴다.** 실패 경로에서 감사를 건너뛰면
                 // 반쪽 상태(계정은 있고 권한은 없음)에 기록이 남지 않는다.
                 self.record(&report.record).await;
@@ -343,14 +345,6 @@ impl BootstrapService {
             None,
         )
         .map_err(BootstrapError::Domain)
-    }
-
-    /// 감사 레코드의 주체 문자열.
-    ///
-    /// 요청자와 워커를 **함께** 남긴다. 요청자만 남기면 여러 워커 배포에서 어느
-    /// 프로세스가 실행했는지 모르고, 워커만 남기면 누가 눌렀는지 모른다.
-    fn audit_actor(&self, requester: &str) -> String {
-        format!("{requester} via {}", self.worker_id)
     }
 
     /// 감사 레코드를 쓴다. **실패해도 부트스트랩을 되돌리지 않는다.**

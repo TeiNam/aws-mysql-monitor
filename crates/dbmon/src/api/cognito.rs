@@ -1230,6 +1230,141 @@ mod tests {
         }
     }
 
+    /// **`auth_by_mode` 를 직접 호출한다** — 소스 문자열이 아니라 동작을 본다.
+    ///
+    /// # 이 테스트가 세 번째 시도다
+    ///
+    /// 같은 결함이 세 라운드를 살아남았다:
+    ///
+    /// 1. 1차 교차 리뷰: "Cognito 모드에서 공유 토큰이 admin 으로 통과"
+    /// 2. 고쳤다고 보고했지만 **편집이 반영되지 않았다.** 테스트는 `effective_mode`
+    ///    **값만** 봐서 통과했다
+    /// 3. 2차 리뷰가 다시 잡음 → 고쳤지만 테스트가 **소스 문자열**을 검사했다
+    /// 4. 3차 리뷰가 그것도 잡음 ("함수 본문의 철자를 고정한다")
+    ///
+    /// 그래서 `auth_by_mode` 가 `ApiState` 대신 `policy`·`verifier` 만 받도록 바꿨고,
+    /// 이 테스트가 그 함수를 부른다. 분기가 바뀌면 **동작이 바뀌므로** 실패한다.
+    #[tokio::test]
+    async fn cognito_mode_refuses_the_shared_token() {
+        use crate::api::auth::{AuthError, AuthPolicy};
+        use crate::api::auth_by_mode;
+        use dbmon_core::env::Env;
+        use std::sync::Arc;
+
+        let shared = "s".repeat(32);
+        let policy = AuthPolicy {
+            deployment_env: Env::Prd,
+            bind_is_loopback: false,
+            dev_token: None,
+            shared_token: Some(Arc::from(shared.as_str())),
+        };
+        let complete = {
+            let mut s = dbmon_core::settings::AppSettings::default();
+            s.auth.mode = dbmon_core::settings::AuthModeSetting::Cognito;
+            s.auth.cognito = dbmon_core::settings::CognitoSettings {
+                user_pool_id: "ap-northeast-2_AbCdEf".into(),
+                client_id: verification().client_id.clone(),
+                region: String::new(),
+                domain: "dbmon-dev".into(),
+            };
+            s
+        };
+
+        // ── 토큰 모드: 공유 토큰이 통과한다 (그 수단이 살아 있어야 한다) ──
+        let ctx = auth_by_mode(
+            &policy,
+            None,
+            Some(&shared),
+            dbmon_core::settings::AuthModeSetting::Token,
+            None,
+            NOW_MS,
+        )
+        .await
+        .expect("토큰 모드에서 공유 토큰");
+        assert_eq!(ctx.subject, "shared-token");
+
+        // ── Cognito 모드: **같은 토큰이 거부된다** ──
+        //
+        // 검증기가 없으면 `NotConfigured`. 있어도 JWT 가 아니므로 통과할 수 없다.
+        assert_eq!(
+            auth_by_mode(
+                &policy,
+                None,
+                Some(&shared),
+                dbmon_core::settings::AuthModeSetting::Cognito,
+                Some(&complete),
+                NOW_MS
+            )
+            .await,
+            Err(AuthError::NotConfigured),
+            "검증기 없는 Cognito 모드에서 공유 토큰이 통과했다"
+        );
+
+        let users: std::sync::Arc<dyn dbmon_core::ports::UserStore> = std::sync::Arc::new(NoUsers);
+        let verifier = CognitoVerifier::new(
+            JwksCache::new(Box::new(FakeSource {
+                doc: jwks_doc(&["k1"]),
+                calls: Default::default(),
+                fail: false,
+            })),
+            users,
+        );
+        assert_eq!(
+            auth_by_mode(
+                &policy,
+                Some(&verifier),
+                Some(&shared),
+                dbmon_core::settings::AuthModeSetting::Cognito,
+                Some(&complete),
+                NOW_MS
+            )
+            .await,
+            Err(AuthError::Invalid),
+            "검증기가 있는 Cognito 모드에서 공유 토큰이 통과했다"
+        );
+
+        // ── 설정이 없으면 거부한다 (검증할 발급자를 모른다) ──
+        assert_eq!(
+            auth_by_mode(
+                &policy,
+                Some(&verifier),
+                Some(&shared),
+                dbmon_core::settings::AuthModeSetting::Cognito,
+                None,
+                NOW_MS
+            )
+            .await,
+            Err(AuthError::NotConfigured)
+        );
+
+        // ── 토큰이 없으면 `Missing` 이다 (`NotConfigured` 와 구분한다) ──
+        assert_eq!(
+            auth_by_mode(
+                &policy,
+                Some(&verifier),
+                None,
+                dbmon_core::settings::AuthModeSetting::Cognito,
+                Some(&complete),
+                NOW_MS
+            )
+            .await,
+            Err(AuthError::Missing)
+        );
+
+        // ── `off` 는 익명 admin 이다 (두 곳의 허용을 거친 뒤에만 여기 온다) ──
+        let anon = auth_by_mode(
+            &policy,
+            None,
+            None,
+            dbmon_core::settings::AuthModeSetting::Off,
+            None,
+            NOW_MS,
+        )
+        .await
+        .expect("off");
+        assert_eq!(anon.subject, "anonymous");
+    }
+
     /// **HTTPS 소스를 실제로 조립한다.**
     ///
     /// 이 테스트가 없어서 ECS 배포가 "No provider set" 으로 세 번 재시작하고
@@ -1308,83 +1443,5 @@ mod mode_dispatch_tests {
     fn off_requires_the_file_setting_too() {
         assert_eq!(settings(M::Off, false).auth.effective_mode(false), M::Token);
         assert_eq!(settings(M::Off, false).auth.effective_mode(true), M::Off);
-    }
-
-    /// **실제 디스패치를 호출한다** — 이전 테스트가 못 잡은 자리다.
-    ///
-    /// # 왜 이 테스트가 필요한가
-    ///
-    /// 같은 결함이 **두 번** 살아남았다:
-    ///
-    /// 1. 1차 교차 리뷰가 "Cognito 모드에서도 공유 토큰이 admin 으로 통과" 를 잡았다
-    /// 2. 내가 고쳤다고 보고했지만 **편집이 실제로 반영되지 않았다**
-    /// 3. 그 위에 쓴 테스트는 `effective_mode` **값만** 봤으므로 통과했다
-    /// 4. 2차 교차 리뷰가 다시 잡았다 ("주석이 언급한 `it_api` 테스트도 없다")
-    ///
-    /// 값을 보는 테스트는 배선을 확인하지 않는다. 그래서 여기서는 인증 함수를
-    /// **직접 부른다.**
-    #[tokio::test]
-    async fn cognito_mode_refuses_the_shared_token() {
-        use crate::api::auth::{AuthError, AuthPolicy};
-        use dbmon_core::env::Env;
-        use std::sync::Arc;
-
-        let shared = "s".repeat(32);
-        let policy = AuthPolicy {
-            deployment_env: Env::Prd,
-            bind_is_loopback: false,
-            dev_token: None,
-            shared_token: Some(Arc::from(shared.as_str())),
-        };
-
-        // 토큰 모드에서는 통과한다 — 그 수단이 살아 있어야 한다.
-        let token_mode = crate::api::auth::authenticate(&policy, Some(&shared));
-        assert_eq!(token_mode.expect("토큰 모드").subject, "shared-token");
-
-        // **Cognito 모드에서는 같은 토큰이 거부돼야 한다.**
-        //
-        // `auth_by_mode` 의 Cognito 분기는 `state.cognito` 를 요구하므로 여기서
-        // 직접 호출할 수 없다. 대신 그 분기가 **`authenticate` 를 부르지 않는다**는
-        // 것을 코드 형태로 고정한다: 분기가 `verifier.authenticate` 하나뿐이다.
-        let src = include_str!("mod.rs");
-        let body = src
-            .split("pub(crate) async fn auth_by_mode")
-            .nth(1)
-            .expect("함수를 찾을 수 없다");
-        let cognito_arm = body
-            .split("M::Cognito => {")
-            .nth(1)
-            .expect("Cognito 분기를 찾을 수 없다");
-        // 분기가 끝나는 곳까지만 본다.
-        let cognito_arm = cognito_arm.split("\n    }").next().unwrap_or(cognito_arm);
-        assert!(
-            !cognito_arm.contains("authenticate(&state.policy"),
-            "Cognito 분기가 토큰 수단을 시도한다:\n{cognito_arm}"
-        );
-        assert!(
-            cognito_arm.contains("verifier.authenticate"),
-            "Cognito 분기가 JWT 를 검증하지 않는다"
-        );
-
-        // 그리고 토큰 분기는 Cognito 를 시도하지 않는다.
-        let token_arm = body
-            .split("M::Token => ")
-            .nth(1)
-            .and_then(|t| t.split(",\n").next())
-            .expect("Token 분기");
-        assert!(
-            !token_arm.contains("verifier"),
-            "토큰 분기가 Cognito 로 넘어간다: {token_arm}"
-        );
-
-        // 실효 모드도 확인한다 (둘 다 필요하다).
-        assert_eq!(
-            settings(M::Cognito, true).auth.effective_mode(true),
-            M::Cognito
-        );
-        assert!(matches!(
-            crate::api::auth::authenticate(&policy, Some("not-the-token")),
-            Err(AuthError::Invalid)
-        ));
     }
 }

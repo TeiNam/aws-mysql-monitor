@@ -66,17 +66,26 @@ export function AuthSection({
             onChange={(mode) => onChange({ ...value, mode })}
             disabled={disabled}
           />
+          {/*
+           * **검증기가 없으면 고를 수 없다.**
+           *
+           * 한때 "저장은 되지만 토큰 방식으로 적용된다" 고 안내했는데 그게 틀렸다 —
+           * 서버는 이제 Cognito 를 유지하고 거부한다(토큰으로 내려가면 권한 상승이다).
+           * 그 상태로 저장하면 **되돌릴 설정 화면까지 닫힌다.**
+           *
+           * 그래서 서버가 저장을 거부하고(`put_settings`), 화면도 선택을 막는다.
+           */}
           <ModeChoice
             mode="cognito"
             label="Cognito"
             hint={
               view.cognito_ready
                 ? "사용자 풀의 JWT 를 검증한다."
-                : "⚠ 검증기가 아직 배선되지 않았다 — 저장은 되지만 토큰 방식으로 적용된다."
+                : "⚠ 이 워커에 검증기가 배선되지 않았다 — 고르면 아무도 못 들어온다. 저장이 거부된다."
             }
             chosen={chosen}
             onChange={(mode) => onChange({ ...value, mode })}
-            disabled={disabled}
+            disabled={disabled || !view.cognito_ready}
           />
           <ModeChoice
             mode="off"
