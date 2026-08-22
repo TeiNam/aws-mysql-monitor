@@ -360,7 +360,8 @@ impl InstanceRegistry for FakeInstanceRegistry {
         // 코드가 실제와 다른 동작을 본다 — `deleted_at_ms` 계약에서 이미 겪었다.
         let last = self.missing_at.lock().unwrap().get(id.as_str()).copied();
         if let Some(prev) = last {
-            if now_ms - prev < crate::instance::MISSING_MIN_GAP_MS {
+            // 페이크는 기본 주기(300초)를 가정한다 — 어댑터와 같은 함수를 쓴다.
+            if now_ms - prev < crate::instance::missing_min_gap_ms(300) {
                 return Ok(inst.clone());
             }
         }

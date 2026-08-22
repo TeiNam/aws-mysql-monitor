@@ -367,13 +367,30 @@ fn ready_user(ctx: &AuthContext) -> ReadyUser<'_> {
     }
 }
 
+/// 전송 상한. 이 시간 안에 못 보내면 그 메시지를 버린다.
+///
+/// # 왜 필요한가
+///
+/// 읽지 않는 클라이언트가 있으면 전송 버퍼가 차고 `send().await` 가 **무한히 블록된다.**
+/// 이 함수는 `select!` 분기 안에서 불리므로, 그러면 유휴 종료와 재인증 타이머 분기가
+/// 폴링되지 않는다 — 강등된 사용자의 연결이 영구히 열려 있고 유휴 종료도 안 걸린다
+/// (교차 리뷰 3회차). 실시간 지표는 버려도 다음 방송이 온다.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 직렬화 실패나 전송 실패를 **삼키지 않고 로그로 남긴다.** 다만 연결을 끊지는
 /// 않는다 — 한 메시지가 못 나간 것이 연결 종료 사유는 아니다.
 async fn send(socket: &mut WebSocket, msg: ServerMsg<'_>) {
     match serde_json::to_string(&msg) {
         Ok(json) => {
-            if let Err(e) = socket.send(Message::Text(json.into())).await {
-                tracing::debug!(error = %e, "WS 전송 실패");
+            match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(json.into()))).await
+            {
+                Ok(Err(e)) => tracing::debug!(error = %e, "WS 전송 실패"),
+                // **버리고 넘어간다.** 여기서 계속 기다리면 타이머 분기가 죽는다.
+                Err(_) => tracing::warn!(
+                    timeout_secs = SEND_TIMEOUT.as_secs(),
+                    "WS 전송이 상한을 넘었다 — 이 메시지를 버린다 (읽지 않는 클라이언트)"
+                ),
+                Ok(Ok(())) => {}
             }
         }
         Err(e) => tracing::error!(error = %e, "WS 메시지 직렬화 실패"),

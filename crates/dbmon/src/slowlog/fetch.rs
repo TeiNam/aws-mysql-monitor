@@ -170,72 +170,100 @@ impl SlowLogFetcher for CloudWatchFetcher {
     async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
         check_scope(instance, &self.region, &self.account)?;
         let group = slowquery_log_group(instance)?;
-        let out = self
-            .client
-            .filter_log_events()
-            .log_group_name(&group)
-            .start_time(since_ms)
-            .limit(self.max_events)
-            .send()
-            .await
-            .map_err(|e| {
-                use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata as _;
-                // **로그 그룹이 없는 것은 장애가 아니다.**
-                //
-                // 슬로우로그가 한 번도 쓰이지 않았거나(RDS 는 첫 기록 때 그룹을 만든다)
-                // 로그 내보내기가 꺼져 있으면 `ResourceNotFoundException` 이 온다.
-                // 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가 쌓이고**
-                // 재시도 대상으로 분류된다 — 존재하지 않는 그룹을 계속 두드린다.
-                //
-                // `Unsupported` 로 구분하면 호출부가 "이 인스턴스는 원천이 없다" 로
-                // 한 번만 말하고 넘어갈 수 있다.
-                if e.code() == Some("ResourceNotFoundException") {
-                    return dbmon_core::error::DomainError::Unsupported {
-                        what: "slowlog_group".into(),
-                        // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게 유일한 단서다.
-                        reason: format!(
-                            "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 않았거나 \
-                             로그 내보내기가 꺼져 있다"
-                        ),
-                    };
-                }
-                dbmon_core::error::DomainError::Unavailable {
-                    dependency: "cloudwatchlogs",
-                    // 서비스 메시지를 살린다(스크럽 통과). `Debug` 만 넘기면 정작 필요한
-                    // 문장이 `Some('?')` 가 된다 — Bedrock 에서 같은 것을 겪었다.
-                    reason: e
-                        .message()
-                        .map(crate::telemetry::scrub)
-                        .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}"))),
-                }
-            })?;
 
-        let events = out.events();
-        // **이벤트 메시지를 줄바꿈으로 잇는다.**
+        // **페이지를 따라간다.**
         //
-        // RDS 는 슬로우 로그 엔트리 하나를 여러 이벤트로 쪼갤 수도, 한 이벤트에 담을
-        // 수도 있다. 파서가 `# Time:` 을 경계로 자르므로 어느 쪽이든 동작한다 —
-        // 그래서 이벤트 경계를 해석하지 않는다.
+        // 전에는 한 페이지만 읽고 체크포인트를 `last_ts + 1` 로 올렸다. `FilterLogEvents`
+        // 는 `limit` 이나 1MB 에서 페이지를 끊으므로, **그 페이지의 최대 타임스탬프와
+        // 같거나 이른 이벤트가 아직 남아 있을 수 있다** — 그걸 지나쳐 올리면 그 구간의
+        // 슬로우 쿼리가 **영구히 유실된다**(교차 리뷰 3회차).
         let mut text = String::new();
         let mut last_ts: Option<EpochMs> = None;
-        for e in events {
-            if let Some(msg) = e.message() {
-                text.push_str(msg.trim_end_matches('\n'));
-                text.push('\n');
+        let mut token: Option<String> = None;
+        let mut hit_cap = false;
+
+        for page in 0..MAX_PAGES {
+            let out = self
+                .client
+                .filter_log_events()
+                .log_group_name(&group)
+                .start_time(since_ms)
+                .limit(self.max_events)
+                .set_next_token(token.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata as _;
+                    // **로그 그룹이 없는 것은 장애가 아니다.**
+                    //
+                    // 슬로우로그가 한 번도 쓰이지 않았거나(RDS 는 첫 기록 때 그룹을
+                    // 만든다) 로그 내보내기가 꺼져 있으면 `ResourceNotFoundException` 이
+                    // 온다. 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가
+                    // 쌓이고** 재시도 대상으로 분류된다 — 없는 그룹을 계속 두드린다.
+                    if e.code() == Some("ResourceNotFoundException") {
+                        return dbmon_core::error::DomainError::Unsupported {
+                            what: "slowlog_group".into(),
+                            // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게
+                            // 유일한 단서다.
+                            reason: format!(
+                                "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 \
+                                 않았거나 로그 내보내기가 꺼져 있다"
+                            ),
+                        };
+                    }
+                    dbmon_core::error::DomainError::Unavailable {
+                        dependency: "cloudwatchlogs",
+                        // 서비스 메시지를 살린다(스크럽 통과). `Debug` 만 넘기면 정작
+                        // 필요한 문장이 `Some('?')` 가 된다 — Bedrock 에서 같은 것을 겪었다.
+                        reason: e
+                            .message()
+                            .map(crate::telemetry::scrub)
+                            .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}"))),
+                    }
+                })?;
+
+            // **이벤트 메시지를 줄바꿈으로 잇는다.**
+            //
+            // RDS 는 슬로우 로그 엔트리 하나를 여러 이벤트로 쪼갤 수도, 한 이벤트에
+            // 담을 수도 있다. 파서가 `# Time:` 을 경계로 자르므로 어느 쪽이든 동작한다.
+            for e in out.events() {
+                if let Some(msg) = e.message() {
+                    text.push_str(msg.trim_end_matches('\n'));
+                    text.push('\n');
+                }
+                if let Some(ts) = e.timestamp() {
+                    last_ts = Some(last_ts.map_or(ts, |p: i64| p.max(ts)));
+                }
             }
-            if let Some(ts) = e.timestamp() {
-                last_ts = Some(last_ts.map_or(ts, |p: i64| p.max(ts)));
+
+            token = out.next_token().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+            // 마지막 반복에서도 토큰이 남았다면 상한에 걸린 것이다.
+            if page + 1 == MAX_PAGES {
+                hit_cap = true;
             }
         }
 
         Ok(LogChunk {
             text,
-            // **처리한 마지막 이벤트 + 1ms.** 같은 이벤트를 다시 읽지 않는다.
-            next_since_ms: last_ts.map(|t| t + 1),
-            has_more: out.next_token().is_some(),
+            // **상한에 걸렸으면 경계를 다시 읽는다.**
+            //
+            // 남은 이벤트가 마지막 타임스탬프와 같을 수 있으므로 `+1` 하면 지나친다.
+            // 같은 이벤트를 다시 읽는 것은 안전하다 — 저장이 `record_id` 로 병합한다.
+            // 다 읽었으면 `+1` 로 올려 재읽기를 없앤다.
+            next_since_ms: last_ts.map(|t| if hit_cap { t } else { t + 1 }),
+            has_more: hit_cap,
         })
     }
 }
+
+/// 한 라운드에 따라갈 페이지 상한.
+///
+/// 없으면 로그가 폭주한 인스턴스 하나가 라운드를 무한히 붙잡고, 다른 인스턴스의 백필이
+/// 굶는다. 걸리면 `has_more` 로 알리고 다음 라운드가 이어받는다.
+const MAX_PAGES: usize = 20;
 
 /// 로컬 슬로우로그 파일 크기 상한 (32MB). 넘으면 거부한다.
 const MAX_LOCAL_FILE_BYTES: u64 = 32 * 1024 * 1024;

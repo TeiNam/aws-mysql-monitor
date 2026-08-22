@@ -170,10 +170,15 @@ async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Re
                 config.storage.config_table.clone(),
             ),
         ))),
-        registry: Arc::new(dbmon::store::registry::DynamoInstanceRegistry::new(
-            client.clone(),
-            config.storage.data_table.clone(),
-        )),
+        registry: Arc::new(
+            dbmon::store::registry::DynamoInstanceRegistry::new(
+                client.clone(),
+                config.storage.data_table.clone(),
+            )
+            // **탐색 주기를 넘긴다.** 중복 미발견 방지 간격이 여기서 유도된다 —
+            // 고정 상수면 짧은 주기 배포에서 정상 라운드가 거부된다.
+            .with_discovery_interval(config.discovery.interval_secs),
+        ),
         checkpoint: Arc::new(dbmon::store::checkpoint::DynamoCheckpointStore::new(
             client.clone(),
             config.storage.data_table.clone(),
@@ -368,8 +373,19 @@ async fn close_in_flight_mine(
     only: Option<&std::collections::BTreeSet<String>>,
 ) {
     use dbmon_core::ports::SlowQueryStore as _;
-    let Ok(in_flight) = store.list_in_flight(ORPHAN_SWEEP_LIMIT).await else {
-        return;
+    // **실패를 조용히 버리지 않는다.** 여기서 못 닫으면 그 레코드는 진행 중으로 남고,
+    // 고아 스윕은 `owner_worker`·`owner_epoch` 가 자기와 같은 것을 건너뛰므로
+    // (그게 "내가 돌리는 중" 의 정의다) **아무도 닫지 않는다.** 다음 정지 전이까지
+    // 남는다 — 이 함수는 전이에서만 불린다(교차 리뷰 3회차).
+    let in_flight = match store.list_in_flight(ORPHAN_SWEEP_LIMIT).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %telemetry::Scrubbed(&e),
+                "정지 확정을 위한 진행 중 목록을 읽지 못했다 — 내 레코드가 진행 중으로 남는다"
+            );
+            return;
+        }
     };
     if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
         tracing::warn!(
@@ -378,6 +394,7 @@ async fn close_in_flight_mine(
         );
     }
     let mut closed = 0usize;
+    let mut failed = 0usize;
     for q in &in_flight {
         if q.owner_worker.as_deref() != Some(worker_id) || q.owner_epoch != epoch {
             continue;
@@ -386,9 +403,26 @@ async fn close_in_flight_mine(
             continue;
         }
         let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
-        if store.upsert_merged(&marked).await.is_ok() {
-            closed += 1;
+        match store.upsert_merged(&marked).await {
+            Ok(_) => closed += 1,
+            // 같은 이유로 개별 실패도 남긴다 — 몇 건이 남았는지 알아야 한다.
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    instance = %q.instance_id.as_str(),
+                    thread_id = q.thread_id,
+                    error = %telemetry::Scrubbed(&e),
+                    "정지 확정 쓰기가 실패했다 — 이 레코드는 진행 중으로 남는다"
+                );
+            }
         }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            failed,
+            closed,
+            "정지 확정이 일부 실패했다 — 남은 레코드는 다음 정지 전이까지 진행 중이다"
+        );
     }
     if closed > 0 {
         tracing::warn!(

@@ -95,16 +95,9 @@
           "duration_ms",
           "app_digest",
           "statement_type",
-          "state",
-          "last_seen_at_ms",
-          "owner_worker",
-          "exec_count",
-          "total_time_ms",
-          "severity",
-          "rule_id",
-          "owner_epoch",
-          "thread_id",
-          "abandoned_reason"
+          "schema_name",
+          "db_user",
+          "kind"
         ]
       }
     }

@@ -41,6 +41,9 @@ const DELETED_RETENTION_DAYS: i64 = 30;
 pub struct DynamoInstanceRegistry {
     client: Client,
     table: String,
+    /// 같은 미발견을 두 번 세지 않기 위한 최소 간격.
+    /// [`dbmon_core::instance::missing_min_gap_ms`] 가 탐색 주기에서 유도한다.
+    missing_min_gap_ms: i64,
 }
 
 impl DynamoInstanceRegistry {
@@ -48,7 +51,19 @@ impl DynamoInstanceRegistry {
         Self {
             client,
             table: table.into(),
+            // 기본은 기본 탐색 주기(300초)에서 유도한 값이다. 실제 주기를 아는
+            // 호출부는 [`Self::with_discovery_interval`] 로 바꾼다.
+            missing_min_gap_ms: dbmon_core::instance::missing_min_gap_ms(300),
         }
+    }
+
+    /// 중복 미발견 방지 간격을 **실제 탐색 주기에서** 유도한다.
+    ///
+    /// 고정 상수로 두면 짧은 주기(설정 하한 30초)를 쓰는 배포에서 정상 라운드가 전부
+    /// 거부되고 삭제 판정이 여러 라운드 늦어진다(교차 리뷰 3회차).
+    pub fn with_discovery_interval(mut self, interval_secs: u64) -> Self {
+        self.missing_min_gap_ms = dbmon_core::instance::missing_min_gap_ms(interval_secs);
+        self
     }
 
     /// `<region>#<instance_id>`.
@@ -221,7 +236,7 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         // 올려 임계값(2)에 한 라운드로 도달한다 — 살아 있는 인스턴스에 삭제 도장이
         // 찍힌다. 마지막으로 올린 시각을 함께 쓰고, 그보다 최근이면 거부한다.
         // 근거와 값은 [`MISSING_MIN_GAP_MS`] 에 있다.
-        let cutoff = now_ms - dbmon_core::instance::MISSING_MIN_GAP_MS;
+        let cutoff = now_ms - self.missing_min_gap_ms;
         let out = req
             .update_expression("SET missing_at_ms = :now ADD missing_count :one")
             // 없는 인스턴스에 카운터만 있는 항목을 만들면 역직렬화가 깨진다.

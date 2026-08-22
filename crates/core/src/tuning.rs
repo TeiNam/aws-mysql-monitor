@@ -595,10 +595,40 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     // `WITH` 로 시작하는 CTE 는 `SELECT` 의 형태다 — 원본이 select 면 허용한다.
     let head = up.split_whitespace().next().unwrap_or("");
     let want = statement_type.trim().to_ascii_uppercase();
-    match head {
+    let head_ok = match head {
         "WITH" | "(" => want == "SELECT",
         h => h == want,
+    };
+    if !head_ok {
+        return false;
     }
+
+    // ④ **선두 키워드만으로는 부족하다.**
+    //
+    // MySQL 8.0 은 `WITH cte AS (...) DELETE FROM t ...` 를 받는다 — 선두는 `WITH` 이고
+    // 본문은 파괴적이다. ②만 있을 때 그게 통과했다(교차 리뷰 3회차가 **내 앞선 수정이
+    // 만든 결함**으로 잡았다). `UNION` 뒤에 붙이는 것도 같은 부류다.
+    //
+    // 깊이별 토큰 정보가 없으므로 **다른 종류의 DML 키워드가 아예 없어야** 한다로
+    // 좁힌다. 넷 다 예약어라서 인용 없이는 식별자로 쓸 수 없고, 인용된 것은
+    // `keywords_only` 에서 이미 덮여 있다 — 정상 문장을 거부하지 않는다.
+    const DML: &[&str] = &["DELETE", "UPDATE", "INSERT", "REPLACE"];
+    for kw in DML {
+        let occurrences = padded.matches(&format!(" {kw} ")).count();
+        let allowed = if head == *kw {
+            // 원본과 같은 종류라 선두에 한 번 나오는 것이 정상이다.
+            1
+        } else if want == "INSERT" && *kw == "UPDATE" {
+            // `INSERT … ON DUPLICATE KEY UPDATE` 는 정상 문장이다.
+            1
+        } else {
+            0
+        };
+        if occurrences > allowed {
+            return false;
+        }
+    }
+    true
 }
 
 /// 모델 응답을 검증해 저장 가능한 권고로 만든다.
@@ -1458,6 +1488,11 @@ mod tests {
             "SELECT * FROM orders INTO OUTFILE '/tmp/x'",
             // 실행 주석 — 우리는 주석으로 보고 지우지만 MySQL 은 실행한다.
             "SELECT 1 /*! , (SELECT 1) */ FROM orders",
+            // **선두만 보면 통과하는 형태.** MySQL 8.0 은 이걸 받는다 — 선두는 `WITH`
+            // 이고 본문은 파괴적이다(교차 리뷰 3회차가 내 수정의 구멍으로 잡았다).
+            "WITH doomed AS (SELECT id FROM orders) DELETE FROM orders WHERE id IN (SELECT id FROM doomed)",
+            "WITH c AS (SELECT 1) UPDATE orders SET status = ?",
+            "SELECT 1 FROM orders UNION DELETE FROM orders",
         ];
         for sql in bad {
             let raw = RawAdvice {

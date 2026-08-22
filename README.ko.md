@@ -703,6 +703,28 @@ curl -s -H "$AUTH" $ALB/api/collector/status | jq '{is_leader, collecting, last_
 | `collecting` 인데 슬로우 쿼리가 안 잡힌다 | 슬로우로그가 CloudWatch Logs 로 안 나가거나, `long_query_time` 이 트래픽보다 높다. |
 | 튜닝 버튼이 `model_failed` | 사유가 버튼 옆에 찍힌다 — 모델 ID, 리전 모델 미활성, 콘텐츠 필터. |
 
+### 헬스 신호가 덮는 것과 덮지 않는 것
+
+| 신호 | 뜻 | 언제 실패하는가 |
+|---|---|---|
+| `GET /healthz` | 프로세스가 HTTP 에 답한다 | 없다 — 항상 200 이다 |
+| `GET /readyz` | 이 워커가 트래픽을 받아야 하는가 | 종료 중, 설정 미로드, 저장소 불가, KMS 거부, 또는 (api+수집 겸임 워커라면) 수집 리더가 아님 |
+| `readyz.collect_stale` | **수집이 멈췄다** | 수집해야 하는 워커에서 5분간 성공한 tick 이 없다 |
+| `GET /api/collector/status` | 왜 그런가 | 인스턴스별 상세 |
+
+ECS 컨테이너 헬스체크가 `/healthz` 를 쓰는 것은 **의도적이다.** standby 워커는 설계상
+`/readyz` 에 503 을 준다(FR-OPS-08 active/standby) — 컨테이너 체크를 `/readyz` 로 두면
+ECS 가 standby 를 영원히 죽이고 다시 띄운다. `/readyz` 를 쓰는 것은 ALB 대상 그룹이다.
+
+**`collect_stale` 은 `ready` 를 내리지 않는다.** 내리면 로드밸런서가 태스크를 빼고 ECS 가
+교체하는데, 수집 실패의 원인은 보통 환경(대상 DB 접속 불가·IAM)이라 교체해도 낫지 않고
+**무한 교체**가 된다. 그건 반응하려던 장애보다 나쁘다. 그래서 값으로 드러내고 경보는
+바깥에 맡긴다.
+
+**자체 CloudWatch 지표를 발행하는 코드는 아직 없다.** IAM 정책에 `PutMetricData` 가 있지만
+부르는 곳이 없어서 `collect_stale` 에 대한 CloudWatch 경보가 없다 — 이미 쓰는 신서틱
+체크에서 `/readyz` 를 폴링한다. FR-OPS-09 지표 발행은 로드맵에 있다.
+
 ## 로컬 개발
 
 핵심 루프는 AWS 계정 없이 돈다.

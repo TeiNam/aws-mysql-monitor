@@ -1648,7 +1648,14 @@ async fn instance_start(
                 .registry
                 .set_state(&instance_id, S::Collecting)
                 .await
-                .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
+                .map_err(|e| match e {
+                    // **그 사이 탐색이 수집 대상에서 뺐다.** 저장소 장애가 아니다 —
+                    // `GET` 과 조건부 갱신 사이의 경합이고, 화면은 다시 읽어야 한다.
+                    dbmon_core::error::DomainError::Conflict(_) => {
+                        ApiError::new(StatusCode::CONFLICT, "state_not_startable")
+                    }
+                    _ => ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"),
+                })?;
             // **즉시 반영시킨다.** `reconcile` 은 탐색 주기(기본 5분)에만 도는데,
             // 그때까지 태스크가 안 뜨면 누르고 5분 기다리는 버튼이 된다 — 고장으로 읽힌다.
             //
