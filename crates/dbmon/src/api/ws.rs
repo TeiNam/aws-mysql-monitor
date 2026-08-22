@@ -121,7 +121,8 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
         },
         Ok(_) => return Err("closed_before_auth"),
         Err(_) => {
-            send(
+            // 사유를 알린다. 못 보내도 어차피 아래에서 닫는다.
+            let _ = send_or_close(
                 &mut socket,
                 ServerMsg::Error {
                     code: "auth_timeout",
@@ -136,7 +137,8 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
     let mut ctx = match context_from_token(&state, token.as_deref()) {
         Ok(ctx) => ctx,
         Err(_) => {
-            send(
+            // 사유를 알린다. 못 보내도 어차피 아래에서 닫는다.
+            let _ = send_or_close(
                 &mut socket,
                 ServerMsg::Error {
                     code: "unauthorized",
@@ -146,13 +148,14 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
             return Err("unauthorized");
         }
     };
-    send(
+    // **`ready` 를 잃으면 클라이언트가 영원히 인증되지 않은 상태로 남는다.**
+    send_or_close(
         &mut socket,
         ServerMsg::Ready {
             user: ready_user(&ctx),
         },
     )
-    .await;
+    .await?;
 
     // ── 2. 본 루프 ─────────────────────────────────────────────────────────
     let mut subscribed: BTreeSet<String> = BTreeSet::new();
@@ -205,7 +208,10 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                     // **알림은 구독자에게만.** 구독하지 않았으면 놓친 것이 없고,
                     // 그런 경고는 화면에 거짓 구멍을 표시하게 만든다.
                     if subscribed.iter().any(|k| k.starts_with("slowq:")) {
-                        send(&mut socket, ServerMsg::Error { code: "stream_lagged" }).await;
+                        // **유실 통보는 대체되지 않는다.** 이걸 놓치면 클라이언트는
+                        // 빠진 구간을 모른 채 계속 붙어 있다 — 다시 붙게 만든다.
+                        send_or_close(&mut socket, ServerMsg::Error { code: "stream_lagged" })
+                            .await?;
                     }
                 }
                 Err(RecvError::Closed) => return Err("hub_closed"),
@@ -240,7 +246,10 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                         ctx = fresh;
                     }
                     Err(_) => {
-                        send(&mut socket, ServerMsg::Error { code: "unauthorized" }).await;
+                        // 사유를 알리고 닫는다. 못 보내도 닫는 것은 같다.
+                        let _ =
+                            send_or_close(&mut socket, ServerMsg::Error { code: "unauthorized" })
+                                .await;
                         return Err("reauth_failed");
                     }
                 }
@@ -377,23 +386,49 @@ fn ready_user(ctx: &AuthContext) -> ReadyUser<'_> {
 /// (교차 리뷰 3회차). 실시간 지표는 버려도 다음 방송이 온다.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 직렬화 실패나 전송 실패를 **삼키지 않고 로그로 남긴다.** 다만 연결을 끊지는
-/// 않는다 — 한 메시지가 못 나간 것이 연결 종료 사유는 아니다.
+/// **대체 가능한 프레임**을 보낸다. 못 보내면 버린다.
+///
+/// 지표 스냅샷은 5초마다 다시 오므로 하나를 잃어도 클라이언트 상태가 어긋나지 않는다.
+/// 프로토콜 프레임에는 [`send_or_close`] 를 쓴다.
 async fn send(socket: &mut WebSocket, msg: ServerMsg<'_>) {
+    let _ = try_send(socket, msg).await;
+}
+
+/// **대체 불가 프레임**을 보낸다. 못 보내면 `Err` — 호출부가 연결을 닫는다.
+///
+/// `ready` 를 잃으면 브라우저는 인증되지 않은 채 `onopen` 에서 핑만 보내고, 서버 쪽
+/// 연결은 "접속 중" 으로 무기한 살아 있다. `error` 를 잃으면 사유 없이 끊긴다. 그런
+/// 상태로 두는 것보다 **닫아서 클라이언트가 다시 붙게** 하는 편이 낫다
+/// (교차 리뷰 4회차).
+async fn send_or_close(socket: &mut WebSocket, msg: ServerMsg<'_>) -> Result<(), &'static str> {
+    try_send(socket, msg).await
+}
+
+/// 직렬화 실패나 전송 실패를 **삼키지 않고 로그로 남긴다.**
+async fn try_send(socket: &mut WebSocket, msg: ServerMsg<'_>) -> Result<(), &'static str> {
     match serde_json::to_string(&msg) {
         Ok(json) => {
             match tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(json.into()))).await
             {
-                Ok(Err(e)) => tracing::debug!(error = %e, "WS 전송 실패"),
-                // **버리고 넘어간다.** 여기서 계속 기다리면 타이머 분기가 죽는다.
-                Err(_) => tracing::warn!(
-                    timeout_secs = SEND_TIMEOUT.as_secs(),
-                    "WS 전송이 상한을 넘었다 — 이 메시지를 버린다 (읽지 않는 클라이언트)"
-                ),
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "WS 전송 실패");
+                    Err("send_failed")
+                }
+                // **여기서 계속 기다리면 타이머 분기가 죽는다.**
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = SEND_TIMEOUT.as_secs(),
+                        "WS 전송이 상한을 넘었다 (읽지 않는 클라이언트)"
+                    );
+                    Err("send_timeout")
+                }
             }
         }
-        Err(e) => tracing::error!(error = %e, "WS 메시지 직렬화 실패"),
+        Err(e) => {
+            tracing::error!(error = %e, "WS 메시지 직렬화 실패");
+            Err("serialize_failed")
+        }
     }
 }
 

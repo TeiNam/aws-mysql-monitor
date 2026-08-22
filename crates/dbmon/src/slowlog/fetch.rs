@@ -31,13 +31,25 @@ pub struct LogChunk {
     pub next_since_ms: Option<EpochMs>,
     /// 더 남았는가. 참이면 같은 주기에 이어서 호출해도 된다.
     pub has_more: bool,
+    /// **정확히 멈춘 자리.** 상한에 걸렸을 때만 있다.
+    ///
+    /// 시각만 저장하면 같은 밀리초에 남은 이벤트를 건너뛰거나(`+1`) 진행이 0 이 된다
+    /// (`last_ts`). 토큰을 체크포인트에 함께 저장해 이어받는다(교차 리뷰 4회차).
+    pub next_token: Option<String>,
 }
 
 /// 슬로우 로그 소스.
 #[async_trait::async_trait]
 pub trait SlowLogFetcher: Send + Sync {
     /// `since_ms` 이후의 로그를 가져온다.
-    async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk>;
+    /// `resume_token` 이 있으면 **그 자리에서** 이어 읽는다. 그때 `since_ms` 는 토큰이
+    /// 발급될 때와 같아야 한다 — CloudWatch 가 그걸 요구한다.
+    async fn fetch(
+        &self,
+        instance: &InstanceId,
+        since_ms: EpochMs,
+        resume_token: Option<&str>,
+    ) -> Result<LogChunk>;
 }
 
 /// CloudWatch Logs 로그 그룹 이름 ([05 §8.3](../../../../docs/05-collector.md)).
@@ -151,7 +163,12 @@ impl RegionalFetchers {
 
 #[async_trait::async_trait]
 impl SlowLogFetcher for RegionalFetchers {
-    async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
+    async fn fetch(
+        &self,
+        instance: &InstanceId,
+        since_ms: EpochMs,
+        resume_token: Option<&str>,
+    ) -> Result<LogChunk> {
         let region = instance.region();
         // **다른 리전 클라이언트로 대신하지 않는다.** 같은 식별자가 그 리전에도
         // 있으면 남의 DB 로그를 파싱해 엉뚱한 인스턴스로 저장한다.
@@ -161,13 +178,18 @@ impl SlowLogFetcher for RegionalFetchers {
                 reason: format!("{region}: 이 리전의 로그 클라이언트가 없다"),
             }
         })?;
-        f.fetch(instance, since_ms).await
+        f.fetch(instance, since_ms, resume_token).await
     }
 }
 
 #[async_trait::async_trait]
 impl SlowLogFetcher for CloudWatchFetcher {
-    async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
+    async fn fetch(
+        &self,
+        instance: &InstanceId,
+        since_ms: EpochMs,
+        resume_token: Option<&str>,
+    ) -> Result<LogChunk> {
         check_scope(instance, &self.region, &self.account)?;
         let group = slowquery_log_group(instance)?;
 
@@ -179,7 +201,8 @@ impl SlowLogFetcher for CloudWatchFetcher {
         // 슬로우 쿼리가 **영구히 유실된다**(교차 리뷰 3회차).
         let mut text = String::new();
         let mut last_ts: Option<EpochMs> = None;
-        let mut token: Option<String> = None;
+        // **저장된 토큰에서 이어받는다.** 없으면 처음부터.
+        let mut token: Option<String> = resume_token.map(str::to_string);
         let mut hit_cap = false;
 
         for page in 0..MAX_PAGES {
@@ -269,40 +292,17 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // 라운드가 같은 자리에서 시작해 **영원히 같은 것을 읽는다**(진행 0). 한
             // 밀리초에 상한을 넘는 이벤트가 있다는 뜻이므로, 그때는 넘기고 그 사실을
             // 크게 남긴다 — 멈춰 있는 것이 건너뛰는 것보다 나쁘다.
-            next_since_ms: last_ts.map(|t| {
-                let next = next_since(since_ms, t, hit_cap);
-                if hit_cap && next > t {
-                    tracing::warn!(
-                        instance = %instance.as_str(),
-                        since_ms,
-                        last_ts = t,
-                        "한 밀리초에 페이지 상한을 넘는 이벤트가 있다 — 일부를 건너뛴다"
-                    );
-                }
-                next
-            }),
+            // **토큰이 있으면 위치를 올리지 않는다.** 다음 라운드가 같은 `start_time`
+            // 과 토큰으로 정확히 이어받는다 — 건너뛰지도, 멈추지도 않는다.
+            next_since_ms: if token.is_some() {
+                Some(since_ms)
+            } else {
+                last_ts.map(|t| t + 1)
+            },
             has_more: hit_cap,
+            // 상한에 걸려 남은 토큰. 다 읽었으면 `None` 이고 위치가 전진한다.
+            next_token: token,
         })
-    }
-}
-
-/// 다음 라운드가 시작할 시각.
-///
-/// # 전진을 보장한다
-///
-/// 상한(`hit_cap`)에 걸렸으면 남은 이벤트가 마지막 타임스탬프와 같을 수 있으므로 `+1`
-/// 하면 지나친다 — 그 구간이 **영구히 유실된다**. 그래서 경계를 다시 읽는다(중복은
-/// `record_id` 로 병합되므로 안전하다).
-///
-/// ⚠ 단 `last_ts` 가 `since_ms` 보다 크지 않으면 다음 라운드가 **같은 자리에서 시작해
-/// 영원히 같은 것을 읽는다**(진행 0). 한 밀리초에 상한을 넘는 이벤트가 있다는 뜻이므로
-/// 그때는 넘긴다 — 멈춰 있는 것이 건너뛰는 것보다 나쁘다. 호출부가 그 사실을 경고로
-/// 남긴다.
-fn next_since(since_ms: EpochMs, last_ts: EpochMs, hit_cap: bool) -> EpochMs {
-    if hit_cap && last_ts > since_ms {
-        last_ts
-    } else {
-        last_ts + 1
     }
 }
 
@@ -334,7 +334,12 @@ impl FileFetcher {
 
 #[async_trait::async_trait]
 impl SlowLogFetcher for FileFetcher {
-    async fn fetch(&self, _instance: &InstanceId, _since_ms: EpochMs) -> Result<LogChunk> {
+    async fn fetch(
+        &self,
+        _instance: &InstanceId,
+        _since_ms: EpochMs,
+        _resume_token: Option<&str>,
+    ) -> Result<LogChunk> {
         let fail = |reason: String| dbmon_core::error::DomainError::Unavailable {
             dependency: "slowlog_file",
             reason: crate::telemetry::scrub(&reason),
@@ -374,6 +379,8 @@ impl SlowLogFetcher for FileFetcher {
             // 파일 소스는 체크포인트를 옮기지 않는다 — 병합이 멱등이라 안전하다.
             next_since_ms: None,
             has_more: false,
+            // 파일 소스는 페이지가 없다.
+            next_token: None,
         })
     }
 }
@@ -395,34 +402,39 @@ mod tests {
         );
     }
 
-    /// **다음 시작 시각은 항상 전진한다.**
+    /// **커서가 없으면 전진과 무손실을 동시에 만족할 수 없다.**
     ///
-    /// 상한에 걸렸을 때 경계를 다시 읽는 것은 유실을 막지만, `last_ts == since_ms` 면
-    /// 다음 라운드가 같은 자리에서 시작해 **영원히 같은 것을 읽는다.** 진행이 0 인
-    /// 백필은 멈춘 것과 같고, 멈춘 것은 건너뛰는 것보다 나쁘다.
+    /// 시각 하나로 재개하면 상한에 걸렸을 때 두 선택뿐이고 둘 다 틀리다:
+    /// `+1` 은 같은 밀리초의 남은 이벤트를 영구히 건너뛰고, 그대로 두면 다음 라운드가
+    /// 같은 자리에서 시작해 진행이 0 이 된다(교차 리뷰 4회차가 그걸 지적했다).
+    ///
+    /// 그래서 `LogChunk` 가 페이지 토큰을 함께 돌려주고 체크포인트가 그걸 저장한다.
+    /// 이 테스트는 **그 계약**을 고정한다 — 토큰이 있으면 위치가 움직이지 않는다.
     #[test]
-    fn the_checkpoint_always_moves_forward() {
-        // 다 읽었으면 +1 (재읽기 없음).
-        assert_eq!(next_since(100, 500, false), 501);
-        // 상한에 걸렸으면 경계를 다시 읽는다 — 그 구간을 지나치지 않는다.
-        assert_eq!(next_since(100, 500, true), 500);
-        // **그러나 전진해야 한다.** 같은 자리면 넘긴다.
-        assert_eq!(next_since(500, 500, true), 501);
-        // 뒤로 가는 경우(시계 역행·이상 응답)도 전진시킨다.
-        assert_eq!(next_since(600, 500, true), 501);
+    fn a_capped_chunk_keeps_its_position_and_carries_the_token() {
+        // 다 읽었을 때: 위치가 전진하고 토큰이 없다.
+        let done = LogChunk {
+            text: String::new(),
+            next_since_ms: Some(501),
+            has_more: false,
+            next_token: None,
+        };
+        assert_eq!(done.next_since_ms, Some(501));
+        assert!(done.next_token.is_none());
 
-        // 성질: 어떤 입력에도 결과가 `since_ms` 보다 크거나, 최소한 같지 않다.
-        for since in [0i64, 1, 100, 1_787_000_000_000] {
-            for last in [0i64, 1, 99, 100, 101, 1_787_000_000_000] {
-                for cap in [false, true] {
-                    let n = next_since(since, last, cap);
-                    assert!(
-                        n > since || n > last,
-                        "since={since} last={last} cap={cap} → {n} (전진하지 않는다)"
-                    );
-                }
-            }
-        }
+        // 상한에 걸렸을 때: 위치는 그대로, 토큰이 있다.
+        let capped = LogChunk {
+            text: String::new(),
+            next_since_ms: Some(100),
+            has_more: true,
+            next_token: Some("tok".into()),
+        };
+        assert_eq!(
+            capped.next_since_ms,
+            Some(100),
+            "토큰이 있는데 위치가 움직였다 — 다음 라운드가 다른 창을 요청해 토큰이 무효해진다"
+        );
+        assert!(capped.has_more, "상한에 걸린 것을 호출부가 알아야 한다");
     }
 
     /// **리전이 다르면 조회하지 않는다.**
@@ -480,7 +492,7 @@ mod tests {
         tokio::fs::write(&path, body).await.expect("쓰기");
 
         let chunk = FileFetcher::new(&path)
-            .fetch(&instance(), 0)
+            .fetch(&instance(), 0, None)
             .await
             .expect("읽기");
         assert_eq!(chunk.text, body);
@@ -494,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_file_is_an_error_not_an_empty_chunk() {
         let e = FileFetcher::new("/nonexistent/dbmon/slow.log")
-            .fetch(&instance(), 0)
+            .fetch(&instance(), 0, None)
             .await
             .expect_err("없는 파일을 읽었다");
         assert!(format!("{e}").contains("slowlog_file"), "{e}");

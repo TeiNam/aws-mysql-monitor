@@ -568,35 +568,94 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     }
     let up = trimmed.to_ascii_uppercase();
 
-    // ③ 스키마·권한 변경 키워드. 재작성이라면 나올 수 없다.
+    // ③ **토큰 단위로 본다.** 공백으로만 자르면 `)DELETE` 가 걸리지 않는다.
+    //
+    // `WITH c AS(SELECT id FROM t)DELETE FROM t` 는 유효한 MySQL 이고, `" DELETE "` 를
+    // 찾는 방식은 그걸 0건으로 본다 — 교차 리뷰 4회차가 그 우회를 실증했다. 식별자
+    // 문자가 아닌 것은 전부 구분자로 바꿔 토큰을 만든다.
+    let tokens: Vec<&str> = up
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |kw: &str| tokens.contains(&kw);
+    let count = |kw: &str| tokens.iter().filter(|t| **t == kw).count();
+
+    // 스키마·권한을 바꾸거나 부수효과가 있는 것. 재작성에는 나올 이유가 없다.
     const FORBIDDEN: &[&str] = &[
-        "DROP ",
-        "TRUNCATE ",
-        "ALTER ",
-        "CREATE ",
-        "GRANT ",
-        "REVOKE ",
-        "RENAME ",
-        "REPLACE INTO",
-        "LOAD DATA",
-        "INTO OUTFILE",
-        "INTO DUMPFILE",
-        "SET GLOBAL",
-        "SET PERSIST",
+        "DROP",
+        "TRUNCATE",
+        "ALTER",
+        "CREATE",
+        "GRANT",
+        "REVOKE",
+        "RENAME",
+        "CALL",
+        "DO",
+        "HANDLER",
+        "PREPARE",
+        "EXECUTE",
+        "DEALLOCATE",
+        "LOCK",
+        "UNLOCK",
+        "COMMIT",
+        "ROLLBACK",
+        "START",
+        "BEGIN",
+        "GET_LOCK",
+        "RELEASE_LOCK",
+        "OUTFILE",
+        "DUMPFILE",
+        "LOAD",
     ];
-    // 앞뒤 공백을 붙여 단어 단위로 본다 — `DROPPED` 같은 식별자에 걸리지 않게.
-    let padded = format!(" {up} ");
-    if FORBIDDEN.iter().any(|k| padded.contains(k)) {
+    if FORBIDDEN.iter().any(|k| has(k)) {
+        return false;
+    }
+    // **`SET` 은 목록에 넣을 수 없다** — `UPDATE t SET x = ?` 의 필수 부분이다.
+    // 문장 단위 `SET`(전역·세션 변수 변경)만 막는다.
+    const SET_SCOPES: &[&str] = &[
+        "GLOBAL",
+        "SESSION",
+        "PERSIST",
+        "PERSIST_ONLY",
+        "NAMES",
+        "CHARACTER",
+        "TRANSACTION",
+    ];
+    for (i, t) in tokens.iter().enumerate() {
+        if *t != "SET" {
+            continue;
+        }
+        // 선두가 `SET` 이면 그 자체가 문장이다.
+        if i == 0 {
+            return false;
+        }
+        if tokens
+            .get(i + 1)
+            .is_some_and(|n| SET_SCOPES.contains(n) || n.starts_with('@'))
+        {
+            return false;
+        }
+    }
+    // `SELECT … FOR UPDATE` / `FOR SHARE` 는 잠금을 잡는다 — 읽기 재작성이 아니다.
+    if has("FOR") && (has("UPDATE") || has("SHARE")) && want_is_select(statement_type) {
+        return false;
+    }
+    // `INTO @var` / `INTO OUTFILE` 은 부수효과다. `INSERT … INTO` 는 선두 검사가 받는다.
+    if has("INTO") && want_is_select(statement_type) {
         return false;
     }
 
     // ② 선두 키워드가 원본과 같아야 한다.
     //
     // `WITH` 로 시작하는 CTE 는 `SELECT` 의 형태다 — 원본이 select 면 허용한다.
-    let head = up.split_whitespace().next().unwrap_or("");
+    let head = tokens.first().copied().unwrap_or("");
     let want = statement_type.trim().to_ascii_uppercase();
+    // **빈 문장 종류는 거부한다.** 무엇과 같아야 하는지 알 수 없으면 통과시키지 않는다.
+    if want.is_empty() {
+        return false;
+    }
     let head_ok = match head {
-        "WITH" | "(" => want == "SELECT",
+        "WITH" => want == "SELECT",
         h => h == want,
     };
     if !head_ok {
@@ -605,16 +664,11 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
 
     // ④ **선두 키워드만으로는 부족하다.**
     //
-    // MySQL 8.0 은 `WITH cte AS (...) DELETE FROM t ...` 를 받는다 — 선두는 `WITH` 이고
-    // 본문은 파괴적이다. ②만 있을 때 그게 통과했다(교차 리뷰 3회차가 **내 앞선 수정이
-    // 만든 결함**으로 잡았다). `UNION` 뒤에 붙이는 것도 같은 부류다.
-    //
-    // 깊이별 토큰 정보가 없으므로 **다른 종류의 DML 키워드가 아예 없어야** 한다로
-    // 좁힌다. 넷 다 예약어라서 인용 없이는 식별자로 쓸 수 없고, 인용된 것은
-    // `keywords_only` 에서 이미 덮여 있다 — 정상 문장을 거부하지 않는다.
+    // 위 `WITH … DELETE` 가 그 예다. 다른 종류의 DML 키워드가 아예 없어야 한다로
+    // 좁힌다 — 넷 다 예약어라서 인용 없이는 식별자로 쓸 수 없고, 인용된 것은
+    // `keywords_only` 에서 이미 덮여 있다.
     const DML: &[&str] = &["DELETE", "UPDATE", "INSERT", "REPLACE"];
     for kw in DML {
-        let occurrences = padded.matches(&format!(" {kw} ")).count();
         let allowed = if head == *kw {
             // 원본과 같은 종류라 선두에 한 번 나오는 것이 정상이다.
             1
@@ -624,11 +678,16 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         } else {
             0
         };
-        if occurrences > allowed {
+        if count(kw) > allowed {
             return false;
         }
     }
     true
+}
+
+/// 원본이 읽기 문장인가. `FOR UPDATE`·`INTO` 판정에 쓴다.
+fn want_is_select(statement_type: &str) -> bool {
+    statement_type.trim().eq_ignore_ascii_case("select")
 }
 
 /// 모델 응답을 검증해 저장 가능한 권고로 만든다.
@@ -1493,6 +1552,21 @@ mod tests {
             "WITH doomed AS (SELECT id FROM orders) DELETE FROM orders WHERE id IN (SELECT id FROM doomed)",
             "WITH c AS (SELECT 1) UPDATE orders SET status = ?",
             "SELECT 1 FROM orders UNION DELETE FROM orders",
+            // **공백이 없는 형태.** `" DELETE "` 를 찾는 방식은 이걸 0건으로 본다 —
+            // 교차 리뷰 4회차가 실증한 우회다.
+            "WITH c AS(SELECT id FROM orders)DELETE FROM orders WHERE id IN(SELECT id FROM c)",
+            "WITH c AS(SELECT 1)UPDATE orders SET status=?",
+            // 부수효과가 있는 읽기 — 잠금을 잡거나 변수·파일에 쓴다.
+            "SELECT id FROM orders FOR UPDATE",
+            "SELECT id FROM orders FOR SHARE",
+            "SELECT GET_LOCK('x', 1) FROM orders",
+            "SELECT id INTO @v FROM orders",
+            // 문장 종류를 바꾸는 것들.
+            "CALL do_something()",
+            "DO SLEEP(1)",
+            "SET SESSION sort_buffer_size = 1",
+            "LOCK TABLES orders READ",
+            "PREPARE s FROM 'DELETE FROM orders'",
         ];
         for sql in bad {
             let raw = RawAdvice {
@@ -1538,6 +1612,30 @@ mod tests {
             let advice =
                 validate(raw, &context(vec![spec("shop", "orders")]), "m", 1).expect("검증");
             assert!(advice.rewrite.is_some(), "{sql:?} 가 버려졌다");
+        }
+    }
+
+    /// **문장 종류를 모르면 통과시키지 않는다.**
+    ///
+    /// 무엇과 같아야 하는지 알 수 없으면 판정할 수 없다 — 그때는 거부한다.
+    #[test]
+    fn an_unknown_statement_type_rejects_every_rewrite() {
+        for st in ["", "   ", "unknown"] {
+            let mut c = context(vec![spec("shop", "orders")]);
+            c.statement_type = st.into();
+            let raw = RawAdvice {
+                summary: "…".into(),
+                rewrite: Some(Rewrite {
+                    sql: "SELECT 1 FROM orders".into(),
+                    rationale: "…".into(),
+                }),
+                ..Default::default()
+            };
+            let advice = validate(raw, &c, "m", 1).expect("검증");
+            assert!(
+                advice.rewrite.is_none(),
+                "statement_type={st:?} 가 통과했다"
+            );
         }
     }
 

@@ -327,6 +327,76 @@ mod tests {
         r
     }
 
+    /// **페이크도 한 라운드를 두 번 세지 않는다.**
+    ///
+    /// 어댑터는 `missing_at_ms` 조건부 갱신으로 막는다. 페이크가 그 규칙을 빼거나
+    /// 파생 `Default`(간격 0)로 꺼 버리면, 페이크로 검증하는 테스트가 실제와 다른
+    /// 동작을 본다(교차 리뷰 4회차).
+    #[tokio::test]
+    async fn the_fake_registry_dedupes_missing_rounds() {
+        use dbmon_core::instance::missing_min_gap_ms;
+        use dbmon_core::ports::InstanceRegistry as _;
+
+        let r = FakeInstanceRegistry::new();
+        let i = inst("orders-01");
+        r.upsert(&i).await.expect("등록");
+
+        assert_eq!(
+            r.mark_missing(&i.id, 1_000)
+                .await
+                .expect("1회")
+                .missing_count,
+            1
+        );
+        // 같은 라운드(간격 미달) → 세지 않는다.
+        assert_eq!(
+            r.mark_missing(&i.id, 2_000)
+                .await
+                .expect("중복")
+                .missing_count,
+            1,
+            "페이크의 중복 방지가 꺼져 있다"
+        );
+
+        // **경계는 거부된다** — 어댑터의 `missing_at_ms < :cutoff` 와 같은 비교다.
+        let gap = missing_min_gap_ms(300);
+        assert_eq!(
+            r.mark_missing(&i.id, 1_000 + gap)
+                .await
+                .expect("경계")
+                .missing_count,
+            1,
+            "경계에서 세면 어댑터와 계약이 갈린다"
+        );
+        assert_eq!(
+            r.mark_missing(&i.id, 1_001 + gap)
+                .await
+                .expect("다음")
+                .missing_count,
+            2
+        );
+    }
+
+    /// 주기를 짧게 주면 그만큼 짧은 간격으로도 센다.
+    #[tokio::test]
+    async fn a_short_interval_shortens_the_fake_gap() {
+        use dbmon_core::ports::InstanceRegistry as _;
+
+        let r = FakeInstanceRegistry::new().with_discovery_interval(30);
+        let i = inst("orders-01");
+        r.upsert(&i).await.expect("등록");
+        r.mark_missing(&i.id, 0).await.expect("1회");
+        // 주기 30초 → 간격 15초. 16초 뒤는 다음 라운드다.
+        assert_eq!(
+            r.mark_missing(&i.id, 16_000)
+                .await
+                .expect("2회")
+                .missing_count,
+            2,
+            "짧은 주기에서 정상 라운드가 거부됐다"
+        );
+    }
+
     /// 통과한 것만 담은 결과. 대부분의 테스트가 쓴다.
     fn found(instances: &[Instance]) -> RoundOutcome {
         RoundOutcome {
