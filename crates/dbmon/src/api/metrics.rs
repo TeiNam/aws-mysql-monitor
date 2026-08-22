@@ -408,7 +408,11 @@ fn rows_from(instances: &[Instance], series: &BTreeMap<String, Series>) -> Vec<F
                     unit: spec.unit.as_str(),
                     stat: spec.stat.as_str(),
                     value: series
-                        .get(&regional_series_key(i.id.region(), &target_for(i, spec), spec))
+                        .get(&regional_series_key(
+                            i.id.region(),
+                            &target_for(i, spec),
+                            spec,
+                        ))
                         .and_then(Series::latest),
                 })
                 .collect(),
@@ -431,12 +435,7 @@ mod tests {
         instance_in("ap-northeast-2", name, engine, cluster)
     }
 
-    fn instance_in(
-        region: &str,
-        name: &str,
-        engine: Engine,
-        cluster: Option<&str>,
-    ) -> Instance {
+    fn instance_in(region: &str, name: &str, engine: Engine, cluster: Option<&str>) -> Instance {
         let raw = crate::aws::discovery::RawDbInstance {
             identifier: name.into(),
             engine: match engine {
@@ -479,7 +478,10 @@ mod tests {
         assert_eq!(vol[0].0.identifier, "aur");
 
         // 인스턴스 메트릭은 인스턴스마다 요청한다.
-        let cpu = pairs.iter().filter(|(_, s)| s.name == "CPUUtilization").count();
+        let cpu = pairs
+            .iter()
+            .filter(|(_, s)| s.name == "CPUUtilization")
+            .count();
         assert_eq!(cpu, 2);
     }
 
@@ -508,9 +510,7 @@ mod tests {
         let pairs = fleet_pairs(&[instance("orphan", Engine::AuroraMysql, None)]);
         assert!(pairs.iter().all(|(t, _)| !t.identifier.is_empty()));
         assert!(
-            pairs
-                .iter()
-                .all(|(_, s)| s.scope == MetricScope::Instance),
+            pairs.iter().all(|(_, s)| s.scope == MetricScope::Instance),
             "클러스터 없는 인스턴스에 클러스터 메트릭을 요청했다"
         );
     }

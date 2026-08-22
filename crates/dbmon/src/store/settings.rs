@@ -106,9 +106,7 @@ impl SettingsStore for DynamoSettingsStore {
             None => {
                 // 속성만 있고 문서가 없다. 이것도 정상 상태가 아니다.
                 tracing::error!(version, "설정 항목에 doc 속성이 없다");
-                return Err(DomainError::Internal(
-                    "설정 항목에 문서가 없다".to_string(),
-                ));
+                return Err(DomainError::Internal("설정 항목에 문서가 없다".to_string()));
             }
         };
         // 문서 안의 버전보다 **속성이 권위값**이다. 조건부 쓰기가 그걸 보기 때문이다.

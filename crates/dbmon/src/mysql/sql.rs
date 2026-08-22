@@ -411,7 +411,9 @@ mod tests {
             // 금지어에 걸리는데, 실제로는 DDL 을 실행하지 않고 정의를 돌려준다
             // (튜닝 컨텍스트 수집이 쓴다). 이름만으로 판정하는 이 테스트의 한계라
             // 그 형태만 지운 뒤 검사한다 — 목록을 느슨하게 하지 않는다.
-            let upper = code.to_uppercase().replace("SHOW CREATE TABLE", "SHOW <read-only>");
+            let upper = code
+                .to_uppercase()
+                .replace("SHOW CREATE TABLE", "SHOW <read-only>");
             for f in forbidden {
                 assert!(
                     !upper.contains(f),

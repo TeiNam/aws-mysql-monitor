@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn the_fallback_regions_are_part_of_the_fingerprint() {
         let s = DiscoverySettings::default();
-        assert_ne!(fingerprint(&s, &seoul()), fingerprint(&s, &["us-east-1".to_string()]));
+        assert_ne!(
+            fingerprint(&s, &seoul()),
+            fingerprint(&s, &["us-east-1".to_string()])
+        );
     }
 
     #[test]

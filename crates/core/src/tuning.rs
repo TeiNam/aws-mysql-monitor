@@ -641,12 +641,9 @@ fn resolve_table(name: &str, known: &[String]) -> Option<String> {
         return None;
     }
     let bare = name.rsplit('.').next().unwrap_or(name);
-    let mut matches = known.iter().filter(|k| {
-        k.rsplit('.')
-            .next()
-            .unwrap_or(k)
-            .eq_ignore_ascii_case(bare)
-    });
+    let mut matches = known
+        .iter()
+        .filter(|k| k.rsplit('.').next().unwrap_or(k).eq_ignore_ascii_case(bare));
     let first = matches.next()?;
     // 같은 이름이 두 스키마에 있으면 어느 쪽인지 정할 수 없다 — 거부한다.
     matches.next().is_none().then(|| first.clone())
@@ -743,7 +740,10 @@ fn split_qualified(raw: &str) -> Vec<String> {
         }
     }
     out.push(cur);
-    out.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+    out.into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// 문자열 안의 식별자들. 낱말 경계로 나눈다(영숫자·`_`·`$` 가 식별자 문자다).
@@ -768,7 +768,12 @@ fn identifiers_in(text: &str) -> Vec<String> {
 /// `memo(20)` → `memo`. 인용부호도 벗긴다.
 fn column_name(raw: &str) -> String {
     let bare = raw.trim().trim_matches('`');
-    bare.split('(').next().unwrap_or(bare).trim().trim_matches('`').to_string()
+    bare.split('(')
+        .next()
+        .unwrap_or(bare)
+        .trim()
+        .trim_matches('`')
+        .to_string()
 }
 
 /// DDL 의 대상 테이블. `ON <t>` 또는 `ALTER TABLE <t>`.
@@ -782,7 +787,9 @@ fn ddl_target_table(scanned: &Scanned) -> Option<String> {
     if toks.first().map(|(k, _)| k.as_str()) == Some("ALTER")
         && toks.get(1).map(|(k, _)| k.as_str()) == Some("TABLE")
     {
-        return toks.get(2).map(|(_, src)| src.trim_end_matches('(').to_string());
+        return toks
+            .get(2)
+            .map(|(_, src)| src.trim_end_matches('(').to_string());
     }
     // `CREATE … INDEX <name> ON <t> (…)` — **키워드로서의** 첫 `ON` 다음 토큰.
     let on = toks.iter().position(|(k, _)| k == "ON")?;
@@ -1388,7 +1395,8 @@ mod tests {
         let mut with_ddl = spec("shop", "orders");
         with_ddl.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
         let mut payments = spec("shop", "payments");
-        payments.create_ddl = Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
+        payments.create_ddl =
+            Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
 
         let raw = RawAdvice {
             summary: "s".into(),
@@ -1413,7 +1421,11 @@ mod tests {
         let advice = validate(raw, &context(vec![with_ddl, payments]), "m", 1).expect("검증");
         assert!(advice.indexes.is_empty(), "{:?}", advice.indexes);
         assert_eq!(advice.caveats.len(), 2, "{:?}", advice.caveats);
-        assert!(advice.caveats.iter().all(|c| c.contains("어긋나")), "{:?}", advice.caveats);
+        assert!(
+            advice.caveats.iter().all(|c| c.contains("어긋나")),
+            "{:?}",
+            advice.caveats
+        );
     }
 
     /// **모델이 스키마 없이 적어도 컬럼 대조가 돌아야 한다.** 정규 이름으로 해석하지
@@ -1435,7 +1447,11 @@ mod tests {
         };
         let advice = validate(raw, &context(vec![with_ddl]), "m", 1).expect("검증");
         assert!(advice.indexes.is_empty(), "컬럼 대조를 건너뛰었다");
-        assert!(advice.caveats.iter().any(|c| c.contains("ghost")), "{:?}", advice.caveats);
+        assert!(
+            advice.caveats.iter().any(|c| c.contains("ghost")),
+            "{:?}",
+            advice.caveats
+        );
     }
 
     /// **DDL 의 실제 대상을 본다.** 이름이 인덱스 이름에만 있어도 통과하면 안 된다.
@@ -1444,7 +1460,8 @@ mod tests {
         let mut orders = spec("shop", "orders");
         orders.create_ddl = Some("CREATE TABLE `orders` (`id` int, `status` varchar(20))".into());
         let mut payments = spec("shop", "payments");
-        payments.create_ddl = Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
+        payments.create_ddl =
+            Some("CREATE TABLE `payments` (`id` int, `secret` varchar(20))".into());
 
         // 인덱스 **이름**에 `orders` 가 들어 있지만 대상은 `payments` 다.
         let raw = RawAdvice {
@@ -1458,7 +1475,10 @@ mod tests {
             ..Default::default()
         };
         let advice = validate(raw, &context(vec![orders.clone(), payments]), "m", 1).expect("검증");
-        assert!(advice.indexes.is_empty(), "인덱스 이름의 부분 문자열로 통과했다");
+        assert!(
+            advice.indexes.is_empty(),
+            "인덱스 이름의 부분 문자열로 통과했다"
+        );
         assert!(
             advice.caveats.iter().any(|c| c.contains("대상")),
             "{:?}",
@@ -1596,7 +1616,10 @@ mod tests {
             ..Default::default()
         };
         let advice = validate(raw, &context(vec![orders.clone()]), "m", 1).expect("검증");
-        assert!(advice.indexes.is_empty(), "다른 스키마의 테이블을 고치는 문장이 통과했다");
+        assert!(
+            advice.indexes.is_empty(),
+            "다른 스키마의 테이블을 고치는 문장이 통과했다"
+        );
 
         // ④ 공백이 든 백틱 식별자를 쪼개지 않는다.
         let mut spaced = spec("shop", "my table");
@@ -1612,7 +1635,12 @@ mod tests {
             ..Default::default()
         };
         let advice = validate(raw, &context(vec![spaced]), "m", 1).expect("검증");
-        assert_eq!(advice.indexes.len(), 1, "공백이 든 식별자를 쪼갰다: {:?}", advice.caveats);
+        assert_eq!(
+            advice.indexes.len(),
+            1,
+            "공백이 든 식별자를 쪼갰다: {:?}",
+            advice.caveats
+        );
     }
 
     /// **함수 인덱스를 거부하지 않는다.** 이름이 식 안에 있어도 그 그룹 안이면 인정한다.
@@ -1631,7 +1659,12 @@ mod tests {
             ..Default::default()
         };
         let advice = validate(raw, &context(vec![orders]), "m", 1).expect("검증");
-        assert_eq!(advice.indexes.len(), 1, "함수 인덱스를 버렸다: {:?}", advice.caveats);
+        assert_eq!(
+            advice.indexes.len(),
+            1,
+            "함수 인덱스를 버렸다: {:?}",
+            advice.caveats
+        );
     }
 
     /// **명시한 스키마를 갈아치우지 않는다.** `archive.orders` 는 `shop.orders` 가 아니다.
@@ -1639,7 +1672,10 @@ mod tests {
     fn an_explicit_schema_is_not_reinterpreted() {
         let known = vec!["shop.orders".to_string()];
         assert_eq!(resolve_table("archive.orders", &known), None);
-        assert_eq!(resolve_table("orders", &known).as_deref(), Some("shop.orders"));
+        assert_eq!(
+            resolve_table("orders", &known).as_deref(),
+            Some("shop.orders")
+        );
     }
 
     /// **잘린 DDL 로 컬럼을 판정하지 않는다.** 뒤쪽 컬럼이 "없다" 로 보인다.
@@ -1660,7 +1696,12 @@ mod tests {
             ..Default::default()
         };
         let advice = validate(raw, &context(vec![wide]), "m", 1).expect("검증");
-        assert_eq!(advice.indexes.len(), 1, "잘린 DDL 로 정상 권고를 버렸다: {:?}", advice.caveats);
+        assert_eq!(
+            advice.indexes.len(),
+            1,
+            "잘린 DDL 로 정상 권고를 버렸다: {:?}",
+            advice.caveats
+        );
     }
 
     /// 정규 이름으로 **바꿔서 저장한다** — 화면이 어느 스키마인지 알 수 있어야 한다.
@@ -1687,7 +1728,10 @@ mod tests {
     #[test]
     fn bare_table_names_resolve_only_when_unambiguous() {
         let known = vec!["shop.orders".to_string()];
-        assert_eq!(resolve_table("orders", &known).as_deref(), Some("shop.orders"));
+        assert_eq!(
+            resolve_table("orders", &known).as_deref(),
+            Some("shop.orders")
+        );
         assert_eq!(
             resolve_table("SHOP.ORDERS", &known).as_deref(),
             Some("shop.orders"),
@@ -1734,7 +1778,10 @@ mod tests {
             "",
             "   ",
         ] {
-            assert!(!is_index_creation_ddl(bad), "위험한 문장을 통과시켰다: {bad:?}");
+            assert!(
+                !is_index_creation_ddl(bad),
+                "위험한 문장을 통과시켰다: {bad:?}"
+            );
         }
     }
 
@@ -1745,7 +1792,9 @@ mod tests {
     fn quote_aware_scanning_closes_the_bypasses() {
         // ① 백틱 안의 `#` 로 뒷부분을 주석 처리해 `DROP COLUMN` 을 숨긴다.
         assert!(
-            !is_index_creation_ddl("ALTER TABLE orders ADD INDEX `ix#safe` (id), DROP COLUMN payload"),
+            !is_index_creation_ddl(
+                "ALTER TABLE orders ADD INDEX `ix#safe` (id), DROP COLUMN payload"
+            ),
             "백틱 안의 `#` 로 DROP COLUMN 이 숨었다"
         );
         // ② 복합 ALTER — 인덱스 추가 + 다른 동작.
@@ -1783,7 +1832,9 @@ mod tests {
             "`--` 를 무조건 주석으로 보아 두 번째 문장을 놓쳤다"
         );
         // 정상 주석은 그대로 주석이다.
-        assert!(is_index_creation_ddl("CREATE INDEX ix ON orders (id) -- 설명"));
+        assert!(is_index_creation_ddl(
+            "CREATE INDEX ix ON orders (id) -- 설명"
+        ));
         assert!(
             is_index_creation_ddl("CREATE INDEX ix ON orders (id); -- 설명"),
             "세미콜론 뒤 주석을 두 번째 문장으로 봤다"
@@ -1829,7 +1880,10 @@ mod tests {
         let hashy = "CREATE TABLE `t` (`a#b` int, `c` int COMMENT 'x')";
         let out = neutralize_ddl(hashy);
         assert!(out.contains("`a#b` int"), "{out}");
-        assert!(out.contains("`c` int"), "백틱 안의 `#` 가 뒤 구조를 지웠다: {out}");
+        assert!(
+            out.contains("`c` int"),
+            "백틱 안의 `#` 가 뒤 구조를 지웠다: {out}"
+        );
     }
 
     /// 주석으로 검사를 속이지 못한다 — 지운 뒤에 본다.
@@ -1861,7 +1915,10 @@ mod tests {
         let advice = validate(raw, &context(vec![spec("shop", "orders")]), "m", 1).expect("검증");
         assert!(advice.indexes.is_empty());
         assert!(
-            advice.caveats.iter().any(|c| c.contains("인덱스 생성문이 아닌")),
+            advice
+                .caveats
+                .iter()
+                .any(|c| c.contains("인덱스 생성문이 아닌")),
             "{:?}",
             advice.caveats
         );

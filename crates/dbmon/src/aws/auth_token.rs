@@ -617,8 +617,8 @@ Action=connect&DBUser=dbmon&X-Amz-Algorithm=AWS4-HMAC-SHA256\
 /// 환경변수만 보면 prd 태스크에 그 변수가 새어 들어갔을 때 IAM 대신 비밀번호로
 /// 붙으려 하고, 실패 원인이 "인증 실패" 로만 보인다.
 pub async fn build_target_auth(config: &crate::config::Config) -> TargetAuth {
-    use aws_config::BehaviorVersion;
     use super::auth_token::{IamAuthTokenProvider, StaticPasswordProvider};
+    use aws_config::BehaviorVersion;
 
     if config.deployment_env == dbmon_core::env::Env::Dev {
         if let Some(p) = StaticPasswordProvider::from_env() {

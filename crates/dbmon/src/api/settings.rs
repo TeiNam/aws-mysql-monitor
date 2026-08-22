@@ -56,7 +56,9 @@ pub struct SettingsView {
 fn view(state: &ApiState, settings: &AppSettings, can_edit: bool) -> SettingsView {
     SettingsView {
         problems: settings.validate(),
-        effective_auth_mode: super::effective_auth_mode(state, settings).as_str().to_string(),
+        effective_auth_mode: super::effective_auth_mode(state, settings)
+            .as_str()
+            .to_string(),
         // **탐색 루프와 같은 기본값을 쓴다.** 다른 값을 쓰면 화면이 실제로 탐색되지
         // 않는 리전을 선택기에 띄우고, 그걸 골랐을 때 목록이 빈다.
         known_regions: settings

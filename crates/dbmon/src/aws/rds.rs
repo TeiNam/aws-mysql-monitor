@@ -45,11 +45,7 @@ pub struct RdsDiscovery {
 }
 
 impl RdsDiscovery {
-    pub fn new(
-        client: Client,
-        region: impl Into<String>,
-        account_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(client: Client, region: impl Into<String>, account_id: impl Into<String>) -> Self {
         Self {
             client,
             region: region.into(),

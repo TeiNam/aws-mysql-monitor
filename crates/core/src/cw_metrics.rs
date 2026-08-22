@@ -86,12 +86,7 @@ pub struct MetricSpec {
     pub label: &'static str,
 }
 
-const fn m(
-    name: &'static str,
-    label: &'static str,
-    unit: MetricUnit,
-    stat: Stat,
-) -> MetricSpec {
+const fn m(name: &'static str, label: &'static str, unit: MetricUnit, stat: Stat) -> MetricSpec {
     MetricSpec {
         name,
         label,
@@ -179,7 +174,12 @@ const DETAIL_AURORA: &[MetricSpec] = &[
     m("Deadlocks", "데드락", CountPerSecond, Average),
     m("EngineUptime", "엔진 가동시간", Seconds, Maximum),
     m("AuroraReplicaLag", "리더 지연", Milliseconds, Maximum),
-    m("RollbackSegmentHistoryListLength", "퍼지 지연", Count, Maximum),
+    m(
+        "RollbackSegmentHistoryListLength",
+        "퍼지 지연",
+        Count,
+        Maximum,
+    ),
     cluster("AuroraVolumeBytesLeftTotal", "볼륨 여유", Bytes, Minimum),
 ];
 
@@ -290,7 +290,10 @@ mod tests {
             .map(|s| s.name)
             .collect();
         for absent in ["FreeStorageSpace", "BinLogDiskUsage", "BurstBalance"] {
-            assert!(!aurora.contains(&absent), "Aurora 세트에 {absent} 가 들어 있다");
+            assert!(
+                !aurora.contains(&absent),
+                "Aurora 세트에 {absent} 가 들어 있다"
+            );
         }
     }
 
@@ -299,7 +302,10 @@ mod tests {
     fn fleet_sets_stay_small() {
         for e in [Engine::Mysql, Engine::AuroraMysql] {
             let n = fleet_metrics(e).len();
-            assert!(n <= 3, "{e:?} 플릿 세트가 {n}개다 — 3개를 넘으면 비용 설계가 깨진다");
+            assert!(
+                n <= 3,
+                "{e:?} 플릿 세트가 {n}개다 — 3개를 넘으면 비용 설계가 깨진다"
+            );
         }
     }
 

@@ -89,7 +89,10 @@ impl DynamoTuningStore {
             .item("PK", AttributeValue::S(pk(record_id)))
             .item("SK", AttributeValue::S("ADVICE".into()))
             .item("doc", AttributeValue::S(doc))
-            .item("created_at_ms", AttributeValue::N(advice.created_at_ms.to_string()))
+            .item(
+                "created_at_ms",
+                AttributeValue::N(advice.created_at_ms.to_string()),
+            )
             .item("model_id", AttributeValue::S(advice.model_id.clone()))
             .item("ttl", AttributeValue::N(ttl.to_string()))
             .send()
@@ -125,7 +128,11 @@ mod tests {
         let id = RecordId::new(&instance, 12, 1_700_000_000_000);
         // **레코드마다 다른 파티션**이어야 한다 — 같은 키를 쓰면 마지막 권고가 모든
         // 레코드의 권고로 보인다.
-        assert!(pk(&id).starts_with("TUNE#000000000000/ap-northeast-2/db"), "{}", pk(&id));
+        assert!(
+            pk(&id).starts_with("TUNE#000000000000/ap-northeast-2/db"),
+            "{}",
+            pk(&id)
+        );
         let other = RecordId::new(&instance, 13, 1_700_000_000_000);
         assert_ne!(pk(&id), pk(&other));
     }
