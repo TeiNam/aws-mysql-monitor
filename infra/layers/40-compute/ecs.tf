@@ -70,6 +70,38 @@ resource "aws_vpc_security_group_ingress_rule" "from_alb" {
   ip_protocol                  = "tcp"
 }
 
+# **ALB 없이 화면을 보는 경로.**
+#
+# dev 는 `enable_alb = false` 다(네트워크 비용 0). 그러면 인바운드가 하나도 없어서 배포한
+# 화면을 볼 방법이 없다 — 로그만 남는다. 그런데 이 VPC 에는 Client VPN 이 있고 태스크는
+# VPC 사설 IP 를 갖는다. VPN 쪽 보안 그룹에서 컨테이너 포트를 열면 **ALB 없이 사설 IP 로
+# 바로 접속**된다(`http://<태스크 사설 IP>:8080`).
+#
+# ⚠ 인바운드가 열리면 **인증이 유일한 방어선**이다. ECS 에서는 dev 토큰 발급도 꺼지므로
+# (`api::auth` 의 세 번째 조건) `auth_token_secret_arn` 을 반드시 넣어야 한다 — 안 넣으면
+# 모든 요청이 401 이고, 넣지 않은 채로 이 규칙만 켜는 것은 의미가 없다.
+resource "aws_vpc_security_group_ingress_rule" "from_admin_cidr" {
+  for_each = toset(var.admin_ingress_cidrs)
+
+  security_group_id = aws_security_group.task.id
+  description       = "from admin CIDR to container port"
+  cidr_ipv4         = each.value
+  from_port         = var.container_port
+  to_port           = var.container_port
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "from_admin_sg" {
+  for_each = toset(var.admin_ingress_security_group_ids)
+
+  security_group_id            = aws_security_group.task.id
+  description                  = "from admin/VPN security group to container port"
+  referenced_security_group_id = each.value
+  from_port                    = var.container_port
+  to_port                      = var.container_port
+  ip_protocol                  = "tcp"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 태스크 정의
 # ─────────────────────────────────────────────────────────────────────────────
