@@ -957,6 +957,17 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     /// **`GSI1SK` 도 함께 올린다.** 진행 중 레코드의 `GSI1SK` 는 `last_seen_at_ms` 이고
     /// 스윕이 그 순서로 훑는다([`keys::gsi1`]). 한쪽만 올리면 인덱스 순서와 속성이
     /// 어긋나 "오래된 것부터" 가 거짓이 된다.
+    ///
+    /// # 계산한 키에 없으면 **찾아서** 갱신한다 (교차 리뷰 24라운드)
+    ///
+    /// 물리 키는 `started_at_ms` **추정치**로 만들어지고 그 추정은 관측자마다 다르다
+    /// (`TIME` 이 정수 초라 최대 1초). 리더가 바뀌면 새 수집기는 다른 추정으로 시작하는데
+    /// `upsert_merged` 는 ±2초 후보 조회로 **이전 리더가 만든 행**에 병합한다 — 행은 A 에
+    /// 있고 새 추정은 B 다. 키를 다시 계산하는 방식은 그 행을 영원히 못 찾고, 살아 있는
+    /// 쿼리가 210초 뒤 고아로 확정된다.
+    ///
+    /// 그래서 조건 실패 시 `upsert_merged` 와 **같은 방법으로** 행을 찾는다. 빠른 경로는
+    /// 여전히 쓰기 한 번이고, 조회는 표류했거나 애초에 행이 없을 때만 든다.
     async fn touch_in_flight(
         &self,
         instance: &InstanceId,
@@ -964,16 +975,39 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         started_at_ms: EpochMs,
         last_seen_at_ms: EpochMs,
     ) -> Result<bool> {
-        use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
-
         let pk = keys::slow_query_pk(instance, started_at_ms);
         let sk = keys::slow_query_sk(started_at_ms, thread_id);
+        if self.touch_at(&pk, &sk, last_seen_at_ms).await? {
+            return Ok(true);
+        }
+
+        // 느린 경로 — 그 실행의 행이 **다른 물리 키**에 있을 수 있다.
+        for c in self
+            .in_flight_rows_for(instance, thread_id, started_at_ms)
+            .await?
+        {
+            if c.pk == pk && c.sk == sk {
+                continue; // 빠른 경로에서 이미 시도했다.
+            }
+            if self.touch_at(&c.pk, &c.sk, last_seen_at_ms).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl DynamoSlowQueryStore {
+    /// 물리 키를 알 때의 조건부 갱신. **조건 실패는 `Ok(false)`** 다.
+    async fn touch_at(&self, pk: &str, sk: &str, last_seen_at_ms: EpochMs) -> Result<bool> {
+        use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
+
         let res = self
             .client
             .update_item()
             .table_name(&self.table)
-            .key("PK", AttributeValue::S(pk))
-            .key("SK", AttributeValue::S(sk))
+            .key("PK", AttributeValue::S(pk.to_string()))
+            .key("SK", AttributeValue::S(sk.to_string()))
             .update_expression("SET last_seen_at_ms = :ls, GSI1SK = :g1sk")
             .condition_expression(
                 "attribute_exists(PK) AND #st = :in_flight \
@@ -999,6 +1033,69 @@ impl SlowQueryStore for DynamoSlowQueryStore {
             }
             Err(e) => Err(map_sdk_err(e)),
         }
+    }
+
+    /// 같은 스레드의 **진행 중** 행들. 표류한 물리 키를 찾는 데만 쓴다.
+    ///
+    /// `find_merge_candidate_stored` 와 같은 범위 조회(`SK BETWEEN`)를 쓴다 — 초 버킷을
+    /// 하나씩 두드리면 창 안의 중간 버킷을 빠뜨린다(실제로 그렇게 한 번 틀렸다).
+    /// 다만 판정은 다르다: 하트비트는 다이제스트를 들고 오지 않으므로 **진행 중 + 같은
+    /// 스레드 + 창 안**으로만 좁히고, 실제 갱신은 조건부 쓰기가 다시 검사한다 — 잘못
+    /// 골라도 값이 뒤로 가지는 않는다(`last_seen_at_ms < :ls`).
+    async fn in_flight_rows_for(
+        &self,
+        instance: &InstanceId,
+        thread_id: u64,
+        around_ms: EpochMs,
+    ) -> Result<Vec<Stored>> {
+        let window = dbmon_core::clock_offset::BASE_MERGE_WINDOW_MS;
+        let (lo, hi) = (around_ms - window, around_ms + window);
+        let mut dates = vec![DatePart::from_epoch_ms(lo)];
+        let hi_date = DatePart::from_epoch_ms(hi);
+        if hi_date != dates[0] {
+            dates.push(hi_date);
+        }
+
+        let mut out: Vec<Stored> = Vec::new();
+        for date in dates {
+            let pk = format!("SQ#{}#{}", instance.as_str(), date.as_str());
+            let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+            loop {
+                let res = self
+                    .client
+                    .query()
+                    .table_name(&self.table)
+                    .key_condition_expression("PK = :pk AND SK BETWEEN :lo AND :hi")
+                    .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                    .expression_attribute_values(":lo", AttributeValue::S(sort_key_ms(lo)))
+                    // `#` 뒤를 열어 같은 밀리초의 모든 스레드를 포함한다.
+                    .expression_attribute_values(
+                        ":hi",
+                        AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(hi))),
+                    )
+                    .consistent_read(true)
+                    .set_exclusive_start_key(start_key)
+                    .send()
+                    .await
+                    .map_err(map_sdk_err)?;
+                for item in res.items.unwrap_or_default() {
+                    let cand = Self::stored_from_item(item)?;
+                    if cand.record.thread_id == thread_id
+                        && cand.record.state == SlowQueryState::InFlight
+                        && !out.iter().any(|e| e.pk == cand.pk && e.sk == cand.sk)
+                    {
+                        out.push(cand);
+                    }
+                }
+                start_key = res.last_evaluated_key;
+                if start_key.is_none() {
+                    break;
+                }
+            }
+        }
+        // 추정에 가까운 것부터 — 창 안에 둘 이상이면 결정론적이어야 한다.
+        out.sort_by_key(|c| (c.record.started_at_ms - around_ms).abs());
+        Ok(out)
     }
 }
 

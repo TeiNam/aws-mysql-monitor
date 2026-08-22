@@ -33,7 +33,7 @@ pub const GRACE_MS: i64 = 30_000;
 /// ([`crate::collector::InstanceCollector::heartbeat`]).
 ///
 /// 이 값은 **주기의 목표**일 뿐이고 실제 상한은 워커의 tick 주기다(하트비트는 tick
-/// 안에서만 쓴다). 그래서 [`stale_threshold_ms`] 는 이 값이 아니라
+/// 안에서만 쓴다). 그래서 [`STALE_THRESHOLD_MS`] 는 이 값이 아니라
 /// [`MAX_DETECT_INTERVAL_MS`] 로 하한을 깐다.
 pub const HEARTBEAT_INTERVAL_MS: i64 = GRACE_MS / 2;
 

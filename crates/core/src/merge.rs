@@ -45,8 +45,6 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
     );
     let duration = merge_duration(existing, incoming, started_at_ms, started_at_ms_precise);
     let digest = merge_digest(existing, incoming);
-    // 아래에서 `abandoned_reason` 판정에 쓴다 — 상태와 사유가 어긋나면 안 된다.
-    let state = merge_state(existing.state, incoming.state);
 
     // 정책은 **먼저 기록된 쪽**을 고정한다. 두 레코드의 `literal_policy_at_ms` 중 이른 쪽.
     let (policy, policy_at) = match existing
@@ -75,7 +73,7 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         env: existing.env,
         engine: existing.engine,
         engine_version: pick_str(&existing.engine_version, &incoming.engine_version),
-        state,
+        state: merge_state(existing.state, incoming.state),
 
         thread_id: existing.thread_id,
         schema_name: pick_opt_str(&existing.schema_name, &incoming.schema_name),
@@ -121,18 +119,20 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         owner_worker: pick_opt_str(&existing.owner_worker, &incoming.owner_worker),
         owner_epoch: existing.owner_epoch.max(incoming.owner_epoch),
         last_seen_at_ms: existing.last_seen_at_ms.max(incoming.last_seen_at_ms),
-        // **확정된 레코드에는 포기 사유를 남기지 않는다.**
+        // **확정돼도 사유를 지우지 않는다.**
         //
-        // `merge_state` 는 `Finalized` 를 `Abandoned` 보다 위에 둔다 — 종료를 실제로
-        // 관측한 근거가 나중에 도착하면 정정하는 것이 맞다. 그런데 사유를 그대로
-        // 들고 있으면 `state=finalized` + `abandoned_reason=owner_lost` 라는 **서로
-        // 모순되는 레코드**가 남고, 화면은 완결된 쿼리에 "추적 중단" 배지를 붙인다.
-        // (`merge_plan` 이 "플랜을 얻었으면 실패 사유를 남기지 않는다" 와 같은 규칙이다.)
-        abandoned_reason: if state == SlowQueryState::Finalized {
-            None
-        } else {
-            pick_opt_str(&existing.abandoned_reason, &incoming.abandoned_reason)
-        },
+        // 23라운드에 "`state=finalized` + `abandoned_reason=owner_lost` 는 모순" 이라고
+        // 보고 지웠다가 24라운드에 되돌렸다. 모순이 아니라 **의도된 이력**이다:
+        //
+        // | 소비자 | 쓰는 방식 |
+        // |---|---|
+        // | `StateBadge` | 확정인데 사유가 있으면 `⚠ <사유>` 를 함께 보여준다 |
+        // | `aggregate::merge_rows` | 한쪽이 끊겼으면 그 사실을 유지한다 |
+        //
+        // 둘 다 **정확 지표를 의심할 근거**로 쓴다. 관측이 한 번 끊겼다면 그 실행의
+        // 검사 행수·잠금 시간은 부분값일 수 있고, 그게 나중에 확정됐다는 사실이
+        // 그 의심을 없애 주지 않는다. 지우면 `merge(q, q)` 의 멱등성도 깨진다.
+        abandoned_reason: pick_opt_str(&existing.abandoned_reason, &incoming.abandoned_reason),
         long_running: existing.long_running || incoming.long_running,
     }
 }
@@ -1223,14 +1223,14 @@ mod tests {
         );
     }
 
-    /// **확정으로 정정되면 포기 사유가 사라진다.**
+    /// **확정으로 정정돼도 "한 번 끊겼다" 는 이력은 남는다.**
     ///
-    /// 고아 스윕이 살아 있는 레코드를 잘못 닫는 경합이 남아 있다(21 의 잔여 위험).
-    /// `Finalized` 가 `Abandoned` 를 이기므로 그 레코드는 나중에 정정되는데, 사유가
-    /// 남으면 `state=finalized` + `abandoned_reason=owner_lost` 라는 모순된 레코드가
-    /// 되고 화면은 완결된 쿼리에 "추적 중단" 을 붙인다.
+    /// 23라운드에 이걸 모순으로 보고 지웠다가 24라운드에 되돌렸다. `StateBadge` 와
+    /// `aggregate::merge_rows` 가 그 값을 **정확 지표를 의심할 근거**로 쓴다 — 관측이
+    /// 끊긴 구간의 지표는 부분값일 수 있고, 나중에 확정됐다는 사실이 그 의심을 없애지
+    /// 않는다. 그리고 지우면 아래 멱등성이 깨진다.
     #[test]
-    fn finalizing_clears_the_abandoned_reason() {
+    fn finalizing_keeps_the_interruption_history() {
         let mut abandoned = base();
         abandoned.state = SlowQueryState::Abandoned;
         abandoned.abandoned_reason = Some("owner_lost".into());
@@ -1244,17 +1244,21 @@ mod tests {
             let m = merge(a, b);
             assert_eq!(m.state, SlowQueryState::Finalized);
             assert_eq!(
-                m.abandoned_reason, None,
-                "확정된 레코드에 포기 사유가 남았다 — 화면이 모순을 표시한다"
+                m.abandoned_reason.as_deref(),
+                Some("owner_lost"),
+                "관측이 끊겼던 이력을 지웠다 — 화면과 집계가 그 값으로 지표를 의심한다"
             );
         }
 
-        // **포기 상태에서는 사유를 지키다.** 왜 닫혔는지가 유일한 단서다.
-        let mut in_flight = base();
-        in_flight.state = SlowQueryState::InFlight;
-        in_flight.ended_at_ms = None;
-        let m = merge(&abandoned, &in_flight);
-        assert_eq!(m.state, SlowQueryState::Abandoned);
-        assert_eq!(m.abandoned_reason.as_deref(), Some("owner_lost"));
+        // **사유를 들고 있는 확정 레코드도 멱등이다.** 이 조합이 없어서 23라운드의
+        // 회귀가 멱등성 테스트를 통과했다.
+        let once = merge(&abandoned, &finalized);
+        assert_eq!(
+            merge(&once, &once),
+            once,
+            "사유가 있는 레코드에서 멱등이 깨졌다"
+        );
+        assert_eq!(merge(&once, &abandoned), once);
+        assert_eq!(merge(&once, &finalized), once);
     }
 }
