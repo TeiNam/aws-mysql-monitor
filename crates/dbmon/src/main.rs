@@ -762,7 +762,23 @@ async fn backfill_round(
                     // 같은 엔트리를 한 번 더 읽지만 `record_id` 로 병합되므로 안전하다.
                     // 파서가 불완전해서 `skipped` 로 보낸 꼬리도 이 재읽기에 들어온다.
                     let (position, token) = if capped {
-                        let pos = parsed.entries.iter().map(|e| e.ended_at_ms).max();
+                        // **전진을 보장한다.** 상한 안의 엔트리가 전부 같은 밀리초면
+                        // 위치가 `since_ms` 와 같아져 다음 라운드가 같은 자리에서
+                        // 시작한다 — 진행 0 이다. 그때는 1ms 넘기고 크게 남긴다.
+                        // 멈춰 있는 것이 한 밀리초를 건너뛰는 것보다 나쁘다.
+                        let pos = parsed.entries.iter().map(|e| e.ended_at_ms).max().map(|t| {
+                            if t > since_ms {
+                                t
+                            } else {
+                                tracing::warn!(
+                                    instance = %instance.id.as_str(),
+                                    since_ms,
+                                    last_entry_ms = t,
+                                    "상한 안의 엔트리가 모두 같은 밀리초다 — 1ms 넘긴다"
+                                );
+                                since_ms + 1
+                            }
+                        });
                         (pos, None)
                     } else {
                         (
