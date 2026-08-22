@@ -86,6 +86,20 @@ pub struct Tracked {
     pub started_at_ms_precise: Option<EpochMs>,
     /// 관측된 **최대** `TIME`(초). 보수적으로 최대값을 쓴다.
     pub max_time_secs: i64,
+    /// 관측된 소요 중 **가장 큰 값**과 그 출처.
+    ///
+    /// # 왜 `max_time_secs` 로는 안 되는가
+    ///
+    /// `PROCESSLIST.TIME` 은 "**현재 상태**에 머문 시간" 이라 상태가 바뀌면 리셋된다
+    /// ([ADR](../../../docs/03-decisions.md)). 그래서 102초 도는 문장의 `TIME` 이 2초일
+    /// 수 있고, 그때 실제 소요는 `TIMER_WAIT` 만 안다.
+    ///
+    /// 하트비트가 `max_time_secs × 1000` 을 쓰면 저장된 정밀값(102.9초)을 **17초로
+    /// 줄인다.** 그 뒤 워커가 급사하면 그 값이 최종 기록으로 남는다 — 교차 리뷰
+    /// 27라운드가 배포 차단으로 잡았다. 그래서 관측 증거를 **한 곳에 모아 최대값을
+    /// 유지**하고, 저장 경로 전부가 이 값을 쓴다.
+    pub best_duration_ms: i64,
+    pub best_duration_source: crate::slow_query::DurationSource,
     /// 마지막으로 관측된 시각(우리 시계). 고아 판정 기준 (F4).
     pub last_seen_at_ms: EpochMs,
     /// 이 항목의 레코드가 **저장소에서 실제로 놓인 자리**. 한 번도 못 썼으면 `None`.
@@ -113,9 +127,24 @@ pub struct Tracked {
 }
 
 impl Tracked {
-    /// 관측된 지속시간(ms). `TIMER_WAIT` 가 있으면 그걸 쓴다.
+    /// 관측된 지속시간(ms). **관측 증거 중 가장 큰 값**이다 — `TIMER_WAIT` 가 있으면
+    /// 보통 그쪽이 크다(`TIME` 은 상태 전이에서 리셋된다).
     pub fn duration_ms(&self) -> i64 {
-        self.max_time_secs * 1000
+        self.best_duration_ms
+    }
+
+    /// 그 값의 출처. 저장할 때 함께 남긴다 — `timer` 로 적고 초 단위 값을 넣으면
+    /// 정밀도를 잘못 주장한다.
+    pub fn duration_source(&self) -> crate::slow_query::DurationSource {
+        self.best_duration_source
+    }
+
+    /// 관측 증거를 반영한다. **줄어들지 않는다.**
+    fn observe_duration(&mut self, ms: i64, source: crate::slow_query::DurationSource) {
+        if ms > self.best_duration_ms {
+            self.best_duration_ms = ms;
+            self.best_duration_source = source;
+        }
     }
 }
 
@@ -313,6 +342,10 @@ impl InFlightTracker {
                     if same_identity && time_not_decreased {
                         existing.state = TrackedState::Tracking;
                         existing.max_time_secs = existing.max_time_secs.max(obs.time_secs);
+                        existing.observe_duration(
+                            obs.time_secs * 1000,
+                            crate::slow_query::DurationSource::Polled,
+                        );
                         existing.last_seen_at_ms = now_ms;
                         // 다이제스트가 뒤늦게 채워지면 반영한다.
                         if existing.identity.digest.is_none() {
@@ -510,13 +543,31 @@ impl InFlightTracker {
             // 병합 후 판정하면 결합법칙이 깨진다(4차 H1).
             let precise = offset.to_db_time(observed_at_ms) - elapsed_ms;
             t.started_at_ms_precise = Some(precise.min(t.started_at_ms));
+            // **`TIME` 이 리셋돼도 이 값은 실제 총 실행시간이다.** 최대값으로 유지한다.
+            t.observe_duration(elapsed_ms, crate::slow_query::DurationSource::Timer);
         }
     }
 
-    pub fn record_plan_attempt(&mut self, thread_id: u64, succeeded: bool) {
+    /// 플랜 수집을 **시도했다**(비용이 들었다). 성공 여부와 무관하게 상한을 소진한다.
+    ///
+    /// # 왜 성공을 여기서 기록하지 않는가
+    ///
+    /// 전에는 `succeeded` 를 받아 `has_plan` 을 여기서 세웠다. 그런데 이 호출은 **저장
+    /// 전**이다 — 플랜을 얻고 저장이 실패하면 `has_plan=true` 라 다시 수집하지 않고,
+    /// 그 실행은 실행계획 없이 남는다. 화면은 "저장된 계획이 없다" 고 말하는데 우리는
+    /// 계획을 **가지고 있었다**(교차 리뷰 27라운드).
+    ///
+    /// 그래서 "얻었다" 는 [`Self::record_plan_saved`] 가 **저장 성공 뒤에** 세운다.
+    pub fn record_plan_attempt(&mut self, thread_id: u64) {
         if let Some(t) = self.entries.get_mut(&thread_id) {
             t.plan_attempts = t.plan_attempts.saturating_add(1);
-            t.has_plan |= succeeded;
+        }
+    }
+
+    /// 플랜이 **저장소에 들어갔다.** 이제 다시 수집할 이유가 없다.
+    pub fn record_plan_saved(&mut self, thread_id: u64) {
+        if let Some(t) = self.entries.get_mut(&thread_id) {
+            t.has_plan = true;
         }
     }
 
@@ -547,6 +598,8 @@ fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Trac
         started_at_ms,
         started_at_ms_precise: None,
         max_time_secs: obs.time_secs,
+        best_duration_ms: obs.time_secs * 1000,
+        best_duration_source: crate::slow_query::DurationSource::Polled,
         last_seen_at_ms: now_ms,
         storage_key: None,
         touch_attempt_ms: None,
@@ -749,7 +802,8 @@ mod tests {
     fn continued_observation_updates_max_time() {
         let mut t = InFlightTracker::default();
         t.tick(&[obs(100, 2, Some("d1"))], 10_000, &no_offset(), false);
-        t.record_plan_attempt(100, true);
+        t.record_plan_attempt(100);
+        t.record_plan_saved(100);
         // **자리를 알아야 대상에서 빠진다.** 플랜만 있고 저장이 안 됐으면 하트비트를
         // 할 수 없으므로 계속 쓰기를 시도해야 한다(26라운드).
         let r = t.tick(&[obs(100, 5, Some("d1"))], 13_000, &no_offset(), false);
@@ -929,10 +983,10 @@ mod tests {
     fn plan_attempts_are_capped() {
         let mut t = InFlightTracker::new(DEFAULT_MAX_TRACKING_MS, 2);
         t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
-        t.record_plan_attempt(1, false);
+        t.record_plan_attempt(1);
         let r = t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset(), false);
         assert_eq!(r.needs_deep_probe, vec![1], "1회 실패 후에는 재시도한다");
-        t.record_plan_attempt(1, false);
+        t.record_plan_attempt(1);
         // 자리를 알려 준 뒤에야 대상에서 빠진다 — 자리를 모르면 쓰기를 계속 시도한다.
         t.record_saved(1, 2_000, crate::ports::StoredKey::new("row-1"));
         let r = t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset(), false);
@@ -943,8 +997,8 @@ mod tests {
         // 남긴 살아 있는 행이 210초 뒤 버려진다(26라운드가 배포 차단으로 잡았다).
         let mut t2 = InFlightTracker::new(DEFAULT_MAX_TRACKING_MS, 2);
         t2.tick(&[obs(9, 2, Some("d"))], 0, &no_offset(), false);
-        t2.record_plan_attempt(9, false);
-        t2.record_plan_attempt(9, false);
+        t2.record_plan_attempt(9);
+        t2.record_plan_attempt(9);
         let r = t2.tick(&[obs(9, 3, Some("d"))], 1_000, &no_offset(), false);
         assert_eq!(
             r.needs_deep_probe,
@@ -1038,7 +1092,8 @@ mod tests {
         assert_eq!(r.needs_deep_probe, vec![1], "새 항목은 심층 조회 대상이다");
 
         // 심층 조회로 플랜을 확보하고 저장했다 — 그때 저장소가 자리를 알려 준다.
-        t.record_plan_attempt(1, true);
+        t.record_plan_attempt(1);
+        t.record_plan_saved(1);
         t.record_saved(1, 1_000, key(1));
 
         // 이제 심층 조회 대상이 아니다 — 저장을 유발하는 경로가 없다.
@@ -1057,6 +1112,71 @@ mod tests {
         t.record_touch_attempt(1, 31_000);
         assert!(t.needs_heartbeat(40_000, INTERVAL).is_empty());
         assert_eq!(t.needs_heartbeat(46_000, INTERVAL), vec![1]);
+    }
+
+    /// **`TIME` 이 리셋돼도 관측된 소요가 줄지 않는다.**
+    ///
+    /// `PROCESSLIST.TIME` 은 "현재 상태에 머문 시간" 이라 상태 전이에서 리셋된다
+    /// (03 의 ADR). 102초 도는 문장의 `TIME` 이 2초로 보일 수 있고, 그때 하트비트가
+    /// `TIME × 1000` 을 쓰면 저장된 정밀값을 **17초로 줄인다** — 그 뒤 워커가 급사하면
+    /// 그 값이 최종 기록이다(교차 리뷰 27라운드가 배포 차단으로 잡았다).
+    #[test]
+    fn observed_duration_never_shrinks_when_time_resets() {
+        let mut t = InFlightTracker::default();
+        t.tick(&[obs(1, 2, Some("d"))], 1_000, &no_offset(), false);
+        assert_eq!(t.get(1).unwrap().duration_ms(), 2_000);
+
+        // 심층 조회가 `TIMER_WAIT` 로 실제 소요 102.9초를 알려 준다.
+        t.record_deep_probe(1, None, Some(102_900_000_000_000), 1_000, &no_offset());
+        assert_eq!(t.get(1).unwrap().duration_ms(), 102_900);
+        assert_eq!(
+            t.get(1).unwrap().duration_source(),
+            crate::slow_query::DurationSource::Timer
+        );
+
+        // **상태가 바뀌어 `TIME` 이 2초로 리셋됐다.** 관측된 소요는 줄지 않는다.
+        t.tick(&[obs(1, 2, Some("d"))], 20_000, &no_offset(), false);
+        assert_eq!(
+            t.get(1).unwrap().duration_ms(),
+            102_900,
+            "TIME 리셋이 관측된 소요를 줄였다 — 하트비트가 그 값을 저장한다"
+        );
+        assert_eq!(
+            t.get(1).unwrap().duration_source(),
+            crate::slow_query::DurationSource::Timer
+        );
+
+        // 코스한 관측이 그 값을 넘어서면 그때는 갱신된다(출처도 바뀐다).
+        t.tick(&[obs(1, 200, Some("d"))], 30_000, &no_offset(), false);
+        assert_eq!(t.get(1).unwrap().duration_ms(), 200_000);
+        assert_eq!(
+            t.get(1).unwrap().duration_source(),
+            crate::slow_query::DurationSource::Polled
+        );
+    }
+
+    /// **플랜을 얻어도 저장이 성공해야 "얻었다" 다.**
+    ///
+    /// 전에는 수집 직후 `has_plan=true` 를 세웠다. 저장이 실패하면 다시 수집하지 않으므로
+    /// 그 실행은 실행계획 없이 남고, 화면은 "저장된 계획이 없다" 고 말한다 — 우리는 계획을
+    /// 가지고 있었다(교차 리뷰 27라운드).
+    #[test]
+    fn a_plan_counts_as_captured_only_after_it_is_stored() {
+        let mut t = InFlightTracker::new(DEFAULT_MAX_TRACKING_MS, 3);
+        t.tick(&[obs(1, 2, Some("d"))], 0, &no_offset(), false);
+
+        // 수집은 했고 저장은 실패했다.
+        t.record_plan_attempt(1);
+        assert!(
+            t.wants_plan(1),
+            "저장이 실패했는데 다시 수집하지 않는다 — 계획을 잃는다"
+        );
+
+        // 두 번째 시도에서 저장까지 됐다.
+        t.record_plan_attempt(1);
+        t.record_plan_saved(1);
+        assert!(!t.wants_plan(1), "저장까지 됐으면 다시 수집하지 않는다");
+        assert_eq!(t.get(1).unwrap().plan_attempts, 2, "시도는 두 번 셌다");
     }
 
     /// **자리를 모르는 항목은 대상이 아니다.**
@@ -1125,7 +1245,8 @@ mod tests {
         // 심층 조회 응답이 확정 이후에 도착할 수 있다. 패닉하지 않아야 한다.
         let mut t = InFlightTracker::default();
         t.record_deep_probe(999, Some("d".into()), Some(1), 0, &no_offset());
-        t.record_plan_attempt(999, true);
+        t.record_plan_attempt(999);
+        t.record_plan_saved(999);
         assert!(t.is_empty());
     }
 }

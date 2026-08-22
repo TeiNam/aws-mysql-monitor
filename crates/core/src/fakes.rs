@@ -221,6 +221,7 @@ impl SlowQueryStore for FakeSlowQueryStore {
         key: &StoredKey,
         last_seen_at_ms: EpochMs,
         duration_ms: i64,
+        duration_source: crate::slow_query::DurationSource,
     ) -> Result<bool> {
         let mut items = self.items.lock().unwrap();
         let Some(e) = items.get_mut(key.as_str()) else {
@@ -234,7 +235,7 @@ impl SlowQueryStore for FakeSlowQueryStore {
         // 어댑터와 같이 **짝으로** 올린다 — 따로 쓰면 화면의 경과가 어긋난다.
         e.last_seen_at_ms = Some(last_seen_at_ms);
         e.duration_ms = duration_ms;
-        e.duration_source = crate::slow_query::DurationSource::Polled;
+        e.duration_source = duration_source;
         Ok(true)
     }
 }

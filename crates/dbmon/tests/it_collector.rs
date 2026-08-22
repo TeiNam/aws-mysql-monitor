@@ -23,9 +23,7 @@ use dbmon_core::env::{Env, EnvResolution};
 use dbmon_core::fakes::FakeSlowQueryStore;
 use dbmon_core::ids::InstanceId;
 use dbmon_core::instance::{Engine, EngineVersion, Instance, InstanceState};
-use dbmon_core::slow_query::{
-    CaptureSource, DurationSource, LiteralPolicy, PlanSource, SlowQueryState,
-};
+use dbmon_core::slow_query::{CaptureSource, LiteralPolicy, PlanSource, SlowQueryState};
 use dbmon_core::time::SystemClock;
 use support::*;
 
@@ -514,10 +512,22 @@ async fn exact_metrics_come_from_statements_current() {
         rec.stats.rows_examined.is_some(),
         "events_statements_current 지표를 받지 못했다 — consumer 설정을 확인한다"
     );
-    assert_eq!(
-        rec.duration_source,
-        DurationSource::Timer,
-        "TIMER_WAIT 가 있으면 초 단위 근사보다 정확하다"
+    // **`TIMER_WAIT` 를 받았다는 증거는 정밀 시작 시각이다.**
+    //
+    // `duration_source` 로 확인하지 않는 이유: 관측된 소요는 이제 **모든 증거의 최대값**
+    // 이고(`Tracked::duration_ms`), `TIME` 은 초 단위로 올라가므로 다음 tick 에 코스한
+    // 값이 타이머 값을 넘어선다 — 그때 `polled` 가 되는 것이 정직하다. 그 규칙은
+    // `TIME` 이 상태 전이에서 리셋돼 저장된 소요가 줄어드는 것을 막기 위한 것이다
+    // (교차 리뷰 27라운드). 정밀 시작 시각은 `TIMER_WAIT` 로만 채워지므로 그 경로가
+    // 살아 있는지를 정확히 가리킨다.
+    assert!(
+        rec.started_at_ms_precise.is_some(),
+        "TIMER_WAIT 를 받지 못했다 — events_statements_current 경로를 확인한다"
+    );
+    assert!(
+        rec.duration_ms >= 1,
+        "소요가 기록되지 않았다: {:?}",
+        rec.duration_ms
     );
 
     kill_and_wait(running).await;

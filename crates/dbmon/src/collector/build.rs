@@ -23,8 +23,8 @@ use dbmon_core::inflight::{FinalizeReason, Tracked};
 use dbmon_core::instance::Instance;
 use dbmon_core::ports::target_db::StmtCurrentRow;
 use dbmon_core::slow_query::{
-    CaptureSource, DurationSource, ExecStats, LiteralPolicy, PlanBundle, PlanSource, SlowQuery,
-    SlowQueryState, UNKNOWN_DIGEST_PREFIX,
+    CaptureSource, ExecStats, LiteralPolicy, PlanBundle, PlanSource, SlowQuery, SlowQueryState,
+    UNKNOWN_DIGEST_PREFIX,
 };
 use dbmon_core::time::EpochMs;
 use dbmon_normalize::{DIGEST_ALGO_VERSION, StatementType, normalize};
@@ -204,11 +204,15 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
 
     // ── 시각과 지속시간 ────────────────────────────────────────────────────
     let started_at_ms = tracked.started_at_ms;
-    let (duration_ms, duration_source) = match stmt.and_then(|s| s.timer_wait_ps) {
-        // `TIMER_WAIT` 는 피코초이고 `TIME` 의 초 단위 오차를 없앤다.
-        Some(ps) => ((ps / 1_000_000_000) as i64, DurationSource::Timer),
-        None => (tracked.duration_ms(), DurationSource::Polled),
-    };
+    // **추적기가 모아 둔 최선의 관측을 쓴다.**
+    //
+    // 전에는 이 tick 의 `TIMER_WAIT` 만 봤다. 그러면 (1) 확정 경로(`stmt: None`)가 정밀값을
+    // 잃고, (2) 하트비트가 쓰는 값과 여기서 쓰는 값이 갈려 **저장된 소요가 줄어들 수
+    // 있었다**(`TIME` 은 상태 전이에서 리셋된다 — 교차 리뷰 27라운드).
+    //
+    // `record_deep_probe` 가 이 tick 의 `TIMER_WAIT` 를 이미 반영했으므로(호출 순서가
+    // 보장된다) 여기서는 모아진 값을 읽으면 된다.
+    let (duration_ms, duration_source) = (tracked.duration_ms(), tracked.duration_source());
 
     // 종료를 관측하지 못했으면 `ended_at_ms` 를 남기지 않는다 — 추측한 시각을
     // 사실처럼 저장하면 리포트가 틀린다.
@@ -379,6 +383,7 @@ mod tests {
     use dbmon_core::ids::InstanceId;
     use dbmon_core::inflight::Identity;
     use dbmon_core::instance::{Engine, EngineVersion, InstanceState};
+    use dbmon_core::slow_query::DurationSource;
 
     fn instance() -> Instance {
         Instance {
@@ -422,6 +427,8 @@ mod tests {
             started_at_ms: 1_000_000,
             started_at_ms_precise: None,
             max_time_secs: 4,
+            best_duration_ms: 4_213,
+            best_duration_source: DurationSource::Timer,
             last_seen_at_ms: 1_004_000,
             storage_key: Some(dbmon_core::ports::StoredKey::new("row-8842119")),
             touch_attempt_ms: Some(1_004_000),
@@ -676,7 +683,11 @@ mod tests {
             "{}",
             out.query.app_digest
         );
-        assert_eq!(out.query.duration_ms, 4_000);
+        // **추적기가 모아 둔 최선의 관측을 쓴다.** 이 tick 에 `stmt` 가 없어도 앞선
+        // 심층 조회에서 얻은 `TIMER_WAIT` 값이 남아 있다 — 전에는 그걸 잃고 초 단위
+        // 값으로 떨어졌다(확정 경로가 그 상태였다, 교차 리뷰 27라운드).
+        assert_eq!(out.query.duration_ms, 4_213);
+        assert_eq!(out.query.duration_source, DurationSource::Timer);
     }
 
     #[test]

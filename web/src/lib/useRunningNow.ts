@@ -32,14 +32,21 @@ export function useRunningNow(
     return () => window.clearInterval(id);
   }, [hasRunning]);
 
-  // 응답이 바뀔 때마다 그 순간의 단조 시계를 함께 잡아 둔다.
-  const anchor = useRef<{ serverNowMs: number; monotonicAtMs: number } | null>(null);
-  useEffect(() => {
-    if (serverNowMs != null) {
-      anchor.current = { serverNowMs, monotonicAtMs: performance.now() };
-    }
-  }, [dataUpdatedAt, serverNowMs]);
+  // **기준점을 렌더 중에 잡는다.**
+  //
+  // effect 에서 잡으면 첫 페인트가 기준점 없이 그려져 벽시계로 떨어진다 — 브라우저 시계가
+  // 5분 빠른 기계에서 2초 쿼리가 **처음 1초 동안 302초로** 보인다(교차 리뷰 27라운드).
+  // ref 쓰기를 렌더 중에 하는 것은 보통 피하지만, 여기서는 같은 입력에 같은 결과이고
+  // (멱등) 외부에 영향을 주지 않으므로 안전하다.
+  const anchor = useRef<{
+    stamp: number;
+    serverNowMs: number;
+    monotonicAtMs: number;
+  } | null>(null);
+  if (serverNowMs != null && anchor.current?.stamp !== dataUpdatedAt) {
+    anchor.current = { stamp: dataUpdatedAt, serverNowMs, monotonicAtMs: performance.now() };
+  }
 
-  // 기준점이 아직 없으면(첫 렌더·옛 API) 벽시계로 떨어진다 — 그래도 표는 그려야 한다.
+  // 기준점이 없으면(옛 API 응답) 벽시계로 떨어진다 — 그래도 표는 그려야 한다.
   return serverNow(anchor.current ?? {}, tickMs, Date.now());
 }

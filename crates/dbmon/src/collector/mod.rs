@@ -86,6 +86,12 @@ pub struct TickStats {
     pub heartbeats_absent: usize,
 }
 
+/// tick 당 **선행 저장**(자리 얻기) 상한.
+///
+/// 배치 조회는 목록이 커도 왕복 수가 같으므로 이 상한은 DynamoDB 쓰기 예산이다.
+/// `deep_probe_limit`(플랜 예산)와 나눠 두는 이유는 `detect_tick` 의 표에 있다.
+const ACQUIRE_LIMIT: usize = 200;
+
 /// tick 당 하트비트 쓰기 상한. 동시 슬로우 쿼리가 폭주해도 쓰기 예산을 묶는다.
 ///
 /// 주기가 임계의 절반보다 짧으므로(`HEARTBEAT_INTERVAL_MS`) 상한에 걸린 항목도 다음
@@ -285,26 +291,67 @@ where
 
         // ── 심층 조회 ──────────────────────────────────────────────────────
         //
-        // **자리를 모르는 항목이 먼저다.** 그 항목은 아직 저장소에 행이 없거나 어디 있는지
-        // 모르고, 그래서 하트비트를 할 수 없다 — 210초 안에 자리를 얻지 못하면 이전
-        // 리더가 남긴 **살아 있는 행**이 버려진다. 긴 쿼리를 먼저 보는 규칙만 두면 상한이
-        // 작을 때 뒤쪽 항목이 영구히 밀린다(교차 리뷰 26라운드가 3개로 재현했다).
+        // **두 예산을 나눈다.**
         //
-        // 그다음이 느린 순이다 — 플랜은 비싸므로 가치가 큰 것부터 본다.
-        let mut targets = tick.needs_deep_probe.clone();
+        // | 무엇 | 비용 | 상한 |
+        // |---|---|---|
+        // | 자리 얻기(선행 저장) | 배치 조회 2회 + 항목당 쓰기 1회 | `ACQUIRE_LIMIT` |
+        // | 플랜 얻기(`EXPLAIN`) | **항목당 왕복** | `deep_probe_limit` |
+        //
+        // 배치 조회(`full_sql`·`stmt_current`)는 `ID IN (…)` 이라 목록이 커도 왕복 수가
+        // 같다. 그런데 전에는 두 일이 `deep_probe_limit` 하나를 나눠 써서, 상한이 작으면
+        // **자리를 못 얻은 항목이 210초 안에 저장되지 못했다** — 리더 교체 직후 이전
+        // 리더가 남긴 살아 있는 행이 버려진다(교차 리뷰 27라운드가 10행으로 재현했다).
+        // 반대로 자리 없는 것을 먼저 보게만 하면 플랜 재시도가 굶는다(같은 라운드).
+        let mut plan_targets: Vec<u64> = tick
+            .needs_deep_probe
+            .iter()
+            .copied()
+            .filter(|id| self.tracker.wants_plan(*id))
+            .collect();
+        // 플랜은 비싸므로 느린 것부터.
+        plan_targets.sort_by_key(|id| {
+            std::cmp::Reverse(self.tracker.get(*id).map(|t| t.max_time_secs).unwrap_or(0))
+        });
+        if plan_targets.len() > self.params.deep_probe_limit {
+            stats.deep_probe_skipped = plan_targets.len() - self.params.deep_probe_limit;
+            plan_targets.truncate(self.params.deep_probe_limit);
+        }
+        // **`deep_probed` 는 이름대로 플랜 조회 수다.** 쓰기 대상 수를 여기 넣으면
+        // `deep_probe_limit` 과 비교할 수 없고, 지표가 상한을 넘긴 것처럼 보인다.
+        stats.deep_probed = plan_targets.len();
+
+        // 쓰기 대상 = 자리를 얻어야 하는 것 ∪ 플랜을 방금 얻은 것.
+        let mut targets: Vec<u64> = tick
+            .needs_deep_probe
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.tracker
+                    .get(*id)
+                    .is_some_and(|t| t.storage_key.is_none())
+                    || plan_targets.contains(id)
+            })
+            .collect();
+        // 자리 없는 것부터 — 상한에 걸리면 그쪽이 살아 있는 행을 지킨다.
         targets.sort_by_key(|id| {
             let t = self.tracker.get(*id);
             (
-                // false(자리 없음) < true(자리 있음) → 자리 없는 것이 앞이다.
                 t.is_some_and(|t| t.storage_key.is_some()),
                 std::cmp::Reverse(t.map(|t| t.max_time_secs).unwrap_or(0)),
             )
         });
-        if targets.len() > self.params.deep_probe_limit {
-            stats.deep_probe_skipped = targets.len() - self.params.deep_probe_limit;
-            targets.truncate(self.params.deep_probe_limit);
+        if targets.len() > ACQUIRE_LIMIT {
+            // **조용히 자르지 않는다.** 잘린 항목은 이번 tick 에 자리를 못 얻는다.
+            tracing::warn!(
+                instance = %self.instance.id,
+                pending = targets.len(),
+                limit = ACQUIRE_LIMIT,
+                "선행 저장 상한에 걸렸다 — 자리 없는 것부터 처리한다"
+            );
+            targets.truncate(ACQUIRE_LIMIT);
         }
-        stats.deep_probed = targets.len();
+        let plan_targets: std::collections::BTreeSet<u64> = plan_targets.into_iter().collect();
 
         if !targets.is_empty() {
             // **실패해도 아래 확정 루프는 반드시 돈다.**
@@ -316,7 +363,10 @@ where
             //
             // 확정 경로는 `full_sql: None, stmt: None` 이라 이 두 조회를 쓰지도 않는다.
             // 즉 실패의 영향은 **선행 저장에만** 국한돼야 한다.
-            if let Err(e) = self.prefetch_save(&targets, now_ms, &mut stats).await {
+            if let Err(e) = self
+                .prefetch_save(&targets, &plan_targets, now_ms, &mut stats)
+                .await
+            {
                 stats.deep_probe_failed += targets.len();
                 tracing::warn!(
                     instance = %self.instance.id,
@@ -424,11 +474,13 @@ where
             // 아무도 확정하지 않는데 영원히 살아 있는 것으로 보인다.
             //
             // 자리는 **쓰기가 알려 준 것**이다(`needs_heartbeat` 가 자리를 아는 항목만 준다).
-            let Some((key, last_seen_at_ms, duration_ms)) = self.tracker.get(id).and_then(|t| {
-                t.storage_key
-                    .clone()
-                    .map(|k| (k, t.last_seen_at_ms, t.duration_ms()))
-            }) else {
+            let Some((key, last_seen_at_ms, duration_ms, duration_source)) =
+                self.tracker.get(id).and_then(|t| {
+                    t.storage_key
+                        .clone()
+                        .map(|k| (k, t.last_seen_at_ms, t.duration_ms(), t.duration_source()))
+                })
+            else {
                 continue;
             };
             // **결과와 무관하게 시도를 기록한다.** 성공으로 기록하면 실패한 항목이 줄의
@@ -436,7 +488,7 @@ where
             self.tracker.record_touch_attempt(id, now_ms);
             match self
                 .store
-                .touch_in_flight(&key, last_seen_at_ms, duration_ms)
+                .touch_in_flight(&key, last_seen_at_ms, duration_ms, duration_source)
                 .await
             {
                 Ok(updated) => {
@@ -561,6 +613,7 @@ where
     async fn prefetch_save(
         &mut self,
         targets: &[u64],
+        plan_targets: &std::collections::BTreeSet<u64>,
         now_ms: dbmon_core::time::EpochMs,
         stats: &mut TickStats,
     ) -> Result<()> {
@@ -586,12 +639,17 @@ where
             // 자리를 얻기 위해 대상에 남은 항목이 있으므로(위 `wants_plan` 참고),
             // 여기서 걸러야 이미 포기한 플랜을 매 tick 다시 시도하지 않는다 — 그건
             // 대상 DB 에 실제 부하다.
-            let plan = if self.tracker.wants_plan(*id) {
+            let plan = if plan_targets.contains(id) {
                 let plan = self.collect_plan(*id, f, s, stats).await;
-                self.tracker.record_plan_attempt(*id, plan.json.is_some());
+                // **시도만 기록한다.** "얻었다" 는 저장이 성공한 뒤에 센다 — 그러지 않으면
+                // 플랜을 들고 있는데 저장이 실패한 실행이 계획 없이 남는다(27라운드).
+                self.tracker.record_plan_attempt(*id);
                 plan
             } else {
-                PlanResult::not_attempted()
+                // 자리를 얻으려고 남은 항목이다. 플랜을 이미 얻었으면 사유가 없고,
+                // 시도 상한에 걸렸으면 **그 사실을 남긴다** — 비면 화면이 "계획이 없다" 만
+                // 말하고 왜 없는지는 아무도 모른다.
+                PlanResult::not_attempted(self.tracker.wants_plan(*id))
             };
 
             // **선행 저장** — 정규화·마스킹을 거친 형태로 (F2).
@@ -628,6 +686,10 @@ where
                 Ok((_, key)) => {
                     stats.prefetch_saved += 1;
                     self.tracker.record_saved(*id, now_ms, key);
+                    // **저장이 성공한 뒤에** 플랜을 얻었다고 센다.
+                    if plan.json.is_some() {
+                        self.tracker.record_plan_saved(*id);
+                    }
                 }
                 Err(e) => {
                     stats.store_errors += 1;
@@ -805,13 +867,20 @@ impl PlanResult {
             error: None,
         }
     }
-    /// **플랜을 시도하지 않았다.** 이미 얻었거나 시도 상한에 걸린 항목이 자리를 얻기
-    /// 위해 대상에 남아 있는 경우다 — 실패가 아니므로 사유를 남기지 않는다.
-    fn not_attempted() -> Self {
+    /// **플랜을 시도하지 않았다.** 자리를 얻기 위해 대상에 남은 항목이다.
+    ///
+    /// `still_wants` 가 거짓이면 이미 얻었거나 시도 상한에 걸렸다는 뜻이다. 상한에 걸린
+    /// 경우 사유를 비워 두면 화면이 "저장된 계획이 없다" 만 말하고 **왜 없는지**는
+    /// 아무도 모른다(교차 리뷰 27라운드).
+    fn not_attempted(still_wants: bool) -> Self {
         Self {
             json: None,
             source: PlanSource::None,
-            error: None,
+            error: if still_wants {
+                None
+            } else {
+                Some("attempts_exhausted".into())
+            },
         }
     }
     fn failed(f: PlanFailure) -> Self {
