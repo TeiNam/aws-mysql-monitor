@@ -417,19 +417,24 @@ impl InFlightTracker {
     /// 관측하지 않는다" 를 뜻하게 되고, 스윕은 시각 비교만으로 옳아진다 — 소유를
     /// 추론할 필요가 없다(그 추론이 20~22라운드에서 양방향으로 틀렸다).
     ///
+    /// # 한 번도 저장되지 않은 항목은 **대상이 아니다**
+    ///
+    /// 하트비트는 있는 레코드를 갱신할 뿐 만들지 않는다. 심층 조회 상한(`deep_probe_limit`)
+    /// 밖의 후보는 레코드가 **없는 것이 설계**다(지표만 남긴다). 그걸 하트비트가 만들면
+    /// SQL 없는 레코드가 생기고, 그 레코드는 정책이 `off` 로 강등되며, 병합은 **먼저
+    /// 기록된 정책을 고정**하므로 나중에 도착한 SQL 이 영구히 버려진다
+    /// (교차 리뷰 23라운드가 배포 차단으로 잡았다).
+    ///
     /// 상한은 두지 않는다. **호출부가 자르고 자른 사실을 기록한다** — 조용히 자르면
     /// 잘린 항목이 고아로 확정되는데 그 이유가 어디에도 남지 않는다.
     pub fn needs_heartbeat(&self, now_ms: EpochMs, interval_ms: i64) -> Vec<u64> {
         let mut stale: Vec<(EpochMs, u64)> = self
             .entries
             .values()
-            .filter(|t| {
-                t.saved_at_ms
-                    // 아직 한 번도 못 썼으면 급하다 — 저장소에 레코드 자체가 없다.
-                    .is_none_or(|saved| now_ms.saturating_sub(saved) >= interval_ms)
+            .filter_map(|t| {
+                let saved = t.saved_at_ms?;
+                (now_ms.saturating_sub(saved) >= interval_ms).then_some((saved, t.thread_id))
             })
-            // 한 번도 못 쓴 것을 가장 앞에 둔다(`None` → 0).
-            .map(|t| (t.saved_at_ms.unwrap_or(0), t.thread_id))
             .collect();
         stale.sort_unstable();
         stale.into_iter().map(|(_, id)| id).collect()
@@ -975,9 +980,13 @@ mod tests {
         assert_eq!(t.needs_heartbeat(46_000, INTERVAL), vec![1]);
     }
 
-    /// **한 번도 못 쓴 항목이 가장 급하다.** 저장소에 레코드 자체가 없다.
+    /// **한 번도 저장되지 않은 항목은 하트비트 대상이 아니다.**
+    ///
+    /// 하트비트는 있는 레코드를 갱신할 뿐 만들지 않는다. 심층 조회 상한 밖의 후보는
+    /// 레코드가 **없는 것이 설계**이고, 만들면 SQL 없는 레코드의 리터럴 정책이 `off` 로
+    /// 고정돼 나중에 도착한 SQL 이 영구히 버려진다(교차 리뷰 23라운드, 배포 차단).
     #[test]
-    fn never_saved_entries_come_first() {
+    fn unsaved_entries_are_not_heartbeat_candidates() {
         const INTERVAL: EpochMs = 15_000;
         let mut t = InFlightTracker::default();
         t.tick(
@@ -992,10 +1001,10 @@ mod tests {
         );
         t.record_saved(1, 20_000);
         t.record_saved(3, 1_000);
-        // 2 는 한 번도 못 썼다 → 맨 앞. 그다음은 오래된 순(3 → 1).
-        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![2, 3, 1]);
+        // 2 는 한 번도 저장되지 않았다 → 빠진다. 나머지는 오래된 순(3 → 1).
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![3, 1]);
         // 상한은 호출부가 자른다 — 여기서 조용히 자르지 않는다.
-        assert_eq!(t.needs_heartbeat(40_000, INTERVAL).len(), 3);
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL).len(), 2);
     }
 
     #[test]

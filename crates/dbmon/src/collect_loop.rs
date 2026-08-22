@@ -48,8 +48,9 @@ pub fn desired_ids(instances: &[Instance], pause: &PauseSet) -> BTreeSet<String>
 /// 지금 멈춰 있는 인스턴스들. **[`desired_ids`] 의 여집합 중 "멈춰서 빠진" 것**이다.
 ///
 /// 이 목록이 필요한 이유는 태스크를 내린 뒤 **진행 중 레코드를 확정해야** 하기
-/// 때문이다. 남겨 두면 그 레코드는 이 워커·이 epoch 소유이므로 고아 스윕이 `Mine`
-/// 으로 보고 매번 건너뛴다 — 리더가 바뀔 때까지 화면에 유령 "실행 중" 이 남는다.
+/// 때문이다. 남겨 두면 고아 스윕이 임계(`orphan::STALE_THRESHOLD_MS`) 뒤에 닫지만
+/// 사유가 `owner_lost` 가 된다 — **워커가 사라진 것과 사람이 멈춘 것은 다른 사실**이고,
+/// 그동안 화면에는 유령 "실행 중" 이 남는다.
 pub fn paused_ids(instances: &[Instance], pause: &PauseSet) -> BTreeSet<String> {
     instances
         .iter()

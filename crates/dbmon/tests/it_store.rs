@@ -267,20 +267,39 @@ async fn in_flight_index_finds_only_running_records() {
     assert!(!ids.contains(&2002), "확정 레코드가 보인다: {ids:?}");
 }
 
-/// **하트비트가 이미 저장된 사실을 지우지 않는다.**
+/// **하트비트는 있는 레코드의 생존 신호만 올린다.**
 ///
-/// 수집기는 15초마다 "아직 관측 중" 을 다시 쓴다(고아 오판 방지). 그 쓰기는 SQL·플랜을
-/// 들고 있지 않으므로, 병합이 `None` 을 덮어쓰기로 처리하면 **15초마다 SQL 과 실행계획이
-/// 사라진다** — 고치려던 버그보다 나쁘다. 그리고 갱신 시각은 반드시 올라가야 한다(안
-/// 오르면 하트비트가 아무 일도 안 한 것이다). 페이크 저장소와 실제 병합이 갈린 전례가
-/// 있으므로 **실제 저장소로** 확인한다.
+/// 세 가지를 못박는다. 처음에는 `upsert_merged` 로 레코드 전체를 다시 썼는데 그게
+/// 셋 다 깨뜨렸다(교차 리뷰 23라운드):
+///
+/// 1. **만들지 않는다** — 심층 조회 상한 밖의 후보는 레코드가 없는 것이 설계다.
+///    만들면 SQL 없는 레코드의 정책이 `off` 로 고정돼 나중 SQL 이 영구히 버려진다.
+/// 2. **되살리지 않는다** — 늦게 도착한 하트비트가 확정 레코드를 진행 중으로 되돌리면
+///    화면에 유령이 생긴다.
+/// 3. **지우지 않는다** — SQL·플랜은 그대로 남고 `last_seen_at_ms` 만 오른다.
 #[tokio::test]
-async fn a_heartbeat_advances_last_seen_without_erasing_sql_or_plan() {
+async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
     let Some(s) = store("heartbeat").await else {
         return;
     };
+    let inst = instance();
 
-    // 선행 저장 — SQL·플랜을 갖춘 진행 중 레코드.
+    // ① 없는 레코드에는 아무 일도 하지 않는다.
+    let absent = s
+        .touch_in_flight(&inst, 2099, T0, T0 + 5_000)
+        .await
+        .expect("호출");
+    assert!(
+        !absent,
+        "없는 레코드에 하트비트가 성공했다 — 레코드를 만들었다"
+    );
+    let id = RecordId::new(&inst, 2099, T0);
+    assert!(
+        s.get(&id).await.expect("조회").is_none(),
+        "하트비트가 레코드를 만들었다 — 심층 조회 상한 밖 후보에 SQL 없는 레코드가 생긴다"
+    );
+
+    // ② 진행 중 레코드는 갱신하고, SQL·플랜은 남는다.
     let mut saved = sample(2010, T0);
     saved.state = SlowQueryState::InFlight;
     saved.ended_at_ms = None;
@@ -292,20 +311,17 @@ async fn a_heartbeat_advances_last_seen_without_erasing_sql_or_plan() {
     };
     s.upsert_merged(&saved).await.expect("선행 저장");
 
-    // 하트비트 — 갱신 시각만 올린다. `full_sql`·플랜 없이 만든 모양 그대로다.
-    let mut beat = sample(2010, T0);
-    beat.state = SlowQueryState::InFlight;
-    beat.ended_at_ms = None;
-    beat.sql_text = None;
-    beat.plan = PlanBundle::default();
-    beat.last_seen_at_ms = Some(T0 + 20_000);
-    s.upsert_merged(&beat).await.expect("하트비트");
+    let updated = s
+        .touch_in_flight(&inst, 2010, T0, T0 + 20_000)
+        .await
+        .expect("호출");
+    assert!(updated, "진행 중 레코드를 갱신하지 못했다");
 
-    let got = s.get(&beat.record_id).await.expect("조회").expect("있음");
+    let got = s.get(&saved.record_id).await.expect("조회").expect("있음");
     assert_eq!(
         got.last_seen_at_ms,
         Some(T0 + 20_000),
-        "하트비트가 갱신 시각을 올리지 못했다 — 살아 있는 쿼리가 고아로 확정된다"
+        "갱신 시각이 오르지 않았다 — 살아 있는 쿼리가 고아로 확정된다"
     );
     assert_eq!(
         got.sql_text.as_deref(),
@@ -317,18 +333,26 @@ async fn a_heartbeat_advances_last_seen_without_erasing_sql_or_plan() {
         Some(r#"{"query_block":{}}"#),
         "하트비트가 실행계획을 지웠다"
     );
+    assert_eq!(got.literal_policy, LiteralPolicy::Masked, "정책이 바뀌었다");
     assert_eq!(got.state, SlowQueryState::InFlight);
 
-    // **확정된 레코드를 되살리지 않는다.** 늦게 도착한 하트비트가 유령을 만들면 안 된다.
+    // ③ 값을 되돌리지 않는다.
+    let backwards = s
+        .touch_in_flight(&inst, 2010, T0, T0 + 10_000)
+        .await
+        .expect("호출");
+    assert!(!backwards, "뒤늦게 도착한 갱신이 값을 되돌렸다");
+
+    // ④ 확정된 레코드는 되살리지 않는다.
     let done = sample(2010, T0); // 같은 record_id, Finalized
     s.upsert_merged(&done).await.expect("확정");
-    s.upsert_merged(&beat).await.expect("늦은 하트비트");
-    let got = s.get(&beat.record_id).await.expect("조회").expect("있음");
-    assert_eq!(
-        got.state,
-        SlowQueryState::Finalized,
-        "늦은 하트비트가 확정 레코드를 진행 중으로 되돌렸다"
-    );
+    let after_close = s
+        .touch_in_flight(&inst, 2010, T0, T0 + 30_000)
+        .await
+        .expect("호출");
+    assert!(!after_close, "확정 레코드에 하트비트가 성공했다");
+    let got = s.get(&saved.record_id).await.expect("조회").expect("있음");
+    assert_eq!(got.state, SlowQueryState::Finalized);
     assert!(
         !s.list_in_flight(50)
             .await
@@ -336,6 +360,53 @@ async fn a_heartbeat_advances_last_seen_without_erasing_sql_or_plan() {
             .iter()
             .any(|q| q.thread_id == 2010),
         "확정된 레코드가 진행 중 인덱스로 돌아왔다"
+    );
+}
+
+/// **`GSI1SK` 도 같이 올라간다.**
+///
+/// 진행 중 레코드의 `GSI1SK` 는 `last_seen_at_ms` 이고 스윕이 그 순서로 훑는다.
+/// 속성만 올리면 인덱스 순서와 속성이 어긋나 "오래된 것부터" 가 거짓이 된다.
+#[tokio::test]
+async fn a_heartbeat_moves_the_record_to_the_back_of_the_sweep_order() {
+    let Some(s) = store("heartbeat-order").await else {
+        return;
+    };
+    let inst = instance();
+
+    for (tid, seen) in [(2101u64, T0 + 1_000), (2102, T0 + 2_000)] {
+        let mut q = sample(tid, T0);
+        q.state = SlowQueryState::InFlight;
+        q.ended_at_ms = None;
+        q.last_seen_at_ms = Some(seen);
+        s.upsert_merged(&q).await.expect("저장");
+    }
+    let order: Vec<u64> = s
+        .list_in_flight(50)
+        .await
+        .expect("조회")
+        .iter()
+        .map(|q| q.thread_id)
+        .collect();
+    assert_eq!(order, vec![2101, 2102], "오래된 것부터가 아니다");
+
+    // 앞자리를 갱신하면 뒤로 간다.
+    assert!(
+        s.touch_in_flight(&inst, 2101, T0, T0 + 9_000)
+            .await
+            .expect("호출")
+    );
+    let order: Vec<u64> = s
+        .list_in_flight(50)
+        .await
+        .expect("조회")
+        .iter()
+        .map(|q| q.thread_id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![2102, 2101],
+        "GSI1SK 가 안 올라 인덱스 순서가 속성과 어긋났다"
     );
 }
 

@@ -23,29 +23,51 @@ use dbmon_core::ports::SlowQueryStore;
 use dbmon_core::slow_query::{SlowQuery, SlowQueryState};
 use dbmon_core::time::EpochMs;
 
-/// 관측이 끊겼다고 볼 여유 (05 §4.5: `3 × poll_interval + 30초`).
+/// 관측이 끊겼다고 볼 여유 (05 §4.5).
 ///
 /// 여유가 없으면 tick 한 번 밀린 것을 고아로 판정한다 — 살아 있는 쿼리를
 /// `abandoned` 로 확정하는 쪽이 유령을 남기는 것보다 나쁘다.
 pub const GRACE_MS: i64 = 30_000;
 
-/// 고아 판정 임계. `poll_interval` 의 3배 + 여유.
-pub fn stale_threshold_ms(poll_interval_ms: u64) -> i64 {
-    (poll_interval_ms as i64) * 3 + GRACE_MS
-}
-
 /// 수집기가 "아직 관측 중" 을 다시 저장하는 주기
-/// ([`crate::collector::Collector::heartbeat`]).
+/// ([`crate::collector::InstanceCollector::heartbeat`]).
 ///
-/// **어떤 임계보다도 작아야 한다.** 임계는 `3 × poll + GRACE_MS` 이므로 최소값이
-/// `GRACE_MS` 다. 스윕하는 리더와 수집하는 워커의 `poll_interval` 이 다를 수 있으므로
-/// (설정은 워커별이다) 주기를 자기 임계에서 유도하면 **긴 poll 을 쓰는 워커의 살아 있는
-/// 레코드를 짧은 poll 을 쓰는 리더가 버린다.** 그래서 고정값으로 둔다.
+/// 이 값은 **주기의 목표**일 뿐이고 실제 상한은 워커의 tick 주기다(하트비트는 tick
+/// 안에서만 쓴다). 그래서 [`stale_threshold_ms`] 는 이 값이 아니라
+/// [`MAX_DETECT_INTERVAL_MS`] 로 하한을 깐다.
 pub const HEARTBEAT_INTERVAL_MS: i64 = GRACE_MS / 2;
 
-/// 위 불변식을 **컴파일 시점에** 지킨다. 런타임 테스트로 두면 상수를 바꾼 사람이
-/// 테스트를 안 돌릴 수 있고, 그 결과는 "살아 있는 쿼리를 버린다" 다.
-const _: () = assert!(HEARTBEAT_INTERVAL_MS < GRACE_MS);
+/// `collector.detect_interval_ms` 의 **설정 상한** (`config.rs` 가 검증한다).
+///
+/// 하트비트는 tick 안에서만 쓸 수 있으므로 **어떤 워커도 자기 tick 주기보다 자주
+/// 갱신할 수 없다.** 임계가 이 값을 고려하지 않으면, 60초 tick 워커의 살아 있는
+/// 레코드를 짧은 tick 리더가 버린다(교차 리뷰 23라운드).
+pub const MAX_DETECT_INTERVAL_MS: i64 = 60_000;
+
+/// 고아 판정 임계. **설정에 의존하지 않는 상수다.**
+///
+/// # 왜 리더의 `poll_interval` 로 계산하지 않는가
+///
+/// 처음에는 `3 × poll + GRACE_MS` 였다. `poll` 은 **스윕하는 리더의** 설정이고 갱신하는
+/// 쪽은 **다른 워커**다. 설정은 워커별이므로 리더가 200ms, 수집 워커가 60초일 수 있다 —
+/// 그러면 임계 30.6초 안에 갱신할 방법이 워커에게 없다. 살아 있는 쿼리가 `abandoned` 로
+/// 확정되고 그건 되돌릴 수 없다(교차 리뷰 23라운드).
+///
+/// 그래서 **합법 설정의 최악값**으로 계산한다. 가장 느린 워커의 tick 은
+/// `MAX_DETECT_INTERVAL_MS` 이고, 원래 설계의 "tick 3번 밀린 것까지는 봐준다" 를
+/// 그대로 적용하면 임계는 그 3배 + 여유다. 리더의 `poll` 은 항상 그보다 작으므로 식에서
+/// 사라진다 — 인자를 두면 **읽는 사람이 그 값이 영향을 준다고 믿는다.**
+///
+/// 대가는 유령이 남는 시간(210초)인데, 스윕 주기(`orphan_sweep_secs`, 기본 300초)가
+/// 이미 그보다 크다 — 사실상 공짜다.
+pub const STALE_THRESHOLD_MS: i64 = 3 * MAX_DETECT_INTERVAL_MS + GRACE_MS;
+
+/// **불변식을 컴파일 시점에 지킨다.** 런타임 테스트로 두면 상수를 바꾼 사람이 테스트를
+/// 안 돌릴 수 있고, 그 결과는 "살아 있는 쿼리를 버린다" 다.
+///
+/// 가장 느린 합법 워커(60초 tick)가 하트비트를 한 번 놓쳐도 임계 안에 들어야 한다.
+const _: () = assert!(HEARTBEAT_INTERVAL_MS < MAX_DETECT_INTERVAL_MS);
+const _: () = assert!(MAX_DETECT_INTERVAL_MS * 2 + HEARTBEAT_INTERVAL_MS < STALE_THRESHOLD_MS);
 
 /// 이 레코드를 어떻게 할 것인가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,26 +249,22 @@ mod tests {
         assert_eq!(judge(&other, NOW, THRESHOLD), Verdict::Alive);
     }
 
-    /// **하트비트 주기는 어떤 임계보다도 작아야 한다.**
+    /// **임계는 가장 느린 합법 워커가 지킬 수 있어야 한다.**
     ///
-    /// 임계 최소값은 `GRACE_MS`(poll → 0)다. 주기가 그보다 크면 살아 있는 레코드가
-    /// 하트비트 사이에 임계를 넘어 `abandoned` 로 확정된다. 스윕하는 리더와 수집하는
-    /// 워커의 `poll_interval` 이 다를 수 있어(설정은 워커별) 자기 임계에서 유도하면
-    /// 안 된다 — 이 단정이 그 회귀를 막는다.
+    /// 하트비트는 tick 안에서만 쓸 수 있으므로 갱신 주기의 실질 상한은 워커의 tick 이다.
+    /// 임계를 리더의 `poll` 로 계산하면 60초 tick 워커의 살아 있는 레코드를 200ms tick
+    /// 리더가 버린다 — 23라운드가 그 조합을 짚었다. 상수 사이의 관계는 컴파일 시점에
+    /// 단정하고, 여기서는 **설정 상한과 실제 값**을 함께 못박는다.
     #[test]
-    fn the_heartbeat_interval_stays_below_every_threshold() {
-        // 상수 사이의 관계는 `const _: () = assert!(..)` 가 컴파일 시점에 본다.
-        // 여기서는 **임계를 만드는 함수**와의 관계를 본다.
-        //
-        // 가장 짧은 poll 로도 임계는 하트비트의 두 배 이상이다 — 한 번 밀려도 안전하다.
-        assert!(stale_threshold_ms(0) >= HEARTBEAT_INTERVAL_MS * 2);
-        assert!(stale_threshold_ms(60_000) > HEARTBEAT_INTERVAL_MS);
-    }
-
-    #[test]
-    fn threshold_is_three_polls_plus_grace() {
-        assert_eq!(stale_threshold_ms(1_000), 33_000);
-        assert_eq!(stale_threshold_ms(5_000), 45_000);
+    fn the_threshold_tolerates_the_slowest_legal_worker() {
+        // 설정 검증과 상수가 어긋나면 이 단정이 먼저 깨진다.
+        assert_eq!(
+            MAX_DETECT_INTERVAL_MS, 60_000,
+            "config.rs 의 detect_interval_ms 상한과 달라졌다"
+        );
+        // 가장 느린 워커가 tick 을 두 번 놓쳐도 임계 안이다 — 상수 사이의 관계는
+        // 모듈 상단의 `const _: () = assert!(..)` 가 컴파일 시점에 본다.
+        assert_eq!(STALE_THRESHOLD_MS, 210_000);
     }
 
     /// **최근 관측된 레코드를 건드리지 않는다.**

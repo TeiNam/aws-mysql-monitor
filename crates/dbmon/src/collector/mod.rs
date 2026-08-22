@@ -374,6 +374,13 @@ where
     /// 알 수 있으므로 **여기서 말한다.** 그러면 침묵이 실제로 "아무도 관측하지 않는다" 를
     /// 뜻하고 스윕은 시각 비교만으로 옳다.
     ///
+    /// # 생존 신호만 쓴다
+    ///
+    /// [`SlowQueryStore::touch_in_flight`] 는 속성 하나를 조건부로 올린다. 처음에는
+    /// `upsert_merged` 로 레코드 전체를 다시 썼는데, 그러면 (1) 없는 레코드를 **만들고**
+    /// (2) SQL 없는 레코드라 정책이 `off` 로 고정돼 나중 SQL 을 버리고 (3) 모든 저장이
+    /// 방송되므로 브라우저가 15초마다 목록을 무효화했다 — 23라운드가 세 개를 함께 잡았다.
+    ///
     /// 실패는 삼킨다 — 다음 tick 이 같은 항목을 다시 고른다(`record_saved` 를 부르지
     /// 않으므로). 스윕의 확정 쓰기도 같은 저장소를 쓰므로, 저장소가 죽어 있으면 여기도
     /// 실패하지만 **버려지지도 않는다.**
@@ -394,33 +401,26 @@ where
         }
 
         for id in stale {
-            let Some(out) = self.tracker.get(id).map(|tracked| {
-                build(CaptureInput {
-                    instance: &self.instance,
-                    tracked,
-                    // 하트비트는 **새 사실을 만들지 않는다.** 갱신 시각만 올린다 —
-                    // `upsert_merged` 가 속성별로 병합하므로 이미 저장된 SQL·플랜은 남는다.
-                    full_sql: None,
-                    stmt: None,
-                    plan_json: None,
-                    plan_source: PlanSource::None,
-                    plan_error: None,
-                    plan_tree: None,
-                    policy: self.params.literal_policy,
-                    policy_at_ms: now_ms,
-                    state: SlowQueryState::InFlight,
-                    finalize_reason: None,
-                    now_ms,
-                    offset: &self.offset,
-                    owner_worker: &self.params.worker_id,
-                    owner_epoch: self.epoch,
-                })
-            }) else {
+            // **관측 시각을 쓴다 — `now_ms` 가 아니다.** 관측이 끊긴 항목(잘린 tick 에서
+            // 못 본 스레드)에 `now` 를 쓰면 "보고 있다" 는 거짓이 저장되고, 그 레코드는
+            // 아무도 확정하지 않는데 영원히 살아 있는 것으로 보인다.
+            let Some((started_at_ms, last_seen_at_ms)) = self
+                .tracker
+                .get(id)
+                .map(|t| (t.started_at_ms, t.last_seen_at_ms))
+            else {
                 continue;
             };
-            match self.store.upsert_merged(&out.query).await {
-                Ok(_) => {
-                    stats.heartbeats += 1;
+            match self
+                .store
+                .touch_in_flight(&self.instance.id, id, started_at_ms, last_seen_at_ms)
+                .await
+            {
+                Ok(updated) => {
+                    stats.heartbeats += usize::from(updated);
+                    // **조건이 깨졌어도 저장 시각을 갱신한다.** 레코드가 이미 확정됐거나
+                    // (슬로우로그가 먼저 닫았다) 없는 경우인데, 그때 매 tick 다시 시도하면
+                    // 스레드가 사라질 때까지 호출을 낭비한다.
                     self.tracker.record_saved(id, now_ms);
                 }
                 Err(e) => {
