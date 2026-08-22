@@ -711,6 +711,28 @@ Common first failures:
 | Empty slow query list but instances are `collecting` | Slow log not exported to CloudWatch Logs, or `long_query_time` above your traffic. |
 | Tuning button says `model_failed` | The reason is printed next to the button — wrong model ID, model not enabled in the region, or a content filter. |
 
+### What the health signals do and do not cover
+
+| Signal | Meaning | Fails when |
+|---|---|---|
+| `GET /healthz` | the process answers HTTP | never — it always returns 200 |
+| `GET /readyz` | this worker should receive traffic | draining, config not loaded, storage unreachable, KMS denied, or (for a combined api+collector worker) not the collect leader |
+| `readyz.collect_stale` | **collection has stopped** | no successful tick for 5 minutes on a worker that should be collecting |
+| `GET /api/collector/status` | why | per-instance detail |
+
+ECS's container health check uses `/healthz` **on purpose**: a standby worker answers `/readyz`
+with 503 by design (FR-OPS-08 active/standby), so pointing the container check at `/readyz` would
+make ECS kill and restart every standby forever. The ALB target group is what uses `/readyz`.
+
+**`collect_stale` does not drop `ready`.** If it did, the load balancer would remove the task and
+ECS would replace it — but collection failures are usually environmental (target DB unreachable,
+IAM), so replacement does not help and you get an endless replace loop. That is worse than the
+outage it is reacting to. So the condition is exposed as a value and alarming is left outside.
+
+**Nothing publishes CloudWatch metrics yet.** `PutMetricData` appears in the IAM policy but no
+code calls it, so there is no CloudWatch alarm on `collect_stale` — poll `/readyz` from whatever
+you already use for synthetic checks. Publishing FR-OPS-09 metrics is on the roadmap.
+
 ## Local development
 
 No AWS account required for the core loops:

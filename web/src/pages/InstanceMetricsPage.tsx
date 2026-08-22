@@ -49,7 +49,13 @@ export function InstanceMetricsPage() {
   // 고른 것이 없으면 첫 인스턴스를 본다. **없는 id 를 다른 것으로 갈아치우지 않는다** —
   // 오래된 링크로 들어왔을 때 엉뚱한 인스턴스의 메트릭을 보여주면 안 된다.
   const picked = selected === "" ? list[0]?.id : list.find((i) => i.id === selected)?.id;
-  const missing = selected !== "" && picked === undefined && !instances.isPending;
+  // **목록 조회가 실패한 것을 "삭제됐다" 로 읽지 않는다.**
+  //
+  // `instances.data ?? []` 는 오류에서도 빈 배열이므로, `/api/instances` 가 502 면
+  // 북마크로 들어온 인스턴스가 "삭제됐거나 스코프 밖" 으로 표시된다 — 실제로는 우리가
+  // 목록을 못 읽은 것이다(교차 리뷰 3회차). 그때는 오류를 보여준다.
+  const missing =
+    selected !== "" && picked === undefined && !instances.isPending && instances.error === null;
   const instance = list.find((i) => i.id === picked);
 
   const metrics = useQuery({
@@ -149,7 +155,10 @@ export function InstanceMetricsPage() {
           )
         }
       >
-        {missing ? (
+        {instances.error !== null ? (
+          // 목록을 못 읽었다. 이 화면의 모든 판정이 그 목록에 기대므로 먼저 말한다.
+          <ErrorNotice error={instances.error} onRetry={() => void instances.refetch()} />
+        ) : missing ? (
           <Note>
             주소로 지정한 인스턴스가 목록에 없다 — 삭제됐거나 환경 스코프 밖이다.{" "}
             <strong>다른 인스턴스의 메트릭을 대신 보여주지 않는다.</strong>
@@ -161,7 +170,7 @@ export function InstanceMetricsPage() {
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {metrics.data.series.map((s) => (
-              <MetricTile key={s.name} series={s} />
+              <MetricTile key={s.name} series={s} fetchFailed={metrics.data.failed !== undefined} />
             ))}
           </div>
         )}
@@ -176,8 +185,12 @@ export function InstanceMetricsPage() {
  * **빈 계열을 숨기지 않는다.** `ReplicaLag`(소스 인스턴스), `BurstBalance`(gp3),
  * `EngineCPUUtilization`(일부 인스턴스 클래스)처럼 **그 구성에서 발행되지 않는** 메트릭이
  * 있다. 숨기면 "이 메트릭이 없는 건가, 값이 0인가, 화면이 깨진 건가" 를 알 수 없다.
+ *
+ * **다만 조회 자체가 실패했으면 그 문구를 쓰지 않는다.** 그때 모든 계열이 비는데,
+ * 타일마다 "이 구성에서 발행되지 않는다" 를 찍으면 위의 실패 배너와 정면으로 어긋난다 —
+ * 배너는 "못 읽었다" 고 하고 타일 27개는 "없는 지표다" 라고 말한다(교차 리뷰 3회차).
  */
-function MetricTile({ series }: { series: MetricSeries }) {
+function MetricTile({ series, fetchFailed }: { series: MetricSeries; fetchFailed: boolean }) {
   const latest = series.values.at(-1) ?? null;
   const empty = series.values.length === 0;
   return (
@@ -193,7 +206,9 @@ function MetricTile({ series }: { series: MetricSeries }) {
       </div>
       <div className="mt-1">
         {empty ? (
-          <span className="text-xs text-gray-500">이 구성에서 발행되지 않는다</span>
+          <span className="text-xs text-gray-500">
+            {fetchFailed ? "못 읽었다" : "이 구성에서 발행되지 않는다"}
+          </span>
         ) : (
           <Sparkline
             values={series.values}

@@ -298,16 +298,24 @@ pub fn blocks_state_write(state: InstanceState) -> bool {
 /// A 가 되살아나 자기 라운드를 마치면 **한 번의 논리적 미발견이 2가 된다** — 그리고
 /// 임계값이 2다. 인스턴스가 즉시 삭제 도장을 받는다(교차 리뷰 2회차).
 ///
-/// 리스 epoch 로 막을 수 없다: epoch 은 리더가 바뀔 때만 오르므로, 같은 리더가 5분마다
+/// 리스 epoch 로 막을 수 없다: epoch 은 리더가 바뀔 때만 오르므로, 같은 리더가 주기마다
 /// 도는 정상 라운드도 같은 epoch 이다. epoch 으로 멱등하게 만들면 임계값 2에 **영원히
 /// 도달하지 못한다.**
 ///
-/// 그래서 **시간**으로 막는다. 탐색 주기(기본 300초)보다 짧게 두어 정상 라운드는
-/// 통과하고, 그보다 짧은 간격의 중복 증가는 거부한다.
+/// # 주기에서 유도한다 (고정 상수가 아니다)
 ///
-/// ⚠ 이 값이 너무 크면 정상 라운드가 건너뛰어져 **삭제 판정이 늦어진다.** 그건 안전한
-/// 방향이다 — 살아 있는 인스턴스를 지우는 것보다 사라진 인스턴스가 오래 남는 편이 낫다.
-pub const MISSING_MIN_GAP_MS: i64 = 240_000;
+/// 처음에는 240초 고정이었다. 그런데 `discovery.interval_secs` 는 30초까지 허용되므로,
+/// 그런 배포에서는 **정상 라운드가 전부 거부되고** 삭제 판정이 8라운드나 늦어진다
+/// (교차 리뷰 3회차가 잡았다). 주기의 절반으로 잡으면 정상 라운드는 항상 통과하고,
+/// 되살아난 리더의 중복은 그 절반 안에 들어오는 한 막힌다.
+///
+/// ⚠ 이 값이 크면 삭제 판정이 늦어진다. 그건 **안전한 방향**이다 — 살아 있는 인스턴스를
+/// 지우는 것보다 사라진 인스턴스가 오래 남는 편이 낫다.
+pub fn missing_min_gap_ms(discovery_interval_secs: u64) -> i64 {
+    // `saturating` 으로 오버플로를 막는다. 하한 1초 — 0 이면 중복 방지가 사라진다.
+    let half = (discovery_interval_secs / 2).max(1);
+    i64::try_from(half.saturating_mul(1_000)).unwrap_or(i64::MAX)
+}
 
 /// 카운터를 올린 **뒤** 삭제로 판정할 것인가 (FR-DSC-07).
 ///
@@ -484,5 +492,28 @@ mod tests {
         ] {
             assert!(!s.should_collect(), "{s:?}");
         }
+    }
+    /// **간격은 탐색 주기에서 유도돼야 한다.**
+    ///
+    /// 고정 240초였을 때, 주기 30초(설정 하한) 배포에서는 정상 라운드가 전부 거부되고
+    /// 삭제 판정이 8라운드 늦어졌다(교차 리뷰 3회차).
+    #[test]
+    fn the_missing_gap_follows_the_discovery_interval() {
+        // 정상 라운드는 항상 통과해야 한다 — 주기 > 간격.
+        for interval in [30u64, 60, 120, 300, 900] {
+            let gap = missing_min_gap_ms(interval);
+            let round = i64::try_from(interval * 1_000).expect("변환");
+            assert!(
+                round > gap,
+                "주기 {interval}초에서 정상 라운드가 거부된다 (간격 {gap}ms)"
+            );
+            // 그리고 0 이 아니어야 한다 — 0 이면 중복 방지가 사라진다.
+            assert!(gap > 0, "주기 {interval}초에서 중복 방지가 꺼졌다");
+        }
+        // 하한: 1초 주기라도 간격이 0 이 되지 않는다.
+        assert!(missing_min_gap_ms(1) > 0);
+        assert!(missing_min_gap_ms(0) > 0);
+        // 오버플로로 패닉하지 않는다.
+        assert!(missing_min_gap_ms(u64::MAX) > 0);
     }
 }

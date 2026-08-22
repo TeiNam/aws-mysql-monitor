@@ -40,6 +40,9 @@ pub struct Readiness {
     collect_leader: AtomicBool,
     /// 이 워커가 API 역할을 수행하는가. 보고용이다.
     serves_api: bool,
+    /// 이 워커가 수집을 하는가. `collect_stale` 판정에 쓴다 — api 전용 워커는 수집
+    /// 성공 시각이 늘 0 이므로 그걸 정지로 읽으면 안 된다.
+    runs_collector: bool,
     /// **준비 판정에 리더 여부를 넣는가.**
     ///
     /// FR-OPS-08: 1단계는 active 1대 + standby 로 운영하고 standby 는 `/readyz` 503 으로
@@ -55,6 +58,12 @@ pub struct Readiness {
     last_collect_ok_ms: AtomicI64,
 }
 
+/// 수집이 **멈춘 것으로 볼** 무응답 시간 (밀리초).
+///
+/// 탐지 주기(기본 1초)와 무관하게 넉넉히 잡는다 — 잠깐의 실패는 정지가 아니다.
+/// 5분은 탐색 주기와 같은 크기이고, 그 안에 한 번도 성공하지 못했다면 손볼 일이다.
+pub const COLLECT_STALE_AFTER_MS: i64 = 300_000;
+
 impl Readiness {
     /// `serves_api` — API 트래픽을 받는가. `runs_collector` — 수집을 하는가.
     ///
@@ -67,6 +76,7 @@ impl Readiness {
             collect_leader: AtomicBool::new(false),
             serves_api,
             // API 와 수집을 **겸하는** 워커만 리더 여부로 ALB 등록을 가른다.
+            runs_collector,
             requires_leadership: serves_api && runs_collector,
             draining: AtomicBool::new(false),
             last_collect_ok_ms: AtomicI64::new(0),
@@ -99,7 +109,23 @@ impl Readiness {
         self.draining.load(Ordering::Relaxed)
     }
 
+    /// 시스템 시계로 스냅샷을 만든다.
     pub fn snapshot(&self) -> ReadyReport {
+        use dbmon_core::time::Clock as _;
+        self.snapshot_at(dbmon_core::time::SystemClock.now_ms())
+    }
+
+    /// # 수집 정지는 `ready` 를 내리지 **않는다**
+    ///
+    /// 내리면 로드밸런서가 이 태스크를 빼고 ECS 가 교체한다. 수집 실패의 원인은 보통
+    /// 환경(대상 DB 접속 불가·IAM)이므로 **교체해도 낫지 않고 무한 교체가 된다** —
+    /// 그건 정지보다 나쁘다.
+    ///
+    /// 대신 `collect_stale` 로 **드러낸다.** `/healthz` 는 프로세스 생존만 보고
+    /// (ECS 헬스체크가 그걸 쓴다 — standby 워커를 죽이지 않기 위해서다), 수집이 죽은
+    /// 것은 이 필드로 외부에서 경보를 건다. 자체 CloudWatch 지표 발행은 아직 없다
+    /// ([17](../../docs/17-roadmap-tasks.md) FR-OPS-09).
+    pub fn snapshot_at(&self, now_ms: i64) -> ReadyReport {
         let draining = self.draining.load(Ordering::Relaxed);
         let config_loaded = self.config_loaded.load(Ordering::Relaxed);
         let storage_ok = self.storage_ok.load(Ordering::Relaxed);
@@ -115,8 +141,16 @@ impl Readiness {
             // 리스를 잡지 않으므로 리더 여부를 물으면 영원히 준비되지 않는다.
             && (!self.requires_leadership || collect_leader);
 
+        // **수집해야 하는 워커에서만** 의미가 있다. api 전용 워커는 성공 시각이 늘 0 이다.
+        let last_ok = self.last_collect_ok_ms.load(Ordering::Relaxed);
+        let collect_stale = self.runs_collector
+            && collect_leader
+            && !draining
+            && (last_ok == 0 || now_ms - last_ok > COLLECT_STALE_AFTER_MS);
+
         ReadyReport {
             ready,
+            collect_stale,
             draining,
             config_loaded,
             storage_ok,
@@ -167,6 +201,10 @@ impl Readiness {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReadyReport {
     pub ready: bool,
+    /// **수집이 멈췄다.** `ready` 를 내리지 않는 이유는 [`Readiness::snapshot_at`] 에 있다.
+    ///
+    /// 이 값이 참인 채로 유지되면 손볼 일이다 — `/api/collector/status` 로 사유를 본다.
+    pub collect_stale: bool,
     pub draining: bool,
     pub config_loaded: bool,
     pub storage_ok: bool,
@@ -322,5 +360,54 @@ mod tests {
         let r = ready_worker(false);
         let j = serde_json::to_string(&r.snapshot()).unwrap();
         assert!(!j.contains("reason"), "{j}");
+    }
+    /// **수집이 멈춘 것을 드러낸다 — 다만 `ready` 를 내리지 않는다.**
+    ///
+    /// 내리면 로드밸런서가 태스크를 빼고 ECS 가 교체하는데, 수집 실패의 원인은 보통
+    /// 환경이라 교체해도 낫지 않고 **무한 교체**가 된다. 그건 정지보다 나쁘다.
+    /// 그래서 값으로 드러내고 경보는 외부에 맡긴다(교차 리뷰 3회차).
+    #[test]
+    fn collection_staleness_is_reported_without_dropping_ready() {
+        const NOW: i64 = 1_787_000_000_000;
+        let r = ready_worker(true);
+        r.set_collect_leader(true);
+
+        // 한 번도 성공하지 못했다 → 정지로 본다.
+        let s = r.snapshot_at(NOW);
+        assert!(s.collect_stale, "성공 기록이 없는데 정지로 보지 않았다");
+        assert!(s.ready, "정지가 ready 를 내렸다 — 무한 교체가 된다");
+
+        // 방금 성공했다 → 정지가 아니다.
+        r.record_collect_ok(NOW);
+        assert!(!r.snapshot_at(NOW).collect_stale);
+
+        // 상한을 넘겼다 → 다시 정지다.
+        assert!(
+            r.snapshot_at(NOW + COLLECT_STALE_AFTER_MS + 1)
+                .collect_stale,
+            "상한을 넘겼는데 정지로 보지 않았다"
+        );
+        // 경계에서는 아직 아니다.
+        assert!(!r.snapshot_at(NOW + COLLECT_STALE_AFTER_MS).collect_stale);
+    }
+
+    /// **api 전용 워커는 정지로 보지 않는다.** 수집 성공 시각이 늘 0 이다.
+    #[test]
+    fn an_api_only_worker_is_never_collect_stale() {
+        const NOW: i64 = 1_787_000_000_000;
+        let r = Readiness::new_for_role(true, false);
+        r.set_config_loaded(true);
+        r.set_storage_ok(true);
+        assert!(!r.snapshot_at(NOW).collect_stale);
+    }
+
+    /// 종료 중에는 정지로 보지 않는다 — 수집을 멈추는 것이 정상 절차다.
+    #[test]
+    fn draining_is_not_reported_as_stale() {
+        const NOW: i64 = 1_787_000_000_000;
+        let r = ready_worker(true);
+        r.set_collect_leader(true);
+        r.begin_draining();
+        assert!(!r.snapshot_at(NOW).collect_stale);
     }
 }

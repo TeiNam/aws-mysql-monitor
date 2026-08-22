@@ -132,7 +132,7 @@ impl DynamoSlowQueryStore {
         // 완전한 레코드로 역직렬화하는 버그가 통합 테스트를 통과했고, 프로덕션에서만
         // 고아 정리가 죽어 있었다(교차 리뷰 2회차). 테스트 테이블이 프로덕션과 다르면
         // 테스트가 무엇을 보증하는지 알 수 없다.
-        let gsi = |name: &str, pk: &str, sk: &str| {
+        let gsi = |name: &str, pk: &str, sk: &str, projected: &[&str]| {
             GlobalSecondaryIndex::builder()
                 .index_name(name)
                 .key_schema(key(pk, KeyType::Hash))
@@ -141,7 +141,7 @@ impl DynamoSlowQueryStore {
                     Projection::builder()
                         .projection_type(ProjectionType::Include)
                         .set_non_key_attributes(Some(
-                            GSI_PROJECTED.iter().map(|s| s.to_string()).collect(),
+                            projected.iter().map(|s| s.to_string()).collect(),
                         ))
                         .build(),
                 )
@@ -162,8 +162,8 @@ impl DynamoSlowQueryStore {
             .attribute_definitions(attr("GSI2SK"))
             .key_schema(key("PK", KeyType::Hash))
             .key_schema(key("SK", KeyType::Range))
-            .global_secondary_indexes(gsi("GSI1", "GSI1PK", "GSI1SK"))
-            .global_secondary_indexes(gsi("GSI2", "GSI2PK", "GSI2SK"))
+            .global_secondary_indexes(gsi("GSI1", "GSI1PK", "GSI1SK", GSI1_PROJECTED))
+            .global_secondary_indexes(gsi("GSI2", "GSI2PK", "GSI2SK", GSI2_PROJECTED))
             .send()
             .await;
         match res {
@@ -970,11 +970,11 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     }
 }
 
-/// 프로덕션 GSI 가 사영하는 속성 (`infra/layers/10-foundation/main.tf` 와 같아야 한다).
+/// 프로덕션 GSI1 이 사영하는 속성 (`infra/layers/10-foundation/main.tf` 와 같아야 한다).
 ///
 /// 여기서 빠진 속성은 인덱스 조회 결과에 **없다.** 인덱스를 읽는 코드는 그 사실을
 /// 전제로 써야 한다 — 완전한 레코드가 필요하면 기본 테이블에서 다시 읽는다.
-const GSI_PROJECTED: &[&str] = &[
+const GSI1_PROJECTED: &[&str] = &[
     "record_id",
     "instance_id",
     "env",
@@ -992,6 +992,25 @@ const GSI_PROJECTED: &[&str] = &[
     "owner_epoch",
     "thread_id",
     "abandoned_reason",
+];
+
+/// 프로덕션 GSI2 가 사영하는 속성. **GSI1 과 다르다.**
+///
+/// 처음에 테스트 테이블을 만들 때 두 인덱스에 GSI1 의 목록을 그대로 줬다 — 그러면
+/// GSI2 를 읽는 코드가 생겼을 때 로컬에서만 되는 상태가 다시 만들어진다
+/// (교차 리뷰 3회차가 low 로 잡았다). 지금은 GSI2 를 읽는 코드가 **없지만**, 테스트
+/// 테이블이 프로덕션과 같아야 하는 이유는 코드가 아직 없다는 사실과 무관하다.
+const GSI2_PROJECTED: &[&str] = &[
+    "record_id",
+    "instance_id",
+    "env",
+    "started_at_ms",
+    "duration_ms",
+    "app_digest",
+    "statement_type",
+    "schema_name",
+    "db_user",
+    "kind",
 ];
 
 /// `BatchGetItem` 한 번의 키 상한. AWS 가 정한 값이다.
@@ -1077,34 +1096,73 @@ pub(crate) mod tests {
         ))
         .expect("10-foundation/main.tf 를 읽을 수 없다");
 
-        // `name = "GSI1"` 뒤의 첫 `non_key_attributes = [...]` 블록을 읽는다.
-        let after = &tf[tf.find(r#"name = "GSI1""#).expect("GSI1 정의")..];
-        let list_start = after.find("non_key_attributes").expect("사영 목록");
-        let open = after[list_start..].find('[').expect("[") + list_start;
-        let close = after[open..].find(']').expect("]") + open;
-        // **주석을 먼저 지운다.** 목록 안에 `# …` 설명 줄이 섞여 있고, 그대로 `,` 로
-        // 쪼개면 주석 뒤의 첫 항목이 주석과 한 조각이 되어 사라진다 — 이 테스트를
-        // 처음 돌렸을 때 `owner_epoch` 가 그렇게 빠졌다.
-        let without_comments: String = after[open + 1..close]
-            .lines()
-            .map(|l| l.split('#').next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut from_tf: Vec<&str> = without_comments
-            .split(',')
-            .map(|s| s.trim().trim_matches('"'))
-            .filter(|s| !s.is_empty())
-            .collect();
-        from_tf.sort_unstable();
+        // `name = "<idx>"` 뒤의 첫 `non_key_attributes = [...]` 블록을 읽는다.
+        let from_tf = |idx: &str| -> Vec<String> {
+            let after = &tf[tf.find(&format!(r#"name = "{idx}""#)).expect("GSI 정의")..];
+            let list_start = after.find("non_key_attributes").expect("사영 목록");
+            let open = after[list_start..].find('[').expect("[") + list_start;
+            let close = after[open..].find(']').expect("]") + open;
+            // **주석을 먼저 지운다.** 목록 안에 `# …` 설명 줄이 섞여 있고, 그대로 `,` 로
+            // 쪼개면 주석 뒤의 첫 항목이 주석과 한 조각이 되어 사라진다 — 이 테스트를
+            // 처음 돌렸을 때 `owner_epoch` 가 그렇게 빠졌다.
+            let cleaned: String = after[open + 1..close]
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut v: Vec<String> = cleaned
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            v.sort();
+            v
+        };
+        let sorted = |xs: &[&str]| {
+            let mut v: Vec<String> = xs.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        };
 
-        let mut from_code: Vec<&str> = super::GSI_PROJECTED.to_vec();
-        from_code.sort_unstable();
-
-        assert_eq!(
-            from_code, from_tf,
-            "코드의 GSI_PROJECTED 와 Terraform 의 non_key_attributes 가 다르다 — \
-             테스트 테이블이 프로덕션과 다른 모양이면 테스트가 무엇을 보증하는지 알 수 없다"
+        // **두 인덱스를 모두 본다.** GSI1 만 보면 GSI2 가 어긋난 것을 놓친다 — 실제로
+        // 그랬다(둘에 GSI1 의 목록을 줬다, 교차 리뷰 3회차).
+        assert_eq!(sorted(super::GSI1_PROJECTED), from_tf("GSI1"), "GSI1");
+        assert_eq!(sorted(super::GSI2_PROJECTED), from_tf("GSI2"), "GSI2");
+        assert_ne!(
+            super::GSI1_PROJECTED.len(),
+            super::GSI2_PROJECTED.len(),
+            "두 인덱스의 사영이 같아졌다 — 한쪽을 복사한 것이 아닌지 확인한다"
         );
+
+        // **로컬 DynamoDB 테이블도 같아야 한다.** `just local-init` 이 이 JSON 을 쓴다.
+        let local: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../local/table.json"
+            ))
+            .expect("local/table.json"),
+        )
+        .expect("JSON");
+        for (idx, want) in [
+            ("GSI1", super::GSI1_PROJECTED),
+            ("GSI2", super::GSI2_PROJECTED),
+        ] {
+            let g = local["GlobalSecondaryIndexes"]
+                .as_array()
+                .expect("배열")
+                .iter()
+                .find(|g| g["IndexName"] == idx)
+                .unwrap_or_else(|| panic!("{idx} 가 local/table.json 에 없다"));
+            assert_eq!(g["Projection"]["ProjectionType"], "INCLUDE", "{idx}");
+            let mut got: Vec<String> = g["Projection"]["NonKeyAttributes"]
+                .as_array()
+                .expect("배열")
+                .iter()
+                .map(|v| v.as_str().expect("문자열").to_string())
+                .collect();
+            got.sort();
+            assert_eq!(got, sorted(want), "local/table.json 의 {idx}");
+        }
     }
 
     /// **쌍둥이가 있을 때 "닫는 쓰기" 는 열려 있는 쪽을 고쳐야 한다.**
