@@ -63,11 +63,16 @@ pub struct BootstrapService {
     audit: Arc<dyn AuditSink>,
     planner: Bootstrapper,
     deployment_env: Env,
-    /// 감사 레코드의 주체. Cognito 가 붙으면 요청의 `sub` 로 바뀐다.
+    /// 이 워커의 식별자. **감사 레코드의 `actor` 가 아니다** — 그건 요청마다
+    /// 다르므로 [`Self::plan`]·[`Self::apply`] 가 인자로 받는다.
     ///
-    /// 지금은 워커 식별자를 쓴다 — 공유 토큰 배포에서는 주체가 하나뿐이고, 그
-    /// 사실을 감사 로그가 정직하게 말해야 한다.
-    actor: String,
+    /// # 왜 나눴나 (교차 리뷰 3차)
+    ///
+    /// 처음에는 기동 시 주입한 워커 id 를 `actor` 로 썼다. 그러면 **Cognito admin A 가
+    /// 계획하고 B 가 실행해도 두 레코드의 주체가 같다** — 마스터 권한으로 DDL 을
+    /// 실행한 사람이 누구인지 감사 로그가 말하지 못한다. T-28 차단 사건도 누가
+    /// 시도했는지 알 수 없다.
+    worker_id: String,
 }
 
 impl BootstrapService {
@@ -81,7 +86,7 @@ impl BootstrapService {
         settings: Arc<crate::settings_state::SettingsState>,
         audit: Arc<dyn AuditSink>,
         deployment_env: Env,
-        actor: impl Into<String>,
+        worker_id: impl Into<String>,
     ) -> Self {
         use aws_config::BehaviorVersion;
         let mut by_region = std::collections::BTreeMap::new();
@@ -104,7 +109,7 @@ impl BootstrapService {
             audit,
             planner: Bootstrapper::new(),
             deployment_env,
-            actor: actor.into(),
+            worker_id: worker_id.into(),
         }
     }
 
@@ -159,6 +164,7 @@ impl BootstrapService {
         &self,
         instance: &Instance,
         desired: &Desired,
+        actor: &str,
     ) -> Result<PlanOutcome, BootstrapError> {
         let facts = self.instance_facts(instance).await?;
         let credentials = self.credentials(instance, &facts).await?;
@@ -179,7 +185,7 @@ impl BootstrapService {
             )
             .await?;
 
-        record.actor = self.actor.clone();
+        record.actor = self.audit_actor(actor);
         self.record(&record).await;
         Ok(outcome)
     }
@@ -190,6 +196,7 @@ impl BootstrapService {
         instance: &Instance,
         plan_id: &str,
         confirmation: Option<&str>,
+        actor: &str,
     ) -> Result<ApplyOutcome, BootstrapError> {
         let facts = self.instance_facts(instance).await?;
         let credentials = self.credentials(instance, &facts).await?;
@@ -211,7 +218,7 @@ impl BootstrapService {
 
         match result {
             Ok(mut report) => {
-                report.record.actor = self.actor.clone();
+                report.record.actor = self.audit_actor(actor);
                 // **성공이든 실패든 먼저 쓴다.** 실패 경로에서 감사를 건너뛰면
                 // 반쪽 상태(계정은 있고 권한은 없음)에 기록이 남지 않는다.
                 self.record(&report.record).await;
@@ -336,6 +343,14 @@ impl BootstrapService {
             None,
         )
         .map_err(BootstrapError::Domain)
+    }
+
+    /// 감사 레코드의 주체 문자열.
+    ///
+    /// 요청자와 워커를 **함께** 남긴다. 요청자만 남기면 여러 워커 배포에서 어느
+    /// 프로세스가 실행했는지 모르고, 워커만 남기면 누가 눌렀는지 모른다.
+    fn audit_actor(&self, requester: &str) -> String {
+        format!("{requester} via {}", self.worker_id)
     }
 
     /// 감사 레코드를 쓴다. **실패해도 부트스트랩을 되돌리지 않는다.**

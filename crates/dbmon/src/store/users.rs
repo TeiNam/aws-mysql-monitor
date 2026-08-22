@@ -182,7 +182,23 @@ fn parse_record(
         // 버전이 없으면 0 이다. 토큰이 버전을 주장하지 않으면 그 검사를 건너뛰므로
         // (`TokenClaims::claims_version` 이 `Option`) 이 값은 문맥에만 실린다.
         claims_version,
-        revoked_after_ms: opt_n("revoked_after_ms")?,
+        // **음수를 거부한다** (교차 리뷰 3차가 잡았다).
+        //
+        // `intersect` 는 `token.issued_at_ms <= revoked_after` 로 판정한다. 값이
+        // 음수면 어떤 실제 토큰도 그 조건에 걸리지 않으므로 **폐기가 조용히 무력해진다**
+        // — 그리고 `claims_version` 이 없는 배포에서는 이게 유일한 즉시 폐기 수단이다.
+        //
+        // 자동화의 언더플로나 오타로 `-1` 이 들어갈 수 있고, 그때 인증이 실패하는
+        // 편이 낫다.
+        revoked_after_ms: match opt_n("revoked_after_ms")? {
+            Some(v) if v < 0 => {
+                return Err(DomainError::InvalidInput {
+                    field: format!("USER#{subject}.revoked_after_ms"),
+                    reason: "음수다 — 폐기가 무력해진다".into(),
+                });
+            }
+            other => other,
+        },
         disabled: opt_b("disabled")?.unwrap_or(false),
     })
 }
@@ -282,6 +298,31 @@ mod tests {
             let err = parse_record("s", &item(vec![(k, v.clone())]))
                 .expect_err(&format!("{k} 의 잘못된 타입을 통과시켰다: {v:?}"));
             assert!(format!("{err}").contains(k), "{err}");
+        }
+    }
+
+    /// **음수 `revoked_after_ms` 는 오류다** (교차 리뷰 3차).
+    ///
+    /// `intersect` 는 `iat <= revoked_after` 로 판정하므로 음수면 어떤 토큰도 걸리지
+    /// 않는다 — `claims_version` 이 없는 배포에서 유일한 즉시 폐기 수단이 조용히
+    /// 무력해진다.
+    #[test]
+    fn a_negative_revoked_after_ms_is_an_error() {
+        let err = parse_record(
+            "s",
+            &item(vec![("revoked_after_ms", AttributeValue::N("-1".into()))]),
+        )
+        .expect_err("거부해야 한다");
+        assert!(format!("{err}").contains("revoked_after_ms"), "{err}");
+
+        // 0 과 양수는 받는다.
+        for ok in ["0", "1700000000000"] {
+            let r = parse_record(
+                "s",
+                &item(vec![("revoked_after_ms", AttributeValue::N(ok.into()))]),
+            )
+            .expect("파싱");
+            assert_eq!(r.revoked_after_ms, Some(ok.parse().unwrap()));
         }
     }
 

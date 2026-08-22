@@ -16,6 +16,43 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+/// 서버가 `GRANT` 의 **데이터베이스 이름**을 어떻게 해석하는가.
+///
+/// # 왜 이 구분이 필요한가
+///
+/// `partial_revokes` 시스템 변수가 이름 해석을 바꾼다:
+///
+/// | 값 | 이름 해석 | 우리가 해야 하는 것 |
+/// |---|---|---|
+/// | `OFF` (RDS 기본값) | `_`·`%` 가 **와일드카드** | 백슬래시로 이스케이프한다 |
+/// | `ON` | 이름이 **리터럴** | 이스케이프하지 **않는다** |
+///
+/// **틀리면 조용히 망가진다.** `ON` 인 서버에 `` `a\_b` `` 를 부여하면 이름이 literally
+/// `a\_b` 인 데이터베이스에 권한이 생긴다 — 그런 DB 는 없으므로 `GRANT` 는 성공하는데
+/// 아무 효과가 없고, 다음 계획이 같은 `GRANT` 를 다시 요구한다(무한 반복).
+///
+/// 그래서 서버 값을 읽어 정한다. RDS·Aurora 실측값은 둘 다 `OFF` 다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaNameMode {
+    /// `partial_revokes = OFF` — 이스케이프한다.
+    #[default]
+    Pattern,
+    /// `partial_revokes = ON` — 이름이 리터럴이다.
+    Literal,
+}
+
+impl SchemaNameMode {
+    /// `@@partial_revokes` 값에서 정한다. `1`/`ON` 이면 리터럴이다.
+    pub fn from_partial_revokes(raw: &str) -> Self {
+        let on = raw == "1" || raw.eq_ignore_ascii_case("on") || raw.eq_ignore_ascii_case("true");
+        if on { Self::Literal } else { Self::Pattern }
+    }
+
+    fn escapes(self) -> bool {
+        self == Self::Pattern
+    }
+}
+
 /// 권한을 부여하는 대상 범위.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GrantScope {
@@ -31,16 +68,26 @@ impl GrantScope {
     /// SQL 의 `ON <여기>` 자리에 넣을 문자열.
     ///
     /// 식별자가 인용될 수 없으면(제어문자 등) `None` — **거부가 기본값이다.**
-    pub fn render(&self) -> Option<String> {
+    /// SQL 의 `ON <여기>` 자리에 넣을 문자열.
+    ///
+    /// `mode` 가 [`SchemaNameMode::Pattern`] 이면 `_`·`%` 를 이스케이프한다 — 안 하면
+    /// `order_items` 가 `orderXitems` 까지 부여한다(실측). `Literal` 이면 하지 않는다 —
+    /// 하면 존재하지 않는 이름에 부여된다.
+    pub fn render(&self, mode: SchemaNameMode) -> Option<String> {
         use crate::ident::{quote_grant_schema, quote_ident};
+        let db_quote = |db: &str| {
+            if mode.escapes() {
+                quote_grant_schema(db)
+            } else {
+                quote_ident(db)
+            }
+        };
         match self {
             Self::Global => Some("*.*".to_string()),
-            // **스키마 이름은 패턴이다** — `_`·`%` 를 이스케이프한다. 안 하면
-            // `order_items` 가 `orderXitems` 까지 부여한다(실측).
-            Self::Schema(db) => Some(format!("{}.*", quote_grant_schema(db)?)),
+            Self::Schema(db) => Some(format!("{}.*", db_quote(db)?)),
             Self::Table(db, tbl) => Some(format!(
                 "{}.{}",
-                quote_grant_schema(db)?,
+                db_quote(db)?,
                 // 테이블 이름은 패턴이 아니다 — `GRANT` 문법에서 와일드카드는
                 // 데이터베이스 자리에만 적용된다.
                 quote_ident(tbl)?
@@ -58,9 +105,11 @@ impl GrantScope {
     }
 }
 
+/// **진단·지문용 표시.** 실행할 SQL 은 [`GrantScope::render`] 를 쓴다 — 그쪽은
+/// 서버의 `partial_revokes` 를 알아야 한다.
 impl fmt::Display for GrantScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.render() {
+        match self.render(SchemaNameMode::default()) {
             Some(s) => f.write_str(&s),
             // 인용할 수 없는 이름은 화면에도 원문으로 내보내지 않는다.
             None => f.write_str("<unrenderable>"),
@@ -245,7 +294,7 @@ fn normalize_privilege(raw: &str) -> String {
 ///
 /// 읽을 수 없는 줄은 `None` 이고, 호출부는 그것을 **경고로 남기고 진행을 멈춘다** —
 /// 못 읽은 줄에 초과 권한이 숨어 있을 수 있으므로 조용히 무시하지 않는다.
-pub fn parse_grant_line(line: &str) -> Option<ParsedGrant> {
+pub fn parse_grant_line(line: &str, mode: SchemaNameMode) -> Option<ParsedGrant> {
     let rest = line.trim();
     let rest = strip_keyword(rest, "GRANT")?;
 
@@ -258,7 +307,7 @@ pub fn parse_grant_line(line: &str) -> Option<ParsedGrant> {
 
     let privileges = parse_privilege_list(priv_part)?;
     let (scope_part, tail) = split_at_top_level_keyword(after_on, "TO")?;
-    let scope = parse_scope(scope_part.trim())?;
+    let scope = parse_scope(scope_part.trim(), mode)?;
     let with_grant_option = contains_top_level_keywords(tail, &["WITH", "GRANT", "OPTION"]);
 
     Some(ParsedGrant::Privileges {
@@ -281,14 +330,17 @@ pub enum ParsedGrant {
 }
 
 /// 여러 줄을 집합으로 접는다. **읽을 수 없는 줄을 함께 돌려준다.**
-pub fn parse_grants<'a>(lines: impl IntoIterator<Item = &'a str>) -> (GrantSet, Vec<String>) {
+pub fn parse_grants<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    mode: SchemaNameMode,
+) -> (GrantSet, Vec<String>) {
     let mut set = GrantSet::default();
     let mut unparsed = Vec::new();
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        match parse_grant_line(line) {
+        match parse_grant_line(line, mode) {
             Some(ParsedGrant::Privileges {
                 scope,
                 privileges,
@@ -468,12 +520,17 @@ fn push_privilege(out: &mut Vec<String>, cur: &mut String, has_columns: &mut boo
 }
 
 /// 범위 파싱 — `*.*` / `` `db`.* `` / `db.*` / `` `db`.`tbl` ``.
-fn parse_scope(s: &str) -> Option<GrantScope> {
+fn parse_scope(s: &str, mode: SchemaNameMode) -> Option<GrantScope> {
     let (db_raw, tbl_raw) = split_scope_parts(s)?;
-    // **데이터베이스 이름은 패턴이므로 이스케이프를 벗긴다.** 벗기지 않으면
-    // 우리가 부여한 `` `a\_b` `` 를 이름이 `a\_b` 인 스키마로 읽고, 차집합이
-    // 매번 같은 `GRANT` 를 다시 요구한다(멱등성이 깨진다).
-    let db = crate::ident::unescape_grant_pattern(&unquote_name(&db_raw)?);
+    let db_quoted = unquote_name(&db_raw)?;
+    // **패턴 모드에서만 이스케이프를 벗긴다.** 벗기지 않으면 우리가 부여한
+    // `` `a\_b` `` 를 이름이 `a\_b` 인 스키마로 읽고, 차집합이 매번 같은 `GRANT` 를
+    // 다시 요구한다(멱등성이 깨진다). 리터럴 모드에서 벗기면 반대로 이름이 망가진다.
+    let db = if mode.escapes() {
+        crate::ident::unescape_grant_pattern(&db_quoted)
+    } else {
+        db_quoted
+    };
     let tbl = unquote_name(&tbl_raw)?;
     match (db.as_str(), tbl.as_str()) {
         ("*", "*") => Some(GrantScope::Global),
@@ -569,7 +626,9 @@ mod tests {
     use super::*;
 
     fn privs(line: &str) -> (GrantScope, Vec<String>) {
-        match parse_grant_line(line).unwrap_or_else(|| panic!("파싱 실패: {line}")) {
+        match parse_grant_line(line, SchemaNameMode::Pattern)
+            .unwrap_or_else(|| panic!("파싱 실패: {line}"))
+        {
             ParsedGrant::Privileges {
                 scope, privileges, ..
             } => (scope, privileges),
@@ -639,7 +698,10 @@ mod tests {
 
     #[test]
     fn usage_is_dropped_because_it_is_not_a_privilege() {
-        let (set, unparsed) = parse_grants(["GRANT USAGE ON *.* TO `dbmon`@`10.1.%`"]);
+        let (set, unparsed) = parse_grants(
+            ["GRANT USAGE ON *.* TO `dbmon`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         assert!(unparsed.is_empty());
         assert!(set.is_empty(), "USAGE 만 있으면 권한이 없는 것이다");
     }
@@ -655,9 +717,10 @@ mod tests {
         assert_eq!(scope, GrantScope::Table("shop".into(), "t".into()));
         assert_eq!(p, vec!["SELECT (COLUMNS)"], "컬럼 GRANT 를 구분하지 않았다");
 
-        let (set, unparsed) = parse_grants([
-            "GRANT SELECT (last_update) ON `mysql`.`innodb_table_stats` TO `dbmon`@`10.1.%`",
-        ]);
+        let (set, unparsed) = parse_grants(
+            ["GRANT SELECT (last_update) ON `mysql`.`innodb_table_stats` TO `dbmon`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         assert!(unparsed.is_empty(), "파싱은 돼야 한다");
         let tbl = GrantScope::Table("mysql".into(), "innodb_table_stats".into());
         assert!(
@@ -678,18 +741,85 @@ mod tests {
         assert!(!set.missing_from(&desired).is_empty());
     }
 
+    /// **`partial_revokes = ON` 이면 이스케이프하지 않는다.**
+    ///
+    /// 하면 존재하지 않는 이름(`a\_b`)에 권한이 생긴다 — `GRANT` 는 성공하는데 효과가
+    /// 없고, 다음 계획이 같은 문장을 무한히 반복한다.
+    #[test]
+    fn literal_mode_does_not_escape_wildcards() {
+        let scope = GrantScope::Schema("order_items".into());
+        assert_eq!(
+            scope.render(SchemaNameMode::Pattern).as_deref(),
+            Some("`order\\_items`.*"),
+            "패턴 모드는 이스케이프한다"
+        );
+        assert_eq!(
+            scope.render(SchemaNameMode::Literal).as_deref(),
+            Some("`order_items`.*"),
+            "리터럴 모드에서 이스케이프하면 존재하지 않는 이름에 부여된다"
+        );
+    }
+
+    /// **리터럴 모드에서는 파싱도 벗기지 않는다.** 벗기면 이름이 망가진다.
+    #[test]
+    fn literal_mode_round_trips_without_unescaping() {
+        for mode in [SchemaNameMode::Pattern, SchemaNameMode::Literal] {
+            let scope = GrantScope::Schema("order_items".into());
+            let rendered = scope.render(mode).expect("렌더");
+            let line = format!("GRANT SELECT ON {rendered} TO `dbmon`@`10.1.%`");
+            let (set, unparsed) = parse_grants([line.as_str()], mode);
+            assert!(unparsed.is_empty(), "{mode:?}: {unparsed:?}");
+            assert!(
+                set.covers(&scope, "SELECT"),
+                "{mode:?}: 왕복이 깨졌다 — 같은 GRANT 를 무한히 반복한다"
+            );
+        }
+
+        // **모드를 섞으면 깨진다** — 그래서 서버 값을 읽어야 한다.
+        let rendered = GrantScope::Schema("order_items".into())
+            .render(SchemaNameMode::Pattern)
+            .expect("렌더");
+        let line = format!("GRANT SELECT ON {rendered} TO `dbmon`@`10.1.%`");
+        let (mismatched, _) = parse_grants([line.as_str()], SchemaNameMode::Literal);
+        assert!(
+            !mismatched.covers(&GrantScope::Schema("order_items".into()), "SELECT"),
+            "모드를 섞었는데 통과했다 — 이 테스트의 전제가 깨졌다"
+        );
+    }
+
+    /// `@@partial_revokes` 값 해석.
+    #[test]
+    fn the_mode_comes_from_partial_revokes() {
+        for on in ["1", "ON", "on", "true", "TRUE"] {
+            assert_eq!(
+                SchemaNameMode::from_partial_revokes(on),
+                SchemaNameMode::Literal,
+                "{on} 을 놓쳤다"
+            );
+        }
+        for off in ["0", "OFF", "off", "false", ""] {
+            assert_eq!(
+                SchemaNameMode::from_partial_revokes(off),
+                SchemaNameMode::Pattern,
+                "{off} 를 리터럴로 봤다"
+            );
+        }
+        // 기본값은 RDS 실측값(OFF)과 같다.
+        assert_eq!(SchemaNameMode::default(), SchemaNameMode::Pattern);
+    }
+
     /// **스키마 이름의 `_`·`%` 를 이스케이프하고, 파싱이 그것을 벗긴다.**
     ///
     /// 왕복이 깨지면 차집합이 매번 같은 GRANT 를 요구한다(멱등성).
     #[test]
     fn schema_pattern_escaping_round_trips() {
         let scope = GrantScope::Schema("order_items".into());
-        let rendered = scope.render().expect("렌더");
+        let rendered = scope.render(SchemaNameMode::Pattern).expect("렌더");
         assert_eq!(rendered, "`order\\_items`.*", "이스케이프가 없다");
 
         // MySQL 이 `SHOW GRANTS` 로 되돌려 주는 형태.
         let line = format!("GRANT SELECT ON {rendered} TO `dbmon`@`10.1.%`");
-        let (set, unparsed) = parse_grants([line.as_str()]);
+        let (set, unparsed) = parse_grants([line.as_str()], SchemaNameMode::Pattern);
         assert!(unparsed.is_empty(), "{unparsed:?}");
         assert!(
             set.covers(&scope, "SELECT"),
@@ -701,7 +831,10 @@ mod tests {
 
     #[test]
     fn role_grants_are_recognized() {
-        let (set, unparsed) = parse_grants(["GRANT `app_role`@`%` TO `dbmon`@`10.1.%`"]);
+        let (set, unparsed) = parse_grants(
+            ["GRANT `app_role`@`%` TO `dbmon`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         assert!(unparsed.is_empty());
         assert_eq!(set.roles().len(), 1);
     }
@@ -710,18 +843,26 @@ mod tests {
     /// 한다.
     #[test]
     fn grant_option_is_detected() {
-        let (set, _) = parse_grants(["GRANT SELECT ON *.* TO `dbmon`@`10.1.%` WITH GRANT OPTION"]);
+        let (set, _) = parse_grants(
+            ["GRANT SELECT ON *.* TO `dbmon`@`10.1.%` WITH GRANT OPTION"],
+            SchemaNameMode::Pattern,
+        );
         assert!(set.has_grant_option);
 
-        let (plain, _) = parse_grants(["GRANT SELECT ON *.* TO `dbmon`@`10.1.%`"]);
+        let (plain, _) = parse_grants(
+            ["GRANT SELECT ON *.* TO `dbmon`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         assert!(!plain.has_grant_option);
     }
 
     /// **`WITH GRANT OPTION` 이 인용 안에 있으면 오탐하지 않는다.**
     #[test]
     fn grant_option_inside_a_name_is_not_grant_option() {
-        let (set, unparsed) =
-            parse_grants(["GRANT SELECT ON `shop`.* TO `WITH GRANT OPTION`@`10.1.%`"]);
+        let (set, unparsed) = parse_grants(
+            ["GRANT SELECT ON `shop`.* TO `WITH GRANT OPTION`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         assert!(unparsed.is_empty(), "파싱은 돼야 한다");
         assert!(
             !set.has_grant_option,
@@ -733,11 +874,14 @@ mod tests {
     /// 수 있으므로 호출부가 진행을 멈출 근거가 된다.
     #[test]
     fn unreadable_lines_are_reported_not_swallowed() {
-        let (set, unparsed) = parse_grants([
-            "GRANT SELECT ON `shop`.* TO `dbmon`@`10.1.%`",
-            "이건 GRANT 문이 아니다",
-            "GRANT SELECT ON *.tbl TO `dbmon`@`10.1.%`", // 세션 의존 범위
-        ]);
+        let (set, unparsed) = parse_grants(
+            [
+                "GRANT SELECT ON `shop`.* TO `dbmon`@`10.1.%`",
+                "이건 GRANT 문이 아니다",
+                "GRANT SELECT ON *.tbl TO `dbmon`@`10.1.%`", // 세션 의존 범위
+            ],
+            SchemaNameMode::Pattern,
+        );
         assert_eq!(unparsed.len(), 2, "{unparsed:?}");
         assert!(set.covers(&GrantScope::Schema("shop".into()), "SELECT"));
     }
@@ -827,18 +971,28 @@ mod tests {
     /// 범위 렌더링은 **인용을 거친다** (T-18).
     #[test]
     fn scope_rendering_quotes_identifiers() {
-        assert_eq!(GrantScope::Global.render().as_deref(), Some("*.*"));
         assert_eq!(
-            GrantScope::Schema("we`ird".into()).render().as_deref(),
+            GrantScope::Global
+                .render(SchemaNameMode::Pattern)
+                .as_deref(),
+            Some("*.*")
+        );
+        assert_eq!(
+            GrantScope::Schema("we`ird".into())
+                .render(SchemaNameMode::Pattern)
+                .as_deref(),
             Some("`we``ird`.*")
         );
         assert_eq!(
             GrantScope::Table("shop".into(), "t".into())
-                .render()
+                .render(SchemaNameMode::Pattern)
                 .as_deref(),
             Some("`shop`.`t`")
         );
         // 인용할 수 없는 이름은 렌더되지 않는다.
-        assert_eq!(GrantScope::Schema("a\nb".into()).render(), None);
+        assert_eq!(
+            GrantScope::Schema("a\nb".into()).render(SchemaNameMode::Pattern),
+            None
+        );
     }
 }
