@@ -67,12 +67,12 @@ locals {
 
   # 앱에 주입할 환경변수. **비밀은 넣지 않는다** — Secrets Manager 를 `secrets` 로 참조한다.
   app_env = {
-    DBMON__DEPLOYMENT_ENV                 = var.environment
-    DBMON__ROLE                           = var.role
-    DBMON__AWS__REGION                    = var.region
-    DBMON__AWS__ACCOUNT_ID                = local.account_id
-    DBMON__STORAGE__DATA_TABLE            = local.foundation.data_table
-    DBMON__STORAGE__CONFIG_TABLE          = local.foundation.config_table
+    DBMON__DEPLOYMENT_ENV        = var.environment
+    DBMON__ROLE                  = var.role
+    DBMON__AWS__REGION           = var.region
+    DBMON__AWS__ACCOUNT_ID       = local.account_id
+    DBMON__STORAGE__DATA_TABLE   = local.foundation.data_table
+    DBMON__STORAGE__CONFIG_TABLE = local.foundation.config_table
     # `DBMON__STORAGE__PLAN_BUCKET` 을 주지 않는다 — 앱에 그 설정이 없다.
     # 주면 `deny_unknown_fields` 에 걸려 **기동이 실패한다.**
     DBMON__DISCOVERY__ALLOWED_VPC_IDS     = join(",", var.allowed_vpc_ids)
