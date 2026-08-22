@@ -67,24 +67,43 @@ pub enum Verdict {
 /// 레코드는 리더가 바뀔 때까지(또는 TTL 35일) 유령으로 남는다 — 교차 리뷰가 8·9회차에서
 /// 정지 확정 경로를 두고 반복해 지적한 것이 전부 이 구멍의 증상이었다.
 ///
-/// `running` 은 **지금 수집 태스크가 도는 인스턴스 id** 집합이다. 여기 없으면 내 것이라도
-/// 살아 있을 수 없으므로 침묵 시간으로 판정한다. 개별 경로를 하나씩 고치는 것보다
-/// **판정을 옳게 만드는 편**이 확실하다.
+/// `running` 은 **인스턴스 id → 그 태스크가 뜬 시각**이다. 없으면 내 것이라도 살아 있을 수
+/// 없으므로 침묵 시간으로 판정한다.
+///
+/// # 왜 시각이 필요한가 (id 집합만으로는 부족하다)
+///
+/// 태스크가 죽고 **같은 이름·같은 epoch 으로 새 태스크가 뜨면**, 옛 태스크가 남긴 레코드가
+/// 계속 `Mine` 으로 보인다 — 새 태스크는 그 레코드를 본 적이 없어 확정하지 못하는데
+/// 아무도 걷지 않는다(교차 리뷰 10회차). 정지 경합에서 늦게 도착한 쓰기도 인스턴스를
+/// 재개하면 같은 상태가 된다.
+///
+/// 그래서 **지금 태스크가 그 레코드를 만졌는가**를 본다: `last_seen_at_ms` 가 태스크가 뜬
+/// 시각 이후면 이 태스크의 것이다.
+///
+/// ⚠ **시작 시각으로 비교하면 안 된다.** 태스크가 뜨기 전에 시작된 긴 쿼리를 그 태스크가
+/// 관측하면 `started_at_ms < 태스크 시작` 인 **살아 있는** 레코드가 만들어진다. 그걸
+/// 남의 것으로 보면 33초 뒤 버려진다 — 가장 막아야 하는 실패다. 갱신 시각은 매 tick
+/// 올라가므로 그 문제가 없고, 아직 안 올라간 갓 만든 레코드는 침묵 시간이 짧아 `Alive` 다.
+pub type RunningTasks = std::collections::BTreeMap<String, EpochMs>;
 pub fn judge(
     q: &SlowQuery,
     me: &str,
     my_epoch: Option<u64>,
     now_ms: EpochMs,
     threshold_ms: i64,
-    running: Option<&std::collections::BTreeSet<String>>,
+    running: Option<&RunningTasks>,
 ) -> Verdict {
     if q.state != SlowQueryState::InFlight {
         return Verdict::NotInFlight;
     }
-    // 이름이 같고 **epoch 도 같고**, 그 인스턴스를 **지금 돌리고 있을 때만** 내 것이다.
+    // 이름이 같고 **epoch 도 같고**, **지금 도는 태스크가 만진 것**일 때만 내 것이다.
     let is_mine = q.owner_worker.as_deref() == Some(me) && q.owner_epoch == my_epoch;
-    let still_running = running.is_none_or(|r| r.contains(q.instance_id.as_str()));
-    if is_mine && still_running {
+    let touched_by_current_task = running.is_none_or(|r| {
+        r.get(q.instance_id.as_str())
+            // 갱신 시각이 없으면 선행 저장 직후다 — 시작 시각을 쓴다(아래 침묵 판정과 같다).
+            .is_some_and(|&started| q.last_seen_at_ms.unwrap_or(q.started_at_ms) >= started)
+    });
+    if is_mine && touched_by_current_task {
         return Verdict::Mine;
     }
     // `last_seen_at_ms` 가 없으면 선행 저장 직후다 — `started_at_ms` 를 쓴다.
@@ -146,8 +165,8 @@ pub async fn sweep<S: SlowQueryStore>(
     now_ms: EpochMs,
     threshold_ms: i64,
     limit: usize,
-    // `running`: 지금 수집 태스크가 도는 인스턴스. `None` 이면 그 정보를 쓰지 않는다.
-    running: Option<&std::collections::BTreeSet<String>>,
+    // `running`: 인스턴스 → 태스크가 뜬 시각. `None` 이면 그 정보를 쓰지 않는다.
+    running: Option<&RunningTasks>,
 ) -> Result<SweepStats> {
     let mut stats = SweepStats::default();
     let in_flight = store.list_in_flight(limit).await?;
@@ -228,19 +247,20 @@ mod tests {
     /// 이 구멍의 증상이었다. 개별 경로를 고치는 것보다 판정을 옳게 만드는 편이 확실하다.
     #[test]
     fn a_record_of_mine_without_a_running_task_is_swept() {
-        use std::collections::BTreeSet;
         let q = in_flight("me", Some(NOW - THRESHOLD - 1_000));
         let id = q.instance_id.as_str().to_string();
 
-        // 그 인스턴스를 돌리고 있으면 내 것이다 — 건드리지 않는다.
-        let running: BTreeSet<String> = [id.clone()].into_iter().collect();
+        // 그 태스크가 이 레코드를 만졌으면 내 것이다 — 건드리지 않는다.
+        let running: RunningTasks = [(id.clone(), NOW - THRESHOLD - 5_000)]
+            .into_iter()
+            .collect();
         assert_eq!(
             judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&running)),
             Verdict::Mine
         );
 
-        // **돌리고 있지 않으면 내 것이라도 걷는다.**
-        let none_running: BTreeSet<String> = BTreeSet::new();
+        // **도는 태스크가 없으면 내 것이라도 걷는다.**
+        let none_running = RunningTasks::new();
         assert!(
             matches!(
                 judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&none_running)),
@@ -249,8 +269,7 @@ mod tests {
             "도는 태스크가 없는데 `Mine` 으로 건너뛴다 — 유령이 남는다"
         );
 
-        // 침묵 시간이 짧으면 아직 걷지 않는다(방금 abort 된 태스크의 마지막 쓰기를
-        // 기다린다).
+        // 침묵 시간이 짧으면 아직 걷지 않는다(방금 abort 된 태스크의 마지막 쓰기를 기다린다).
         let fresh = in_flight("me", Some(NOW - 1_000));
         assert_eq!(
             judge(&fresh, "me", Some(7), NOW, THRESHOLD, Some(&none_running)),
@@ -261,6 +280,43 @@ mod tests {
         assert_eq!(
             judge(&q, "me", Some(7), NOW, THRESHOLD, None),
             Verdict::Mine
+        );
+    }
+
+    /// **같은 이름·epoch 으로 뜬 새 태스크가 옛 레코드를 가리지 않는다.**
+    ///
+    /// 태스크가 죽고 교체되면 옛 레코드는 새 태스크가 본 적 없어 확정할 수 없는데,
+    /// id 만 보면 계속 `Mine` 이라 아무도 걷지 않는다(교차 리뷰 10회차).
+    #[test]
+    fn a_replacement_task_does_not_shield_the_previous_incarnation() {
+        let q = in_flight("me", Some(NOW - THRESHOLD - 1_000));
+        let id = q.instance_id.as_str().to_string();
+        // 새 태스크가 **그 레코드의 마지막 갱신 이후에** 떴다 → 그 태스크의 것이 아니다.
+        let replacement: RunningTasks = [(id, NOW - 500)].into_iter().collect();
+        assert!(
+            matches!(
+                judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&replacement)),
+                Verdict::Orphaned { .. }
+            ),
+            "교체 태스크가 옛 레코드를 영구히 가린다"
+        );
+    }
+
+    /// **태스크보다 먼저 시작된 긴 쿼리를 버리지 않는다.**
+    ///
+    /// 시작 시각으로 비교하면(갱신 시각이 아니라) 태스크가 뜨기 전에 시작된 살아 있는
+    /// 쿼리가 남의 것으로 보여 버려진다 — 가장 막아야 하는 방향이다.
+    #[test]
+    fn a_long_query_that_predates_its_task_is_not_abandoned() {
+        let mut q = in_flight("me", Some(NOW - 1_000));
+        q.started_at_ms = NOW - 3_600_000;
+        let id = q.instance_id.as_str().to_string();
+        // 태스크는 쿼리 시작보다 **뒤에** 떴다.
+        let running: RunningTasks = [(id, NOW - 60_000)].into_iter().collect();
+        assert_eq!(
+            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&running)),
+            Verdict::Mine,
+            "살아 있는 긴 쿼리를 남의 것으로 봤다"
         );
     }
 

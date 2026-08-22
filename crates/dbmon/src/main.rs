@@ -507,7 +507,7 @@ async fn sweep_orphans(
     config: &Config,
     // **지금 도는 수집 태스크.** `Mine` 판정의 근거다 — 내 이름·내 epoch 인데 태스크가
     // 없으면 살아 있을 수 없다(교차 리뷰 8·9회차가 지적한 정지 확정 누락의 근본).
-    running: &std::collections::BTreeSet<String>,
+    running: &dbmon::orphan::RunningTasks,
 ) {
     let threshold = dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
     // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면 `gate.refresh()`
@@ -697,18 +697,16 @@ async fn backfill_round(
         //
         // 버린 엔트리는 **다시 읽는다**: 체크포인트를 남긴 마지막 엔트리 기준으로 잡고
         // 페이지 토큰을 버린다. 중복은 `record_id` 로 병합되므로 안전하다.
-        let capped_dropped = if chunk.has_more && parsed.entries.len() > 1 {
-            let dropped = parsed.entries.pop();
+        // 상한에 걸렸으면 **경계를 다시 읽는다.** 엔트리가 둘 이상이면 마지막 하나를
+        // 버리고(그게 잘렸을 수 있다), 하나뿐이면 버리지 않는다(버리면 진행이 0 이다).
+        let capped = chunk.has_more;
+        if capped && parsed.entries.len() > 1 {
+            parsed.entries.pop();
             tracing::info!(
                 instance = %instance.id.as_str(),
                 "상한에서 마지막 엔트리를 버렸다 — 다음 라운드가 그 자리부터 다시 읽는다"
             );
-            dropped.is_some()
-        } else {
-            // 엔트리가 하나뿐이면 버릴 수 없다(버리면 진행이 0 이다). 그 경우는 8MB 를
-            // 한 엔트리가 채운 것이고, 절단 위험을 안고 저장한다 — 멈추는 것보다 낫다.
-            false
-        };
+        }
         // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
         //
         // 파일 소스는 파일 전체를 준다. 그대로 병합하면 매 라운드 같은 수천 건을
@@ -753,18 +751,18 @@ async fn backfill_round(
                 // 실패한 엔트리가 있으면 옮기지 않는다 — 옮기면 그 엔트리는 영구히
                 // 다시 시도되지 않는다. 병합이 멱등이므로 다시 읽는 비용이 유실보다 싸다.
                 if s.errors == 0 {
-                    // **엔트리를 버렸으면 토큰을 쓰지 않는다.**
+                    // **상한에 걸렸으면 토큰을 쓰지 않고 경계를 다시 읽는다.**
                     //
-                    // 토큰은 우리가 읽은 페이지 **뒤**를 가리키므로, 버린 엔트리를 다시
-                    // 읽을 수 없다. 대신 처리한 마지막 엔트리 시각으로 위치를 잡아 그
-                    // 뒤부터 다시 읽는다 — 버린 엔트리가 거기 들어온다.
-                    let (position, token) = if capped_dropped {
-                        let pos = parsed
-                            .entries
-                            .iter()
-                            .map(|e| e.ended_at_ms)
-                            .max()
-                            .map(|t| t + 1);
+                    // 토큰은 우리가 읽은 페이지 **뒤**를 가리키므로 버린 엔트리를 다시
+                    // 읽을 수 없다. 대신 마지막으로 처리한 엔트리 시각을 위치로 쓴다 —
+                    // **`+1` 하지 않는다.** 버린 엔트리가 그 엔트리와 **같은 밀리초**일
+                    // 수 있고(로그 시각은 ms 해상도다), `+1` 하면 재읽기 필터
+                    // (`ended_at_ms >= since_ms`)가 그걸 걸러낸다(교차 리뷰 10회차).
+                    //
+                    // 같은 엔트리를 한 번 더 읽지만 `record_id` 로 병합되므로 안전하다.
+                    // 파서가 불완전해서 `skipped` 로 보낸 꼬리도 이 재읽기에 들어온다.
+                    let (position, token) = if capped {
+                        let pos = parsed.entries.iter().map(|e| e.ended_at_ms).max();
                         (pos, None)
                     } else {
                         (
@@ -945,17 +943,36 @@ async fn discover(
 /// 인스턴스별 수집 태스크 집합.
 struct CollectTasks {
     handles: std::collections::BTreeMap<String, tokio::task::JoinHandle<()>>,
+    /// 인스턴스 → **그 태스크가 뜬 시각.**
+    ///
+    /// 고아 판정이 "지금 도는 태스크가 만진 레코드인가" 를 묻는 데 쓴다. id 만으로는
+    /// 같은 이름·같은 epoch 으로 뜬 **새** 태스크가 옛 태스크의 레코드를 영구히 가린다
+    /// (교차 리뷰 10회차).
+    started_ms: std::collections::BTreeMap<String, i64>,
 }
 
 impl CollectTasks {
     fn new() -> Self {
         Self {
             handles: std::collections::BTreeMap::new(),
+            started_ms: std::collections::BTreeMap::new(),
         }
     }
 
+    /// 도는 인스턴스 id 집합. **델타 계산용**이다.
     fn running(&self) -> std::collections::BTreeSet<String> {
         self.handles.keys().cloned().collect()
+    }
+
+    /// 인스턴스 → 태스크가 뜬 시각. **고아 판정용**이다.
+    fn running_since(&self) -> dbmon::orphan::RunningTasks {
+        self.handles
+            .keys()
+            .map(|id| {
+                let started = self.started_ms.get(id).copied().unwrap_or(0);
+                (id.clone(), started)
+            })
+            .collect()
     }
 
     /// **끝난 태스크를 걷어낸다.** 이게 없으면 인스턴스가 영구히 수집되지 않는다.
@@ -975,6 +992,7 @@ impl CollectTasks {
             // **패닉과 정상 종료를 구분한다.** `is_finished()` 가 참이므로 `await` 는
             // 즉시 반환한다 — 비용 0 인데, 구분하지 않으면 패닉이 tracing(JSON)
             // 스트림에 아예 나타나지 않는다(기본 패닉 훅은 stderr 로만 쓴다).
+            self.started_ms.remove(id);
             if let Some(h) = self.handles.remove(id)
                 && let Err(e) = h.await
                 && e.is_panic()
@@ -1012,6 +1030,7 @@ impl CollectTasks {
         let by_id = index_by_id(instances);
 
         for id in &delta.to_stop {
+            self.started_ms.remove(id);
             if let Some(h) = self.handles.remove(id) {
                 // `abort()` 는 다음 await 지점에서 태스크를 끊는다. 수집 tick 은
                 // 읽기뿐이고 저장은 멱등(`upsert_merged`)이라 중간에 끊겨도 안전하다.
@@ -1025,6 +1044,11 @@ impl CollectTasks {
             };
             let handle = spawn_instance_collector((*instance).clone(), deps.clone());
             self.handles.insert(id.clone(), handle);
+            // **뜬 시각을 기록한다.** 고아 판정이 "이 태스크가 만진 것인가" 를 묻는다.
+            self.started_ms.insert(id.clone(), {
+                use dbmon_core::time::Clock as _;
+                dbmon_core::time::SystemClock.now_ms()
+            });
             tracing::info!(instance = %id, "수집 태스크 시작");
         }
     }
@@ -1694,7 +1718,7 @@ fn spawn_leader_loop(
                                 // **전체 정지 상태다** — 도는 태스크가 없다. 그래서 내
                                 // 이름·epoch 레코드도 걷어야 한다(그게 정지 확정이
                                 // 놓친 것을 자동으로 정리한다).
-                                &tasks.running(),
+                                &tasks.running_since(),
                             )
                             .await;
                             swept = true;
@@ -1930,7 +1954,7 @@ fn spawn_leader_loop(
                         gate.epoch(),
                         now_ms,
                         &config,
-                        &tasks.running(),
+                        &tasks.running_since(),
                     )
                     .await;
                 }
