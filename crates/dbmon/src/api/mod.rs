@@ -1530,6 +1530,12 @@ pub struct MetricRangeParams {
 struct InstanceMetricsResponse {
     /// 페이지 상한에 걸려 **뒤쪽 데이터를 못 읽었는가.**
     truncated: bool,
+    /// 조회 자체가 실패했다 (스크럽된 사유). `None` 이면 성공했다.
+    ///
+    /// **빈 계열과 다르다.** 지표를 내보내지 않는 인스턴스도 계열이 비지만 그건 정상
+    /// 이고, 이 값이 있으면 우리가 못 읽은 것이다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed: Option<String>,
     instance_id: String,
     engine: String,
     series: Vec<crate::api::metrics::MetricSeries>,
@@ -1576,18 +1582,22 @@ async fn metrics_instance(
     let range = checked_range(from_ms, to_ms)?;
 
     let discovery = state.settings.load(now).await.discovery;
-    let (series, choice, truncated) = svc
+    let out = svc
         .detail(&found, &discovery, range.from_ms(), range.to_ms(), now)
         .await;
     Ok(Json(InstanceMetricsResponse {
         instance_id: found.id.as_str().to_string(),
         engine: format!("{:?}", found.engine).to_lowercase(),
-        series,
-        period_secs: choice.period_secs,
-        period_adjusted: choice.adjusted,
+        series: out.series,
+        period_secs: out.choice.period_secs,
+        period_adjusted: out.choice.adjusted,
+        // **못 읽은 것과 값이 없는 것을 구분한다.** 전에는 조회가 실패해도 200 에 빈
+        // 계열이 실려 나가서, IAM 거부·스로틀링이 "이 지표를 안 내보내는 인스턴스" 와
+        // 같아 보였다. 플릿 경로의 `failed_scopes` 와 같은 역할이다.
+        failed: out.failed,
         // **다 읽지 못했으면 말한다.** 긴 구간(400일 × 27메트릭)은 페이지 상한에
         // 걸릴 수 있고, 그때 뒤쪽은 "값이 없는 것" 이 아니라 "안 읽은 것" 이다.
-        truncated,
+        truncated: out.truncated,
         from_ms: range.from_ms(),
         to_ms: range.to_ms(),
     }))

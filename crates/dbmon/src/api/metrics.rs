@@ -102,6 +102,21 @@ pub struct FleetOutcome {
     pub failed_scopes: Vec<String>,
 }
 
+/// 인스턴스 상세 조회 결과.
+///
+/// **실패를 값으로 담는다.** 전에는 `Err` 를 로그로만 남기고 빈 계열을 돌려줬다 —
+/// 응답은 200 이고 차트가 비어 있어서, IAM 거부·스로틀링·AssumeRole 실패가 "이 지표를
+/// 내보내지 않는 인스턴스" 와 구분되지 않았다(교차 리뷰 2회차). 플릿 경로는
+/// [`FleetOutcome::failed_scopes`] 로 이미 그렇게 하고 있었다.
+pub struct DetailOutcome {
+    pub series: Vec<MetricSeries>,
+    pub choice: PeriodChoice,
+    /// 페이지 상한에 걸려 뒤쪽을 못 읽었다.
+    pub truncated: bool,
+    /// 조회가 실패했다. 스크럽된 사유이며, 화면이 그대로 보여준다.
+    pub failed: Option<String>,
+}
+
 /// 인스턴스 한 대의 플릿 행.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FleetRow {
@@ -214,7 +229,7 @@ impl MetricsService {
         from_ms: EpochMs,
         to_ms: EpochMs,
         now_ms: EpochMs,
-    ) -> (Vec<MetricSeries>, PeriodChoice, bool) {
+    ) -> DetailOutcome {
         let choice = period_for(now_ms, from_ms, to_ms);
         // **시간 범위를 해상도 경계로 맞춘다.**
         //
@@ -235,6 +250,7 @@ impl MetricsService {
 
         let specs = detail_metrics(instance.engine);
         let mut truncated = false;
+        let mut failed: Option<String> = None;
         let series = match self.cached(&cache_key) {
             Some(hit) => {
                 truncated = hit.truncated;
@@ -275,6 +291,9 @@ impl MetricsService {
                             error = %crate::telemetry::Scrubbed(&e),
                             "인스턴스 메트릭 조회 실패"
                         );
+                        // **실패를 캐시하지 않는다.** 다음 요청이 다시 시도해야 한다 —
+                        // 일시적 스로틀링을 60초간 "데이터 없음" 으로 고정하면 안 된다.
+                        failed = Some(crate::telemetry::scrub(&e.to_string()));
                         BTreeMap::new()
                     }
                 }
@@ -302,7 +321,12 @@ impl MetricsService {
                 }
             })
             .collect();
-        (out, choice, truncated)
+        DetailOutcome {
+            series: out,
+            choice,
+            truncated,
+            failed,
+        }
     }
 
     fn cached(&self, key: &str) -> Option<CachedDetail> {

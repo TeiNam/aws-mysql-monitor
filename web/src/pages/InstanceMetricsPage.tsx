@@ -134,6 +134,17 @@ export function InstanceMetricsPage() {
                   없는 것이 아니다. 조회 범위를 좁힌다.
                 </span>
               ) : null}
+              {/*
+                **못 읽은 것과 값이 없는 것을 구분한다.** 전에는 조회가 실패해도 200 에
+                빈 계열이 와서, 차트가 비어 있으면 "이 인스턴스는 이 지표를 안 내보낸다"
+                로 읽혔다. 그건 IAM 거부·스로틀링과 구분되지 않는다.
+              */}
+              {metrics.data.failed === undefined ? null : (
+                <span className="ml-2 font-medium text-red-700">
+                  ⚠ CloudWatch 를 읽지 못했다 — 아래 차트가 빈 것은 값이 없는 것이
+                  아니다. 사유: <span className="font-mono">{metrics.data.failed}</span>
+                </span>
+              )}
             </>
           )
         }

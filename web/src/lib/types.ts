@@ -514,6 +514,13 @@ export interface InstanceMetricsResponse {
    * 뒤쪽 계열이 비는데, 그건 "값이 없다" 와 다르다.
    */
   truncated: boolean;
+  /**
+   * **조회 자체가 실패했다** (스크럽된 사유). 없으면 성공했다.
+   *
+   * 빈 계열과 다르다 — 지표를 내보내지 않는 인스턴스도 계열이 비지만 그건 정상이고,
+   * 이 값이 있으면 우리가 못 읽은 것이다(IAM 거부·스로틀링·AssumeRole 실패).
+   */
+  failed?: string;
   instance_id: string;
   engine: string;
   series: MetricSeries[];

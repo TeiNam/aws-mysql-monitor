@@ -533,17 +533,22 @@ mod tests {
     }
 
     /// 이미 삭제 판정된 것은 **다시 세지 않는다.**
+    ///
+    /// 라운드를 실제 주기(5분)만큼 벌린다. 1ms 간격으로 부르면 `mark_missing` 의 중복
+    /// 방지가 걸려 카운터가 오르지 않고, 그러면 이 테스트는 "삭제 판정" 자체에 도달하지
+    /// 못한다 — 검증하려는 상태를 만들지 못한 채 통과하거나 실패한다.
     #[tokio::test]
     async fn already_deleted_instances_are_not_recounted() {
+        const ROUND: i64 = 300_000;
         let r = registry(&[inst("a"), inst("b")]);
         reconcile(Arc::clone(&r), found(&[inst("a")]), NOW)
             .await
             .expect("1회");
-        reconcile(Arc::clone(&r), found(&[inst("a")]), NOW + 1)
+        reconcile(Arc::clone(&r), found(&[inst("a")]), NOW + ROUND)
             .await
             .expect("2회");
 
-        let s = reconcile(Arc::clone(&r), found(&[inst("a")]), NOW + 2)
+        let s = reconcile(Arc::clone(&r), found(&[inst("a")]), NOW + 2 * ROUND)
             .await
             .expect("3회");
         assert_eq!((s.missing, s.deleted), (0, 0), "삭제된 것을 또 셌다");

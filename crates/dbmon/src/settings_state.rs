@@ -57,6 +57,34 @@ impl SettingsState {
     }
 
     /// 캐시를 무시하고 읽는다.
+    /// 저장된 값을 다시 읽고, **실패를 감추지 않는다.**
+    ///
+    /// # 왜 [`Self::refresh`] 와 나누는가
+    ///
+    /// `refresh` 는 실패하면 마지막으로 읽은 값(없으면 **기본값**)을 돌려준다. 폴러에는
+    /// 그게 맞다 — 저장소가 잠깐 죽었다고 화면이 비어서는 안 된다.
+    ///
+    /// 저장 경로에서는 그게 **비밀을 지운다.** 화면은 비밀 참조를 마스킹된 형태로
+    /// 받으므로, 저장할 때 서버가 현재 값을 읽어 되메꿔야 한다
+    /// ([`AppSettings::merge_secrets_from`]). 읽기가 실패한 걸 모르고 기본값으로
+    /// 병합하면 마스킹 자리에 **빈 값**이 들어가고, `expected_version` 은 여전히
+    /// 맞으므로 조건부 저장이 성공한다 — Slack 참조가 조용히 사라진다
+    /// (교차 리뷰 2회차가 잡았다).
+    ///
+    /// 그래서 저장 경로는 이걸 쓰고, 실패하면 **저장하지 않는다.** 재시도가 사용자를
+    /// 귀찮게 하는 것이 비밀을 잃는 것보다 낫다.
+    pub async fn refresh_checked(&self, now_ms: EpochMs) -> dbmon_core::error::Result<AppSettings> {
+        match self.store.load().await {
+            Ok(s) => Ok(self.apply(s, now_ms)),
+            Err(e) => {
+                if let Ok(mut c) = self.cache.lock() {
+                    c.last_error = Some(crate::telemetry::scrub(&e.to_string()));
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub async fn refresh(&self, now_ms: EpochMs) -> AppSettings {
         match self.store.load().await {
             Ok(s) => self.apply(s, now_ms),
@@ -261,6 +289,47 @@ mod tests {
             fail,
             stored: Mutex::new(stored),
         })
+    }
+
+    /// **저장 경로는 읽기 실패를 삼키지 않는다.**
+    ///
+    /// `refresh` 는 실패하면 마지막 값(없으면 기본값)을 돌려준다 — 폴러에는 맞지만
+    /// 저장 경로에서는 그게 비밀을 지운다. 마스킹된 비밀 자리에 기본값의 빈 문자열이
+    /// 들어가고, `expected_version` 은 맞으므로 조건부 저장이 성공한다.
+    #[tokio::test]
+    async fn a_failed_read_is_reported_to_the_save_path() {
+        let st = SettingsState::new(fake(true, AppSettings::default()));
+
+        // 관대한 경로: 실패를 삼키고 기본값을 준다.
+        let lenient = st.refresh(0).await;
+        assert_eq!(lenient.version, 0, "기본값이 온다");
+
+        // 저장 경로: 오류가 그대로 온다.
+        assert!(
+            st.refresh_checked(0).await.is_err(),
+            "읽기 실패가 저장 경로에 보고되지 않았다 — 비밀이 지워질 수 있다"
+        );
+        assert!(st.last_error().is_some(), "사유가 남아야 한다");
+    }
+
+    /// 성공하면 두 경로가 같은 값을 준다 (정상 경로에 차이를 만들지 않는다).
+    #[tokio::test]
+    async fn both_refresh_paths_agree_when_the_store_works() {
+        let stored = AppSettings {
+            version: 7,
+            notify: dbmon_core::settings::NotifySettings {
+                slack_secret: "dbmon/channel/slack".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let st = SettingsState::new(fake(false, stored));
+
+        let a = st.refresh(0).await;
+        let b = st.refresh_checked(0).await.expect("성공");
+        assert_eq!(a.version, 7);
+        assert_eq!(b.version, 7);
+        assert_eq!(b.notify.slack_secret, "dbmon/channel/slack");
     }
 
     #[tokio::test]

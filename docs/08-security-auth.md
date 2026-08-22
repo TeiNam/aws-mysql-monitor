@@ -352,6 +352,24 @@ dbmon-auth-admin-role
 
 ### 5.2 `dbmon-core` 정책 (요약)
 
+> ⚠ **이 JSON 은 설계 시점의 것이고 정본이 아니다.**
+>
+> 정본은 [`infra/layers/40-compute/iam.tf`](../infra/layers/40-compute/iam.tf) 이고,
+> 그쪽이 더 좁다. 이 절을 그대로 적용하면 코드가 쓰지 않는 권한이 붙는다
+> (교차 리뷰 2회차가 지적).
+>
+> | 이 절 | 실제 | 왜 |
+> |---|---|---|
+> | `cloudwatch:ListMetrics` | **없다** | 지표 카탈로그가 코드에 있다 (`dbmon_core::cw_metrics`) |
+> | `cloudwatch:GetMetricData` 조건 없음 | `cloudwatch:namespace = AWS/RDS` 조건 | 없으면 계정의 모든 지표(비용·보안 포함)를 읽는다 |
+> | `logs:DescribeLogGroups`·`DescribeLogStreams`·`GetLogEvents` | **`FilterLogEvents` 만** | 나머지를 부르는 코드가 없다 |
+> | 로그 자원 `/aws/rds/*` | `/aws/rds/instance/*/slowquery` | 앞쪽은 **audit 로그**(모든 문장)까지 포함한다 |
+> | `S3ReadWrite`(raw·athena·plans) | **없다** | 콜드 티어는 철회, 플랜 오프로드는 미구현 |
+> | `DynamoExport` | **없다** | 증분 내보내기 경로가 없다 |
+> | — | `Deny dynamodb:Scan` | 실수로 전체 스캔하는 것을 권한으로 막는다 |
+>
+> 아래 JSON 은 "무엇을 하려 했는가" 의 기록으로 남긴다.
+
 ```json
 {
   "Version": "2012-10-17",

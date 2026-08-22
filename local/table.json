@@ -2,33 +2,111 @@
   "TableName": "dbmon-data-local",
   "BillingMode": "PAY_PER_REQUEST",
   "AttributeDefinitions": [
-    {"AttributeName": "PK", "AttributeType": "S"},
-    {"AttributeName": "SK", "AttributeType": "S"},
-    {"AttributeName": "GSI1PK", "AttributeType": "S"},
-    {"AttributeName": "GSI1SK", "AttributeType": "S"},
-    {"AttributeName": "GSI2PK", "AttributeType": "S"},
-    {"AttributeName": "GSI2SK", "AttributeType": "S"}
+    {
+      "AttributeName": "PK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "SK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "GSI1PK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "GSI1SK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "GSI2PK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "GSI2SK",
+      "AttributeType": "S"
+    }
   ],
   "KeySchema": [
-    {"AttributeName": "PK", "KeyType": "HASH"},
-    {"AttributeName": "SK", "KeyType": "RANGE"}
+    {
+      "AttributeName": "PK",
+      "KeyType": "HASH"
+    },
+    {
+      "AttributeName": "SK",
+      "KeyType": "RANGE"
+    }
   ],
   "GlobalSecondaryIndexes": [
     {
       "IndexName": "GSI1",
       "KeySchema": [
-        {"AttributeName": "GSI1PK", "KeyType": "HASH"},
-        {"AttributeName": "GSI1SK", "KeyType": "RANGE"}
+        {
+          "AttributeName": "GSI1PK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "GSI1SK",
+          "KeyType": "RANGE"
+        }
       ],
-      "Projection": {"ProjectionType": "ALL"}
+      "Projection": {
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": [
+          "record_id",
+          "instance_id",
+          "env",
+          "started_at_ms",
+          "duration_ms",
+          "app_digest",
+          "statement_type",
+          "state",
+          "last_seen_at_ms",
+          "owner_worker",
+          "exec_count",
+          "total_time_ms",
+          "severity",
+          "rule_id",
+          "owner_epoch",
+          "thread_id",
+          "abandoned_reason"
+        ]
+      }
     },
     {
       "IndexName": "GSI2",
       "KeySchema": [
-        {"AttributeName": "GSI2PK", "KeyType": "HASH"},
-        {"AttributeName": "GSI2SK", "KeyType": "RANGE"}
+        {
+          "AttributeName": "GSI2PK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "GSI2SK",
+          "KeyType": "RANGE"
+        }
       ],
-      "Projection": {"ProjectionType": "ALL"}
+      "Projection": {
+        "ProjectionType": "INCLUDE",
+        "NonKeyAttributes": [
+          "record_id",
+          "instance_id",
+          "env",
+          "started_at_ms",
+          "duration_ms",
+          "app_digest",
+          "statement_type",
+          "state",
+          "last_seen_at_ms",
+          "owner_worker",
+          "exec_count",
+          "total_time_ms",
+          "severity",
+          "rule_id",
+          "owner_epoch",
+          "thread_id",
+          "abandoned_reason"
+        ]
+      }
     }
   ]
 }

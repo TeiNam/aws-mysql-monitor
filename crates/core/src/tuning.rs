@@ -536,6 +536,71 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
     create || alter
 }
 
+/// 모델이 낸 **재작성 SQL** 을 화면에 붙여도 되는 형태인지 본다.
+///
+/// # 왜 인덱스 DDL 만으로 부족했나
+///
+/// 인덱스 제안은 [`is_index_creation_ddl`] 로 형태를 좁혔지만 재작성은 "비어 있지
+/// 않다" 만 봤다(교차 리뷰 2회차). 우리가 실행하지는 않지만 **복사해 실행하라고
+/// 붙여 주는 문장**이므로 같은 기준을 받아야 한다 — 프롬프트 주입이나 잘못된 응답이
+/// `DELETE FROM orders` 를 "튜닝된 쿼리" 로 만들 수 있다.
+///
+/// # 규칙
+///
+/// 1. 실행 주석(`/*! … */`)·다중 문장·`"` 인용은 거부한다 ([`is_index_creation_ddl`] 과 같은 이유).
+/// 2. 선두 키워드가 **원본과 같아야** 한다. `SELECT` 를 고친 결과가 `UPDATE` 일 수는 없다.
+/// 3. 스키마·권한을 바꾸는 키워드가 있으면 거부한다 — 재작성에 나올 이유가 없다.
+///
+/// 완전한 파서가 아니다. 목적은 형태를 좁히는 것이고 실행은 사람이 검토한 뒤에 한다.
+pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
+    let scanned = scan(sql);
+    if scanned.executable_comment || scanned.multi_statement || scanned.double_quoted {
+        return false;
+    }
+    let flat = scanned
+        .keywords_only
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = flat.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let up = trimmed.to_ascii_uppercase();
+
+    // ③ 스키마·권한 변경 키워드. 재작성이라면 나올 수 없다.
+    const FORBIDDEN: &[&str] = &[
+        "DROP ",
+        "TRUNCATE ",
+        "ALTER ",
+        "CREATE ",
+        "GRANT ",
+        "REVOKE ",
+        "RENAME ",
+        "REPLACE INTO",
+        "LOAD DATA",
+        "INTO OUTFILE",
+        "INTO DUMPFILE",
+        "SET GLOBAL",
+        "SET PERSIST",
+    ];
+    // 앞뒤 공백을 붙여 단어 단위로 본다 — `DROPPED` 같은 식별자에 걸리지 않게.
+    let padded = format!(" {up} ");
+    if FORBIDDEN.iter().any(|k| padded.contains(k)) {
+        return false;
+    }
+
+    // ② 선두 키워드가 원본과 같아야 한다.
+    //
+    // `WITH` 로 시작하는 CTE 는 `SELECT` 의 형태다 — 원본이 select 면 허용한다.
+    let head = up.split_whitespace().next().unwrap_or("");
+    let want = statement_type.trim().to_ascii_uppercase();
+    match head {
+        "WITH" | "(" => want == "SELECT",
+        h => h == want,
+    }
+}
+
 /// 모델 응답을 검증해 저장 가능한 권고로 만든다.
 ///
 /// **버린 것은 주의사항으로 남긴다.** 조용히 지우면 (a) 사용자가 모델이 무엇을 말했는지
@@ -614,11 +679,32 @@ pub fn validate(
         ));
     }
 
+    // **재작성도 형태를 좁혀서만 보여준다.**
+    //
+    // 우리가 실행하지는 않지만 "복사해서 실행하라" 고 붙여 주는 문장이다. 인덱스
+    // DDL 과 같은 기준을 받아야 한다 — 전에는 "비어 있지 않다" 만 봤다.
+    let rewrite = match raw.rewrite {
+        Some(r) if r.sql.trim().is_empty() => None,
+        Some(r) if is_safe_rewrite(&r.sql, &context.statement_type) => Some(r),
+        Some(_) => {
+            // **버린 사실을 남긴다.** 조용히 지우면 모델이 무엇을 말했는지 알 수 없고,
+            // 같은 문제가 반복되는지도 알 수 없다. SQL 자체는 담지 않는다 — 형태를
+            // 신뢰할 수 없는 문장을 화면에 실어 보내는 것이 이 검사의 목적과 반대다.
+            caveats.push(format!(
+                "모델이 낸 재작성 SQL 을 버렸다 — 문장이 하나가 아니거나, 선두 키워드가 \
+                 원본({})과 다르거나, 스키마·권한을 바꾸는 키워드가 있다",
+                context.statement_type
+            ));
+            None
+        }
+        None => None,
+    };
+
     Ok(TuningAdvice {
         summary: raw.summary.trim().to_string(),
         findings: raw.findings,
         indexes,
-        rewrite: raw.rewrite.filter(|r| !r.sql.trim().is_empty()),
+        rewrite,
         verification: raw.verification,
         caveats,
         confidence: raw.confidence,
@@ -1351,6 +1437,93 @@ mod tests {
             tables,
             tables_truncated: false,
         }
+    }
+
+    /// **재작성 SQL 도 형태를 좁혀서만 보여준다.**
+    ///
+    /// 우리가 실행하지는 않지만 "복사해서 실행하라" 고 붙여 주는 문장이다. 전에는
+    /// "비어 있지 않다" 만 봤으므로, 프롬프트 주입이나 잘못된 응답이
+    /// `DELETE FROM orders` 를 "튜닝된 쿼리" 로 만들 수 있었다(교차 리뷰 2회차).
+    #[test]
+    fn an_unsafe_rewrite_is_dropped_with_a_caveat() {
+        let bad = [
+            // 원본은 select 다 — 다른 종류로 바뀔 수 없다.
+            "DELETE FROM orders WHERE status = ?",
+            "UPDATE orders SET status = ?",
+            // 다중 문장.
+            "SELECT 1; DROP TABLE orders",
+            // 스키마·권한 변경.
+            "SELECT 1 FROM orders; TRUNCATE orders",
+            "DROP TABLE orders",
+            "SELECT * FROM orders INTO OUTFILE '/tmp/x'",
+            // 실행 주석 — 우리는 주석으로 보고 지우지만 MySQL 은 실행한다.
+            "SELECT 1 /*! , (SELECT 1) */ FROM orders",
+        ];
+        for sql in bad {
+            let raw = RawAdvice {
+                summary: "풀스캔이다".into(),
+                rewrite: Some(Rewrite {
+                    sql: sql.into(),
+                    rationale: "…".into(),
+                }),
+                ..Default::default()
+            };
+            let advice =
+                validate(raw, &context(vec![spec("shop", "orders")]), "m", 1).expect("검증");
+            assert!(advice.rewrite.is_none(), "{sql:?} 가 통과했다");
+            assert!(
+                advice
+                    .caveats
+                    .iter()
+                    .any(|c| c.contains("재작성 SQL 을 버렸다")),
+                "{sql:?}: 버린 사실을 남기지 않았다: {:?}",
+                advice.caveats
+            );
+        }
+    }
+
+    /// 정상 재작성은 그대로 통과한다 — 가드가 쓸모 있는 권고를 막지 않는다.
+    #[test]
+    fn a_safe_rewrite_survives() {
+        for sql in [
+            "SELECT c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.status = ?",
+            // CTE 는 select 의 형태다.
+            "WITH s AS (SELECT id FROM orders) SELECT * FROM s",
+            // 세미콜론 하나로 끝나는 것은 다중 문장이 아니다.
+            "SELECT 1 FROM orders;",
+        ] {
+            let raw = RawAdvice {
+                summary: "풀스캔이다".into(),
+                rewrite: Some(Rewrite {
+                    sql: sql.into(),
+                    rationale: "…".into(),
+                }),
+                ..Default::default()
+            };
+            let advice =
+                validate(raw, &context(vec![spec("shop", "orders")]), "m", 1).expect("검증");
+            assert!(advice.rewrite.is_some(), "{sql:?} 가 버려졌다");
+        }
+    }
+
+    /// **원본이 DML 이면 같은 종류의 재작성은 허용한다.**
+    ///
+    /// 이 도구는 `UPDATE`·`DELETE` 도 관측한다. select 만 허용하면 그 쿼리들의 권고가
+    /// 전부 버려진다 — 가드가 기능을 지우면 안 된다.
+    #[test]
+    fn a_rewrite_matching_a_dml_original_is_allowed() {
+        let mut c = context(vec![spec("shop", "orders")]);
+        c.statement_type = "update".into();
+        let raw = RawAdvice {
+            summary: "인덱스가 없다".into(),
+            rewrite: Some(Rewrite {
+                sql: "UPDATE orders SET status = ? WHERE id = ?".into(),
+                rationale: "…".into(),
+            }),
+            ..Default::default()
+        };
+        let advice = validate(raw, &c, "m", 1).expect("검증");
+        assert!(advice.rewrite.is_some(), "같은 종류의 재작성이 버려졌다");
     }
 
     /// **없는 테이블에 인덱스를 걸라는 권고는 버린다** — 실행되지 않는 문장을 권고로

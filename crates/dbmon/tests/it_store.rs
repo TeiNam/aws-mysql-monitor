@@ -72,6 +72,11 @@ fn instance() -> InstanceId {
     InstanceId::new(ACCOUNT, "ap-northeast-2", "orders-prd-01").expect("id")
 }
 
+/// 탐색 라운드 간격. **`MISSING_MIN_GAP_MS`(240초)보다 커야 한다** — 그보다 짧은
+/// 간격의 두 번째 미발견은 "같은 라운드" 로 보고 거부된다(한 라운드를 두 번 세는 것을
+/// 막는 장치다). 기본 탐색 주기가 300초이므로 그 값을 쓴다.
+const ROUND_MS: i64 = 300_000;
+
 const T0: i64 = 1_755_500_400_000;
 
 fn sample(thread_id: u64, started_at_ms: i64) -> SlowQuery {
@@ -649,6 +654,48 @@ async fn one_missed_discovery_does_not_delete_the_instance() {
 }
 
 /// 2회 연속이면 `deleted_at` 을 찍는다. **항목은 남는다.**
+/// **`set_state` 는 "수집하지 않는다" 는 결정을 덮지 않는다.**
+///
+/// 수집 태스크는 자기가 뜰 때 읽은 사본으로 첫 판정을 쓴다. 그 사이 탐색이
+/// `dbmon:enabled=false` 태그를 보고 `Disabled` 로 바꿨다면, 여기서 `Collecting` 을
+/// 쓰면 **opt-out 이 조용히 무시된다** — 재조정은 수집 가능한 상태를 보고 계속 수집한다.
+#[tokio::test]
+async fn set_state_does_not_overwrite_an_opt_out() {
+    let Some(r) = registry("optout").await else {
+        return;
+    };
+    let mut inst = discovered("orders-01");
+
+    // 사용자가 끈 상태로 등록부에 있다.
+    inst.state = InstanceState::Disabled;
+    r.upsert(&inst).await.expect("등록");
+
+    // 수집 태스크의 첫 판정이 그걸 덮으려 한다.
+    let err = r
+        .set_state(&inst.id, InstanceState::Collecting)
+        .await
+        .expect_err("덮어써졌다");
+    assert!(
+        matches!(err, dbmon_core::error::DomainError::Conflict(_)),
+        "사유가 구분되지 않는다: {err:?}"
+    );
+
+    let after = r.get(&inst.id).await.expect("조회").expect("있다");
+    assert_eq!(after.state, InstanceState::Disabled, "상태가 덮어써졌다");
+
+    // 정상 전이는 막지 않는다.
+    let mut pending = discovered("orders-02");
+    pending.state = InstanceState::Pending;
+    r.upsert(&pending).await.expect("등록");
+    r.set_state(&pending.id, InstanceState::Collecting)
+        .await
+        .expect("정상 전이가 막혔다");
+    assert_eq!(
+        r.get(&pending.id).await.expect("조회").expect("있다").state,
+        InstanceState::Collecting
+    );
+}
+
 #[tokio::test]
 async fn two_consecutive_misses_stamp_deleted_but_keep_the_item() {
     let Some(r) = registry("reg-twomiss").await else {
@@ -658,16 +705,78 @@ async fn two_consecutive_misses_stamp_deleted_but_keep_the_item() {
     r.upsert(&i).await.expect("등록");
 
     r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
-    let after = r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
+    let after = r
+        .mark_missing(&i.id, T0 + 1_000 + ROUND_MS)
+        .await
+        .expect("2회");
 
     assert_eq!(after.missing_count, 2);
-    assert_eq!(after.deleted_at_ms, Some(T0 + 2_000));
+    // 삭제 도장은 **두 번째 미발견 시각**이다 — 라운드 간격만큼 뒤다.
+    assert_eq!(after.deleted_at_ms, Some(T0 + 1_000 + ROUND_MS));
     assert_eq!(after.state, InstanceState::Deleted);
 
     // **항목이 지워지지 않았다** — 과거 슬로우 쿼리의 메타 참조가 살아 있어야 한다.
     assert!(
         r.get(&i.id).await.expect("조회").is_some(),
         "삭제 판정이 항목을 지웠다 — 과거 데이터의 인스턴스 메타를 영구히 잃는다"
+    );
+}
+
+/// **한 라운드를 두 번 세지 않는다** (FR-DSC-07 의 임계값이 2라서 치명적이다).
+///
+/// 재조정은 수집 리더만 돌리지만, 멈췄다 되살아난 옛 리더와 새 리더가 같은 미발견을
+/// 각각 올릴 수 있다. 임계값이 2이므로 **한 라운드로 삭제 도장이 찍힌다** — 살아 있는
+/// 인스턴스가 등록부에서 사라진 것으로 판정된다(교차 리뷰 2회차).
+#[tokio::test]
+async fn a_second_write_in_the_same_round_does_not_count_twice() {
+    let Some(r) = registry("reg-dupmiss").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    // 새 리더가 센다.
+    let first = r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    assert_eq!(first.missing_count, 1);
+
+    // 멈췄다 되살아난 옛 리더가 **같은 라운드**를 다시 센다 (30초 뒤).
+    let again = r.mark_missing(&i.id, T0 + 31_000).await.expect("중복");
+    assert_eq!(again.missing_count, 1, "한 라운드가 두 번 세졌다");
+    assert_eq!(again.deleted_at_ms, None, "한 라운드로 삭제 도장이 찍혔다");
+    assert_ne!(again.state, InstanceState::Deleted);
+
+    // 다음 라운드는 정상적으로 센다 — 가드가 기능을 지우지 않는다.
+    let next = r
+        .mark_missing(&i.id, T0 + 1_000 + ROUND_MS)
+        .await
+        .expect("2회");
+    assert_eq!(next.missing_count, 2);
+    assert_eq!(next.state, InstanceState::Deleted);
+}
+
+/// **되살아난 뒤 첫 미발견은 즉시 세야 한다.**
+///
+/// `mark_seen` 이 `missing_at_ms` 를 지우지 않으면 그 도장이 남아, 다시 사라졌을 때
+/// 첫 미발견이 "이미 셌다" 로 거부되고 판정이 한 라운드 늦어진다.
+#[tokio::test]
+async fn a_reappearance_clears_the_dedupe_stamp() {
+    let Some(r) = registry("reg-redupe").await else {
+        return;
+    };
+    let i = discovered("orders-01");
+    r.upsert(&i).await.expect("등록");
+
+    r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
+    r.mark_seen(&i.id, T0 + 2_000).await.expect("재발견");
+
+    // 라운드 간격보다 **짧은** 간격이어도 세야 한다 — 도장이 지워졌으므로.
+    let after = r
+        .mark_missing(&i.id, T0 + 3_000)
+        .await
+        .expect("재발견 후 1회");
+    assert_eq!(
+        after.missing_count, 1,
+        "재발견 뒤 첫 미발견이 중복으로 거부됐다"
     );
 }
 
@@ -683,8 +792,14 @@ async fn deleted_at_keeps_the_first_disappearance_time() {
     r.upsert(&i).await.expect("등록");
 
     r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
-    let first = r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
-    let later = r.mark_missing(&i.id, T0 + 999_000).await.expect("3회");
+    let first = r
+        .mark_missing(&i.id, T0 + 1_000 + ROUND_MS)
+        .await
+        .expect("2회");
+    let later = r
+        .mark_missing(&i.id, T0 + 1_000 + 3 * ROUND_MS)
+        .await
+        .expect("3회");
 
     assert_eq!(
         later.deleted_at_ms, first.deleted_at_ms,
@@ -703,7 +818,7 @@ async fn reappearing_clears_the_counter_and_the_delete_stamp() {
     r.upsert(&i).await.expect("등록");
 
     r.mark_missing(&i.id, T0 + 1_000).await.expect("1회");
-    r.mark_missing(&i.id, T0 + 2_000)
+    r.mark_missing(&i.id, T0 + 1_000 + ROUND_MS)
         .await
         .expect("2회 — 삭제 판정");
     assert!(
@@ -826,7 +941,9 @@ async fn retention_ttl_is_set_only_when_deleted() {
         !raw("").await.contains_key("ttl"),
         "1회 미발견으로 TTL 이 걸렸다"
     );
-    r.mark_missing(&i.id, T0 + 2_000).await.expect("2회");
+    r.mark_missing(&i.id, T0 + 1_000 + ROUND_MS)
+        .await
+        .expect("2회");
 
     let item = raw("").await;
     let ttl: i64 = item
@@ -836,7 +953,8 @@ async fn retention_ttl_is_set_only_when_deleted() {
         .expect("N 타입")
         .parse()
         .expect("숫자");
-    let expected = (T0 + 2_000) / 1000 + 30 * 86_400;
+    // 두 번째 미발견 시각 기준이다 — 라운드 간격만큼 뒤.
+    let expected = (T0 + 1_000 + ROUND_MS) / 1000 + 30 * 86_400;
     assert_eq!(ttl, expected, "보존 기간이 30일이 아니다");
 
     // **되살아나면 TTL 이 지워져야 한다.** 남아 있으면 30일 뒤 조용히 사라진다.
