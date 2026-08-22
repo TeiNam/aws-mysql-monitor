@@ -2843,3 +2843,68 @@ LeadingKeys = ["USER#me", "CFG"]
 
 그 창을 줄이는 것은 배포 순서의 문제다(모드를 바꾸기 전에 이미지를 먼저 배포한다).
 문서 08 §2.9 에 그 순서를 적었다.
+
+
+---
+
+## dev 배포가 `?` 만 저장하고 있었다 (2026-08-23)
+
+사용자 질문: "값들이 `?` 아닌 실제 값을 저장하기로 했었는데 왜 `?` 로 저장되었지?"
+
+**설정은 맞았고 그 설정이 컨테이너에 도달하지 않았다.**
+
+| 층 | 값 |
+|---|---|
+| `local/dbmon-aws.toml:62` | `literal_policy = "full_restricted"` ✅ |
+| 코드 기본값 (`config.rs:288`) | `Masked` |
+| 런타임 이미지 (`Dockerfile`) | 바이너리 + `web/dist` 뿐 — **설정 파일이 없다** |
+| ECS 태스크 정의 env | 11개. `DBMON__COLLECTOR__LITERAL_POLICY` **없음** |
+
+컨테이너는 `Config::load(None)` 으로 기동하므로 env 에 없는 값은 코드 기본값이 된다.
+`local/dbmon-aws.toml` 은 **로컬 실행에만** 적용된다. OPEN-Q-15 는 전환 방법을 "설정 한
+줄" 로 정의했는데, **배포 경로에는 그 한 줄을 넣을 자리가 없었다.**
+
+DynamoDB 증거 — `owner_worker` 가 VPC 사설 IP 이므로 로컬이 아니라 ECS 가 쓴 것이다:
+
+```
+literal_policy=masked  sql_text="SELECT count ( * ) FROM order_items a STRAIGHT_JOIN customers c ON c . id % ? = a . id % ?"
+owner_worker=all-ip-10-1-74-170.ap-northeast-2.compute.internal
+```
+
+토큰 사이 공백은 `normalize` 의 `canonical` 출력이다 — `Masked` 분기가 원문 대신 그걸
+저장한다(`build.rs:132`).
+
+### 고친 것
+
+`40-compute` 에 `literal_policy` 변수를 만들고 `app_env` 에 배선했다. **기본값은 코드와
+같은 `masked`** 로 둔다 — OPEN-Q-15 의 비대칭(잘못 마스킹하면 설정 한 줄로 복구, 잘못
+저장하면 복구 불가)이 여기서도 그대로 성립한다.
+
+검증 (apply 후 실제 부하):
+
+```
+정책 분포: {'masked': 4760, 'full_restricted': 21, 'off': 17}
+SELECT COUNT(*) FROM order_items a STRAIGHT_JOIN customers c ON c.id % 13 = a.id % 13
+SELECT COUNT(*) FROM order_items a JOIN order_items b ON b.order_id BETWEEN a.order_id AND a.order_id+80
+```
+
+`masked` 4,760건은 **되돌릴 수 없다** — TTL 로 빠질 때까지 남는다. `off` 17건은 마스킹
+후조건 실패로 강등된 것이고 전부 05:50 이전이다(이 수정과 무관).
+
+### 이 결함의 부류
+
+"설정 파일에 적었으므로 적용된다" 는 가정이다. 같은 부류를 하나 더 만들지 않으려면
+**배포 단위마다 설정 소스가 무엇인지** 물어야 한다. 이 프로젝트에서 컨테이너의 설정
+소스는 env 하나다.
+
+### apply 입력값이 어디에도 없었다
+
+이 수정을 apply 하려고 `terraform plan` 을 돌렸더니 **이전 apply 의 `-var` 값이 아무
+데도 남아 있지 않았다.** state 는 루트 모듈 입력 변수를 저장하지 않는다. 살아 있는 IAM
+정책·보안그룹·태스크 정의를 읽어 역구성했다(AWS 조회 10여 회).
+
+그냥 기본값으로 apply 했다면 `db_auth_resource_ids = []` 가 되어 `iam.tf` 가
+`dbuser:*/dbmon` 으로 폴백하고 **prd 인스턴스까지 IAM DB 인증이 열렸다**. 역구성을
+건너뛰는 것이 조용한 권한 확대였다.
+
+`dev.tfvars`(gitignore) + `dev.tfvars.example`(커밋) 로 고정했다.

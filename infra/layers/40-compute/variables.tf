@@ -89,6 +89,25 @@ variable "monitor_db_user" {
   default     = "dbmon"
 }
 
+# **컨테이너에는 설정 파일이 없다.** 런타임 이미지는 바이너리와 `web/dist` 만 담으므로
+# (`Dockerfile`) 앱은 `Config::load(None)` 으로 기동하고, 여기서 주지 않는 값은 코드
+# 기본값이 된다. `local/dbmon-aws.toml` 의 `literal_policy` 는 로컬 실행에만 적용된다 —
+# 그래서 dev 배포가 `masked` 로 돌며 `?` 만 저장하고 있었다.
+variable "literal_policy" {
+  description = <<-EOT
+    SQL 리터럴 저장 정책 (OPEN-Q-15, [08 §6.1]).
+    masked = `?` 치환 저장 (**되돌릴 수 없다**), full_restricted = 원문 저장 + operator 이상 노출.
+    코드 기본값과 같은 `masked` 를 기본으로 둔다 — 잘못된 방향의 되돌리기 비용이 비대칭이다.
+  EOT
+  type        = string
+  default     = "masked"
+
+  validation {
+    condition     = contains(["full", "full_restricted", "masked", "off"], var.literal_policy)
+    error_message = "literal_policy 는 full, full_restricted, masked, off 중 하나여야 한다."
+  }
+}
+
 variable "role" {
   description = "all | api | collector | control"
   type        = string

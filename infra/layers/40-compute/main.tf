@@ -76,6 +76,7 @@ locals {
     # `DBMON__STORAGE__PLAN_BUCKET` 을 주지 않는다 — 앱에 그 설정이 없다.
     # 주면 `deny_unknown_fields` 에 걸려 **기동이 실패한다.**
     DBMON__DISCOVERY__ALLOWED_VPC_IDS     = join(",", var.allowed_vpc_ids)
+    DBMON__COLLECTOR__LITERAL_POLICY      = var.literal_policy
     DBMON__HTTP__PORT                     = tostring(var.container_port)
     DBMON__HTTP__SHUTDOWN_GRACE_SECS      = tostring(var.shutdown_grace_secs)
     DBMON__HTTP__DEREGISTRATION_WAIT_SECS = tostring(var.enable_alb ? var.deregistration_wait_secs : 0)

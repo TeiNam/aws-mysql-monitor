@@ -1,0 +1,32 @@
+# cp dev.tfvars.example dev.tfvars 후 값을 채운다. 실제 값이 든 `dev.tfvars` 는 gitignore 된다.
+#
+# **이 파일을 유지하는 이유**: apply 입력값은 state 에 남지 않는다. 한 번 잃으면 살아 있는
+# 리소스에서 역구성해야 하고(IAM 정책·보안그룹·태스크 정의를 읽어서), 그 사이에 기본값으로
+# apply 하면 db_auth_resource_ids 가 `dbuser:*/dbmon` 으로 폴백해 **prd 까지 열린다**.
+
+environment  = "dev"
+state_bucket = "dbmon-tfstate-CHANGEME"     # 00-bootstrap 이 만든 버킷
+vpc_id       = "vpc-CHANGEME"               # dev-vpc-01. prd VPC 를 넣지 않는다
+subnet_ids   = ["subnet-CHANGEME", "subnet-CHANGEME"]
+
+image_tag = "vX.Y.Z-CHANGEME"               # `latest` 금지 — 커밋 SHA 를 붙인다
+
+allowed_vpc_ids = ["vpc-CHANGEME"]          # T-37. 비우면 앱이 기동을 거부한다
+
+# `aws rds describe-db-instances --query 'DBInstances[].DbiResourceId'` /
+# `describe-db-clusters --query 'DBClusters[].DbClusterResourceId'` 로 얻는다.
+db_auth_resource_ids = ["db-CHANGEME", "cluster-CHANGEME"]
+
+slowlog_log_group_arns = [
+  "arn:aws:logs:ap-northeast-2:CHANGEME:log-group:/aws/rds/instance/<id>/slowquery:*",
+]
+
+# ALB 를 쓰지 않는다 — VPN 에서 컨테이너 포트로 직접 붙는다.
+admin_ingress_security_group_ids = ["sg-CHANGEME"]
+admin_ingress_cidrs              = ["10.99.0.0/16"]
+
+auth_token_secret_arn = "arn:aws:secretsmanager:ap-northeast-2:CHANGEME:secret:dbmon/dev/auth-token-XXXXXX"
+enable_bootstrap      = true
+
+# 기본값 `masked` 는 `?` 로 저장하고 **되돌릴 수 없다**. 원문이 필요하면 여기서 바꾼다.
+literal_policy = "full_restricted"

@@ -8,6 +8,9 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
+# 실제 계정 ID·VPC ID·DB 리소스 id 가 들어간다. `.example` 만 커밋한다.
+*.tfvars
+!*.tfvars.example
 # `.terraform.lock.hcl` 은 **커밋한다** (HashiCorp 권고). provider 6.x 에서
 # GSI 의 hash_key 가 deprecated 되어 `key_schema` 로 바꿀 정도로 버전에 민감한 코드다.
 # 커밋하지 않으면 다른 사람·CI 가 다른 6.x 를 받아 다르게 동작한다.
