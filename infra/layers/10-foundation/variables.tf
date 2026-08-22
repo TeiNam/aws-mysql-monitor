@@ -40,10 +40,21 @@ variable "endpoint_route_table_ids" {
             --query 'RouteTables[].{id:RouteTableId,tags:Tags}'`
   EOT
   type        = list(string)
+  # 엔드포인트를 하나도 만들지 않으면 빈 목록이 맞다.
+  default = []
 
+  # **엔드포인트를 만들 때만 요구한다.**
+  #
+  # 전에는 무조건 "최소 하나" 였다. 그런데 게이트웨이 엔드포인트를 둘 다 끄는 구성
+  # (퍼블릭 서브넷 + IGW, NAT 없는 VPC)에서는 연결할 라우트 테이블이 **없는 것이
+  # 맞다** — 그때 이 검증이 apply 를 막았다. 조건을 실제 요구사항으로 좁힌다.
+  #
+  # `>= 1.9` 라 검증에서 다른 변수를 참조할 수 있다(`required_version`).
   validation {
-    condition     = length(var.endpoint_route_table_ids) > 0
-    error_message = "연결할 라우트 테이블을 최소 하나 지정해야 한다."
+    condition = (
+      !var.create_dynamodb_gateway_endpoint && !var.create_s3_gateway_endpoint
+    ) || length(var.endpoint_route_table_ids) > 0
+    error_message = "게이트웨이 엔드포인트를 만들려면 연결할 라우트 테이블을 최소 하나 지정해야 한다."
   }
 }
 
