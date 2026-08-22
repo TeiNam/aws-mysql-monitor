@@ -167,15 +167,19 @@ impl TuningService {
                 field: "endpoint".into(),
                 reason: "엔드포인트가 없다".into(),
             })?;
-        let provider =
-            self.auth
-                .for_region(instance.id.region())
-                .ok_or_else(|| DomainError::Unavailable {
-                    dependency: "target-auth",
-                    // **다른 리전 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
-                    // 정책 오류처럼 보여 추적이 오래 걸린다.
-                    reason: format!("{} 리전의 인증 공급자가 없다", instance.id.region()),
-                })?;
+        let provider = self
+            .auth
+            .for_instance(&instance.id, &self.config.aws.account_id)
+            .ok_or_else(|| DomainError::Unavailable {
+                dependency: "target-auth",
+                // **다른 리전·계정 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
+                // 정책 오류처럼 보여 추적이 오래 걸린다.
+                reason: format!(
+                    "{}/{} 에 쓸 인증 공급자가 없다",
+                    instance.id.account(),
+                    instance.id.region()
+                ),
+            })?;
         let secret = provider.token(&host, instance.port, &db_user).await?;
         let via = self.config.collector.tunnel_for(instance.id.identifier());
         let opts = crate::mysql::connect::target_opts(

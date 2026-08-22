@@ -190,11 +190,12 @@ ALTER USER 'dbmon'@'10.1.%'
   IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS' REQUIRE SSL;
 
 -- 3) 전역 권한
-GRANT PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
+--    PROCESS  — `information_schema.PROCESSLIST` 에서 남의 세션을 본다(없으면 탐지 불가)
+--    SHOW VIEW — 뷰에 `SHOW CREATE TABLE` 을 하려면 필요하다(계획이 뷰를 참조한다)
+GRANT PROCESS, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
 
 -- 4) 관측 스키마
 GRANT SELECT ON `performance_schema`.* TO 'dbmon'@'10.1.%';
-GRANT SELECT ON `sys`.*                TO 'dbmon'@'10.1.%';
 
 -- 5) 데이터 스키마 — 권한 모드 (07 §2.3)
 --    모드 B(권장): 관측 대상 스키마만 화이트리스트
@@ -202,6 +203,16 @@ GRANT SELECT ON `shop`.* TO 'dbmon'@'10.1.%';
 --    모드 A(broad): GRANT SELECT ON *.* — 카디널리티·DDL 을 전부 얻지만
 --    이 계정이 운영 데이터를 읽을 수 있게 된다
 ```
+
+**전에는 `REPLICATION CLIENT`·`SHOW DATABASES`·`SELECT ON sys.*` 도 줬다.** 코드가 그것을
+필요로 하는 쿼리를 하나도 던지지 않는다는 것이 교차 리뷰에서 확인됐다 — 읽는 것은
+`performance_schema.{processlist, events_statements_current,
+events_statements_summary_by_digest, global_status, global_variables}`,
+`information_schema.{PROCESSLIST, STATISTICS, TABLES}`, `SHOW CREATE TABLE` 이다.
+리플리카 지연을 지표로 넣게 되면 그때 `REPLICATION CLIENT` 를 다시 준다.
+
+⚠ 로컬 픽스처(`local/seed/03-monitor-users.sql`)는 편의상 조금 더 넓게 준다. 실제
+인스턴스에는 위 목록만 준다.
 
 확인:
 

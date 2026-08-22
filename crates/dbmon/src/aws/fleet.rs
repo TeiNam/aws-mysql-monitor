@@ -96,6 +96,8 @@ pub async fn build(
                 // 부르지 않는다 — 실제 호출 시점에 맡고, 만료되면 SDK 가 갱신한다.
                 let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn.clone())
                     .session_name(SESSION_NAME)
+                    // 문서의 신뢰 정책이 요구한다. 조건이 없는 역할에는 무시된다.
+                    .external_id(super::ASSUME_ROLE_EXTERNAL_ID)
                     // STS 를 부를 리전. 대상 리전으로 두면 리전 엔드포인트를 쓴다
                     // (글로벌 엔드포인트보다 빠르고, 리전 차단 정책과도 맞다).
                     .region(region.clone())

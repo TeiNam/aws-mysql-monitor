@@ -53,6 +53,46 @@ pub fn slowquery_log_group(instance: &InstanceId) -> Result<String> {
     ))
 }
 
+/// 이 클라이언트로 이 인스턴스의 로그를 읽어도 되는가.
+///
+/// # 왜 순수 함수인가
+///
+/// 로그 그룹 이름에는 **계정도 리전도 없다**(`/aws/rds/instance/<id>/slowquery`).
+/// 둘은 클라이언트의 자격증명·엔드포인트가 정하므로, 틀린 클라이언트로 조회하면
+/// **같은 이름의 다른 DB** 로그를 읽어 엉뚱한 `instance_id` 로 저장한다 — 리터럴을
+/// 포함한 오귀속이고 prd↔dev, 계정 경계를 넘을 수 있다.
+///
+/// 그 판정은 AWS 호출 없이 전부 검증할 수 있으므로 여기 둔다.
+fn check_scope(instance: &InstanceId, region: &str, account: &str) -> Result<()> {
+    if instance.region() != region {
+        return Err(dbmon_core::error::DomainError::InvalidInput {
+            field: "region".into(),
+            reason: format!(
+                "{}: 인스턴스 리전({})과 클라이언트 리전({})이 다르다",
+                instance.as_str(),
+                instance.region(),
+                region
+            ),
+        });
+    }
+    // **크로스 계정 수집은 배선되지 않았다.** 탐색과 메트릭은 역할을 맡지만
+    // (`sts:AssumeRole`) 슬로우로그 클라이언트는 기본 자격증명으로 돈다. 그대로
+    // 조회하면 우리 계정에서 같은 이름을 찾고, 있으면 남의 로그를 저장한다.
+    if instance.account() != account {
+        return Err(dbmon_core::error::DomainError::Unsupported {
+            what: "cross_account_slowlog".into(),
+            reason: format!(
+                "{}: 인스턴스 계정({})과 클라이언트 계정({})이 다르다 — 크로스 계정 \
+                 슬로우로그 수집은 아직 지원하지 않는다",
+                instance.as_str(),
+                instance.account(),
+                account
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// CloudWatch Logs 에서 가져온다. **프로덕션 경로.**
 ///
 /// # 리전별 클라이언트가 필요하다
@@ -71,15 +111,28 @@ pub struct CloudWatchFetcher {
     client: aws_sdk_cloudwatchlogs::Client,
     /// 이 클라이언트가 붙는 리전.
     region: String,
+    /// 이 클라이언트의 자격증명이 속한 계정.
+    ///
+    /// 리전과 **같은 이유**로 들고 있다. 로그 그룹 이름에는 계정도 없으므로,
+    /// 크로스 계정 인스턴스를 우리 계정 클라이언트로 조회하면 같은 이름의 **다른
+    /// 계정 DB** 로그를 읽어 엉뚱한 `instance_id` 로 저장한다 — 리터럴을 포함한
+    /// 오귀속이다. 리전 불일치를 fail-closed 로 막아 두고 계정은 열려 있었다
+    /// (교차 리뷰가 잡았다).
+    account: String,
     /// 한 번에 가져올 이벤트 상한. 레이트 리밋과 메모리를 함께 막는다.
     max_events: i32,
 }
 
 impl CloudWatchFetcher {
-    pub fn new(client: aws_sdk_cloudwatchlogs::Client, region: impl Into<String>) -> Self {
+    pub fn new(
+        client: aws_sdk_cloudwatchlogs::Client,
+        region: impl Into<String>,
+        account: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             region: region.into(),
+            account: account.into(),
             max_events: 10_000,
         }
     }
@@ -115,19 +168,7 @@ impl SlowLogFetcher for RegionalFetchers {
 #[async_trait::async_trait]
 impl SlowLogFetcher for CloudWatchFetcher {
     async fn fetch(&self, instance: &InstanceId, since_ms: EpochMs) -> Result<LogChunk> {
-        // **리전 불일치는 거부한다.** 로그 그룹 이름에 리전이 없으므로, 틀린 리전
-        // 클라이언트로 조회하면 같은 이름의 **다른 DB** 로그를 읽을 수 있다.
-        if instance.region() != self.region {
-            return Err(dbmon_core::error::DomainError::InvalidInput {
-                field: "region".into(),
-                reason: format!(
-                    "{}: 인스턴스 리전({})과 클라이언트 리전({})이 다르다",
-                    instance.as_str(),
-                    instance.region(),
-                    self.region
-                ),
-            });
-        }
+        check_scope(instance, &self.region, &self.account)?;
         let group = slowquery_log_group(instance)?;
         let out = self
             .client
@@ -274,6 +315,45 @@ mod tests {
             slowquery_log_group(&instance()).expect("이름"),
             "/aws/rds/instance/orders-01/slowquery"
         );
+    }
+
+    /// **리전이 다르면 조회하지 않는다.**
+    ///
+    /// 로그 그룹 이름에 리전이 없으므로 틀린 리전 클라이언트로 조회하면 같은 이름의
+    /// 다른 DB 로그를 읽어 엉뚱한 인스턴스로 저장한다.
+    #[test]
+    fn a_region_mismatch_is_refused() {
+        let e = check_scope(&instance(), "us-east-1", "123456789012").expect_err("거부");
+        assert!(matches!(
+            e,
+            dbmon_core::error::DomainError::InvalidInput { .. }
+        ));
+    }
+
+    /// **계정이 다르면 조회하지 않는다.**
+    ///
+    /// 크로스 계정 수집은 배선되지 않았다 — 클라이언트는 우리 계정 자격증명으로 돈다.
+    /// 그대로 조회하면 우리 계정에서 같은 이름을 찾고, 있으면 **남의 DB 슬로우로그를
+    /// 그 인스턴스의 것으로 저장한다.** 리터럴을 포함한 오귀속이다.
+    #[test]
+    fn a_cross_account_instance_is_refused() {
+        let other = InstanceId::new("999988887777", "ap-northeast-2", "orders-01").expect("id");
+        let e = check_scope(&other, "ap-northeast-2", "123456789012").expect_err("거부");
+        match e {
+            dbmon_core::error::DomainError::Unsupported { what, reason } => {
+                assert_eq!(what, "cross_account_slowlog");
+                // 사유가 두 계정을 모두 말해야 한다 — 어느 쪽이 틀렸는지 알 수 있게.
+                assert!(reason.contains("999988887777"), "{reason}");
+                assert!(reason.contains("123456789012"), "{reason}");
+            }
+            other => panic!("예상과 다르다: {other:?}"),
+        }
+    }
+
+    /// 같은 계정·리전이면 통과한다 (가드가 정상 경로를 막지 않는다).
+    #[test]
+    fn the_same_scope_passes() {
+        check_scope(&instance(), "ap-northeast-2", "123456789012").expect("통과");
     }
 
     /// **계정·리전을 이름에 넣지 않는다.** 넣으면 존재하지 않는 그룹을 조회한다.

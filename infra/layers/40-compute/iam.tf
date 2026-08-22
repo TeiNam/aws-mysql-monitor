@@ -98,18 +98,13 @@ resource "aws_iam_role_policy" "task_storage" {
         Action   = ["dynamodb:Scan"]
         Resource = "*"
       },
-      {
-        Sid      = "PlanOffload"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:CopyObject"]
-        Resource = "arn:aws:s3:::${local.foundation.plan_bucket}/*"
-      },
-      {
-        Sid      = "PlanBucketList"
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket"]
-        Resource = "arn:aws:s3:::${local.foundation.plan_bucket}"
-      },
+      # S3 플랜 오프로드 권한을 주지 않는다.
+      #
+      # 코드에 그 경로가 없다 — `storage.plan_bucket` 은 선언만 있고 읽는 곳이 없어서
+      # 지웠다(교차 리뷰가 잡았다). 쓰지 않는 권한을 남겨 두면 침해 시 열람 범위만
+      # 넓어진다. 오프로드를 구현할 때 이 문을 다시 넣는다.
+      #
+      # 버킷(`10-foundation`)은 **그대로 둔다** — 지우면 데이터가 사라진다.
       {
         Sid      = "KmsUse"
         Effect   = "Allow"
@@ -157,12 +152,12 @@ resource "aws_iam_role_policy" "task_discovery" {
         ]
         Resource = "*"
       },
-      {
-        Sid      = "Metrics"
-        Effect   = "Allow"
-        Action   = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]
-        Resource = "*"
-      },
+      # ⚠ 여기에 조건 없는 `cloudwatch:GetMetricData` 문을 두지 않는다.
+      #
+      # 예전에 `Sid = "Metrics"` 로 `GetMetricData` + `ListMetrics` 를 조건 없이
+      # 허용하는 문이 아래 `MetricsRead` **앞에** 있었다. IAM 은 허용의 합집합이므로
+      # 뒤 문의 네임스페이스 조건이 아무것도 좁히지 못했고 — 좁히려고 쓴 주석만 남아
+      # 있었다(교차 리뷰가 잡았다). 조건을 걸려면 **넓은 문이 없어야** 한다.
       {
         Sid      = "PutOwnMetrics"
         Effect   = "Allow"

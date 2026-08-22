@@ -39,8 +39,25 @@ impl Role {
 
     /// Cognito 그룹 목록에서 **가장 높은** 역할을 뽑는다.
     /// 인식할 수 없는 그룹은 무시한다(권한을 주지 않는다).
+    ///
+    /// # `dbmon-` 접두어를 벗긴다
+    ///
+    /// 실제 Cognito 그룹 이름은 `dbmon-admin`·`dbmon-operator`·`dbmon-viewer` 다
+    /// ([08 §5](../../../docs/08-security-auth.md)). 접두어가 붙는 이유는 사용자 풀이
+    /// 다른 앱과 공유될 수 있어서다 — `admin` 이라는 그룹은 어느 앱의 admin 인지
+    /// 말해 주지 않는다.
+    ///
+    /// 벗기지 않으면 `parse` 가 전부 `None` 을 주고, 그러면
+    /// [`Self::intersect`] 가 토큰의 역할을 **없는 것으로** 보고 서버 레코드 값을
+    /// 그대로 쓴다 — 토큰이 좁히지 못한다. 문서와 코드가 어긋난 상태였고 Cognito 가
+    /// 배선되는 순간 그게 fail-open 이 된다(교차 리뷰가 잡았다).
+    ///
+    /// 접두어 없는 이름도 받는다 — 로컬 테스트와 문서 예시가 둘 다 돈다.
     pub fn highest_from_groups(groups: &[String]) -> Option<Self> {
-        groups.iter().filter_map(|g| Self::parse(g)).max()
+        groups
+            .iter()
+            .filter_map(|g| Self::parse(g.strip_prefix("dbmon-").unwrap_or(g)))
+            .max()
     }
 }
 
@@ -73,7 +90,13 @@ impl AuthContext {
             return None;
         }
         // 강등 후 발급된 구 토큰을 막는다 (T-33).
-        if token.claims_version < server.claims_version {
+        //
+        // **같지 않으면 거부한다.** `<` 로만 보면 서버보다 **높은** 버전을 주장하는
+        // 토큰이 통과한다. 서명이 그 값을 덮으므로 클라이언트가 위조할 수는 없지만,
+        // 서버 버전이 되돌아간 상황(백업 복원, 레코드 재생성)에서 폐기했어야 할
+        // 토큰이 살아난다. 이 검사의 의도는 "발급 시점과 현재가 같다" 이므로 그대로
+        // 쓴다.
+        if token.claims_version != server.claims_version {
             return None;
         }
         if let Some(revoked_after) = server.revoked_after_ms {
@@ -206,6 +229,61 @@ mod tests {
     fn token_role_can_also_lower_the_result() {
         let ctx = AuthContext::intersect(&token(&["viewer"]), &server(Role::Admin)).unwrap();
         assert_eq!(ctx.role, Role::Viewer, "더 낮은 쪽을 쓴다");
+    }
+
+    /// **실제 Cognito 그룹 이름은 `dbmon-` 접두어가 붙는다.**
+    ///
+    /// 문서([08 §5])가 규정한 이름이 `dbmon-admin`·`dbmon-operator`·`dbmon-viewer` 인데
+    /// `parse` 는 접두어 없는 이름만 알았다. 그러면 모든 그룹이 인식되지 않아
+    /// 토큰이 역할을 **좁히지 못하고** 서버 레코드 값이 그대로 쓰인다 — Cognito 가
+    /// 배선되는 순간 fail-open 이다.
+    #[test]
+    fn prefixed_cognito_groups_are_recognized() {
+        let ctx =
+            AuthContext::intersect(&token(&["dbmon-viewer"]), &server(Role::Admin)).expect("인가");
+        assert_eq!(
+            ctx.role,
+            Role::Viewer,
+            "dbmon-viewer 가 admin 을 낮춰야 한다"
+        );
+
+        // 접두어 없는 이름도 계속 받는다 (문서 예시·로컬 테스트가 둘 다 돈다).
+        let plain =
+            AuthContext::intersect(&token(&["viewer"]), &server(Role::Admin)).expect("인가");
+        assert_eq!(plain.role, Role::Viewer);
+
+        // 여러 그룹이면 가장 높은 것.
+        let both = AuthContext::intersect(
+            &token(&["dbmon-viewer", "dbmon-operator"]),
+            &server(Role::Admin),
+        )
+        .expect("인가");
+        assert_eq!(both.role, Role::Operator);
+    }
+
+    /// **`claims_version` 은 같아야 한다.**
+    ///
+    /// `<` 로만 보면 서버보다 높은 버전을 주장하는 토큰이 통과한다. 서명이 그 값을
+    /// 덮으므로 위조는 아니지만, 서버 버전이 되돌아간 상황(백업 복원)에서 폐기했어야
+    /// 할 토큰이 살아난다.
+    #[test]
+    fn a_claims_version_mismatch_is_rejected_in_both_directions() {
+        let mut older = token(&["admin"]);
+        older.claims_version = 2; // 서버는 3
+        assert!(
+            AuthContext::intersect(&older, &server(Role::Admin)).is_none(),
+            "강등 전 토큰이 통과했다"
+        );
+
+        let mut newer = token(&["admin"]);
+        newer.claims_version = 4; // 서버보다 높다
+        assert!(
+            AuthContext::intersect(&newer, &server(Role::Admin)).is_none(),
+            "서버보다 높은 버전을 주장하는 토큰이 통과했다"
+        );
+
+        let same = token(&["admin"]);
+        assert!(AuthContext::intersect(&same, &server(Role::Admin)).is_some());
     }
 
     #[test]

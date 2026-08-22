@@ -47,7 +47,7 @@
 | DynamoDB `data` 테이블 (+GSI1·GSI2) | `10-foundation` | **필수, 지금** | 기동이 `DescribeTable` 에서 실패한다 |
 | DynamoDB `config` 테이블 | `10-foundation` | **필수, 지금** | 정지 스코프를 읽지 못한다(수집은 돌지만 정지 조작이 죽는다) |
 | KMS 키 | `10-foundation` | 필수 | 저장 암호화 |
-| S3 플랜 버킷 | `10-foundation` | 선택 | 초대형 플랜 오프로드만 안 된다(`plan_bucket` 미설정이면 그 경로를 안 탄다) |
+| S3 플랜 버킷 | `10-foundation` | **쓰이지 않는다** | 오프로드 경로가 코드에 없다. 150KB 를 넘는 계획은 `too_large` 사유로 버려지고 레코드는 남는다 |
 | S3 Tables·Glue·Athena | `20-data` | **아직 아니다** | 아카이브(콜드 티어)는 미구현이다 — `ArchiveQuery` 포트만 선언돼 있다 |
 | Cognito·IAM | `30-identity` | prd 필수 | 로컬은 루프백 바이패스로 돈다 |
 

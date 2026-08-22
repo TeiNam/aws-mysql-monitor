@@ -29,6 +29,13 @@ use dbmon_core::slow_query::{
 use dbmon_core::time::EpochMs;
 use dbmon_normalize::{DIGEST_ALGO_VERSION, StatementType, normalize};
 
+/// 저장할 실행계획 JSON 의 상한.
+///
+/// DynamoDB 항목 상한이 400KB 다. 한 레코드에는 계획 말고도 SQL·다이제스트·통계가
+/// 들어가므로 계획 하나에 그 절반 이상을 주지 않는다. 넘으면 **계획만 버리고 레코드는
+/// 저장한다** — 계획 때문에 슬로우 쿼리 자체를 잃는 것이 훨씬 나쁘다.
+const MAX_PLAN_BYTES: usize = 150 * 1024;
+
 use crate::mysql::IS_PROCESSLIST_INFO_MAX_BYTES;
 
 /// 조립 입력.
@@ -134,6 +141,33 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
     let mut plan_parse_failed = false;
     let plan = match plan_json {
         Some(raw) => match dbmon_planparse::parse(raw, tracked.schema_name.as_deref()) {
+            Ok(parsed) if parsed.normalized_json.len() > MAX_PLAN_BYTES => {
+                // **계획만 버린다, 레코드는 남긴다.**
+                //
+                // DynamoDB 항목 상한은 400KB 다. 큰 조인의 `EXPLAIN FORMAT=JSON` 은
+                // 그걸 넘길 수 있고, 그러면 `upsert_merged` 가 실패해 **슬로우 쿼리
+                // 자체가 기록되지 않는다** — 가장 중요한 정보를 부수적인 것 때문에
+                // 잃는다. 계획을 빼면 나머지(SQL·소요시간·검사 행수)는 남는다.
+                //
+                // 버렸다는 사실과 크기를 남긴다. 화면이 "계획 없음" 과 "계획이 너무
+                // 커서 버렸다" 를 구분할 수 있어야 한다.
+                //
+                // S3 오프로드가 원래 계획이었으나(`storage.plan_bucket`) 읽는 코드가
+                // 없어 설정만 존재했다 — 그 설정은 지웠다([17](../../../docs/17-roadmap-tasks.md)).
+                plan_parse_failed = false;
+                PlanBundle {
+                    source: PlanSource::None,
+                    error: Some(format!(
+                        "too_large:{}KB>{}KB",
+                        parsed.normalized_json.len() / 1024,
+                        MAX_PLAN_BYTES / 1024
+                    )),
+                    tree_text: None,
+                    // 참조 테이블은 남긴다 — 작고, 다이제스트 사전이 쓴다.
+                    referenced_tables: parsed.referenced_tables,
+                    ..Default::default()
+                }
+            }
             Ok(parsed) => {
                 plan_redactions = parsed.redactions;
                 PlanBundle {
@@ -517,6 +551,50 @@ mod tests {
         assert_eq!(out.query.plan.referenced_tables, vec!["shop.users"]);
         assert!(out.query.plan.fingerprint.is_some());
         assert!(out.query.plan.error.is_none());
+    }
+
+    /// **거대한 계획 때문에 슬로우 쿼리를 잃지 않는다.**
+    ///
+    /// DynamoDB 항목 상한(400KB)을 넘기면 `upsert_merged` 가 실패하고, 그러면 계획이
+    /// 아니라 **레코드 전체**가 사라진다. 계획만 버리고 나머지를 남긴다.
+    #[test]
+    fn an_oversized_plan_is_dropped_but_the_record_survives() {
+        let (i, t, o) = (instance(), tracked(), ClockOffset::restored(0));
+        // 테이블을 많이 만들어 정규화된 JSON 이 상한을 넘게 한다.
+        let tables: Vec<String> = (0..4_000)
+            .map(|n| {
+                format!(
+                    r#"{{"table":{{"table_name":"t{n}","access_type":"ALL","rows_examined_per_scan":10}}}}"#
+                )
+            })
+            .collect();
+        let plan = format!(
+            r#"{{"query_block":{{"nested_loop":[{}]}}}}"#,
+            tables.join(",")
+        );
+        assert!(
+            plan.len() > MAX_PLAN_BYTES,
+            "테스트 입력이 상한을 넘어야 한다"
+        );
+
+        let mut inp = input(&i, &t, &o, LiteralPolicy::Masked, Some(RAW));
+        inp.plan_json = Some(&plan);
+        inp.plan_source = PlanSource::Rerun;
+        let out = build(inp);
+
+        assert!(
+            out.query.plan.normalized_json.is_none(),
+            "계획을 버려야 한다"
+        );
+        // **왜 없는지 말한다.** "계획 없음" 과 "너무 커서 버렸다" 는 다른 사실이다.
+        let err = out.query.plan.error.expect("사유");
+        assert!(err.starts_with("too_large:"), "{err}");
+        // 레코드는 살아 있다.
+        assert!(out.query.sql_text.is_some());
+        assert!(
+            !out.query.plan.referenced_tables.is_empty(),
+            "참조 테이블은 남긴다"
+        );
     }
 
     #[test]

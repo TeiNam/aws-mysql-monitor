@@ -480,6 +480,10 @@ async fn build_slowlog_fetcher(config: &Config) -> Arc<dyn dbmon::slowlog::SlowL
             dbmon::slowlog::CloudWatchFetcher::new(
                 aws_sdk_cloudwatchlogs::Client::new(&sdk),
                 region,
+                // **이 클라이언트는 우리 계정 자격증명으로 돈다.** 크로스 계정
+                // 인스턴스가 여기로 오면 페처가 거부한다 — 같은 이름의 우리 계정
+                // 로그를 읽어 남의 인스턴스로 저장하는 것보다 낫다.
+                &config.aws.account_id,
             ),
         );
     }
@@ -1036,14 +1040,19 @@ fn spawn_instance_collector(
             return;
         };
 
-        // **인스턴스의 리전으로 서명하는 공급자를 고른다.** 없으면 접속하지 않는다 —
+        // **인스턴스의 계정·리전에 맞는 공급자를 고른다.** 없으면 접속하지 않는다 —
         // 다른 리전 공급자로 대신하면 서명이 틀린 토큰으로 붙으려 하고, 실패 원인이
-        // IAM 정책처럼 보여 추적이 오래 걸린다.
-        let Some(auth) = deps.auth.for_region(instance.id.region()) else {
+        // IAM 정책처럼 보여 추적이 오래 걸린다. 계정이 다르면 애초에 없다(크로스 계정
+        // 수집은 배선되지 않았다).
+        let Some(auth) = deps
+            .auth
+            .for_instance(&instance.id, &deps.config.aws.account_id)
+        else {
             tracing::error!(
                 instance = %label,
                 region = %instance.id.region(),
-                "이 리전의 인증 공급자가 없다 — 수집하지 않는다"
+                cross_account = instance.id.account() != deps.config.aws.account_id,
+                "이 인스턴스에 쓸 인증 공급자가 없다 — 수집하지 않는다"
             );
             return;
         };
@@ -1837,6 +1846,22 @@ fn auth_policy(
             )
         );
     }
+    // **우회가 켜졌다는 사실을 크게 남긴다.**
+    //
+    // 우회는 `dev` ∧ 루프백 바인드에서 유도되는데, 그 판정은 **우리가 어디에 바인드
+    // 했는지**만 본다. 같은 호스트의 리버스 프록시가 그 포트를 공개하면 외부에서
+    // 인증 없이 들어온다 — 프록시의 peer 주소도 루프백이라 요청 출처를 봐도 구분되지
+    // 않는다(교차 리뷰가 지적, 그래서 코드로 막을 수 없다). 남는 방어는 이 로그와
+    // "dev 배포를 공개하지 않는다" 는 운영 규칙이다.
+    if policy.allows_local_bypass() {
+        tracing::warn!(
+            bind = %config.http.bind,
+            concat!(
+                "인증 우회가 켜져 있다 (dev + 루프백) — 토큰 없이 admin 으로 들어온다. ",
+                "이 포트를 리버스 프록시·터널로 공개하면 그대로 외부에 열린다"
+            )
+        );
+    }
     policy
 }
 
@@ -2125,16 +2150,24 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // 조회 API 와 화면은 **저장소가 조립된 뒤에만** 붙는다 — 저장소 없이 라우트를
     // 열면 500 을 돌려주는 엔드포인트가 생기고, 그건 "데이터가 없다" 로 오해된다.
     if let Some(api_state) = api_state {
-        // **임베드 화면은 로컬 개발에서만 서빙한다.**
+        // **화면은 배포에서도 서빙한다.**
         //
-        // 정적 HTML 이라 데이터가 새지는 않지만, 서빙하면 T-01 의 인증 예외가
-        // `/healthz`·`/readyz`·`/api/auth/config` 에서 하나 더 늘어난다. 게다가
-        // prd 에서는 인증을 통과할 수 없으니 **깨진 화면**이다 — 표를 못 채운다.
-        // 실제 SPA(M0-12)가 오면 그때 인증을 태워 붙인다.
-        let serve_ui = api_state.policy.serves_local_ui();
+        // 전에는 로컬 개발(`serves_local_ui`)에서만 붙였다. 근거는 "prd 에서는 인증을
+        // 통과할 수 없으니 깨진 화면이다" 였는데, 공유 토큰(`http.auth_token`)이
+        // 배선되면서 그 전제가 사라졌다. 게이트를 그대로 두면 ECS 배포에서 `/` 가
+        // **404** 다 — README 가 "브라우저로 들어와 설정을 마친다" 를 안내하는데
+        // 들어갈 화면이 없는 상태였다(교차 리뷰가 잡았다).
+        //
+        // 정적 자산은 비밀을 담지 않는다. 데이터는 전부 `/api` 뒤에 있고 그건 인증을
+        // 탄다. 자격증명이 없는 배포에서도 서빙하는 편이 낫다 — 화면이
+        // `mode=unconfigured` 를 받아 "배포 설정에 토큰을 넣어라" 를 말한다. 404 는
+        // 아무것도 말해 주지 않는다.
+        //
+        // `DBMON_UI_DIR` 이 없으면(`spa_dir()` → `None`) 붙지 않는다. API 전용 배포는
+        // 그 환경변수를 두지 않으면 된다.
         app = app.merge(dbmon::api::router(api_state));
-        let spa = if serve_ui { spa_dir() } else { None };
-        if serve_ui {
+        let spa = spa_dir();
+        {
             match &spa {
                 Some(dir) => {
                     use tower_http::services::{ServeDir, ServeFile};
@@ -2187,7 +2220,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
         tracing::info!(
             bind_is_loopback = %dbmon::api::auth::is_loopback_bind(&config.http.bind),
-            serve_ui,
             spa = %spa.as_ref().map_or_else(|| "(임베드 화면)".to_string(), |d| d.display().to_string()),
             "조회 API 를 서비스한다"
         );

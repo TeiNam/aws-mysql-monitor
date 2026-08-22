@@ -84,6 +84,8 @@ impl MetricFetchers {
                 let role_arn = format!("arn:aws:iam::{account}:role/{role}");
                 let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn.clone())
                     .session_name("dbmon-metrics")
+                    // 탐색과 **같은 값**이어야 한다 — 신뢰 정책은 역할 하나에 걸린다.
+                    .external_id(super::ASSUME_ROLE_EXTERNAL_ID)
                     .region(aws_region.clone())
                     .build()
                     .await;
