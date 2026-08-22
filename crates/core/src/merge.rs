@@ -259,7 +259,18 @@ fn merge_duration(
     // 판정을 **레코드 자신의 시작 시각**으로 하는 것이 요점이다 — 병합된 시작
     // (`min`) 으로 판정하면 이전에 무효였던 값이 유효해져 결합법칙이 깨진다.
     let valid_end = |q: &SlowQuery| q.ended_at_ms.filter(|e| *e >= q.started_at_ms);
-    let ended_at_ms = min_opt(valid_end(a), valid_end(b));
+    // **늦은 쪽을 고른다.**
+    //
+    // 전에는 `min`(가장 이른 종료)이었다. 종료 시각은 **하한**이다 — 우리는 "그때는
+    // 있었다" 만 알고 실제 종료는 그 뒤다(`build.rs` 가 마지막 관측 시각을 쓴다). 그래서
+    // 늦은 쪽이 참에 가깝고, 이른 쪽을 고르면 **낡은 쓰기가 새 관측을 줄인다** — 리스가
+    // 만료된 옛 리더가 뒤늦게 확정하면 그 시각이 이겨서 소요가 180초에서 100초로
+    // 줄어들었다(교차 리뷰 29라운드).
+    //
+    // `max` 는 교환·결합법칙을 만족하므로 병합의 대칭성이 유지된다.
+    let ended_at_ms = max_opt(valid_end(a), valid_end(b));
+    // **관측된 소요의 하한.** 어떤 규칙으로도 이 값보다 작게 저장하지 않는다.
+    let observed_floor = a.duration_ms.max(b.duration_ms);
 
     // ① 슬로우로그의 `duration_ms` 는 실제 측정값이므로 구간보다 신뢰한다.
     match (authoritative(a), authoritative(b)) {
@@ -281,6 +292,22 @@ fn merge_duration(
     let span_base = started_at_ms_precise.unwrap_or(started_at_ms);
     if let Some(end) = ended_at_ms {
         let span = end - span_base;
+        // ⚠ **구간이 관측된 소요보다 짧을 수 있다** — 그리고 그때 구간이 이긴다.
+        //
+        // 낡은 쓰기(리스 만료 뒤 되살아난 옛 리더)가 자기가 마지막으로 본 시각을 종료로
+        // 적으면, 그 사이 다른 워커가 관측한 더 큰 소요를 **줄인다**(교차 리뷰 29라운드).
+        //
+        // 병합에서는 못 고친다. 세 요구가 동시에 성립하지 않기 때문이다:
+        //
+        // | 요구 | 이 경우 |
+        // |---|---|
+        // | 관측된 소요를 줄이지 않는다 | 구간(100초) < 관측(180초) |
+        // | 레코드가 자기모순이 아니다(`duration == ended − started`) | 관측을 쓰면 깨진다 |
+        // | 병합이 결합법칙을 만족한다 | 조건부로 종료를 버리면 순서에 따라 결과가 갈린다 |
+        //
+        // 뒤의 두 개는 하드 요구사항이므로(4.25M 쌍 검증) 첫 번째를 포기한다. 근본 원인은
+        // **쓰기 펜싱이 없는 것**이고([21 의 잔여 위험 1](../../../docs/21-resume.md)),
+        // 그쪽을 닫으면 낡은 쓰기 자체가 거부된다.
         if span >= 0 {
             // **`Span` 으로 표시한다.** `Timer` 로 표시하면 `TIMER_WAIT` 정밀도를 가진
             // 것처럼 보이는데, 시작 시각 추정의 오차가 섞여 있다.
@@ -309,16 +336,22 @@ fn merge_duration(
     }
 
     // ③ 종료를 못 봤다 → 두 관측 모두 하한이므로 큰 쪽이 참에 가깝다.
+    (observed_floor, observed_source(a, b), ended_at_ms)
+}
+
+/// 관측된 소요 중 **큰 쪽의 출처**. 같으면 정확도 순위가 높은 쪽.
+///
+/// 크기와 출처를 따로 고르면 레코드가 "초 단위 값인데 `timer` 라고 적혀 있다" 가 된다.
+fn observed_source(a: &SlowQuery, b: &SlowQuery) -> DurationSource {
     match a.duration_ms.cmp(&b.duration_ms) {
-        std::cmp::Ordering::Less => (b.duration_ms, b.duration_source, ended_at_ms),
-        std::cmp::Ordering::Greater => (a.duration_ms, a.duration_source, ended_at_ms),
+        std::cmp::Ordering::Less => b.duration_source,
+        std::cmp::Ordering::Greater => a.duration_source,
         std::cmp::Ordering::Equal => {
-            let source = if duration_rank(a.duration_source) >= duration_rank(b.duration_source) {
+            if duration_rank(a.duration_source) >= duration_rank(b.duration_source) {
                 a.duration_source
             } else {
                 b.duration_source
-            };
-            (a.duration_ms, source, ended_at_ms)
+            }
         }
     }
 }
