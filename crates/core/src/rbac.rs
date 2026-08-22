@@ -19,6 +19,13 @@ pub enum Role {
     Admin,
 }
 
+/// Cognito 그룹 이름 접두어.
+///
+/// 사용자 풀이 다른 앱과 공유될 수 있으므로 **접두어가 필수다** — `admin` 이라는
+/// 그룹은 어느 앱의 admin 인지 말해 주지 않는다. Terraform 이 이 이름으로 그룹을
+/// 만든다(`infra/layers/30-identity/cognito.tf`).
+pub const GROUP_PREFIX: &str = "dbmon-";
+
 impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -40,23 +47,27 @@ impl Role {
     /// Cognito 그룹 목록에서 **가장 높은** 역할을 뽑는다.
     /// 인식할 수 없는 그룹은 무시한다(권한을 주지 않는다).
     ///
-    /// # `dbmon-` 접두어를 벗긴다
+    /// # `dbmon-` 접두어를 **요구한다**
     ///
     /// 실제 Cognito 그룹 이름은 `dbmon-admin`·`dbmon-operator`·`dbmon-viewer` 다
-    /// ([08 §5](../../../docs/08-security-auth.md)). 접두어가 붙는 이유는 사용자 풀이
+    /// ([08 §4.1](../../../docs/08-security-auth.md)). 접두어가 붙는 이유는 사용자 풀이
     /// 다른 앱과 공유될 수 있어서다 — `admin` 이라는 그룹은 어느 앱의 admin 인지
     /// 말해 주지 않는다.
     ///
-    /// 벗기지 않으면 `parse` 가 전부 `None` 을 주고, 그러면
-    /// [`Self::intersect`] 가 토큰의 역할을 **없는 것으로** 보고 서버 레코드 값을
-    /// 그대로 쓴다 — 토큰이 좁히지 못한다. 문서와 코드가 어긋난 상태였고 Cognito 가
-    /// 배선되는 순간 그게 fail-open 이 된다(교차 리뷰가 잡았다).
+    /// 이 판정은 **두 방향으로** 틀렸던 적이 있다:
     ///
-    /// 접두어 없는 이름도 받는다 — 로컬 테스트와 문서 예시가 둘 다 돈다.
+    /// | 잘못 | 결과 |
+    /// |---|---|
+    /// | 접두어를 **모른다** | 모든 그룹이 `None` → 토큰이 역할을 좁히지 못한다 (fail-open) |
+    /// | 접두어를 **요구하지 않는다** | 공유 풀의 다른 앱 `admin` 이 dbmon admin 이 된다 |
+    ///
+    /// 두 번째를 서버 레코드 교집합이 막지 못한다 — 서버 레코드가 admin 이면
+    /// `min()` 이 아무것도 낮추지 않는다(교차 리뷰 3차).
     pub fn highest_from_groups(groups: &[String]) -> Option<Self> {
         groups
             .iter()
-            .filter_map(|g| Self::parse(g.strip_prefix("dbmon-").unwrap_or(g)))
+            .filter_map(|g| g.strip_prefix(GROUP_PREFIX))
+            .filter_map(Self::parse)
             .max()
     }
 }
@@ -238,7 +249,7 @@ mod tests {
     /// T-20 — 위조된 `cognito:groups` 로 admin 을 주장해도 통하지 않는다.
     #[test]
     fn t20_forged_admin_group_is_capped_by_server_record() {
-        let ctx = AuthContext::intersect(&token(&["admin"]), &server(Role::Viewer)).unwrap();
+        let ctx = AuthContext::intersect(&token(&["dbmon-admin"]), &server(Role::Viewer)).unwrap();
         assert_eq!(ctx.role, Role::Viewer, "서버 레코드가 권위값이다");
         assert!(!ctx.has_role(Role::Operator));
     }
@@ -282,18 +293,22 @@ mod tests {
 
     #[test]
     fn token_role_can_also_lower_the_result() {
-        let ctx = AuthContext::intersect(&token(&["viewer"]), &server(Role::Admin)).unwrap();
+        let ctx = AuthContext::intersect(&token(&["dbmon-viewer"]), &server(Role::Admin)).unwrap();
         assert_eq!(ctx.role, Role::Viewer, "더 낮은 쪽을 쓴다");
     }
 
-    /// **실제 Cognito 그룹 이름은 `dbmon-` 접두어가 붙는다.**
+    /// **`dbmon-` 접두어가 붙은 그룹만 인식한다.**
     ///
-    /// 문서([08 §5])가 규정한 이름이 `dbmon-admin`·`dbmon-operator`·`dbmon-viewer` 인데
-    /// `parse` 는 접두어 없는 이름만 알았다. 그러면 모든 그룹이 인식되지 않아
-    /// 토큰이 역할을 **좁히지 못하고** 서버 레코드 값이 그대로 쓰인다 — Cognito 가
-    /// 배선되는 순간 fail-open 이다.
+    /// 두 방향의 결함을 함께 고정한다:
+    ///
+    /// 1. 접두어를 **모르면** 모든 그룹이 인식되지 않아 토큰이 역할을 좁히지 못한다
+    ///    (fail-open, 초기 결함)
+    /// 2. 접두어를 **요구하지 않으면** 사용자 풀을 공유하는 다른 앱의 평범한 `admin`
+    ///    그룹이 dbmon admin 이 된다 (교차 리뷰 3차)
+    ///
+    /// 접두어를 붙인 이유가 2번이므로, 접두어 없는 이름을 받으면 그 이유가 사라진다.
     #[test]
-    fn prefixed_cognito_groups_are_recognized() {
+    fn only_prefixed_cognito_groups_are_recognized() {
         let ctx =
             AuthContext::intersect(&token(&["dbmon-viewer"]), &server(Role::Admin)).expect("인가");
         assert_eq!(
@@ -302,10 +317,26 @@ mod tests {
             "dbmon-viewer 가 admin 을 낮춰야 한다"
         );
 
-        // 접두어 없는 이름도 계속 받는다 (문서 예시·로컬 테스트가 둘 다 돈다).
-        let plain =
-            AuthContext::intersect(&token(&["viewer"]), &server(Role::Admin)).expect("인가");
-        assert_eq!(plain.role, Role::Viewer);
+        // **접두어 없는 이름은 받지 않는다.**
+        for plain in ["viewer", "operator", "admin"] {
+            assert!(
+                AuthContext::intersect(&token(&[plain]), &server(Role::Admin)).is_none(),
+                "접두어 없는 {plain:?} 이 권한을 줬다 — 다른 앱의 그룹이 dbmon 권한이 된다"
+            );
+        }
+        // 다른 접두어도 받지 않는다.
+        for other in [
+            "otherapp-admin",
+            "DBMON-admin",
+            "dbmon_admin",
+            "xdbmon-admin",
+        ] {
+            assert_eq!(
+                Role::highest_from_groups(&[other.to_string()]),
+                None,
+                "{other:?} 를 인식했다"
+            );
+        }
 
         // 여러 그룹이면 가장 높은 것.
         let both = AuthContext::intersect(
@@ -323,21 +354,21 @@ mod tests {
     /// 할 토큰이 살아난다.
     #[test]
     fn a_claims_version_mismatch_is_rejected_in_both_directions() {
-        let mut older = token(&["admin"]);
+        let mut older = token(&["dbmon-admin"]);
         older.claims_version = Some(2); // 서버는 3
         assert!(
             AuthContext::intersect(&older, &server(Role::Admin)).is_none(),
             "강등 전 토큰이 통과했다"
         );
 
-        let mut newer = token(&["admin"]);
+        let mut newer = token(&["dbmon-admin"]);
         newer.claims_version = Some(4); // 서버보다 높다
         assert!(
             AuthContext::intersect(&newer, &server(Role::Admin)).is_none(),
             "서버보다 높은 버전을 주장하는 토큰이 통과했다"
         );
 
-        let same = token(&["admin"]);
+        let same = token(&["dbmon-admin"]);
         assert!(AuthContext::intersect(&same, &server(Role::Admin)).is_some());
     }
 
@@ -350,6 +381,12 @@ mod tests {
             "인식 못하는 그룹이 권한을 줬다"
         );
         assert_eq!(Role::highest_from_groups(&["nope".into()]), None);
+        // 접두어가 없으면 인식하지 않는다.
+        assert_eq!(Role::highest_from_groups(&["admin".into()]), None);
+        assert_eq!(
+            Role::highest_from_groups(&["dbmon-admin".into()]),
+            Some(Role::Admin)
+        );
         // 인식하는 그룹이 하나라도 있으면 그것으로 판정한다.
         let ctx = AuthContext::intersect(
             &token(&["superuser", "dbmon-viewer"]),
@@ -364,7 +401,7 @@ mod tests {
     fn t33_stale_claims_version_is_rejected() {
         let mut s = server(Role::Admin);
         s.claims_version = 4; // 강등 등으로 서버가 버전을 올렸다
-        let mut t = token(&["admin"]);
+        let mut t = token(&["dbmon-admin"]);
         t.claims_version = Some(3); // 구 토큰
         assert!(AuthContext::intersect(&t, &s).is_none());
     }
@@ -373,7 +410,7 @@ mod tests {
     fn revoked_after_blocks_older_tokens() {
         let mut s = server(Role::Admin);
         s.revoked_after_ms = Some(2_000);
-        let mut t = token(&["admin"]);
+        let mut t = token(&["dbmon-admin"]);
         t.issued_at_ms = 1_500;
         assert!(AuthContext::intersect(&t, &s).is_none());
         t.issued_at_ms = 2_500;
@@ -384,12 +421,12 @@ mod tests {
     fn disabled_user_is_rejected() {
         let mut s = server(Role::Admin);
         s.disabled = true;
-        assert!(AuthContext::intersect(&token(&["admin"]), &s).is_none());
+        assert!(AuthContext::intersect(&token(&["dbmon-admin"]), &s).is_none());
     }
 
     #[test]
     fn env_scope_is_intersected_not_unioned() {
-        let mut t = token(&["operator"]);
+        let mut t = token(&["dbmon-operator"]);
         t.env_scope = vec![Env::Prd, Env::Dev]; // 토큰이 prd 를 주장
         let ctx = AuthContext::intersect(&t, &server(Role::Operator)).unwrap();
         assert_eq!(
@@ -402,7 +439,7 @@ mod tests {
 
     #[test]
     fn scope_intersection_empty_request_means_all_of_mine() {
-        let ctx = AuthContext::intersect(&token(&["viewer"]), &server(Role::Viewer)).unwrap();
+        let ctx = AuthContext::intersect(&token(&["dbmon-viewer"]), &server(Role::Viewer)).unwrap();
         assert_eq!(ctx.scope_intersection(&[]), vec![Env::Dev, Env::Stg]);
         assert_eq!(ctx.scope_intersection(&[Env::Prd]), Vec::<Env>::new());
         assert_eq!(
@@ -413,9 +450,10 @@ mod tests {
 
     #[test]
     fn literal_visibility_follows_policy_and_role() {
-        let viewer = AuthContext::intersect(&token(&["viewer"]), &server(Role::Viewer)).unwrap();
+        let viewer =
+            AuthContext::intersect(&token(&["dbmon-viewer"]), &server(Role::Viewer)).unwrap();
         let operator =
-            AuthContext::intersect(&token(&["operator"]), &server(Role::Operator)).unwrap();
+            AuthContext::intersect(&token(&["dbmon-operator"]), &server(Role::Operator)).unwrap();
 
         // viewer 는 can_see_literals=true 여도 operator 미달이라 full_restricted 를 못 본다.
         assert!(

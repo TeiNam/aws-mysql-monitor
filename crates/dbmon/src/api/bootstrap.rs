@@ -27,7 +27,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use dbmon_core::bootstrap::{AuthMethod, Desired, PrivilegeMode};
 use dbmon_core::instance::Instance;
-use dbmon_core::rbac::Role;
+use dbmon_core::rbac::{AuthContext, Role};
 use serde::Deserialize;
 
 use super::{ApiError, ApiState};
@@ -107,7 +107,7 @@ pub async fn authorize(
     state: &ApiState,
     headers: &HeaderMap,
     id: &str,
-) -> Result<(dbmon_core::ids::InstanceId, Instance), ApiError> {
+) -> Result<(dbmon_core::ids::InstanceId, Instance, AuthContext), ApiError> {
     use dbmon_core::ports::InstanceRegistry as _;
 
     let ctx = super::context_of(state, headers).await?;
@@ -134,7 +134,9 @@ pub async fn authorize(
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "instance_not_found"))?;
 
-    Ok((instance_id, instance))
+    // **`ctx` 를 함께 돌려준다.** 감사 레코드의 주체가 요청자여야 한다 — 버리면
+    // 마스터 권한으로 DDL 을 실행한 사람을 알 수 없다(교차 리뷰 3차).
+    Ok((instance_id, instance, ctx))
 }
 
 /// `POST /api/instances/{id}/bootstrap/plan`.
@@ -144,7 +146,7 @@ pub async fn plan(
     Path(id): Path<String>,
     Json(req): Json<PlanRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, instance) = authorize(&state, &headers, &id).await?;
+    let (_, instance, ctx) = authorize(&state, &headers, &id).await?;
     let svc = require_service(&state)?;
     let settings = state
         .settings
@@ -168,7 +170,7 @@ pub async fn plan(
     })?;
 
     let outcome = svc
-        .plan(&instance, &desired)
+        .plan(&instance, &desired, &ctx.subject)
         .await
         .map_err(bootstrap_error)?;
     Ok(Json(serde_json::to_value(outcome).map_err(|_| {
@@ -183,11 +185,16 @@ pub async fn apply(
     Path(id): Path<String>,
     Json(req): Json<ApplyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (_, instance) = authorize(&state, &headers, &id).await?;
+    let (_, instance, ctx) = authorize(&state, &headers, &id).await?;
     let svc = require_service(&state)?;
 
     let outcome = svc
-        .apply(&instance, &req.plan_id, req.confirmation.as_deref())
+        .apply(
+            &instance,
+            &req.plan_id,
+            req.confirmation.as_deref(),
+            &ctx.subject,
+        )
         .await
         .map_err(bootstrap_error)?;
     Ok(Json(serde_json::to_value(outcome).map_err(|_| {
@@ -204,7 +211,7 @@ pub async fn capability(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<BootstrapCapability>, ApiError> {
-    let (_, instance) = authorize(&state, &headers, &id).await?;
+    let (_, instance, _ctx) = authorize(&state, &headers, &id).await?;
     let settings = state
         .settings
         .load(dbmon_core::time::Clock::now_ms(

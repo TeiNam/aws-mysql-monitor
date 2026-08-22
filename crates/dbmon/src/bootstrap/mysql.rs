@@ -29,7 +29,7 @@
 //! (일부 관리형 포크)에서는 [`Introspection::user_state`] 가 오류를 내고, 계획은
 //! **판정 불가로 차단**된다 — 못 읽은 상태를 정상으로 가정하지 않는다.
 
-use dbmon_core::bootstrap::grants::parse_grants;
+use dbmon_core::bootstrap::grants::{SchemaNameMode, parse_grants};
 use dbmon_core::bootstrap::{CurrentState, Desired, sql as bsql};
 use dbmon_core::error::{DomainError, Result};
 use mysql_async::prelude::*;
@@ -77,25 +77,50 @@ impl MasterConn {
         iam_auth_enabled: bool,
     ) -> Result<CurrentState> {
         let user_state = self.user_state(&desired.user, &desired.host).await?;
-        let (user_exists, auth_plugin, requires_ssl, locked, auth_string_digest) = match user_state
-        {
-            Some(s) => (
-                true,
-                Some(s.plugin),
-                s.requires_ssl,
-                s.locked,
-                s.auth_string_digest,
-            ),
-            None => (false, None, false, false, None),
-        };
+        let (user_exists, auth_plugin, requires_ssl, locked, auth_string_digest) =
+            match user_state.as_ref() {
+                Some(s) => (
+                    true,
+                    Some(s.plugin.clone()),
+                    s.requires_ssl,
+                    s.locked,
+                    s.auth_string_digest.clone(),
+                ),
+                None => (false, None, false, false, None),
+            };
+
+        // **서버가 GRANT 의 DB 이름을 어떻게 해석하는지 읽는다.**
+        //
+        // 이걸 가정하면 조용히 망가진다: `partial_revokes = ON` 인 서버에
+        // `` `a\_b` `` 를 부여하면 존재하지 않는 이름에 권한이 생기고, `GRANT` 는
+        // 성공하는데 효과가 없어 다음 계획이 같은 문장을 무한히 반복한다.
+        let schema_name_mode = self.schema_name_mode().await?;
 
         let (grants, unparsed_grants) = if user_exists {
             let lines = self.show_grants(&desired.user, &desired.host).await?;
-            let (set, unparsed) = parse_grants(lines.iter().map(String::as_str));
-            (set, unparsed)
+            parse_grants(lines.iter().map(String::as_str), schema_name_mode)
         } else {
             Default::default()
         };
+
+        // **스냅샷이 찢어지지 않았는지 확인한다** (교차 리뷰 3차가 잡은 결함).
+        //
+        // `mysql.user` 와 `SHOW GRANTS` 는 두 번의 왕복이다. 그 사이에 `ALTER USER`
+        // 권한이 있는 내부자가 인증 수단을 바꾸면, **앞은 안전한 플러그인이고 뒤는
+        // 기존 권한인 혼합 스냅샷**이 만들어진다. 그 지문은 계획과 같으므로 재검증을
+        // 통과하고, 이어지는 `GRANT` 가 탈취된 계정에 적용된다.
+        //
+        // MySQL 에 계정 상태의 스냅샷 격리가 없으므로 **다시 읽어 같은지 본다.**
+        // 다르면 상태가 움직이는 중이고, 그때는 진행하지 않는 것이 맞다.
+        if user_exists {
+            let again = self.user_state(&desired.user, &desired.host).await?;
+            if again.as_ref() != user_state.as_ref() {
+                return Err(DomainError::Conflict(format!(
+                    "{}: 상태를 읽는 동안 계정이 바뀌었다 — 다시 시도한다",
+                    self.label
+                )));
+            }
+        }
 
         Ok(CurrentState {
             user_exists,
@@ -106,7 +131,28 @@ impl MasterConn {
             unparsed_grants,
             iam_auth_enabled,
             auth_string_digest,
+            schema_name_mode,
         })
+    }
+
+    /// `@@partial_revokes` 를 읽어 이름 해석 모드를 정한다.
+    ///
+    /// 읽을 수 없으면 **오류다.** 기본값(`Pattern`)으로 접으면 `ON` 인 서버에서
+    /// 이스케이프된 이름을 부여하게 되고, 그건 조용한 무한 반복이다.
+    async fn schema_name_mode(&mut self) -> Result<SchemaNameMode> {
+        let rows: Vec<String> = self
+            .conn
+            .query("SELECT @@global.partial_revokes")
+            .await
+            .map_err(|e| DomainError::Unavailable {
+                dependency: "target-mysql",
+                reason: format!("{}: partial_revokes 를 읽을 수 없다 — {e}", self.label),
+            })?;
+        let raw = rows.first().ok_or_else(|| DomainError::Unavailable {
+            dependency: "target-mysql",
+            reason: format!("{}: partial_revokes 값이 비었다", self.label),
+        })?;
+        Ok(SchemaNameMode::from_partial_revokes(raw))
     }
 
     /// `mysql.user` 한 행. 계정이 없으면 `None`.
@@ -295,7 +341,7 @@ mod tests {
             "GRANT SELECT ON `sys`.* TO `dbmon`@`10.1.%`",
             "GRANT SELECT ON `performance_schema`.* TO `dbmon`@`10.1.%`",
         ];
-        let (set, unparsed) = parse_grants(real);
+        let (set, unparsed) = parse_grants(real, SchemaNameMode::Pattern);
         assert!(unparsed.is_empty(), "읽지 못한 줄: {unparsed:?}");
 
         use dbmon_core::bootstrap::grants::GrantScope;
@@ -324,12 +370,15 @@ mod tests {
     fn the_real_seed_state_plans_exactly_one_grant() {
         use dbmon_core::bootstrap::{AuthMethod, PrivilegeMode, plan};
 
-        let (grants, _) = parse_grants([
-            "GRANT PROCESS, SHOW DATABASES, REPLICATION CLIENT, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
-            "GRANT SELECT ON `shop`.* TO `dbmon`@`10.1.%`",
-            "GRANT SELECT ON `sys`.* TO `dbmon`@`10.1.%`",
-            "GRANT SELECT ON `performance_schema`.* TO `dbmon`@`10.1.%`",
-        ]);
+        let (grants, _) = parse_grants(
+            [
+                "GRANT PROCESS, SHOW DATABASES, REPLICATION CLIENT, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+                "GRANT SELECT ON `shop`.* TO `dbmon`@`10.1.%`",
+                "GRANT SELECT ON `sys`.* TO `dbmon`@`10.1.%`",
+                "GRANT SELECT ON `performance_schema`.* TO `dbmon`@`10.1.%`",
+            ],
+            SchemaNameMode::Pattern,
+        );
         let current = CurrentState {
             user_exists: true,
             auth_plugin: Some("AWSAuthenticationPlugin".into()),
@@ -339,6 +388,7 @@ mod tests {
             unparsed_grants: vec![],
             iam_auth_enabled: true,
             auth_string_digest: Some("digest".into()),
+            schema_name_mode: SchemaNameMode::Pattern,
         };
         let desired = Desired {
             user: "dbmon".into(),

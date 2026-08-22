@@ -2390,6 +2390,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 //
                 // 사용자 레코드는 config 테이블의 `USER#<sub>` 를 **읽기만** 한다 —
                 // 쓰기는 IAM 에서 Deny 되어 있다(08 §5.2).
+                // 설정 캐시가 낡았을 때 토큰 모드로 떨어지지 않게 하는 플래그.
+                // 기동 시에는 거짓이고, `cognito` 모드를 한 번 보면 참이 된다.
+                cognito_engaged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cognito: dbmon::api::cognito::CognitoVerifier::with_https(Arc::new(
                     dbmon::store::users::DynamoUserStore::new(
                         stores.dynamo.clone(),

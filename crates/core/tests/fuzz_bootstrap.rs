@@ -13,6 +13,7 @@
 //! 처음 이 파일을 쓸 때 그 둘을 섞어 오탐 3건을 만들었다.
 #[test]
 fn fuzz_bootstrap_sql_assembly() {
+    use dbmon_core::bootstrap::grants::SchemaNameMode;
     use dbmon_core::bootstrap::{AuthMethod, Desired, PrivilegeMode, sql};
     use dbmon_core::ident::has_statement_break;
 
@@ -100,7 +101,7 @@ fn fuzz_bootstrap_sql_assembly() {
                 for (scope, privs) in
                     dbmon_core::bootstrap::grants::GrantSet::default().missing_from(&d.grant_set())
                 {
-                    if let Ok(stmt) = sql::grant(&d, &scope, &privs) {
+                    if let Ok(stmt) = sql::grant(&d, &scope, &privs, SchemaNameMode::Pattern) {
                         let raw = stmt.to_execute();
                         if has_statement_break(raw) {
                             escaped.push(format!("[{which}/grant] {p:?} → {raw}"));
@@ -127,6 +128,7 @@ fn fuzz_bootstrap_sql_assembly() {
             &d,
             &dbmon_core::bootstrap::grants::GrantScope::Global,
             &privs,
+            SchemaNameMode::Pattern,
         ) {
             let raw = stmt.to_execute();
             if has_statement_break(raw) || raw.matches('\'').count() % 2 != 0 {
@@ -146,7 +148,7 @@ fn fuzz_bootstrap_sql_assembly() {
 /// 넓게 판정하면 필요한 GRANT 를 건너뛴다 — 그게 위험한 방향이다.
 #[test]
 fn fuzz_grant_parser_never_overstates() {
-    use dbmon_core::bootstrap::grants::{GrantScope, parse_grants};
+    use dbmon_core::bootstrap::grants::{GrantScope, SchemaNameMode, parse_grants};
 
     // 이 줄들은 전역 SELECT 를 주지 **않는다.** 파서가 준다고 판정하면 결함이다.
     let not_global_select = [
@@ -162,7 +164,7 @@ fn fuzz_grant_parser_never_overstates() {
         "GRANT SELECT ON `db`.* TO `SELECT ON *.* TO evil`@`h`",
     ];
     for line in not_global_select {
-        let (set, unparsed) = parse_grants([line]);
+        let (set, unparsed) = parse_grants([line], SchemaNameMode::Pattern);
         assert!(
             !set.covers(&GrantScope::Global, "SELECT"),
             "과대 판정: {line}\n  → unparsed={unparsed:?}"
@@ -177,7 +179,7 @@ fn fuzz_grant_parser_never_overstates() {
         "REVOKE SELECT ON *.* FROM `u`@`h`",
     ];
     for line in must_not_parse_as_privileges {
-        let (set, _) = parse_grants([line]);
+        let (set, _) = parse_grants([line], SchemaNameMode::Pattern);
         assert!(
             !set.covers(&GrantScope::Global, "SELECT"),
             "이상한 줄에서 전역 SELECT 를 읽었다: {line}"

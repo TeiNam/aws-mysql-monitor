@@ -18,7 +18,7 @@ pub mod grants;
 pub mod schemas;
 pub mod sql;
 
-use grants::{GrantScope, GrantSet};
+use grants::{GrantScope, GrantSet, SchemaNameMode};
 
 /// 권한 모드 ([07 §2.3](../../../../docs/07-credentials-bootstrap.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -231,6 +231,16 @@ pub fn is_valid_host_pattern(s: &str) -> bool {
         return false;
     }
 
+    // **와일드카드가 없으면 옥텟이 4개여야 한다** (교차 리뷰 3차).
+    //
+    // `"10"`·`"10.1"` 은 와일드카드가 없는 정확한 호스트 값이므로 `10.1.x.y` 에서
+    // 접속하지 못한다 — 설정한 사람은 접두어라고 생각하는데 아무도 못 붙는다.
+    // 받는 것은 둘 중 하나다: 정확한 IPv4 4옥텟, 또는 와일드카드로 끝나는 접두어.
+    let has_wildcard = s.contains('%') || s.contains('_');
+    if !has_wildcard && octets.len() != 4 {
+        return false;
+    }
+
     let mut seen_wildcard = false;
     for (idx, octet) in octets.iter().enumerate() {
         if octet.is_empty() {
@@ -300,6 +310,10 @@ pub struct CurrentState {
     /// 원문(해시된 비밀번호)을 담지 않는 이유: 그 값 자체가 오프라인 대입 공격의
     /// 재료다. 우리가 필요한 것은 "바뀌었는가" 뿐이므로 해시로 충분하다.
     pub auth_string_digest: Option<String>,
+    /// 서버가 `GRANT` 의 데이터베이스 이름을 어떻게 해석하는가
+    /// (`@@partial_revokes`). **이걸 틀리면 조용히 망가진다** —
+    /// [`SchemaNameMode`] 문서 참조.
+    pub schema_name_mode: SchemaNameMode,
 }
 
 impl CurrentState {
@@ -326,6 +340,9 @@ impl CurrentState {
         );
         h.update(b"\0");
         h.update([self.grants.has_grant_option as u8]);
+        // **모드가 바뀌면 같은 이름의 GRANT 가 다른 대상을 가리킨다.** 상태 변화다.
+        h.update(format!("{:?}", self.schema_name_mode).as_bytes());
+        h.update(b"\0");
         // 권한 집합 전체. 정렬된 `BTreeMap`/`BTreeSet` 이라 순회가 결정적이다.
         for (scope, privs) in self.grants.scopes() {
             h.update(format!("{scope}").as_bytes());
@@ -565,7 +582,12 @@ pub fn plan(
     // ── 권한 차집합: 부족한 것만 GRANT 한다 (멱등성) ──
     let want = desired.grant_set();
     for (scope, privileges) in current.grants.missing_from(&want) {
-        actions.push(Action::Sql(sql::grant(desired, &scope, &privileges)?));
+        actions.push(Action::Sql(sql::grant(
+            desired,
+            &scope,
+            &privileges,
+            current.schema_name_mode,
+        )?));
     }
 
     // ── 초과 권한: REVOKE 하지 않는다 ──
@@ -691,9 +713,12 @@ mod tests {
 
     /// 계정이 있고 모드 A 의 권한이 이미 전부 있는 상태.
     fn fully_granted() -> CurrentState {
-        let (grants, unparsed) = grants::parse_grants([
-            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
-        ]);
+        let (grants, unparsed) = grants::parse_grants(
+            [
+                "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+            ],
+            SchemaNameMode::Pattern,
+        );
         assert!(unparsed.is_empty());
         CurrentState {
             user_exists: true,
@@ -704,6 +729,7 @@ mod tests {
             unparsed_grants: vec![],
             iam_auth_enabled: true,
             auth_string_digest: None,
+            schema_name_mode: grants::SchemaNameMode::Pattern,
         }
     }
 
@@ -744,8 +770,10 @@ mod tests {
     /// 부족한 권한만 추가한다 — 이미 있는 것을 다시 주지 않는다.
     #[test]
     fn only_missing_privileges_are_granted() {
-        let (grants, _) =
-            grants::parse_grants(["GRANT PROCESS, SHOW DATABASES ON *.* TO `dbmon`@`10.1.%`"]);
+        let (grants, _) = grants::parse_grants(
+            ["GRANT PROCESS, SHOW DATABASES ON *.* TO `dbmon`@`10.1.%`"],
+            SchemaNameMode::Pattern,
+        );
         let current = CurrentState {
             grants,
             ..fully_granted()
@@ -823,9 +851,12 @@ mod tests {
 
     #[test]
     fn grant_option_is_blocked() {
-        let (grants, _) = grants::parse_grants([
-            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%` WITH GRANT OPTION",
-        ]);
+        let (grants, _) = grants::parse_grants(
+            [
+                "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%` WITH GRANT OPTION",
+            ],
+            SchemaNameMode::Pattern,
+        );
         let current = CurrentState {
             grants,
             ..fully_granted()
@@ -855,10 +886,13 @@ mod tests {
     /// 초과 권한: prd 는 차단, 비prd 는 경고.
     #[test]
     fn excess_privileges_block_production_but_only_warn_elsewhere() {
-        let (grants, _) = grants::parse_grants([
-            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
-            "GRANT INSERT ON `shop`.* TO `dbmon`@`10.1.%`",
-        ]);
+        let (grants, _) = grants::parse_grants(
+            [
+                "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+                "GRANT INSERT ON `shop`.* TO `dbmon`@`10.1.%`",
+            ],
+            SchemaNameMode::Pattern,
+        );
         let current = CurrentState {
             grants,
             ..fully_granted()
@@ -876,10 +910,13 @@ mod tests {
     /// 롤도 초과 권한으로 센다 — 롤 안을 펼치지 않으므로.
     #[test]
     fn granted_roles_count_as_excess() {
-        let (grants, _) = grants::parse_grants([
-            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
-            "GRANT `app_writer`@`%` TO `dbmon`@`10.1.%`",
-        ]);
+        let (grants, _) = grants::parse_grants(
+            [
+                "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+                "GRANT `app_writer`@`%` TO `dbmon`@`10.1.%`",
+            ],
+            SchemaNameMode::Pattern,
+        );
         let current = CurrentState {
             grants,
             ..fully_granted()
@@ -1084,8 +1121,6 @@ mod tests {
             "10.%.%.%",
             "10.1.__",
             "192.168.%",
-            "10",
-            "10.1",
             "172.16.%.%",
             "10.255.%",
         ] {
@@ -1167,10 +1202,13 @@ mod tests {
     #[test]
     fn the_state_digest_covers_grant_changes() {
         let a = fully_granted();
-        let (grants, _) = grants::parse_grants([
-            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
-            "GRANT INSERT ON `shop`.* TO `dbmon`@`10.1.%`",
-        ]);
+        let (grants, _) = grants::parse_grants(
+            [
+                "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+                "GRANT INSERT ON `shop`.* TO `dbmon`@`10.1.%`",
+            ],
+            SchemaNameMode::Pattern,
+        );
         let b = CurrentState {
             grants,
             ..fully_granted()

@@ -21,7 +21,7 @@
 
 use crate::ident::{has_statement_break, quote_literal};
 
-use super::grants::GrantScope;
+use super::grants::{GrantScope, SchemaNameMode};
 use super::{AuthMethod, Desired, InvalidDesired};
 
 /// 실행할 SQL 한 문장.
@@ -174,10 +174,11 @@ pub fn grant<'a>(
     desired: &Desired,
     scope: &GrantScope,
     privileges: impl IntoIterator<Item = &'a String>,
+    mode: SchemaNameMode,
 ) -> Result<Statement, InvalidDesired> {
     let acct = account(desired)?;
     let target = scope
-        .render()
+        .render(mode)
         .ok_or_else(|| InvalidDesired::Schema(format!("{scope:?}")))?;
 
     let mut names: Vec<&str> = Vec::new();
@@ -314,7 +315,13 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let s = grant(&desired(), &GrantScope::Global, &privs).expect("문장");
+        let s = grant(
+            &desired(),
+            &GrantScope::Global,
+            &privs,
+            SchemaNameMode::Pattern,
+        )
+        .expect("문장");
         assert_eq!(
             s.to_execute(),
             "GRANT PROCESS, SELECT, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%'"
@@ -333,10 +340,10 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(
-            grant(&desired(), &GrantScope::Global, &a)
+            grant(&desired(), &GrantScope::Global, &a, SchemaNameMode::Pattern)
                 .unwrap()
                 .to_execute(),
-            grant(&desired(), &GrantScope::Global, &b)
+            grant(&desired(), &GrantScope::Global, &b, SchemaNameMode::Pattern)
                 .unwrap()
                 .to_execute()
         );
@@ -345,7 +352,13 @@ mod tests {
     #[test]
     fn grant_quotes_schema_and_table_identifiers() {
         let privs = vec!["SELECT".to_string()];
-        let s = grant(&desired(), &GrantScope::Schema("we`ird".into()), &privs).expect("문장");
+        let s = grant(
+            &desired(),
+            &GrantScope::Schema("we`ird".into()),
+            &privs,
+            SchemaNameMode::Pattern,
+        )
+        .expect("문장");
         assert_eq!(
             s.to_execute(),
             "GRANT SELECT ON `we``ird`.* TO 'dbmon'@'10.1.%'"
@@ -355,6 +368,7 @@ mod tests {
             &desired(),
             &GrantScope::Table("mysql".into(), "innodb_table_stats".into()),
             &privs,
+            SchemaNameMode::Pattern,
         )
         .expect("문장");
         assert!(t.to_execute().contains("`mysql`.`innodb_table_stats`"));
@@ -378,7 +392,13 @@ mod tests {
             assert!(!is_valid_privilege_name(bad), "{bad:?} 가 통과했다");
             let privs = vec![bad.to_string()];
             assert!(
-                grant(&desired(), &GrantScope::Global, &privs).is_err(),
+                grant(
+                    &desired(),
+                    &GrantScope::Global,
+                    &privs,
+                    SchemaNameMode::Pattern
+                )
+                .is_err(),
                 "{bad:?} 로 GRANT 가 만들어졌다"
             );
         }
@@ -395,7 +415,15 @@ mod tests {
     #[test]
     fn an_empty_privilege_list_is_rejected() {
         let empty: Vec<String> = vec![];
-        assert!(grant(&desired(), &GrantScope::Global, &empty).is_err());
+        assert!(
+            grant(
+                &desired(),
+                &GrantScope::Global,
+                &empty,
+                SchemaNameMode::Pattern
+            )
+            .is_err()
+        );
     }
 
     // ── T-19: 비밀번호가 든 문장 ────────────────────────────────────────────
