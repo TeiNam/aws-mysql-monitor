@@ -378,6 +378,18 @@ resource "aws_secretsmanager_secret" "mysql_master" {
 
   # 테스트 플릿: destroy 후 name_prefix 재사용이 가능하도록 유예 없이 지운다.
   recovery_window_in_days = 0
+
+  # **부트스트랩이 이 태그를 요구한다** (M3 경로 b, docs/07 §1.2).
+  #
+  # 앱의 IAM 정책이 `secretsmanager:ResourceTag/dbmon = true` 로 좁혀져 있고, 앱
+  # 코드도 같은 태그를 확인한다(`is_tagged_for_dbmon`). 태그가 없으면 정책과 코드
+  # 양쪽에서 막힌다 — 임의 ARN 으로 계정의 다른 비밀을 읽는 것을 막기 위해서다.
+  #
+  # Aurora 는 `manage_master_user_password = true` 라 RDS 관리형 시크릿(`rds!*`)을
+  # 쓰고, 그 경로는 이름 규칙으로 좁히므로 태그가 필요 없다.
+  tags = {
+    dbmon = "true"
+  }
 }
 
 # 평상시 plan/apply 에 비밀번호 변수를 요구하지 않기 위해, 변수가 없으면 시크릿의

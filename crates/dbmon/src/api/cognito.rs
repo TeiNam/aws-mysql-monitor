@@ -315,8 +315,30 @@ pub struct HttpJwksSource {
     client: reqwest::Client,
 }
 
+/// 프로세스 기본 CryptoProvider 를 설치한다. **여러 번 불러도 안전하다.**
+///
+/// # 왜 필요한가 (실배포에서 잡힌 결함)
+///
+/// `mysql_async` 와 AWS SDK 가 rustls 를 `aws-lc-rs` 로 쓰고, `reqwest` 의
+/// `rustls-tls-webpki-roots` 는 `ring` 을 켠다. 둘이 함께 있으면 rustls 가 기본
+/// 프로바이더를 정하지 못해 **첫 TLS 연결에서 패닉한다.**
+///
+/// 그래서 reqwest 를 `-no-provider` feature 로 바꿨는데, 그러면 이번에는 reqwest 가
+/// "No provider set" 으로 패닉한다 — 프로바이더가 하나뿐이어도 `reqwest` 는
+/// **명시적 설치**를 요구한다. ECS 배포가 그 패닉으로 세 번 재시작하고 롤백됐다.
+///
+/// # 왜 테스트가 못 잡았나
+///
+/// 단위 테스트는 [`JwksSource`] 를 페이크로 대체하므로 **reqwest 클라이언트를 한
+/// 번도 만들지 않았다.** 그래서 아래 테스트가 실제로 클라이언트를 조립한다.
+fn install_crypto_provider() {
+    // 이미 설치돼 있으면 `Err` 다 — 그건 정상이고 무시한다.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 impl HttpJwksSource {
     pub fn new() -> Result<Self, String> {
+        install_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             // **리다이렉트를 따르지 않는다.** JWKS 엔드포인트는 고정 주소이고,
@@ -1127,6 +1149,31 @@ mod tests {
         ) -> dbmon_core::error::Result<Option<dbmon_core::rbac::UserRecord>> {
             Ok(None)
         }
+    }
+
+    /// **HTTPS 소스를 실제로 조립한다.**
+    ///
+    /// 이 테스트가 없어서 ECS 배포가 "No provider set" 으로 세 번 재시작하고
+    /// 롤백됐다 — 다른 모든 테스트는 [`JwksSource`] 를 페이크로 대체하므로
+    /// reqwest 클라이언트를 한 번도 만들지 않았다.
+    ///
+    /// 네트워크를 타지 않는다. 클라이언트 **조립**만 확인한다.
+    #[test]
+    fn the_https_source_can_actually_be_constructed() {
+        HttpJwksSource::new().expect("reqwest 클라이언트 조립");
+        // 두 번 불러도 프로바이더 설치가 실패하지 않는다.
+        HttpJwksSource::new().expect("두 번째 조립");
+    }
+
+    /// 검증기 조립도 같은 경로를 탄다.
+    #[test]
+    fn the_verifier_with_https_can_be_constructed() {
+        let users: std::sync::Arc<dyn dbmon_core::ports::UserStore> =
+            std::sync::Arc::new(NoUsers);
+        assert!(
+            CognitoVerifier::with_https(users).is_some(),
+            "검증기가 조립되지 않으면 Cognito 로 들어올 수 없다"
+        );
     }
 
     #[test]

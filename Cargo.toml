@@ -75,6 +75,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 # 이미 이 프로바이더를 쓰므로, `ring` 을 더하면 위와 같은 프로바이더 충돌이 된다.
 # API 는 `ring` 과 호환된다(aws-lc-rs 가 그렇게 설계됐다).
 aws-lc-rs = "1"
+# 프로세스 기본 CryptoProvider 를 **명시적으로** 설치하기 위해 직접 의존한다.
+# 이미 트리에 있으므로 크레이트가 늘지 않는다.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 aws-sigv4 = { version = "1", features = ["http1"] }
 percent-encoding = "2"
 aws-credential-types = "1"
