@@ -240,6 +240,17 @@ impl SlowLogFetcher for CloudWatchFetcher {
             if token.is_none() {
                 break;
             }
+            // **누적 크기 상한.** 페이지 20개 × 이벤트 1만 개는 수십 MB 가 될 수 있고,
+            // 태스크 메모리가 1GB 다. 크기로 먼저 끊고 다음 라운드에 넘긴다.
+            if text.len() >= MAX_CHUNK_BYTES {
+                tracing::info!(
+                    bytes = text.len(),
+                    instance = %instance.as_str(),
+                    "슬로우로그 청크가 크기 상한에 닿았다 — 나머지는 다음 라운드가 읽는다"
+                );
+                hit_cap = true;
+                break;
+            }
             // 마지막 반복에서도 토큰이 남았다면 상한에 걸린 것이다.
             if page + 1 == MAX_PAGES {
                 hit_cap = true;
@@ -253,11 +264,50 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // 남은 이벤트가 마지막 타임스탬프와 같을 수 있으므로 `+1` 하면 지나친다.
             // 같은 이벤트를 다시 읽는 것은 안전하다 — 저장이 `record_id` 로 병합한다.
             // 다 읽었으면 `+1` 로 올려 재읽기를 없앤다.
-            next_since_ms: last_ts.map(|t| if hit_cap { t } else { t + 1 }),
+            //
+            // ⚠ **단, 전진은 보장한다.** `last_ts` 가 `since_ms` 보다 크지 않으면 다음
+            // 라운드가 같은 자리에서 시작해 **영원히 같은 것을 읽는다**(진행 0). 한
+            // 밀리초에 상한을 넘는 이벤트가 있다는 뜻이므로, 그때는 넘기고 그 사실을
+            // 크게 남긴다 — 멈춰 있는 것이 건너뛰는 것보다 나쁘다.
+            next_since_ms: last_ts.map(|t| {
+                let next = next_since(since_ms, t, hit_cap);
+                if hit_cap && next > t {
+                    tracing::warn!(
+                        instance = %instance.as_str(),
+                        since_ms,
+                        last_ts = t,
+                        "한 밀리초에 페이지 상한을 넘는 이벤트가 있다 — 일부를 건너뛴다"
+                    );
+                }
+                next
+            }),
             has_more: hit_cap,
         })
     }
 }
+
+/// 다음 라운드가 시작할 시각.
+///
+/// # 전진을 보장한다
+///
+/// 상한(`hit_cap`)에 걸렸으면 남은 이벤트가 마지막 타임스탬프와 같을 수 있으므로 `+1`
+/// 하면 지나친다 — 그 구간이 **영구히 유실된다**. 그래서 경계를 다시 읽는다(중복은
+/// `record_id` 로 병합되므로 안전하다).
+///
+/// ⚠ 단 `last_ts` 가 `since_ms` 보다 크지 않으면 다음 라운드가 **같은 자리에서 시작해
+/// 영원히 같은 것을 읽는다**(진행 0). 한 밀리초에 상한을 넘는 이벤트가 있다는 뜻이므로
+/// 그때는 넘긴다 — 멈춰 있는 것이 건너뛰는 것보다 나쁘다. 호출부가 그 사실을 경고로
+/// 남긴다.
+fn next_since(since_ms: EpochMs, last_ts: EpochMs, hit_cap: bool) -> EpochMs {
+    if hit_cap && last_ts > since_ms {
+        last_ts
+    } else {
+        last_ts + 1
+    }
+}
+
+/// 한 청크의 누적 크기 상한. 페이지 상한과 함께 메모리를 묶는다.
+const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// 한 라운드에 따라갈 페이지 상한.
 ///
@@ -343,6 +393,36 @@ mod tests {
             slowquery_log_group(&instance()).expect("이름"),
             "/aws/rds/instance/orders-01/slowquery"
         );
+    }
+
+    /// **다음 시작 시각은 항상 전진한다.**
+    ///
+    /// 상한에 걸렸을 때 경계를 다시 읽는 것은 유실을 막지만, `last_ts == since_ms` 면
+    /// 다음 라운드가 같은 자리에서 시작해 **영원히 같은 것을 읽는다.** 진행이 0 인
+    /// 백필은 멈춘 것과 같고, 멈춘 것은 건너뛰는 것보다 나쁘다.
+    #[test]
+    fn the_checkpoint_always_moves_forward() {
+        // 다 읽었으면 +1 (재읽기 없음).
+        assert_eq!(next_since(100, 500, false), 501);
+        // 상한에 걸렸으면 경계를 다시 읽는다 — 그 구간을 지나치지 않는다.
+        assert_eq!(next_since(100, 500, true), 500);
+        // **그러나 전진해야 한다.** 같은 자리면 넘긴다.
+        assert_eq!(next_since(500, 500, true), 501);
+        // 뒤로 가는 경우(시계 역행·이상 응답)도 전진시킨다.
+        assert_eq!(next_since(600, 500, true), 501);
+
+        // 성질: 어떤 입력에도 결과가 `since_ms` 보다 크거나, 최소한 같지 않다.
+        for since in [0i64, 1, 100, 1_787_000_000_000] {
+            for last in [0i64, 1, 99, 100, 101, 1_787_000_000_000] {
+                for cap in [false, true] {
+                    let n = next_since(since, last, cap);
+                    assert!(
+                        n > since || n > last,
+                        "since={since} last={last} cap={cap} → {n} (전진하지 않는다)"
+                    );
+                }
+            }
+        }
     }
 
     /// **리전이 다르면 조회하지 않는다.**
