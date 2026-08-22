@@ -39,7 +39,12 @@ use mysql_async::{Conn, Opts, Row, Value};
 const ER_NONEXISTING_GRANT: u16 = 1141;
 
 /// `mysql.user` 에서 계정 상태를 읽는다. 계정이 없으면 행이 없다.
-const USER_STATE: &str = "SELECT plugin, ssl_type, account_locked \
+///
+/// `authentication_string` 을 **SHA2 로 해시해서** 읽는다. 원문(비밀번호 해시)은
+/// 오프라인 대입 공격의 재료이므로 프로세스 메모리에도 들이지 않는다 — 우리가
+/// 필요한 것은 "계획 이후에 바뀌었는가" 뿐이다.
+const USER_STATE: &str = "SELECT plugin, ssl_type, account_locked, \
+                          SHA2(COALESCE(authentication_string, ''), 256) \
                           FROM mysql.user WHERE user = ? AND host = ?";
 
 /// 대상 DB 에 붙은 마스터 연결.
@@ -72,9 +77,16 @@ impl MasterConn {
         iam_auth_enabled: bool,
     ) -> Result<CurrentState> {
         let user_state = self.user_state(&desired.user, &desired.host).await?;
-        let (user_exists, auth_plugin, requires_ssl, locked) = match user_state {
-            Some(s) => (true, Some(s.plugin), s.requires_ssl, s.locked),
-            None => (false, None, false, false),
+        let (user_exists, auth_plugin, requires_ssl, locked, auth_string_digest) = match user_state
+        {
+            Some(s) => (
+                true,
+                Some(s.plugin),
+                s.requires_ssl,
+                s.locked,
+                s.auth_string_digest,
+            ),
+            None => (false, None, false, false, None),
         };
 
         let (grants, unparsed_grants) = if user_exists {
@@ -93,6 +105,7 @@ impl MasterConn {
             grants,
             unparsed_grants,
             iam_auth_enabled,
+            auth_string_digest,
         })
     }
 
@@ -193,6 +206,8 @@ pub struct UserState {
     pub plugin: String,
     pub requires_ssl: bool,
     pub locked: bool,
+    /// `SHA2(authentication_string, 256)`. **원문을 담지 않는다.**
+    pub auth_string_digest: Option<String>,
 }
 
 impl UserState {
@@ -201,6 +216,7 @@ impl UserState {
             plugin: column_string(row, 0).unwrap_or_default(),
             requires_ssl: is_ssl_required(column_string(row, 1).as_deref().unwrap_or("")),
             locked: is_yes(column_string(row, 2).as_deref().unwrap_or("")),
+            auth_string_digest: column_string(row, 3),
         }
     }
 }
@@ -322,6 +338,7 @@ mod tests {
             grants,
             unparsed_grants: vec![],
             iam_auth_enabled: true,
+            auth_string_digest: Some("digest".into()),
         };
         let desired = Desired {
             user: "dbmon".into(),

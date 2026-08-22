@@ -196,11 +196,14 @@ impl BootstrapService {
             .await;
 
         match result {
-            Ok((outcome, mut record)) => {
-                record.actor = self.actor.clone();
-                self.record(&record).await;
-                Ok(outcome)
+            Ok(mut report) => {
+                report.record.actor = self.actor.clone();
+                // **성공이든 실패든 먼저 쓴다.** 실패 경로에서 감사를 건너뛰면
+                // 반쪽 상태(계정은 있고 권한은 없음)에 기록이 남지 않는다.
+                self.record(&report.record).await;
+                report.result
             }
+            // 대상 DB 에 닿기 전에 거부됐다 — 남길 것이 없다.
             Err(e) => Err(e),
         }
     }

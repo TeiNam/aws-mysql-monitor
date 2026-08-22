@@ -302,6 +302,16 @@ aws dynamodb update-item --table-name dbmon-config-dev \
 
 그룹이 없으면 권한 없음(fail-closed). 여러 그룹에 속하면 가장 높은 권한.
 
+**이것이 코드의 동작이다** (`AuthContext::intersect`). 한동안 그렇지 않았다 — 빈 그룹을
+"토큰이 좁히지 않는다" 로 읽어 서버 역할을 그대로 썼고, 그러면 사용자를 Cognito
+그룹에서 빼도 여전히 admin 이었다(교차 리뷰 31라운드). Cognito 는 **네이티브 사용자의
+그룹 멤버십을 `cognito:groups` 에 자동으로 넣으므로**(트리거가 필요 없다) 빈 목록은
+"정보 없음" 이 아니라 "그룹이 없다" 다.
+
+⚠ **IdP 페더레이션을 붙일 때** 는 Pre Token Generation 트리거로 그룹을 주입해야 한다
+(§2.3). 그러지 않으면 IdP 사용자는 그룹 클레임이 비어 권한을 받지 못한다. 이 프로젝트는
+아직 IdP 를 배선하지 않았다.
+
 ### 4.2 권한 매트릭스
 
 | 동작 | admin | operator | viewer |

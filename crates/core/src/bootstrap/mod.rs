@@ -204,12 +204,30 @@ pub fn is_valid_account_name(s: &str) -> bool {
 /// `dbmon@app.internal` 같은 이름 기반 호스트는 MySQL 이 **역방향 DNS 로 판정**한다.
 /// DNS 를 인증 경계로 쓰면 그 경계가 DNS 침해로 넘어간다. CIDR 축약(`10.1.%`)만 받는다.
 pub fn is_valid_host_pattern(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 60
-        && s.chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '%' || c == '_')
-        // `%` 단독은 "어디서든" 이다 — T-04 가 막으려는 값이다.
-        && s != "%"
+    if s.is_empty() || s.len() > 60 {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == '%' || c == '_')
+    {
+        return false;
+    }
+    // **"어디서든" 과 같은 값을 전부 막는다** (T-04).
+    //
+    // `s != "%"` 만 보면 `%%`·`%.%`·`_%` 가 통과한다. 그것들은 MySQL 에서 `%` 와
+    // 똑같이 모든 호스트를 매칭한다 — 교차 리뷰가 잡은 결함이다.
+    //
+    // 판정 기준을 바꾼다: **숫자가 하나도 없으면 거부한다.** IPv4 접두어를 좁히는
+    // 것이 이 필드의 목적이므로, 숫자가 없는 패턴은 좁히지 않는다.
+    if !s.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // 연속된 `%` 는 의미가 없고(한 개와 같다) 실수의 신호다.
+    if s.contains("%%") {
+        return false;
+    }
+    true
 }
 
 /// 스키마 이름 — 영숫자·밑줄·하이픈. 64자.
@@ -235,6 +253,58 @@ pub struct CurrentState {
     pub unparsed_grants: Vec<String>,
     /// 인스턴스에서 IAM DB 인증이 켜져 있는가 (`DescribeDB*`).
     pub iam_auth_enabled: bool,
+    /// `mysql.user.authentication_string` 의 **해시**. 원문을 담지 않는다.
+    ///
+    /// # 왜 필요한가 (교차 리뷰가 잡은 결함)
+    ///
+    /// 계획과 실행 사이에 **비밀번호가 바뀌면** 플러그인·SSL·권한은 그대로이므로
+    /// 기존 검사가 전부 통과한다. 비밀번호 폴백 경로에서는 그 계정의 비밀번호를
+    /// 아는 쪽이 우리가 아닐 수 있고, 그 계정에 `GRANT` 하면 T-28 시나리오가 성립한다.
+    ///
+    /// 원문(해시된 비밀번호)을 담지 않는 이유: 그 값 자체가 오프라인 대입 공격의
+    /// 재료다. 우리가 필요한 것은 "바뀌었는가" 뿐이므로 해시로 충분하다.
+    pub auth_string_digest: Option<String>,
+}
+
+impl CurrentState {
+    /// **보안 판정에 쓰이는 상태의 지문.**
+    ///
+    /// 계획과 실행 사이에 이 값이 바뀌면 거부한다. [`Plan::fingerprint`] 는 *액션* 을
+    /// 해시하므로 액션이 같아지는 상태 변화(비밀번호 교체 등)를 못 잡는다 — 그게
+    /// 교차 리뷰가 지적한 자리다.
+    pub fn security_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update([
+            self.user_exists as u8,
+            self.requires_ssl as u8,
+            self.locked as u8,
+        ]);
+        h.update(self.auth_plugin.as_deref().unwrap_or("<none>").as_bytes());
+        h.update(b"\0");
+        h.update(
+            self.auth_string_digest
+                .as_deref()
+                .unwrap_or("<none>")
+                .as_bytes(),
+        );
+        h.update(b"\0");
+        h.update([self.grants.has_grant_option as u8]);
+        // 권한 집합 전체. 정렬된 `BTreeMap`/`BTreeSet` 이라 순회가 결정적이다.
+        for (scope, privs) in self.grants.scopes() {
+            h.update(format!("{scope}").as_bytes());
+            for p in privs {
+                h.update(b"|");
+                h.update(p.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        for r in self.grants.roles() {
+            h.update(b"role|");
+            h.update(r.as_bytes());
+        }
+        format!("{:x}", h.finalize())
+    }
 }
 
 /// 실행할 액션 하나.
@@ -270,6 +340,16 @@ pub enum Blocker {
     IamAuthDisabled,
     /// 계획 시점과 실행 시점의 상태가 다르다.
     PlanStale { expected: String, found: String },
+    /// 비밀번호 방식인데 계정이 이미 있다.
+    ///
+    /// # 왜 차단인가 (교차 리뷰가 잡은 결함)
+    ///
+    /// 플러그인이 기대와 같아도 **그 계정의 비밀번호를 우리가 안다고 증명할 수 없다.**
+    /// 누가 먼저 만들었을 수 있고, 그러면 `GRANT` 는 남이 아는 계정에 권한을 준다.
+    /// IAM 방식은 비밀번호가 없으므로 이 문제가 없다 — 그래서 비밀번호 방식만 막는다.
+    ///
+    /// 되살리려면 사람이 계정을 지우거나 `ALTER USER` 로 비밀번호를 다시 세운다.
+    PasswordAccountAlreadyExists,
 }
 
 impl std::fmt::Display for Blocker {
@@ -307,6 +387,12 @@ impl std::fmt::Display for Blocker {
             Self::PlanStale { expected, found } => write!(
                 f,
                 "계획을 만든 뒤 상태가 바뀌었다 (계획: {expected}, 현재: {found})"
+            ),
+            Self::PasswordAccountAlreadyExists => write!(
+                f,
+                "비밀번호 방식인데 계정이 이미 있다 — 그 비밀번호를 우리가 안다고 \
+                 증명할 수 없으므로 권한을 주지 않는다. 계정을 지우거나 비밀번호를 \
+                 다시 세운 뒤 계획을 만든다"
             ),
         }
     }
@@ -432,6 +518,10 @@ pub fn plan(
         if current.grants.has_grant_option {
             blockers.push(Blocker::GrantOptionPresent);
         }
+        // **비밀번호 방식은 기존 계정을 받지 않는다.** 근거는 변형 문서에 있다.
+        if desired.auth == AuthMethod::Password {
+            blockers.push(Blocker::PasswordAccountAlreadyExists);
+        }
     } else {
         actions.push(Action::Sql(sql::create_user(desired)?));
     }
@@ -491,15 +581,31 @@ pub fn revalidate(
     is_production: bool,
     stored_fingerprint: &str,
     planned_user_exists: bool,
+    stored_state_digest: &str,
 ) -> Result<Plan, Vec<Blocker>> {
-    // **(b) 계획은 계정이 없다고 했는데 지금 있으면 거부한다.**
+    // ── 검사 순서는 **진단 품질** 순이다 ──
     //
-    // 지문 비교보다 **먼저** 본다. T-28 시나리오는 "계획 이후에 누가 계정을 만들었다"
-    // 이고, 그 사실을 지문 불일치가 아니라 그대로 말해 줘야 진단이 된다.
+    // 세 검사가 같은 사건을 잡을 수 있다. 사람에게 무슨 일이 있었는지 말해 주는
+    // 검사를 먼저 둔다 — "지문이 다르다" 는 맞지만 아무것도 알려주지 않는다.
+
+    // **(b) 계획은 계정이 없다고 했는데 지금 있다.**
+    //
+    // T-28 시나리오의 머리말이다. 이 사실을 그대로 말해 줘야 사람이 대응할 수 있다.
     if !planned_user_exists && current.user_exists {
         return Err(vec![Blocker::PlanStale {
             expected: "계정 없음".into(),
             found: "계정이 이미 존재한다 — 계획 이후에 누가 만들었다".into(),
+        }]);
+    }
+
+    // **(a′) 보안 상태가 그대로인가.**
+    //
+    // 계획 이후에 비밀번호가 바뀌었거나 권한이 늘었으면 **액션이 같아도** 상황이
+    // 다르다. 액션 지문은 그것을 못 잡는다 — 교차 리뷰가 잡은 T-28 잔여 경로다.
+    if current.security_digest() != stored_state_digest {
+        return Err(vec![Blocker::PlanStale {
+            expected: "계획 시점의 계정 상태".into(),
+            found: "계정 상태가 바뀌었다 (인증 자료·권한·SSL·잠금 중 하나) — 다시 계획한다".into(),
         }]);
     }
 
@@ -561,6 +667,7 @@ mod tests {
             grants,
             unparsed_grants: vec![],
             iam_auth_enabled: true,
+            auth_string_digest: None,
         }
     }
 
@@ -885,6 +992,115 @@ mod tests {
         assert!(schemas::is_system_schema("mysql"));
     }
 
+    /// **`%` 와 같은 뜻인 호스트 패턴을 전부 막는다** (교차 리뷰가 잡은 결함).
+    ///
+    /// `s != "%"` 만 보면 `%%`·`%.%`·`_` 가 통과하는데 MySQL 에서는 전부 모든 호스트를
+    /// 매칭한다 — T-04 가 막으려던 것이 그대로 통과한다.
+    #[test]
+    fn host_patterns_equivalent_to_wildcard_are_rejected() {
+        for h in ["%", "%%", "%.%", "_", "___", "%._", "..", ".", "%%%"] {
+            let d = Desired {
+                host: h.into(),
+                ..desired()
+            };
+            assert!(
+                matches!(d.validate(), Err(InvalidDesired::Host(_))),
+                "{h:?} 가 통과했다 — 모든 호스트를 허용한다"
+            );
+        }
+        // 숫자로 좁힌 패턴만 받는다.
+        for h in ["10.1.%", "10.1.2.3", "10.%.%.%", "10.1.__", "192.168.%"] {
+            let d = Desired {
+                host: h.into(),
+                ..desired()
+            };
+            assert!(d.validate().is_ok(), "{h} 가 막혔다");
+        }
+    }
+
+    /// **비밀번호 방식은 기존 계정을 받지 않는다** (교차 리뷰가 잡은 결함).
+    ///
+    /// 플러그인이 같아도 그 비밀번호를 우리가 안다고 증명할 수 없다. IAM 방식은
+    /// 비밀번호가 없으므로 이 제약이 없다.
+    #[test]
+    fn password_mode_refuses_a_preexisting_account() {
+        let current = CurrentState {
+            auth_plugin: Some("mysql_native_password".into()),
+            ..fully_granted()
+        };
+        let pw_desired = Desired {
+            auth: AuthMethod::Password,
+            ..desired()
+        };
+        let p = plan(&pw_desired, &current, "inst", false).expect("계획");
+        assert!(
+            p.blockers.contains(&Blocker::PasswordAccountAlreadyExists),
+            "{:?}",
+            p.blockers
+        );
+
+        // IAM 방식은 같은 상황에서 이 차단이 없다 (플러그인 불일치로 걸릴 뿐이다).
+        let iam = plan(&desired(), &fully_granted(), "inst", false).expect("계획");
+        assert!(
+            !iam.blockers
+                .contains(&Blocker::PasswordAccountAlreadyExists)
+        );
+    }
+
+    /// **인증 자료가 바뀌면 재검증이 거부한다** (교차 리뷰가 잡은 T-28 잔여 경로).
+    ///
+    /// 플러그인·SSL·권한이 그대로면 액션 지문이 같으므로, 그것만으로는 "계획 후
+    /// 비밀번호가 바뀌었다" 를 못 잡는다.
+    #[test]
+    fn a_credential_change_between_plan_and_apply_is_refused() {
+        let before = CurrentState {
+            auth_string_digest: Some("digest-of-old-password".into()),
+            ..fully_granted()
+        };
+        let planned = plan(&desired(), &before, "inst", false).expect("계획");
+        let fp = planned.fingerprint();
+        let sd = before.security_digest();
+
+        // 같은 상태면 통과한다.
+        assert!(revalidate(&desired(), &before, "inst", false, &fp, true, &sd).is_ok());
+
+        // 비밀번호만 바뀌었다 — 액션은 같다(둘 다 noop).
+        let after = CurrentState {
+            auth_string_digest: Some("digest-of-NEW-password".into()),
+            ..fully_granted()
+        };
+        assert_eq!(
+            plan(&desired(), &after, "inst", false)
+                .expect("계획")
+                .fingerprint(),
+            fp,
+            "전제: 액션 지문은 같다"
+        );
+        let err = revalidate(&desired(), &after, "inst", false, &fp, true, &sd)
+            .expect_err("거부해야 한다");
+        assert!(
+            matches!(err.first(), Some(Blocker::PlanStale { .. })),
+            "{err:?}"
+        );
+    }
+
+    /// 상태 지문이 **권한 변화도** 잡는다.
+    #[test]
+    fn the_state_digest_covers_grant_changes() {
+        let a = fully_granted();
+        let (grants, _) = grants::parse_grants([
+            "GRANT SELECT, PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`",
+            "GRANT INSERT ON `shop`.* TO `dbmon`@`10.1.%`",
+        ]);
+        let b = CurrentState {
+            grants,
+            ..fully_granted()
+        };
+        assert_ne!(a.security_digest(), b.security_digest());
+        // 같은 상태는 같은 지문이다 (재검증이 성립하려면 필요하다).
+        assert_eq!(a.security_digest(), fully_granted().security_digest());
+    }
+
     // ── 지문과 재검증 (§2.6.1 a·b) ────────────────────────────────────────────
 
     #[test]
@@ -910,8 +1126,11 @@ mod tests {
             requires_ssl: false,
             ..fresh_instance()
         };
-        let err = revalidate(&desired(), &hijacked, "inst", false, &fp, false)
+        let sd = fresh_instance().security_digest();
+        let err = revalidate(&desired(), &hijacked, "inst", false, &fp, false, &sd)
             .expect_err("거부해야 한다");
+        // **"계정이 나타났다" 로 진단돼야 한다.** 상태 지문 불일치로만 걸리면
+        // 사람이 무슨 일이 있었는지 모른다 — T-28 시나리오는 그 사실이 요점이다.
         assert!(
             matches!(err.first(), Some(Blocker::PlanStale { found, .. }) if found.contains("이미 존재")),
             "{err:?}"
@@ -923,7 +1142,16 @@ mod tests {
         let current = fresh_instance();
         let planned = plan(&desired(), &current, "inst", false).expect("계획");
         let fp = planned.fingerprint();
-        let ok = revalidate(&desired(), &current, "inst", false, &fp, false).expect("통과");
+        let ok = revalidate(
+            &desired(),
+            &current,
+            "inst",
+            false,
+            &fp,
+            false,
+            &current.security_digest(),
+        )
+        .expect("통과");
         assert_eq!(ok.actions, planned.actions);
     }
 
@@ -937,6 +1165,17 @@ mod tests {
             iam_auth_enabled: false,
             ..fresh_instance()
         };
-        assert!(revalidate(&desired(), &changed, "inst", false, &fp, false).is_err());
+        assert!(
+            revalidate(
+                &desired(),
+                &changed,
+                "inst",
+                false,
+                &fp,
+                false,
+                &fresh_instance().security_digest()
+            )
+            .is_err()
+        );
     }
 }

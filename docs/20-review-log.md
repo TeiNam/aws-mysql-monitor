@@ -2409,3 +2409,74 @@ DynamoDB 쓰기까지 유지된다는 점, 세 카운터가 서로 겹치지 않
 
 **남는 것:** 이 오류를 코드가 미리 못 잡는다. `describe-db-clusters` 로 Aurora 를 골라
 클러스터 id 를 자동으로 채우면 변수 자체가 사라진다 — M3 부트스트랩 작업과 함께 볼 자리다.
+
+
+---
+
+## 31라운드 — M3 부트스트랩 + Cognito 검증 (2026-08-23)
+
+교차 리뷰가 `NO-SHIP` 과 blocker 8건을 냈다. 6번은 리뷰가 읽기 전에 내가 이미 고쳤고
+(자체 리뷰로 같은 것을 찾았다), 나머지 7건은 전부 유효했다.
+
+### 실측으로 확인한 것 — `GRANT` 의 스키마 이름은 **패턴**이다
+
+가장 위험한 발견이다. `partial_revokes` 가 꺼져 있으면(RDS MySQL 8.4.11 기본값)
+`_` 와 `%` 가 와일드카드로 해석된다. **백틱으로 감싸도 그렇다.**
+
+```sql
+-- dbmon-seed-dev-mysql 에서 실행
+CREATE DATABASE dbmon_wild_a; CREATE DATABASE dbmon_wildXa;
+GRANT SELECT ON `dbmon_wild_a`.* TO 'dbmon_wildtest'@'10.1.%';
+```
+
+그 계정으로 붙으면:
+
+```
+SHOW DATABASES → dbmon_wildXa, dbmon_wild_a, information_schema, performance_schema
+SELECT COUNT(*) FROM dbmon_wildXa.t → 0    ← 읽힌다
+```
+
+**`order_items` 같은 흔한 이름 하나가 의도하지 않은 스키마를 열어 준다.** 모드 B
+(화이트리스트)의 요점이 정확히 그것을 막는 것이므로 치명적이었다.
+
+백슬래시 이스케이프가 정확히 막는다(실측):
+
+```sql
+GRANT SELECT ON `dbmon_wild\_a`.* TO 'dbmon_wildtest'@'10.1.%';
+→ SHOW DATABASES 에 dbmon_wild_a 만. dbmon_wildXa 는 SELECT command denied.
+```
+
+`ident::quote_grant_schema` / `unescape_grant_pattern` 을 만들고 왕복 테스트로 고정했다
+— 벗기지 않으면 차집합이 매번 같은 `GRANT` 를 요구해 멱등성이 깨진다.
+
+### blocker 표
+
+| # | 지적 | 실제 | 고친 것 |
+|---|---|---|---|
+| 1 | Cognito 모드에서도 공유 토큰이 admin 으로 통과 | ✅ CRITICAL | **실효 모드가 수단을 하나로 정한다.** "순서대로 시도" 를 버렸다 — 그러면 전환이 끝나지 않는다 |
+| 2 | 같은 플러그인의 선점 계정을 식별 못함 | ✅ (비밀번호 경로) | `authentication_string` 을 **SHA2 해시로** 읽어 `CurrentState::security_digest` 에 넣고, 비밀번호 방식은 기존 계정을 항상 차단 |
+| 3 | 화이트리스트가 의미상 와일드카드 허용 | ✅ CRITICAL (실측) | 위 절 + 호스트 패턴에 "숫자가 없으면 거부" 규칙 (`%%`·`%.%`·`_` 를 막는다) |
+| 4 | 빈 Cognito 그룹이 서버 admin 으로 승격 | ✅ CRITICAL | `highest_from_groups` 가 `None` 이면 **거부**한다. Cognito 는 네이티브 사용자 그룹을 자동으로 클레임에 넣으므로 빈 목록은 "정보 없음" 이 아니다 |
+| 5 | `claims_version` 검사가 항상 참 | ✅ HIGH | `TokenClaims::claims_version` 을 `Option<u32>` 로. **없는 정보로 판정을 흉내내지 않는다** |
+| 6 | JWKS TTL·레이트 리밋이 동작하지 않음 | ✅ (자체 리뷰가 먼저 잡았다) | `key()` 를 `lookup() -> KeyLookup` 으로. 두 분기가 같은 값을 반환해 리밋 판정이 버려지고 있었다 |
+| 7 | 손상된 USER 레코드가 fail-open | ✅ HIGH | **없는 것과 타입이 틀린 것을 구분한다.** `disabled: S:"true"` 가 `false` 로 읽혀 비활성 admin 이 통과했다 |
+| 8 | 컬럼 GRANT 를 테이블 전체로 판정 | ✅ HIGH | `SELECT (COLUMNS)` 로 다른 권한으로 기록. `covers("SELECT")` 가 거짓이 되고 초과 권한으로도 잡힌다 |
+
+### 내가 스스로 찾은 것 (리뷰 대기 중 병행)
+
+| 결함 | 왜 위험했나 |
+|---|---|
+| JWKS `key()` 가 리밋 판정을 버린다 | TTL 이 무한이 되고(키 회전을 못 따라간다), 무작위 `kid` 로 오는 요청마다 JWKS 를 가져온다(외부 호출 증폭) |
+| 부분 실패 시 감사 레코드를 버린다 | 계정은 만들어졌고 권한은 반쪽인데 기록이 없다 — 감사가 가장 필요한 순간이다. `ApplyReport` 로 레코드를 항상 돌려준다 |
+| `reqwest` 가 rustls 프로바이더를 둘로 만든다 | 통합 테스트 8개가 첫 TLS 연결에서 패닉. `-no-provider` + `aws-lc-rs` 로 통일 |
+| 생성기가 Aurora 클러스터 시크릿을 못 본다 | **다른 DB 의 자격증명**으로 18849회 접속 시도. IAM 클러스터 리소스 id 문제와 같은 부류 |
+
+### 남은 것
+
+- **`partial_revokes`** 를 읽지 않는다. 켜져 있으면 이스케이프가 불필요하고(오히려
+  이름에 백슬래시가 든 스키마를 찾는다), 지금은 꺼져 있다고 가정한다. RDS 기본값이
+  꺼짐이고 켜는 것은 명시적 파라미터 그룹 변경이므로 실용적 위험은 낮다 —
+  자가진단에 `@@partial_revokes` 를 노출하는 것이 다음 순서다.
+- **IdP 페더레이션.** 4번 수정으로 그룹 클레임이 필수가 됐으므로, IdP 사용자는 Pre
+  Token Generation 트리거로 그룹을 주입해야 한다. 이 프로젝트는 IdP 를 배선하지
+  않았으므로 지금 깨지는 사용자는 없다.

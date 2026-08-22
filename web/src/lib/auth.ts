@@ -18,7 +18,12 @@
  * `localStorage` 를 쓰지 않는 이유: 탭을 닫으면 사라지는 편이 맞다.
  */
 
-const STORAGE_KEY = "dbmon.token";
+/**
+ * 액세스 토큰 저장 키. **`cognito.ts` 도 이걸 쓴다** — 두 곳이 문자열을 각자 적으면
+ * 키를 바꿀 때 한쪽만 고쳐지고, 그러면 로그인은 되는데 요청에 토큰이 안 붙는다.
+ */
+export const TOKEN_STORAGE_KEY = "dbmon.token";
+const STORAGE_KEY = TOKEN_STORAGE_KEY;
 const TOKEN_PARAM = "token";
 
 /**

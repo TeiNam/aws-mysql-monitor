@@ -17,6 +17,8 @@
  * 맞고, XSS 가 있을 때 노출 창이 짧다. 기존 공유 토큰 경로(`auth.ts`)와 같은 판단이다.
  */
 
+import { TOKEN_STORAGE_KEY } from "./auth";
+
 const VERIFIER_KEY = "dbmon.pkce.verifier";
 const STATE_KEY = "dbmon.pkce.state";
 const REFRESH_KEY = "dbmon.cognito.refresh";
@@ -276,7 +278,7 @@ export function expiryOf(expiresInSec: number, nowMs: number): number {
 
 function storeTokens(tokens: TokenResponse): void {
   // 액세스 토큰은 기존 경로(`auth.ts`)에 저장한다 — `authHeaders()` 가 한 곳만 본다.
-  sessionStorage.setItem("dbmon.token", tokens.access_token);
+  sessionStorage.setItem(TOKEN_STORAGE_KEY, tokens.access_token);
   if (tokens.refresh_token) {
     sessionStorage.setItem(REFRESH_KEY, tokens.refresh_token);
   }
@@ -288,7 +290,7 @@ function storeTokens(tokens: TokenResponse): void {
 
 /** 세션을 버린다. */
 export function clearSession(): void {
-  for (const k of [VERIFIER_KEY, STATE_KEY, REFRESH_KEY, EXPIRES_KEY, "dbmon.token"]) {
+  for (const k of [VERIFIER_KEY, STATE_KEY, REFRESH_KEY, EXPIRES_KEY, TOKEN_STORAGE_KEY]) {
     sessionStorage.removeItem(k);
   }
 }
