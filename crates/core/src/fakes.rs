@@ -311,6 +311,10 @@ impl DigestTextEntry {
 #[derive(Default)]
 pub struct FakeInstanceRegistry {
     items: Mutex<BTreeMap<String, Instance>>,
+    /// 마지막으로 미발견을 센 시각. **실제 어댑터의 `missing_at_ms` 속성과 같은 역할**
+    /// 이다 — 한 라운드를 두 번 세지 않기 위한 것이고, `Instance` 필드가 아니므로
+    /// 여기 따로 둔다.
+    missing_at: Mutex<BTreeMap<String, EpochMs>>,
 }
 
 impl FakeInstanceRegistry {
@@ -351,6 +355,20 @@ impl InstanceRegistry for FakeInstanceRegistry {
                 kind: "인스턴스",
                 id: id.to_string(),
             })?;
+        // **한 라운드를 두 번 세지 않는다.** 실제 어댑터는 `missing_at_ms` 를 항목에
+        // 쓰고 조건부 갱신으로 막는다. 페이크가 그 규칙을 빼면 페이크로 테스트하는
+        // 코드가 실제와 다른 동작을 본다 — `deleted_at_ms` 계약에서 이미 겪었다.
+        let last = self.missing_at.lock().unwrap().get(id.as_str()).copied();
+        if let Some(prev) = last {
+            if now_ms - prev < crate::instance::MISSING_MIN_GAP_MS {
+                return Ok(inst.clone());
+            }
+        }
+        self.missing_at
+            .lock()
+            .unwrap()
+            .insert(id.as_str().to_string(), now_ms);
+
         inst.missing_count += 1;
         // 1회 API 실패로 삭제되지 않는다 (FR-DSC-07).
         // **술어를 여기서 다시 적지 않는다** — 상수만 공유하면 규칙의 드리프트를 못 막는다.
@@ -375,6 +393,15 @@ impl InstanceRegistry for FakeInstanceRegistry {
                 kind: "인스턴스",
                 id: id.to_string(),
             })?;
+        // **"수집하지 않는다" 는 결정을 덮지 않는다.** 실제 어댑터가 조건부 갱신으로
+        // 막고 `Conflict` 를 올린다 — 규칙과 오류 종류를 함께 맞춘다.
+        if crate::instance::blocks_state_write(inst.state) {
+            return Err(DomainError::Conflict(format!(
+                "{}: 수집 대상이 아닌 상태여서 {} 로 바꾸지 않았다",
+                id.as_str(),
+                state.as_str()
+            )));
+        }
         inst.state = state;
         Ok(())
     }
@@ -388,6 +415,8 @@ impl InstanceRegistry for FakeInstanceRegistry {
             // 단위 테스트하는 코드는 실제 동작과 다른 상태를 본다(2차 리뷰가 지적).
             inst.deleted_at_ms = None;
         }
+        // 중복 제거 도장도 지운다 — 남으면 다시 사라졌을 때 첫 미발견이 거부된다.
+        self.missing_at.lock().unwrap().remove(id.as_str());
         Ok(())
     }
 }

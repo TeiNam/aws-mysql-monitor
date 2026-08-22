@@ -49,6 +49,24 @@ resource "aws_iam_role_policy" "execution_kms" {
   })
 }
 
+# 공유 접속 토큰을 주입하기 위한 권한. **실행 롤**이다 — 태스크 롤이 아니다.
+#
+# 주입은 컨테이너 기동 **전에** ECS 에이전트가 한다. 앱에게 이 권한을 주면 앱이
+# 침해됐을 때 자기 자신의 열쇠를 다시 읽을 수 있게 되고, 그건 필요 없는 능력이다.
+resource "aws_iam_role_policy" "execution_secrets" {
+  count = var.auth_token_secret_arn == "" ? 0 : 1
+  name  = "auth-token-secret"
+  role  = aws_iam_role.execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = var.auth_token_secret_arn
+    }]
+  })
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 태스크 역할 — 우리 프로세스의 권한
 # ─────────────────────────────────────────────────────────────────────────────

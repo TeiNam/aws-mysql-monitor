@@ -106,6 +106,17 @@ resource "aws_ecs_task_definition" "app" {
       for k, v in local.app_env : { name = k, value = v }
     ]
 
+    # **토큰은 `environment` 가 아니라 `secrets` 로 넣는다.**
+    #
+    # `environment` 에 두면 값이 태스크 정의에 평문으로 남고, 태스크 정의는
+    # `ecs:DescribeTaskDefinition` 을 가진 누구나 읽는다. `secrets` 는 ARN 만 남기고
+    # ECS 에이전트가 기동 시점에 주입한다 — 실행 롤이 그 비밀을 읽을 권한을 갖는다
+    # (아래 `execution_secrets` 정책).
+    secrets = var.auth_token_secret_arn == "" ? [] : [{
+      name      = "DBMON__HTTP__AUTH_TOKEN"
+      valueFrom = var.auth_token_secret_arn
+    }]
+
     # **`/healthz` 를 본다. `/readyz` 가 아니다.**
     #
     # standby 워커는 `/readyz` 가 503 이지만 살아 있다(F1). 헬스체크가 `/readyz` 를 보면

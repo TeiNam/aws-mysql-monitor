@@ -669,18 +669,29 @@ dev 컨테이너용으로 남겨 둔다.
 ## 8. 확인
 
 ```bash
+ALB=http://<alb>
+# `/api` 아래는 전부 토큰이 필요하다. `/healthz`·`/readyz` 는 아니다 — 인증 없이 답하는
+# 세 경로 중 둘이다(나머지는 `/api/auth/config`).
+AUTH="Authorization: Bearer $DBMON_TOKEN"
+
 # 헬스
-curl -s http://<alb>/healthz && curl -s http://<alb>/readyz
+curl -s $ALB/healthz && curl -s $ALB/readyz
+
+# 어느 인증 방식이 실제로 적용됐는가
+curl -s $ALB/api/auth/config | jq '.mode'
 
 # 탐색이 인스턴스를 찾았는가
-curl -s http://<alb>/api/instances | jq 'length, .[0].state'
+curl -s -H "$AUTH" $ALB/api/instances | jq 'length, .[0].state'
 
 # 플릿 메트릭 (failed_scopes 가 비어 있어야 한다)
-curl -s http://<alb>/api/metrics/fleet | jq '.failed_scopes, (.rows | length)'
+curl -s -H "$AUTH" $ALB/api/metrics/fleet | jq '.failed_scopes, (.rows | length)'
 
 # 수집기가 리더이고 돌고 있는가
-curl -s http://<alb>/api/collector/status | jq '{is_leader, collecting, last_tick_ms}'
+curl -s -H "$AUTH" $ALB/api/collector/status | jq '{is_leader, collecting, last_tick_ms}'
 ```
+
+`.mode` 가 `unconfigured` 면 여기서 멈춘다 — 자격증명이 없어서 `/api` 는 전부 401 이다.
+`http.auth_token`(§5)을 넣고 다시 배포한다.
 
 처음에 흔한 실패:
 

@@ -1014,6 +1014,15 @@ fn spawn_instance_collector(
                     Ok(()) => {
                         tracing::info!(instance = %label, state = to.as_str(), "첫 판정 기록")
                     }
+                    // **덮지 않은 것은 장애가 아니다.** 그 사이 탐색이 이 인스턴스를
+                    // 수집 대상에서 뺐다(`Disabled`·`Excluded`·…). 재시도하면 안 되고,
+                    // 다음 탐색 라운드의 재조정이 이 태스크를 멈춘다.
+                    Err(dbmon_core::error::DomainError::Conflict(reason)) => tracing::info!(
+                        instance = %label,
+                        state = to.as_str(),
+                        %reason,
+                        "첫 판정을 쓰지 않았다 — 그 사이 수집 대상에서 빠졌다"
+                    ),
                     Err(e) => tracing::warn!(
                         instance = %label,
                         state = to.as_str(),

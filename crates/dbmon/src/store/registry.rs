@@ -215,11 +215,24 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         for (k, v) in self.key(id) {
             req = req.key(k, v);
         }
+        // **한 라운드를 두 번 세지 않는다.**
+        //
+        // 무조건 `ADD` 하면, 멈췄다 되살아난 옛 리더와 새 리더가 같은 미발견을 각각
+        // 올려 임계값(2)에 한 라운드로 도달한다 — 살아 있는 인스턴스에 삭제 도장이
+        // 찍힌다. 마지막으로 올린 시각을 함께 쓰고, 그보다 최근이면 거부한다.
+        // 근거와 값은 [`MISSING_MIN_GAP_MS`] 에 있다.
+        let cutoff = now_ms - dbmon_core::instance::MISSING_MIN_GAP_MS;
         let out = req
-            .update_expression("ADD missing_count :one")
+            .update_expression("SET missing_at_ms = :now ADD missing_count :one")
             // 없는 인스턴스에 카운터만 있는 항목을 만들면 역직렬화가 깨진다.
-            .condition_expression("attribute_exists(PK)")
+            .condition_expression(
+                "attribute_exists(PK) AND (attribute_not_exists(missing_at_ms) \
+                 OR missing_at_ms = :null OR missing_at_ms < :cutoff)",
+            )
             .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
+            .expression_attribute_values(":cutoff", AttributeValue::N(cutoff.to_string()))
+            .expression_attribute_values(":null", AttributeValue::Null(true))
             .return_values(ReturnValue::AllNew)
             .send()
             .await;
@@ -227,10 +240,24 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         let updated = match out {
             Ok(o) => Self::from_item(o.attributes.unwrap_or_default())?,
             Err(e) if super::is_conditional_failure(&e) => {
-                return Err(DomainError::NotFound {
-                    kind: "instance",
-                    id: id.as_str().to_string(),
-                });
+                // 조건이 두 개다 — 어느 쪽이 걸렸는지 항목을 읽어 가린다.
+                // 이 경로는 드물다(항목이 없거나 방금 센 경우).
+                return match self.get(id).await? {
+                    // **이미 셌다.** 현재 상태를 그대로 돌려준다 — 호출부는 카운터가
+                    // 오르지 않은 것을 보고 삭제 판정을 하지 않는다.
+                    Some(current) => {
+                        tracing::info!(
+                            instance = %id.as_str(),
+                            missing_count = current.missing_count,
+                            "미발견을 이미 셌다 — 같은 라운드로 보고 넘어간다"
+                        );
+                        Ok(current)
+                    }
+                    None => Err(DomainError::NotFound {
+                        kind: "instance",
+                        id: id.as_str().to_string(),
+                    }),
+                };
             }
             Err(e) => return Err(map_sdk_err(e)),
         };
@@ -260,14 +287,41 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         for (k, v) in self.key(id) {
             req = req.key(k, v);
         }
-        req.update_expression("SET #s = :state")
+        // **"수집하지 않는다" 는 결정을 덮지 않는다.**
+        //
+        // 수집 태스크는 자기가 뜰 때 읽은 사본으로 첫 판정을 쓴다. 그 사이 탐색이
+        // `dbmon:enabled=false` 태그를 보고 `Disabled` 로, 또는 범위 필터로 `Excluded`
+        // 로 바꿨다면, 여기서 `Collecting` 을 쓰면 **opt-out 이 조용히 무시된다**
+        // (교차 리뷰 2회차). 그 뒤 재조정은 수집 가능한 상태를 보고 계속 수집한다.
+        //
+        // 사람이 다시 켜는 경로는 이 조건에 걸리지 않는다 — API 는 `Pending` 일 때만
+        // `set_state` 를 부르고, `Disabled` 는 `state_not_startable` 로 거부한다.
+        // 되살리려면 태그를 지우고 탐색이 갱신하게 한다.
+        let mut req = req
+            .update_expression("SET #s = :state")
             .expression_attribute_names("#s", "state")
             .expression_attribute_values(":state", AttributeValue::S(state.as_str().to_string()))
-            .condition_expression("attribute_exists(PK)")
-            .send()
-            .await
-            .map_err(map_sdk_err)?;
-        Ok(())
+            .condition_expression("attribute_exists(PK) AND NOT #s IN (:no1, :no2, :no3, :no4)");
+        for (slot, blocked) in dbmon_core::instance::NOT_OVERWRITABLE_STATES
+            .iter()
+            .enumerate()
+        {
+            req = req.expression_attribute_values(
+                format!(":no{}", slot + 1),
+                AttributeValue::S(blocked.as_str().to_string()),
+            );
+        }
+        match req.send().await {
+            Ok(_) => Ok(()),
+            // **조용히 성공으로 만들지 않는다.** 호출자가 "썼다" 고 믿으면 같은 판정을
+            // 다시 시도하지 않는다. 사유를 구분해 올린다.
+            Err(e) if super::is_conditional_failure(&e) => Err(DomainError::Conflict(format!(
+                "{}: 수집 대상이 아닌 상태여서 {} 로 바꾸지 않았다",
+                id.as_str(),
+                state.as_str()
+            ))),
+            Err(e) => Err(map_sdk_err(e)),
+        }
     }
 
     async fn mark_seen(&self, id: &InstanceId, now_ms: EpochMs) -> Result<()> {
@@ -280,7 +334,10 @@ impl InstanceRegistry for DynamoInstanceRegistry {
         // **`ttl` 도 지운다.** 삭제 도장을 찍을 때 걸어 둔 30일 TTL 이 남아 있으면
         // 되살아난 인스턴스가 30일 뒤 등록부에서 조용히 사라진다.
         req.update_expression(
-            "SET missing_count = :zero, last_seen_ms = :now, deleted_at_ms = :null REMOVE #ttl",
+            // **`missing_at_ms` 도 지운다.** 남겨 두면 되살아난 인스턴스가 다시
+            // 사라졌을 때 첫 미발견이 "이미 셌다" 로 거부되어 판정이 한 라운드 늦어진다.
+            "SET missing_count = :zero, last_seen_ms = :now, deleted_at_ms = :null, \
+             missing_at_ms = :null REMOVE #ttl",
         )
         .expression_attribute_names("#ttl", "ttl")
         .condition_expression("attribute_exists(PK)")

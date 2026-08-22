@@ -126,6 +126,12 @@ impl DynamoSlowQueryStore {
                 .build()
                 .expect("키 정의")
         };
+        // **프로덕션과 같은 사영을 쓴다.**
+        //
+        // 여기가 `ALL` 이었고 프로덕션은 `INCLUDE` 였다. 그 차이 때문에 인덱스 항목을
+        // 완전한 레코드로 역직렬화하는 버그가 통합 테스트를 통과했고, 프로덕션에서만
+        // 고아 정리가 죽어 있었다(교차 리뷰 2회차). 테스트 테이블이 프로덕션과 다르면
+        // 테스트가 무엇을 보증하는지 알 수 없다.
         let gsi = |name: &str, pk: &str, sk: &str| {
             GlobalSecondaryIndex::builder()
                 .index_name(name)
@@ -133,7 +139,10 @@ impl DynamoSlowQueryStore {
                 .key_schema(key(sk, KeyType::Range))
                 .projection(
                     Projection::builder()
-                        .projection_type(ProjectionType::All)
+                        .projection_type(ProjectionType::Include)
+                        .set_non_key_attributes(Some(
+                            GSI_PROJECTED.iter().map(|s| s.to_string()).collect(),
+                        ))
                         .build(),
                 )
                 .build()
@@ -823,11 +832,28 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     /// 레코드는 SQL 원문을 들고 있어 몇 KB 씩 되므로 `limit=200` 을 줘도 한 페이지가
     /// 그보다 적게 돌아올 수 있다. 그 결과를 "진행 중인 것이 이게 전부" 로 읽으면
     /// 고아 정리와 일시정지 확정이 **조용히 일부만 처리한다.**
+    /// # 인덱스에서 **키만** 읽고 기본 테이블에서 본문을 가져온다
+    ///
+    /// 프로덕션 GSI1 은 `INCLUDE` 사영이다 — `sql_text`·`plan_json` 을 넣지 않는다
+    /// (인덱스 크기와 쓰기 비용이 배가 된다). 그래서 인덱스 항목을 `SlowQuery` 로
+    /// 역직렬화하면 **필수 필드 21개가 없어 실패한다.** `SlowQuery` 에 컨테이너
+    /// `#[serde(default)]` 가 없으므로 `Option` 필드조차 없으면 오류다.
+    ///
+    /// 그러면 고아 정리와 일시정지 확정이 **프로덕션에서만 아무것도 하지 못한다** —
+    /// 진행 중 레코드가 영구히 쌓인다. 로컬·통합 테스트는 테이블을 `ALL` 사영으로
+    /// 만들어서 이걸 가리고 있었다(교차 리뷰 2회차가 잡았다. 테스트 테이블도 같은
+    /// 사영으로 맞췄다).
+    ///
+    /// `default` 를 붙여 넘기는 방법은 더 나쁘다: 0으로 채워진 레코드가 만들어지고,
+    /// 고아 판정이 그걸 그대로 `upsert_merged` 하면 **실제 데이터를 덮어쓴다.**
     async fn list_in_flight(&self, limit: usize) -> Result<Vec<SlowQuery>> {
-        let mut out: Vec<SlowQuery> = Vec::new();
+        // ── 1단계: 인덱스에서 기본 테이블 키만 모은다 ───────────────────────
+        //
+        // 키 속성(`PK`·`SK`)은 사영 설정과 무관하게 **항상** 인덱스에 있다.
+        let mut keys: Vec<(String, String)> = Vec::new();
         let mut start_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
         loop {
-            let remaining = limit.saturating_sub(out.len());
+            let remaining = limit.saturating_sub(keys.len());
             let res = self
                 .client
                 .query()
@@ -838,6 +864,8 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                     ":pk",
                     AttributeValue::S(keys::IN_FLIGHT_PK.to_string()),
                 )
+                // 키만 받는다 — 어차피 본문은 기본 테이블에서 읽는다.
+                .projection_expression("PK, SK")
                 .scan_index_forward(true)
                 .limit(remaining as i32)
                 .set_exclusive_start_key(start_key)
@@ -845,17 +873,131 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                 .await
                 .map_err(map_sdk_err)?;
             for item in res.items.unwrap_or_default() {
-                out.push(Self::from_item(item)?);
+                let get = |n: &str| item.get(n).and_then(|v| v.as_s().ok()).cloned();
+                if let (Some(pk), Some(sk)) = (get("PK"), get("SK")) {
+                    keys.push((pk, sk));
+                }
             }
             start_key = res.last_evaluated_key;
-            if start_key.is_none() || out.len() >= limit {
+            if start_key.is_none() || keys.len() >= limit {
                 break;
             }
         }
-        out.truncate(limit);
-        Ok(out)
+        keys.truncate(limit);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ── 2단계: 완전한 레코드를 가져온다 ────────────────────────────────
+        //
+        // `BatchGetItem` 은 한 번에 100개다. 처리되지 않은 키(스로틀링)는 다시
+        // 요청한다 — 빠뜨리면 고아 정리가 조용히 일부만 처리한다.
+        let mut by_key: std::collections::HashMap<(String, String), SlowQuery> =
+            std::collections::HashMap::new();
+        for chunk in keys.chunks(BATCH_GET_MAX) {
+            let mut pending: Vec<(String, String)> = chunk.to_vec();
+            // 상한을 둔다 — 스로틀링이 계속되면 무한 루프가 된다.
+            for _ in 0..BATCH_GET_RETRIES {
+                if pending.is_empty() {
+                    break;
+                }
+                let mut req = aws_sdk_dynamodb::types::KeysAndAttributes::builder();
+                for (pk, sk) in &pending {
+                    req = req.keys(std::collections::HashMap::from([
+                        ("PK".to_string(), AttributeValue::S(pk.clone())),
+                        ("SK".to_string(), AttributeValue::S(sk.clone())),
+                    ]));
+                }
+                let res = self
+                    .client
+                    .batch_get_item()
+                    .request_items(
+                        &self.table,
+                        req.build().map_err(|e| {
+                            DomainError::Internal(format!("배치 조회 요청 조립 실패: {e}"))
+                        })?,
+                    )
+                    .send()
+                    .await
+                    .map_err(map_sdk_err)?;
+
+                for item in res
+                    .responses
+                    .as_ref()
+                    .and_then(|m| m.get(&self.table))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    let get = |n: &str| item.get(n).and_then(|v| v.as_s().ok()).cloned();
+                    let Some(key) = get("PK").zip(get("SK")) else {
+                        continue;
+                    };
+                    by_key.insert(key, Self::from_item(item.clone())?);
+                }
+
+                pending = res
+                    .unprocessed_keys
+                    .as_ref()
+                    .and_then(|m| m.get(&self.table))
+                    .map(|k| {
+                        k.keys()
+                            .iter()
+                            .filter_map(|m| {
+                                let g = |n: &str| m.get(n).and_then(|v| v.as_s().ok()).cloned();
+                                g("PK").zip(g("SK"))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            if !pending.is_empty() {
+                // **조용히 넘기지 않는다.** 일부만 처리한 결과를 "전부" 로 읽으면
+                // 고아가 남고, 남은 이유를 아무도 모른다.
+                return Err(DomainError::Unavailable {
+                    dependency: "dynamodb",
+                    reason: format!(
+                        "진행 중 레코드 {}건을 {}회 시도 후에도 읽지 못했다",
+                        pending.len(),
+                        BATCH_GET_RETRIES
+                    ),
+                });
+            }
+        }
+
+        // 인덱스 순서(오래된 것부터)를 유지한다 — 배치 응답은 순서를 보장하지 않는다.
+        // 그 사이 지워진 레코드는 빠진다(정상).
+        Ok(keys.iter().filter_map(|k| by_key.remove(k)).collect())
     }
 }
+
+/// 프로덕션 GSI 가 사영하는 속성 (`infra/layers/10-foundation/main.tf` 와 같아야 한다).
+///
+/// 여기서 빠진 속성은 인덱스 조회 결과에 **없다.** 인덱스를 읽는 코드는 그 사실을
+/// 전제로 써야 한다 — 완전한 레코드가 필요하면 기본 테이블에서 다시 읽는다.
+const GSI_PROJECTED: &[&str] = &[
+    "record_id",
+    "instance_id",
+    "env",
+    "started_at_ms",
+    "duration_ms",
+    "app_digest",
+    "statement_type",
+    "state",
+    "last_seen_at_ms",
+    "owner_worker",
+    "exec_count",
+    "total_time_ms",
+    "severity",
+    "rule_id",
+    "owner_epoch",
+    "thread_id",
+    "abandoned_reason",
+];
+
+/// `BatchGetItem` 한 번의 키 상한. AWS 가 정한 값이다.
+const BATCH_GET_MAX: usize = 100;
+/// 처리되지 않은 키 재시도 횟수. 스로틀링이 계속되면 오류로 올린다.
+const BATCH_GET_RETRIES: usize = 3;
 
 /// 스캔을 금지하는 것은 IAM 이 하지만(`Deny dynamodb:Scan`), 코드에도 없어야 한다.
 /// 이 상수는 그 사실을 테스트가 확인하는 데 쓴다.
@@ -916,6 +1058,53 @@ pub(crate) mod tests {
             abandoned_reason: None,
             long_running: false,
         }
+    }
+
+    /// **테스트 테이블의 GSI 사영이 Terraform 과 같아야 한다.**
+    ///
+    /// `create_table_for_local` 의 주석은 "`it_store` 가 두 정의를 대조한다" 고
+    /// 주장했지만 **그런 테스트는 없었다.** 그래서 테스트 테이블이 `ALL`, 프로덕션이
+    /// `INCLUDE` 인 상태가 유지됐고, 인덱스 항목을 완전한 레코드로 역직렬화하는 버그가
+    /// 통합 테스트 33개를 통과한 채 프로덕션에서만 고아 정리를 죽였다.
+    ///
+    /// 이 테스트는 AWS 를 쓰지 않는다 — Terraform 파일을 읽어 문자열로 대조한다.
+    /// 그래서 `unit` 잡에서 돌고, 한쪽만 바꾸면 즉시 깨진다.
+    #[test]
+    fn the_test_table_projection_matches_terraform() {
+        let tf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../infra/layers/10-foundation/main.tf"
+        ))
+        .expect("10-foundation/main.tf 를 읽을 수 없다");
+
+        // `name = "GSI1"` 뒤의 첫 `non_key_attributes = [...]` 블록을 읽는다.
+        let after = &tf[tf.find(r#"name = "GSI1""#).expect("GSI1 정의")..];
+        let list_start = after.find("non_key_attributes").expect("사영 목록");
+        let open = after[list_start..].find('[').expect("[") + list_start;
+        let close = after[open..].find(']').expect("]") + open;
+        // **주석을 먼저 지운다.** 목록 안에 `# …` 설명 줄이 섞여 있고, 그대로 `,` 로
+        // 쪼개면 주석 뒤의 첫 항목이 주석과 한 조각이 되어 사라진다 — 이 테스트를
+        // 처음 돌렸을 때 `owner_epoch` 가 그렇게 빠졌다.
+        let without_comments: String = after[open + 1..close]
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut from_tf: Vec<&str> = without_comments
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        from_tf.sort_unstable();
+
+        let mut from_code: Vec<&str> = super::GSI_PROJECTED.to_vec();
+        from_code.sort_unstable();
+
+        assert_eq!(
+            from_code, from_tf,
+            "코드의 GSI_PROJECTED 와 Terraform 의 non_key_attributes 가 다르다 — \
+             테스트 테이블이 프로덕션과 다른 모양이면 테스트가 무엇을 보증하는지 알 수 없다"
+        );
     }
 
     /// **쌍둥이가 있을 때 "닫는 쓰기" 는 열려 있는 쪽을 고쳐야 한다.**

@@ -677,18 +677,29 @@ field those steps need, so this is code, not configuration.
 ## 8. Verify
 
 ```bash
+ALB=http://<alb>
+# Everything under /api needs the token. /healthz and /readyz do not — they are two of the
+# three routes that answer without authentication (the third is /api/auth/config).
+AUTH="Authorization: Bearer $DBMON_TOKEN"
+
 # Health
-curl -s http://<alb>/healthz && curl -s http://<alb>/readyz
+curl -s $ALB/healthz && curl -s $ALB/readyz
+
+# Which authentication mode is actually in effect
+curl -s $ALB/api/auth/config | jq '.mode'
 
 # Discovery found the instances
-curl -s http://<alb>/api/instances | jq 'length, .[0].state'
+curl -s -H "$AUTH" $ALB/api/instances | jq 'length, .[0].state'
 
 # Fleet metrics (failed_scopes must be empty)
-curl -s http://<alb>/api/metrics/fleet | jq '.failed_scopes, (.rows | length)'
+curl -s -H "$AUTH" $ALB/api/metrics/fleet | jq '.failed_scopes, (.rows | length)'
 
 # Collector is leading and ticking
-curl -s http://<alb>/api/collector/status | jq '{is_leader, collecting, last_tick_ms}'
+curl -s -H "$AUTH" $ALB/api/collector/status | jq '{is_leader, collecting, last_tick_ms}'
 ```
+
+If `.mode` is `unconfigured`, stop here — no credential is configured and every `/api` call
+returns 401. Set `http.auth_token` (§5) and redeploy.
 
 Common first failures:
 

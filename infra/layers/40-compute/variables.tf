@@ -328,3 +328,38 @@ variable "channel_secret_prefix" {
   type        = string
   default     = "dbmon/channel/"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API 인증 — 공유 토큰
+# ─────────────────────────────────────────────────────────────────────────────
+
+# **이 값 없이는 화면과 API 에 들어갈 수 없다.**
+#
+# 앱의 인증 수단 넷 중 셋(`local-dev`·`local-token`·`off`)은 ECS 에서 쓸 수 없거나
+# 두 곳의 명시적 허용을 요구한다. 남는 것은 공유 토큰이고, 그 값은 배포 설정
+# (`DBMON__HTTP__AUTH_TOKEN`)으로만 들어간다.
+#
+# 비워 두면 태스크가 뜨긴 하지만 **모든 API 요청이 401** 이고 화면이
+# "이 배포에는 인증 수단이 없다" 를 보여준다. 기동 로그도 경고를 남긴다.
+variable "auth_token_secret_arn" {
+  description = <<-EOT
+    공유 접속 토큰을 담은 Secrets Manager 비밀의 ARN.
+
+    평문 토큰을 변수로 받지 않는다 — 그러면 값이 tfstate 와 plan 출력에 남는다.
+    비밀을 먼저 만들고 ARN 만 넘긴다:
+
+      aws secretsmanager create-secret --name dbmon/api-token \
+        --secret-string "$(openssl rand -hex 32)"
+
+    32자 미만이거나 공백이 섞이면 앱이 기동을 거부한다.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    # 오타를 배포 시점에 잡는다. 빈 값은 "인증 없이 띄운다" 는 의도로 허용한다.
+    condition     = var.auth_token_secret_arn == "" || can(regex("^arn:aws[a-z-]*:secretsmanager:", var.auth_token_secret_arn))
+    error_message = "Secrets Manager 비밀의 ARN 이어야 한다 (평문 토큰이 아니다)."
+  }
+}
+

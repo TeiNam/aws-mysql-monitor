@@ -40,7 +40,7 @@ terraform output 에서 읽는다). 그 밖의 DB 는 §4 의 SQL 을 직접 실
 | 수집 대상 **판정** (VPC·태그·이름 필터) | **자동** — `[discovery]` 설정 |
 | 모니터링 **계정 생성** | **사람 손** — 실행 코드가 없다(§8-②) |
 | `rds-db:connect` IAM 부여 | terraform (`40-compute`) — 목록이 비면 `dbuser:*/dbmon` 와일드카드라 새 인스턴스가 자동 포함된다 |
-| 수집 **시작** | **막혀 있다** — `Pending → Collecting` 승격 주체가 없다(§8-①) |
+| 수집 **시작** | **사람이 누른다** — 화면의 `수집 시작`(`POST /api/instances/{id}/start`). 자동 승격은 없다(§8-①) |
 
 즉 "태그만 달면 알아서 계정 만들고 수집" 은 **아직 아니다.** 필요한 조각은 §8 에 적어 뒀다.
 
@@ -330,14 +330,25 @@ curl -s http://<host>/api/instances | python3 -m json.tool | head -40
 
 ## 8. 알려진 한계 (2026-08-21)
 
-### ① `Pending → Collecting` 승격이 없다 — 수집이 시작되지 않는다
+### ① `Pending → Collecting` **자동** 승격이 없다 (사람이 누른다)
 
 탐색은 `Pending` 으로만 등록하고(`aws/discovery.rs` `initial_state`),
-`Instance::should_collect()` 는 `Collecting|Degraded|Unreachable` 만 참이다. 그 사이를
-잇는 FR-DSC-10 자가진단이 [05 §9](05-collector.md) 에 문서화만 돼 있고 구현이 없다.
+`Instance::should_collect()` 는 `Collecting|Degraded|Unreachable` 만 참이다.
 
-도커 로컬에서 이게 안 드러난 이유는 `local/instance.json` 이 `state: "collecting"` 을
-손으로 박아 넣기 때문이다.
+**그 사이를 사람이 잇는다.** 화면의 `RDS Instance Management` → `수집 시작`
+(`POST /api/instances/{id}/start`, `operator` 이상)이 그 승격이다. 전에 이 절은 "승격
+주체가 없다 — 수집이 시작되지 않는다" 였는데, 그 라우트가 들어온 뒤에도 문장이 남아
+있었다(교차 리뷰 2회차가 지적). 지금 없는 것은 **자동** 승격이다.
+
+자동으로 하지 않는 이유: 수집 시작은 대상 DB 에 매초 쿼리를 던지기 시작하는 일이고,
+모니터링 계정이 아직 없으면 실패 로그가 쏟아진다(실측). 등록은 자동, 시작은 명시적이다.
+
+FR-DSC-10 자가진단(붙을 수 있는지 미리 확인해 사유를 제시하는 것)은 여전히
+[05 §9](05-collector.md) 에 문서만 있다 — 그게 있으면 누르기 전에 "이 인스턴스는 계정이
+없다" 를 말해 줄 수 있다.
+
+도커 로컬에서 이 구분이 안 드러난 이유는 `local/instance.json` 이 `state: "collecting"`
+을 손으로 박아 넣기 때문이다.
 
 ### ② 계정 부트스트랩 실행기가 없다
 

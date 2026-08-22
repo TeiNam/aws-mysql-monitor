@@ -105,7 +105,15 @@ pub async fn put_settings(
 
     // **현재 값을 강제로 다시 읽는다.** 캐시된 값으로 병합하면 다른 워커가 방금 바꾼
     // 비밀 참조를 옛 값으로 되돌려 쓸 수 있다.
-    let current = state.settings.refresh(now_ms).await;
+    //
+    // 읽기가 **실패하면 저장하지 않는다.** 실패를 삼키고 마지막 값(없으면 기본값)으로
+    // 병합하면 마스킹된 비밀 자리에 빈 값이 들어가고, `expected_version` 은 여전히
+    // 맞으므로 조건부 저장이 성공한다 — Slack 참조가 조용히 사라진다.
+    let current = state
+        .settings
+        .refresh_checked(now_ms)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
 
     let mut next = body.settings;
     next.merge_secrets_from(&current);
