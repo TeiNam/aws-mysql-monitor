@@ -267,6 +267,78 @@ async fn in_flight_index_finds_only_running_records() {
     assert!(!ids.contains(&2002), "확정 레코드가 보인다: {ids:?}");
 }
 
+/// **하트비트가 이미 저장된 사실을 지우지 않는다.**
+///
+/// 수집기는 15초마다 "아직 관측 중" 을 다시 쓴다(고아 오판 방지). 그 쓰기는 SQL·플랜을
+/// 들고 있지 않으므로, 병합이 `None` 을 덮어쓰기로 처리하면 **15초마다 SQL 과 실행계획이
+/// 사라진다** — 고치려던 버그보다 나쁘다. 그리고 갱신 시각은 반드시 올라가야 한다(안
+/// 오르면 하트비트가 아무 일도 안 한 것이다). 페이크 저장소와 실제 병합이 갈린 전례가
+/// 있으므로 **실제 저장소로** 확인한다.
+#[tokio::test]
+async fn a_heartbeat_advances_last_seen_without_erasing_sql_or_plan() {
+    let Some(s) = store("heartbeat").await else {
+        return;
+    };
+
+    // 선행 저장 — SQL·플랜을 갖춘 진행 중 레코드.
+    let mut saved = sample(2010, T0);
+    saved.state = SlowQueryState::InFlight;
+    saved.ended_at_ms = None;
+    saved.last_seen_at_ms = Some(T0 + 1_000);
+    saved.plan = PlanBundle {
+        normalized_json: Some(r#"{"query_block":{}}"#.into()),
+        source: PlanSource::Rerun,
+        ..Default::default()
+    };
+    s.upsert_merged(&saved).await.expect("선행 저장");
+
+    // 하트비트 — 갱신 시각만 올린다. `full_sql`·플랜 없이 만든 모양 그대로다.
+    let mut beat = sample(2010, T0);
+    beat.state = SlowQueryState::InFlight;
+    beat.ended_at_ms = None;
+    beat.sql_text = None;
+    beat.plan = PlanBundle::default();
+    beat.last_seen_at_ms = Some(T0 + 20_000);
+    s.upsert_merged(&beat).await.expect("하트비트");
+
+    let got = s.get(&beat.record_id).await.expect("조회").expect("있음");
+    assert_eq!(
+        got.last_seen_at_ms,
+        Some(T0 + 20_000),
+        "하트비트가 갱신 시각을 올리지 못했다 — 살아 있는 쿼리가 고아로 확정된다"
+    );
+    assert_eq!(
+        got.sql_text.as_deref(),
+        Some("SELECT a FROM t WHERE id = ?"),
+        "하트비트가 SQL 을 지웠다"
+    );
+    assert_eq!(
+        got.plan.normalized_json.as_deref(),
+        Some(r#"{"query_block":{}}"#),
+        "하트비트가 실행계획을 지웠다"
+    );
+    assert_eq!(got.state, SlowQueryState::InFlight);
+
+    // **확정된 레코드를 되살리지 않는다.** 늦게 도착한 하트비트가 유령을 만들면 안 된다.
+    let done = sample(2010, T0); // 같은 record_id, Finalized
+    s.upsert_merged(&done).await.expect("확정");
+    s.upsert_merged(&beat).await.expect("늦은 하트비트");
+    let got = s.get(&beat.record_id).await.expect("조회").expect("있음");
+    assert_eq!(
+        got.state,
+        SlowQueryState::Finalized,
+        "늦은 하트비트가 확정 레코드를 진행 중으로 되돌렸다"
+    );
+    assert!(
+        !s.list_in_flight(50)
+            .await
+            .expect("조회")
+            .iter()
+            .any(|q| q.thread_id == 2010),
+        "확정된 레코드가 진행 중 인덱스로 돌아왔다"
+    );
+}
+
 /// 확정되면 GSI1 파티션이 **바뀌어야** 한다 — 진행 중 목록에서 빠진다.
 #[tokio::test]
 async fn finalizing_moves_the_record_out_of_the_in_flight_index() {

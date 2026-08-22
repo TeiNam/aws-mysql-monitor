@@ -423,6 +423,7 @@ mod tests {
             started_at_ms_precise: None,
             max_time_secs: 4,
             last_seen_at_ms: 1_004_000,
+            saved_at_ms: Some(1_004_000),
             plan_attempts: 1,
             has_plan: true,
         }
