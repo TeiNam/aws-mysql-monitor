@@ -499,29 +499,16 @@ const ORPHAN_SWEEP_LIMIT: usize = 500;
 /// 일시정지 분기는 루프 뒤쪽을 건너뛰므로 **스윕도 함께 건너뛰었다**(4라운드 지적).
 /// 사람이 며칠 멈춰 두면 다른 워커·이전 epoch 의 고아가 그동안 계속 "진행 중" 으로
 /// 남는다 — F4 가 없애려던 그 상태다. 두 경로가 같은 코드를 부르면 다시 어긋나지 않는다.
-async fn sweep_orphans(
-    store: &Arc<dbmon::store::AppSlowQueryStore>,
-    worker_id: &str,
-    epoch: Option<u64>,
-    now_ms: i64,
-    config: &Config,
-    // **지금 도는 수집 태스크.** `Mine` 판정의 근거다 — 내 이름·내 epoch 인데 태스크가
-    // 없으면 살아 있을 수 없다(교차 리뷰 8·9회차가 지적한 정지 확정 누락의 근본).
-    running: &dbmon::orphan::RunningTasks,
-) {
+async fn sweep_orphans(store: &Arc<dbmon::store::AppSlowQueryStore>, now_ms: i64, config: &Config) {
     let threshold = dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
     // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면 `gate.refresh()`
     // 가 불리지 않아 리스가 만료되고, 그 사이 수집 태스크는 계속 돌아 두 리더가
     // 같은 인스턴스를 수집한다. `work_budget()` 의 주석이 설명하는 그 불변식이다.
     match run_in_budget(dbmon::orphan::sweep(
         Arc::clone(store),
-        worker_id,
-        // **현재 리스 epoch 를 넘긴다.** 이름만 보면 재시작한 자기 유령을 영구히 건너뛴다.
-        epoch,
         now_ms,
         threshold,
         ORPHAN_SWEEP_LIMIT,
-        Some(running),
     ))
     .await
     {
@@ -530,7 +517,6 @@ async fn sweep_orphans(
             scanned = s.scanned,
             abandoned = s.abandoned,
             alive = s.alive,
-            mine = s.mine,
             errors = s.errors,
             "고아 스윕"
         ),
@@ -974,36 +960,18 @@ async fn discover(
 /// 인스턴스별 수집 태스크 집합.
 struct CollectTasks {
     handles: std::collections::BTreeMap<String, tokio::task::JoinHandle<()>>,
-    /// 인스턴스 → **그 태스크가 뜬 시각.**
-    ///
-    /// 고아 판정이 "지금 도는 태스크가 만진 레코드인가" 를 묻는 데 쓴다. id 만으로는
-    /// 같은 이름·같은 epoch 으로 뜬 **새** 태스크가 옛 태스크의 레코드를 영구히 가린다
-    /// (교차 리뷰 10회차).
-    started_ms: std::collections::BTreeMap<String, i64>,
 }
 
 impl CollectTasks {
     fn new() -> Self {
         Self {
             handles: std::collections::BTreeMap::new(),
-            started_ms: std::collections::BTreeMap::new(),
         }
     }
 
     /// 도는 인스턴스 id 집합. **델타 계산용**이다.
     fn running(&self) -> std::collections::BTreeSet<String> {
         self.handles.keys().cloned().collect()
-    }
-
-    /// 인스턴스 → 태스크가 뜬 시각. **고아 판정용**이다.
-    fn running_since(&self) -> dbmon::orphan::RunningTasks {
-        self.handles
-            .keys()
-            .map(|id| {
-                let started = self.started_ms.get(id).copied().unwrap_or(0);
-                (id.clone(), started)
-            })
-            .collect()
     }
 
     /// **끝난 태스크를 걷어낸다.** 이게 없으면 인스턴스가 영구히 수집되지 않는다.
@@ -1023,7 +991,6 @@ impl CollectTasks {
             // **패닉과 정상 종료를 구분한다.** `is_finished()` 가 참이므로 `await` 는
             // 즉시 반환한다 — 비용 0 인데, 구분하지 않으면 패닉이 tracing(JSON)
             // 스트림에 아예 나타나지 않는다(기본 패닉 훅은 stderr 로만 쓴다).
-            self.started_ms.remove(id);
             if let Some(h) = self.handles.remove(id)
                 && let Err(e) = h.await
                 && e.is_panic()
@@ -1061,7 +1028,6 @@ impl CollectTasks {
         let by_id = index_by_id(instances);
 
         for id in &delta.to_stop {
-            self.started_ms.remove(id);
             if let Some(h) = self.handles.remove(id) {
                 // `abort()` 는 다음 await 지점에서 태스크를 끊는다. 수집 tick 은
                 // 읽기뿐이고 저장은 멱등(`upsert_merged`)이라 중간에 끊겨도 안전하다.
@@ -1075,11 +1041,6 @@ impl CollectTasks {
             };
             let handle = spawn_instance_collector((*instance).clone(), deps.clone());
             self.handles.insert(id.clone(), handle);
-            // **뜬 시각을 기록한다.** 고아 판정이 "이 태스크가 만진 것인가" 를 묻는다.
-            self.started_ms.insert(id.clone(), {
-                use dbmon_core::time::Clock as _;
-                dbmon_core::time::SystemClock.now_ms()
-            });
             tracing::info!(instance = %id, "수집 태스크 시작");
         }
     }
@@ -1740,18 +1701,7 @@ fn spawn_leader_loop(
                         // (4라운드 지적). 사람이 며칠 멈춰 두면 **다른 워커·이전 epoch 의
                         // 고아가 그동안 계속 "진행 중"** 으로 남는다 — F4 가 없애려던 상태다.
                         if sweep_due {
-                            sweep_orphans(
-                                &stores.slow_query,
-                                &collect_deps.worker_id,
-                                gate.epoch(),
-                                now_ms,
-                                &config,
-                                // **전체 정지 상태다** — 도는 태스크가 없다. 그래서 내
-                                // 이름·epoch 레코드도 걷어야 한다(그게 정지 확정이
-                                // 놓친 것을 자동으로 정리한다).
-                                &tasks.running_since(),
-                            )
-                            .await;
+                            sweep_orphans(&stores.slow_query, now_ms, &config).await;
                             swept = true;
                         }
                     })
@@ -1979,15 +1929,7 @@ fn spawn_leader_loop(
                 // 화면에 유령 쿼리로 남는다.
                 if now_ms - last_sweep_ms >= (config.collector.orphan_sweep_secs as i64) * 1000 {
                     last_sweep_ms = now_ms;
-                    sweep_orphans(
-                        &stores.slow_query,
-                        &collect_deps.worker_id,
-                        gate.epoch(),
-                        now_ms,
-                        &config,
-                        &tasks.running_since(),
-                    )
-                    .await;
+                    sweep_orphans(&stores.slow_query, now_ms, &config).await;
                 }
 
                 // ── 슬로우로그 백필 ──────────────────────────────────────────

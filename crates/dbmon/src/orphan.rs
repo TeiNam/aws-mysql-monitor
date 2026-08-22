@@ -34,6 +34,19 @@ pub fn stale_threshold_ms(poll_interval_ms: u64) -> i64 {
     (poll_interval_ms as i64) * 3 + GRACE_MS
 }
 
+/// 수집기가 "아직 관측 중" 을 다시 저장하는 주기
+/// ([`crate::collector::Collector::heartbeat`]).
+///
+/// **어떤 임계보다도 작아야 한다.** 임계는 `3 × poll + GRACE_MS` 이므로 최소값이
+/// `GRACE_MS` 다. 스윕하는 리더와 수집하는 워커의 `poll_interval` 이 다를 수 있으므로
+/// (설정은 워커별이다) 주기를 자기 임계에서 유도하면 **긴 poll 을 쓰는 워커의 살아 있는
+/// 레코드를 짧은 poll 을 쓰는 리더가 버린다.** 그래서 고정값으로 둔다.
+pub const HEARTBEAT_INTERVAL_MS: i64 = GRACE_MS / 2;
+
+/// 위 불변식을 **컴파일 시점에** 지킨다. 런타임 테스트로 두면 상수를 바꾼 사람이
+/// 테스트를 안 돌릴 수 있고, 그 결과는 "살아 있는 쿼리를 버린다" 다.
+const _: () = assert!(HEARTBEAT_INTERVAL_MS < GRACE_MS);
+
 /// 이 레코드를 어떻게 할 것인가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -41,84 +54,34 @@ pub enum Verdict {
     Alive,
     /// 관측이 끊겼다 — `abandoned` 로 확정한다.
     Orphaned { silent_for_ms: i64 },
-    /// **내가 소유한 레코드다.** 재수화를 시도한다(기동 시 경로).
-    Mine,
     /// `in_flight` 가 아니다. 스윕 대상이 아니다.
     NotInFlight,
 }
 
-/// 고아인가. **순수 함수** — `now_ms` 와 임계를 받는다.
+/// 고아인가. **순수 함수** — 침묵 시간만 본다.
 ///
-/// # `Mine` 은 이름만으로 판정하지 않는다 (epoch 를 함께 본다)
+/// # 소유자를 보지 않는다
 ///
-/// `worker_id` 는 `{role}-{HOSTNAME}` 이고, docker compose·k8s StatefulSet·로컬은
-/// **재시작해도 같은 문자열**이다. 이름만 보면 급사한 프로세스가 남긴 진행 중
-/// 레코드를 같은 이름의 새 프로세스가 `Mine` 으로 보고 **매 스윕 건너뛴다** —
-/// F4 가 없애려던 유령이 정확히 그 경로로 TTL(35일)까지 남는다.
+/// 교차 리뷰 20~22라운드가 같은 자리를 세 번 지적했다. "내 이름·내 epoch 이면 내
+/// 것이니 건너뛴다" 에서 시작해, 그게 유령을 남기니(급사한 태스크의 레코드) "지금 도는
+/// 태스크가 만졌는가" 를 벽시계로 추론하는 쪽으로 갔고, 그 추론이 **양방향으로** 틀렸다:
 ///
-/// 리스 획득은 항상 `epoch + 1` 이므로(`store::lease`), **`owner_epoch` 가 현재
-/// epoch 보다 작으면 그 레코드는 이전 생애의 것**이다 — 지금 살아 있을 수 없다.
-/// 그 근거는 이미 레코드에 저장돼 있는데 판정이 쓰지 않고 있었다.
-/// # `Mine` 은 "**지금 그 인스턴스를 돌리고 있다**" 를 뜻해야 한다
+/// | 조인 방향 | 열린 반대 방향 |
+/// |---|---|
+/// | 이름·epoch 이면 건너뛴다 | 급사한 태스크의 레코드를 TTL(35일)까지 가린다 |
+/// | 태스크가 만진 것만 내 것 | 갓 뜬 태스크의 **살아 있는** 레코드를 버린다 |
+/// | 갓 뜬 태스크에 유예 | 크래시 루프가 유예를 되돌려 무기한 가린다 |
 ///
-/// 이름·epoch 만 보면 그렇지 않은 경우가 남는다. 정지 확정이 실패했거나, 태스크를
-/// `abort()` 한 뒤 마지막 쓰기가 늦게 도착했거나, 등록부 조회가 실패해 확정을 건너뛰었으면
-/// **내 이름·내 epoch 인데 그 인스턴스의 태스크는 없다.** 그때 `Mine` 으로 건너뛰면 그
-/// 레코드는 리더가 바뀔 때까지(또는 TTL 35일) 유령으로 남는다 — 교차 리뷰가 8·9회차에서
-/// 정지 확정 경로를 두고 반복해 지적한 것이 전부 이 구멍의 증상이었다.
+/// 근본 원인은 **관측 중이라는 사실을 스윕이 알 수 없다**는 것이었다. 그건 수집기만
+/// 안다. 그래서 수집기가 주기적으로 그 사실을 저장하고
+/// ([`crate::collector::Collector::heartbeat`]), 여기서는 침묵만 본다 — 침묵이 곧
+/// "아무도 관측하지 않는다" 다.
 ///
-/// `running` 은 **인스턴스 id → 그 태스크가 뜬 시각**이다. 없으면 내 것이라도 살아 있을 수
-/// 없으므로 침묵 시간으로 판정한다.
-///
-/// # 왜 시각이 필요한가 (id 집합만으로는 부족하다)
-///
-/// 태스크가 죽고 **같은 이름·같은 epoch 으로 새 태스크가 뜨면**, 옛 태스크가 남긴 레코드가
-/// 계속 `Mine` 으로 보인다 — 새 태스크는 그 레코드를 본 적이 없어 확정하지 못하는데
-/// 아무도 걷지 않는다(교차 리뷰 10회차). 정지 경합에서 늦게 도착한 쓰기도 인스턴스를
-/// 재개하면 같은 상태가 된다.
-///
-/// 그래서 **지금 태스크가 그 레코드를 만졌는가**를 본다: `last_seen_at_ms` 가 태스크가 뜬
-/// 시각 이후면 이 태스크의 것이다.
-///
-/// ⚠ **시작 시각으로 비교하면 안 된다.** 태스크가 뜨기 전에 시작된 긴 쿼리를 그 태스크가
-/// 관측하면 `started_at_ms < 태스크 시작` 인 **살아 있는** 레코드가 만들어진다. 그걸
-/// 남의 것으로 보면 33초 뒤 버려진다 — 가장 막아야 하는 실패다. 갱신 시각은 매 tick
-/// 올라가므로 그 문제가 없고, 아직 안 올라간 갓 만든 레코드는 침묵 시간이 짧아 `Alive` 다.
-pub type RunningTasks = std::collections::BTreeMap<String, EpochMs>;
-pub fn judge(
-    q: &SlowQuery,
-    me: &str,
-    my_epoch: Option<u64>,
-    now_ms: EpochMs,
-    threshold_ms: i64,
-    running: Option<&RunningTasks>,
-) -> Verdict {
+/// 저장소가 죽으면 하트비트도 실패하지만 **아래 확정 쓰기도 같은 저장소를 쓰므로**
+/// 버려지지도 않는다. 판정이 한쪽으로 치우칠 여지가 없다.
+pub fn judge(q: &SlowQuery, now_ms: EpochMs, threshold_ms: i64) -> Verdict {
     if q.state != SlowQueryState::InFlight {
         return Verdict::NotInFlight;
-    }
-    // 이름이 같고 **epoch 도 같고**, **지금 도는 태스크의 것**일 때만 내 것이다.
-    let is_mine = q.owner_worker.as_deref() == Some(me) && q.owner_epoch == my_epoch;
-    let owned_by_current_task = running.is_none_or(|r| {
-        r.get(q.instance_id.as_str()).is_some_and(|&started| {
-            // 갱신 시각이 없으면 선행 저장 직후다 — 시작 시각을 쓴다(침묵 판정과 같다).
-            let last_seen = q.last_seen_at_ms.unwrap_or(q.started_at_ms);
-            // ① 이 태스크가 만졌다. **엄격한 `>`** 다 — 우연히 같은 밀리초인 레코드를
-            //    "만졌다" 로 보면 영구히 가려진다(교차 리뷰 11회차). 살아 있는 레코드는
-            //    다음 tick(1초)에 갱신되어 넘어가므로 엄격해도 안전하다.
-            last_seen > started
-                // ② **갓 뜬 태스크에는 유예를 준다.** 태스크는 뜬 직후 인증·연결·첫
-                //    탐지를 비동기로 한다 — 그 사이에는 아직 아무 레코드도 만지지
-                //    못했다. 그때 ①만 보면 **살아 있는 쿼리의 레코드를 버린다.**
-                //    `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수 없다
-                //    (11회차가 배포 차단으로 잡았다 — 10회차 수정의 반대 방향이다).
-                //
-                //    유예는 침묵 임계와 같다: 그만큼 지났는데도 못 만졌으면 그 레코드는
-                //    이 태스크의 것이 아니다.
-                || now_ms.saturating_sub(started) <= threshold_ms
-        })
-    });
-    if is_mine && owned_by_current_task {
-        return Verdict::Mine;
     }
     // `last_seen_at_ms` 가 없으면 선행 저장 직후다 — `started_at_ms` 를 쓴다.
     let last_seen = q.last_seen_at_ms.unwrap_or(q.started_at_ms);
@@ -164,8 +127,6 @@ pub struct SweepStats {
     pub abandoned: usize,
     /// 아직 살아 있어 건드리지 않은 수.
     pub alive: usize,
-    /// 내 소유라 건너뛴 수.
-    pub mine: usize,
     pub errors: usize,
 }
 
@@ -174,20 +135,16 @@ pub struct SweepStats {
 /// 희소 GSI1(`SQS#in_flight`)로 진행 중 레코드만 조회한다 — `Scan` 이 아니다.
 pub async fn sweep<S: SlowQueryStore>(
     store: Arc<S>,
-    me: &str,
-    my_epoch: Option<u64>,
     now_ms: EpochMs,
     threshold_ms: i64,
     limit: usize,
-    // `running`: 인스턴스 → 태스크가 뜬 시각. `None` 이면 그 정보를 쓰지 않는다.
-    running: Option<&RunningTasks>,
 ) -> Result<SweepStats> {
     let mut stats = SweepStats::default();
     let in_flight = store.list_in_flight(limit).await?;
     stats.scanned = in_flight.len();
 
     for q in &in_flight {
-        match judge(q, me, my_epoch, now_ms, threshold_ms, running) {
+        match judge(q, now_ms, threshold_ms) {
             Verdict::Orphaned { silent_for_ms } => {
                 let abandoned = abandon(q, now_ms);
                 match store.upsert_merged(&abandoned).await {
@@ -213,7 +170,6 @@ pub async fn sweep<S: SlowQueryStore>(
                 }
             }
             Verdict::Alive => stats.alive += 1,
-            Verdict::Mine => stats.mine += 1,
             // 희소 GSI 가 진행 중만 준다. 여기 오면 인덱스가 갈렸다는 신호다.
             Verdict::NotInFlight => tracing::warn!(
                 state = ?q.state,
@@ -252,137 +208,39 @@ mod tests {
         q
     }
 
-    /// **`Mine` 은 "지금 그 인스턴스를 돌리고 있다" 를 뜻해야 한다.**
+    /// **소유자와 무관하게 침묵만 본다.**
     ///
-    /// 이름·epoch 만 보면, 정지 확정이 실패했거나 `abort()` 뒤 마지막 쓰기가 늦게
-    /// 도착했거나 등록부 조회가 실패해 확정을 건너뛴 경우에 **내 이름·내 epoch 인데
-    /// 태스크는 없는** 레코드가 남는다. 그때 건너뛰면 리더가 바뀔 때까지(또는 TTL 35일)
-    /// 유령이다 — 교차 리뷰가 8·9회차에서 정지 확정 경로를 두고 반복해 지적한 것이 전부
-    /// 이 구멍의 증상이었다. 개별 경로를 고치는 것보다 판정을 옳게 만드는 편이 확실하다.
+    /// 이름·epoch 으로 건너뛰면 급사한 태스크의 레코드가 TTL(35일)까지 유령으로 남고,
+    /// "지금 도는 태스크가 만졌는가" 를 벽시계로 추론하면 갓 뜬 태스크의 살아 있는
+    /// 레코드를 버린다 — 20~22라운드가 그 두 방향을 번갈아 지적했다. 관측 중이라는
+    /// 사실은 수집기가 하트비트로 저장하므로, 여기서는 소유자를 볼 이유가 없다.
     #[test]
-    fn a_record_of_mine_without_a_running_task_is_swept() {
-        let q = in_flight("me", Some(NOW - THRESHOLD - 1_000));
-        let id = q.instance_id.as_str().to_string();
-
-        // 그 태스크가 이 레코드를 만졌으면 내 것이다 — 건드리지 않는다.
-        let running: RunningTasks = [(id.clone(), NOW - THRESHOLD - 5_000)]
-            .into_iter()
-            .collect();
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&running)),
-            Verdict::Mine
-        );
-
-        // **도는 태스크가 없으면 내 것이라도 걷는다.**
-        let none_running = RunningTasks::new();
+    fn ownership_does_not_shield_a_silent_record() {
+        // 내 이름·내 epoch 이라도 침묵이 임계를 넘으면 걷는다.
+        let mine = in_flight("me", Some(NOW - THRESHOLD - 1_000));
         assert!(
-            matches!(
-                judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&none_running)),
-                Verdict::Orphaned { .. }
-            ),
-            "도는 태스크가 없는데 `Mine` 으로 건너뛴다 — 유령이 남는다"
+            matches!(judge(&mine, NOW, THRESHOLD), Verdict::Orphaned { .. }),
+            "내 소유라고 건너뛰면 확정 실패·정지 경합의 레코드가 영구히 남는다"
         );
-
-        // 침묵 시간이 짧으면 아직 걷지 않는다(방금 abort 된 태스크의 마지막 쓰기를 기다린다).
-        let fresh = in_flight("me", Some(NOW - 1_000));
-        assert_eq!(
-            judge(&fresh, "me", Some(7), NOW, THRESHOLD, Some(&none_running)),
-            Verdict::Alive
-        );
-
-        // `None` 이면 옛 판정과 같다(호출부가 정보를 모르는 경우).
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::Mine
-        );
+        // 남의 이름이어도 관측이 계속되면 건드리지 않는다.
+        let other = in_flight("other-worker", Some(NOW - 1_000));
+        assert_eq!(judge(&other, NOW, THRESHOLD), Verdict::Alive);
     }
 
-    /// **같은 이름·epoch 으로 뜬 새 태스크가 옛 레코드를 가리지 않는다.**
+    /// **하트비트 주기는 어떤 임계보다도 작아야 한다.**
     ///
-    /// 태스크가 죽고 교체되면 옛 레코드는 새 태스크가 본 적 없어 확정할 수 없는데,
-    /// id 만 보면 계속 `Mine` 이라 아무도 걷지 않는다(교차 리뷰 10회차).
+    /// 임계 최소값은 `GRACE_MS`(poll → 0)다. 주기가 그보다 크면 살아 있는 레코드가
+    /// 하트비트 사이에 임계를 넘어 `abandoned` 로 확정된다. 스윕하는 리더와 수집하는
+    /// 워커의 `poll_interval` 이 다를 수 있어(설정은 워커별) 자기 임계에서 유도하면
+    /// 안 된다 — 이 단정이 그 회귀를 막는다.
     #[test]
-    fn a_replacement_task_does_not_shield_the_previous_incarnation() {
-        // 레코드는 오래 전에 갱신이 끊겼다.
-        let q = in_flight("me", Some(NOW - 3 * THRESHOLD));
-        let id = q.instance_id.as_str().to_string();
-        // 새 태스크가 **그 레코드의 마지막 갱신 이후에** 떴고, **유예도 지났다** —
-        // 그만큼 돌았는데 못 만졌으면 그 태스크의 것이 아니다.
+    fn the_heartbeat_interval_stays_below_every_threshold() {
+        // 상수 사이의 관계는 `const _: () = assert!(..)` 가 컴파일 시점에 본다.
+        // 여기서는 **임계를 만드는 함수**와의 관계를 본다.
         //
-        // 유예 안이면 `Mine` 이 맞다(갓 뜬 태스크는 아직 아무것도 못 만진다) — 그 경우는
-        // `a_freshly_spawned_task_gets_a_grace_period` 가 덮는다.
-        let replacement: RunningTasks = [(id, NOW - THRESHOLD - 1)].into_iter().collect();
-        assert!(
-            matches!(
-                judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&replacement)),
-                Verdict::Orphaned { .. }
-            ),
-            "교체 태스크가 옛 레코드를 영구히 가린다"
-        );
-    }
-
-    /// **갓 뜬 태스크의 인스턴스 레코드를 버리지 않는다.**
-    ///
-    /// 태스크는 뜬 직후 인증·연결·첫 탐지를 비동기로 한다 — 그 사이에는 아직 어떤
-    /// 레코드도 만지지 못했다. "만진 것만 내 것" 으로만 보면 그때 **살아 있는 쿼리의
-    /// 레코드를 버린다**, 그리고 `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수
-    /// 없다(교차 리뷰 11회차가 배포 차단으로 잡았다).
-    #[test]
-    fn a_freshly_spawned_task_gets_a_grace_period() {
-        let q = in_flight("me", Some(NOW - THRESHOLD - 10_000));
-        let id = q.instance_id.as_str().to_string();
-
-        // 방금 뜬 태스크 — 아직 아무것도 못 만졌다.
-        let fresh_task: RunningTasks = [(id.clone(), NOW - 1_000)].into_iter().collect();
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&fresh_task)),
-            Verdict::Mine,
-            "갓 뜬 태스크의 살아 있는 레코드를 버렸다"
-        );
-
-        // 유예가 지났는데도 못 만졌으면 이 태스크의 것이 아니다.
-        let old_task: RunningTasks = [(id, NOW - THRESHOLD - 1)].into_iter().collect();
-        assert!(matches!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&old_task)),
-            Verdict::Orphaned { .. }
-        ));
-    }
-
-    /// **우연히 같은 밀리초인 레코드를 "만졌다" 로 보지 않는다.**
-    ///
-    /// `>=` 로 두면 그 레코드가 영구히 가려진다. 살아 있는 레코드는 다음 tick 에 갱신되어
-    /// 넘어가므로 엄격한 `>` 가 안전하다(교차 리뷰 11회차).
-    #[test]
-    fn an_equal_timestamp_is_not_treated_as_touched() {
-        let q = in_flight("me", Some(NOW - THRESHOLD - 10_000));
-        let id = q.instance_id.as_str().to_string();
-        // 태스크 시작 == 레코드 갱신 시각, 그리고 유예도 지났다.
-        let same: RunningTasks = [(id, NOW - THRESHOLD - 10_000)].into_iter().collect();
-        assert!(
-            matches!(
-                judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&same)),
-                Verdict::Orphaned { .. }
-            ),
-            "같은 밀리초를 '만졌다' 로 보아 영구히 가렸다"
-        );
-    }
-
-    /// **태스크보다 먼저 시작된 긴 쿼리를 버리지 않는다.**
-    ///
-    /// 시작 시각으로 비교하면(갱신 시각이 아니라) 태스크가 뜨기 전에 시작된 살아 있는
-    /// 쿼리가 남의 것으로 보여 버려진다 — 가장 막아야 하는 방향이다.
-    #[test]
-    fn a_long_query_that_predates_its_task_is_not_abandoned() {
-        let mut q = in_flight("me", Some(NOW - 1_000));
-        q.started_at_ms = NOW - 3_600_000;
-        let id = q.instance_id.as_str().to_string();
-        // 태스크는 쿼리 시작보다 **뒤에** 떴다.
-        let running: RunningTasks = [(id, NOW - 60_000)].into_iter().collect();
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&running)),
-            Verdict::Mine,
-            "살아 있는 긴 쿼리를 남의 것으로 봤다"
-        );
+        // 가장 짧은 poll 로도 임계는 하트비트의 두 배 이상이다 — 한 번 밀려도 안전하다.
+        assert!(stale_threshold_ms(0) >= HEARTBEAT_INTERVAL_MS * 2);
+        assert!(stale_threshold_ms(60_000) > HEARTBEAT_INTERVAL_MS);
     }
 
     #[test]
@@ -397,16 +255,10 @@ mod tests {
     #[test]
     fn recently_seen_records_are_left_alone() {
         let q = in_flight("other-worker", Some(NOW - 5_000));
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::Alive
-        );
+        assert_eq!(judge(&q, NOW, THRESHOLD), Verdict::Alive);
         // 임계 직전도 살아 있다.
         let q = in_flight("other-worker", Some(NOW - THRESHOLD));
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::Alive
-        );
+        assert_eq!(judge(&q, NOW, THRESHOLD), Verdict::Alive);
     }
 
     /// 임계를 넘으면 고아다.
@@ -414,47 +266,26 @@ mod tests {
     fn silent_records_past_the_threshold_are_orphaned() {
         let q = in_flight("dead-worker", Some(NOW - THRESHOLD - 1));
         assert!(matches!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
+            judge(&q, NOW, THRESHOLD),
             Verdict::Orphaned { .. }
         ));
     }
 
-    /// **현재 생애의 내 레코드는 고아가 아니다.** 내가 관측을 갱신하고 있다.
-    #[test]
-    fn my_own_records_in_this_lease_are_never_orphaned() {
-        let q = in_flight("me", Some(NOW - 10 * 60_000));
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::Mine
-        );
-    }
-
-    /// **이전 생애의 내 레코드는 고아다** (2차 리뷰 CRITICAL).
+    /// **급사한 프로세스의 레코드를 이름 때문에 건너뛰지 않는다** (2차 리뷰 CRITICAL).
     ///
-    /// `worker_id` 는 `{role}-{HOSTNAME}` 이라 재시작해도 같다. 이름만 보면 급사한
-    /// 프로세스의 레코드를 새 프로세스가 `Mine` 으로 보고 **영구히 건너뛴다** —
-    /// F4 가 없애려던 유령이 그 경로로 TTL(35일)까지 남는다.
+    /// `worker_id` 는 `{role}-{HOSTNAME}` 이라 재시작해도 같다. 이름으로 건너뛰면 급사한
+    /// 프로세스의 레코드를 새 프로세스가 자기 것으로 보고 **영구히 건너뛴다** — F4 가
+    /// 없애려던 유령이 그 경로로 TTL(35일)까지 남는다. 이제 소유자를 아예 보지 않으므로
+    /// 이름·epoch 이 어떻든 침묵이 판정한다.
     #[test]
-    fn my_records_from_a_previous_lease_are_orphaned() {
-        // 레코드의 epoch 는 7, 지금 내 epoch 는 8 (리스를 다시 잡았다).
-        let q = in_flight("me", Some(NOW - 10 * 60_000));
-        assert!(
-            matches!(
-                judge(&q, "me", Some(8), NOW, THRESHOLD, None),
-                Verdict::Orphaned { .. }
-            ),
-            "같은 이름이라고 이전 생애의 유령을 건너뛰었다"
-        );
-    }
-
-    /// 리더가 아니면(epoch 없음) 이름이 같아도 내 것이 아니다.
-    #[test]
-    fn without_a_lease_nothing_counts_as_mine() {
-        let q = in_flight("me", Some(NOW - 10 * 60_000));
-        assert!(matches!(
-            judge(&q, "me", None, NOW, THRESHOLD, None),
-            Verdict::Orphaned { .. }
-        ));
+    fn a_dead_process_leaves_no_ghost_regardless_of_its_name() {
+        for owner in ["me", "other-worker", "dbmon-collector-pod-0"] {
+            let q = in_flight(owner, Some(NOW - 10 * 60_000));
+            assert!(
+                matches!(judge(&q, NOW, THRESHOLD), Verdict::Orphaned { .. }),
+                "{owner} 의 유령이 남았다"
+            );
+        }
     }
 
     /// `last_seen_at_ms` 가 없으면 `started_at_ms` 를 쓴다 — 선행 저장 직후다.
@@ -463,16 +294,13 @@ mod tests {
         // 시작이 2분 전이고 임계가 33초 → 고아다.
         let q = in_flight("dead-worker", None);
         assert!(matches!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
+            judge(&q, NOW, THRESHOLD),
             Verdict::Orphaned { .. }
         ));
         // 시작이 방금이면 살아 있다.
         let mut fresh = in_flight("dead-worker", None);
         fresh.started_at_ms = NOW - 1_000;
-        assert_eq!(
-            judge(&fresh, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::Alive
-        );
+        assert_eq!(judge(&fresh, NOW, THRESHOLD), Verdict::Alive);
     }
 
     /// 확정된 레코드는 스윕 대상이 아니다.
@@ -480,10 +308,7 @@ mod tests {
     fn finalized_records_are_not_swept() {
         let mut q = in_flight("other", Some(NOW - 10 * 60_000));
         q.state = SlowQueryState::Finalized;
-        assert_eq!(
-            judge(&q, "me", Some(7), NOW, THRESHOLD, None),
-            Verdict::NotInFlight
-        );
+        assert_eq!(judge(&q, NOW, THRESHOLD), Verdict::NotInFlight);
     }
 
     /// **완료 시각을 만들어 내지 않는다.**
@@ -537,6 +362,8 @@ mod tests {
         alive.thread_id = 2;
         alive.record_id =
             dbmon_core::ids::RecordId::new(&alive.instance_id, 2, alive.started_at_ms);
+        // **내 소유이고 침묵한 레코드도 걷는다** — 확정 저장이 실패했거나 정지 확정을
+        // 건너뛴 경우가 정확히 이 모양이고, 건너뛰면 아무도 닫지 않는다.
         let mut mine = in_flight("me", Some(NOW - 10 * 60_000));
         mine.thread_id = 3;
         mine.record_id = dbmon_core::ids::RecordId::new(&mine.instance_id, 3, mine.started_at_ms);
@@ -545,12 +372,11 @@ mod tests {
             store.upsert_merged(q).await.expect("저장");
         }
 
-        let stats = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100, None)
+        let stats = sweep(Arc::clone(&store), NOW, THRESHOLD, 100)
             .await
             .expect("스윕");
-        assert_eq!(stats.abandoned, 1, "{stats:?}");
+        assert_eq!(stats.abandoned, 2, "{stats:?}");
         assert_eq!(stats.alive, 1);
-        assert_eq!(stats.mine, 1);
         assert_eq!(stats.errors, 0);
 
         // 고아만 상태가 바뀌었다.
@@ -579,13 +405,13 @@ mod tests {
         let orphan = in_flight("dead-worker", Some(NOW - 10 * 60_000));
         store.upsert_merged(&orphan).await.expect("저장");
 
-        let first = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100, None)
+        let first = sweep(Arc::clone(&store), NOW, THRESHOLD, 100)
             .await
             .expect("1회");
         assert_eq!(first.abandoned, 1);
 
         // 확정 후에는 희소 인덱스에서 빠지므로 두 번째 스윕은 아무것도 보지 않는다.
-        let second = sweep(Arc::clone(&store), "me", Some(7), NOW, THRESHOLD, 100, None)
+        let second = sweep(Arc::clone(&store), NOW, THRESHOLD, 100)
             .await
             .expect("2회");
         assert_eq!(second.abandoned, 0, "같은 레코드를 또 확정했다");

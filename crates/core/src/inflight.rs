@@ -88,6 +88,13 @@ pub struct Tracked {
     pub max_time_secs: i64,
     /// 마지막으로 관측된 시각(우리 시계). 고아 판정 기준 (F4).
     pub last_seen_at_ms: EpochMs,
+    /// 이 항목을 **저장소에 마지막으로 쓴 시각**. 한 번도 못 썼으면 `None`.
+    ///
+    /// 고아 판정은 저장된 `last_seen_at_ms` 의 침묵으로 한다. 그런데 저장은 심층 조회
+    /// 대상일 때만 일어나고, 플랜을 확보하면 그 대상에서 빠진다 — **살아 있는 쿼리의
+    /// 저장된 갱신 시각이 굳는다.** 그러면 임계를 넘겨 고아로 확정된다(교차 리뷰 22라운드).
+    /// 이 값으로 "굳기 전에 다시 쓸 항목" 을 고른다 ([`Tracker::needs_heartbeat`]).
+    pub saved_at_ms: Option<EpochMs>,
     /// 플랜 수집 시도 횟수. 상한을 넘으면 포기한다.
     pub plan_attempts: u8,
     /// 플랜을 확보했다.
@@ -388,6 +395,46 @@ impl InFlightTracker {
     }
 
     /// 심층 조회 결과를 반영한다.
+    /// 이 항목을 저장소에 **성공적으로 썼다**고 표시한다.
+    ///
+    /// 실패했을 때는 부르지 않는다 — 다음 tick 이 다시 고르게 둔다.
+    pub fn record_saved(&mut self, thread_id: u64, now_ms: EpochMs) {
+        if let Some(t) = self.entries.get_mut(&thread_id) {
+            t.saved_at_ms = Some(now_ms);
+        }
+    }
+
+    /// **저장된 갱신 시각이 굳은** 항목들. 오래 안 쓴 것부터 준다.
+    ///
+    /// # 왜 필요한가
+    ///
+    /// 고아 스윕은 저장된 `last_seen_at_ms` 의 침묵으로 판정한다. 그런데 저장은 심층
+    /// 조회 대상일 때만 일어나고, 플랜을 확보하면(또는 시도 상한에 걸리면) 그 대상에서
+    /// 빠진다 — 살아 있는 긴 쿼리의 저장된 값이 그 시점에 굳어 임계를 넘고, **살아 있는
+    /// 쿼리가 `abandoned` 로 확정된다**(교차 리뷰 22라운드의 배포 차단 항목).
+    ///
+    /// 그래서 추적 중인 항목은 주기적으로 다시 쓴다. 그러면 "침묵" 이 실제로 "아무도
+    /// 관측하지 않는다" 를 뜻하게 되고, 스윕은 시각 비교만으로 옳아진다 — 소유를
+    /// 추론할 필요가 없다(그 추론이 20~22라운드에서 양방향으로 틀렸다).
+    ///
+    /// 상한은 두지 않는다. **호출부가 자르고 자른 사실을 기록한다** — 조용히 자르면
+    /// 잘린 항목이 고아로 확정되는데 그 이유가 어디에도 남지 않는다.
+    pub fn needs_heartbeat(&self, now_ms: EpochMs, interval_ms: i64) -> Vec<u64> {
+        let mut stale: Vec<(EpochMs, u64)> = self
+            .entries
+            .values()
+            .filter(|t| {
+                t.saved_at_ms
+                    // 아직 한 번도 못 썼으면 급하다 — 저장소에 레코드 자체가 없다.
+                    .is_none_or(|saved| now_ms.saturating_sub(saved) >= interval_ms)
+            })
+            // 한 번도 못 쓴 것을 가장 앞에 둔다(`None` → 0).
+            .map(|t| (t.saved_at_ms.unwrap_or(0), t.thread_id))
+            .collect();
+        stale.sort_unstable();
+        stale.into_iter().map(|(_, id)| id).collect()
+    }
+
     pub fn record_deep_probe(
         &mut self,
         thread_id: u64,
@@ -447,6 +494,7 @@ fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Trac
         started_at_ms_precise: None,
         max_time_secs: obs.time_secs,
         last_seen_at_ms: now_ms,
+        saved_at_ms: None,
         plan_attempts: 0,
         has_plan: false,
     }
@@ -891,6 +939,63 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(t.is_empty());
         assert!(drained.iter().all(|(_, r)| !r.observed_end()));
+    }
+
+    /// **플랜을 확보한 뒤에도 하트비트 대상이다.**
+    ///
+    /// 심층 조회 대상은 "플랜이 없는 것" 이므로 플랜을 확보하면 저장이 멈춘다. 그때
+    /// 하트비트가 없으면 저장된 `last_seen_at_ms` 가 굳고, 살아 있는 쿼리가 임계를 넘겨
+    /// `abandoned` 로 확정된다 — 되돌릴 수 없는 실패다(교차 리뷰 22라운드).
+    #[test]
+    fn a_tracked_entry_still_needs_heartbeats_after_its_plan_is_captured() {
+        const INTERVAL: EpochMs = 15_000;
+        let mut t = InFlightTracker::default();
+        let r = t.tick(&[obs(1, 2, Some("a"))], 1_000, &no_offset(), false);
+        assert_eq!(r.needs_deep_probe, vec![1], "새 항목은 심층 조회 대상이다");
+
+        // 심층 조회로 플랜을 확보하고 저장했다.
+        t.record_plan_attempt(1, true);
+        t.record_saved(1, 1_000);
+
+        // 이제 심층 조회 대상이 아니다 — 저장을 유발하는 경로가 없다.
+        let r = t.tick(&[obs(1, 30, Some("a"))], 31_000, &no_offset(), false);
+        assert!(
+            r.needs_deep_probe.is_empty(),
+            "플랜이 있으면 다시 조회하지 않는다 — 그래서 하트비트가 필요하다"
+        );
+
+        // 관측은 계속되고 있다(메모리 값은 올라간다).
+        assert_eq!(t.get(1).unwrap().last_seen_at_ms, 31_000);
+        // **주기가 지났으므로 다시 써야 한다.**
+        assert_eq!(t.needs_heartbeat(31_000, INTERVAL), vec![1]);
+
+        // 쓰고 나면 주기 안에는 다시 고르지 않는다 — 쓰기 비용에 상한이 생긴다.
+        t.record_saved(1, 31_000);
+        assert!(t.needs_heartbeat(40_000, INTERVAL).is_empty());
+        assert_eq!(t.needs_heartbeat(46_000, INTERVAL), vec![1]);
+    }
+
+    /// **한 번도 못 쓴 항목이 가장 급하다.** 저장소에 레코드 자체가 없다.
+    #[test]
+    fn never_saved_entries_come_first() {
+        const INTERVAL: EpochMs = 15_000;
+        let mut t = InFlightTracker::default();
+        t.tick(
+            &[
+                obs(1, 2, Some("a")),
+                obs(2, 3, Some("b")),
+                obs(3, 4, Some("c")),
+            ],
+            1_000,
+            &no_offset(),
+            false,
+        );
+        t.record_saved(1, 20_000);
+        t.record_saved(3, 1_000);
+        // 2 는 한 번도 못 썼다 → 맨 앞. 그다음은 오래된 순(3 → 1).
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![2, 3, 1]);
+        // 상한은 호출부가 자른다 — 여기서 조용히 자르지 않는다.
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL).len(), 3);
     }
 
     #[test]

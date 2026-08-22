@@ -75,7 +75,15 @@ pub struct TickStats {
     pub masking_degraded: usize,
     pub plan_redactions: usize,
     pub store_errors: usize,
+    /// **아직 관측 중이라고 다시 쓴 레코드 수** (고아 오판 방지 — `heartbeat` 참조).
+    pub heartbeats: usize,
 }
+
+/// tick 당 하트비트 쓰기 상한. 동시 슬로우 쿼리가 폭주해도 쓰기 예산을 묶는다.
+///
+/// 주기가 임계의 절반보다 짧으므로(`HEARTBEAT_INTERVAL_MS`) 상한에 걸린 항목도 다음
+/// tick 에 다시 후보가 된다 — 한 번 밀린 것이 곧바로 고아가 되지는 않는다.
+const HEARTBEAT_LIMIT: usize = 200;
 
 /// 수집 파라미터. 설정에서 온다.
 #[derive(Debug, Clone)]
@@ -345,7 +353,87 @@ where
             }
         }
 
+        self.heartbeat(now_ms, &mut stats).await;
+
         Ok(stats)
+    }
+
+    /// **아직 관측 중이라고 저장소에 다시 말한다.**
+    ///
+    /// # 왜 필요한가
+    ///
+    /// 고아 스윕(F4)은 저장된 `last_seen_at_ms` 의 침묵으로 판정한다. 그런데 선행 저장은
+    /// **심층 조회 대상일 때만** 일어나고, 플랜을 확보하면 그 대상에서 빠진다 — 살아 있는
+    /// 긴 쿼리의 저장된 값이 그 시점에 굳고, 임계를 넘기면 **살아 있는 쿼리가
+    /// `abandoned` 로 확정된다.** `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수
+    /// 없다(교차 리뷰 22라운드의 배포 차단 항목).
+    ///
+    /// 앞선 라운드들은 이걸 스윕 쪽에서 "지금 도는 태스크의 것인가" 를 벽시계로 추론해
+    /// 가리려 했는데, 그 추론이 20~22라운드에서 **양방향으로** 틀렸다(살아 있는 것을
+    /// 버리거나, 아무도 확정하지 않을 것을 영구히 가렸다). 관측하고 있다는 사실은 여기서만
+    /// 알 수 있으므로 **여기서 말한다.** 그러면 침묵이 실제로 "아무도 관측하지 않는다" 를
+    /// 뜻하고 스윕은 시각 비교만으로 옳다.
+    ///
+    /// 실패는 삼킨다 — 다음 tick 이 같은 항목을 다시 고른다(`record_saved` 를 부르지
+    /// 않으므로). 스윕의 확정 쓰기도 같은 저장소를 쓰므로, 저장소가 죽어 있으면 여기도
+    /// 실패하지만 **버려지지도 않는다.**
+    async fn heartbeat(&mut self, now_ms: dbmon_core::time::EpochMs, stats: &mut TickStats) {
+        let mut stale = self
+            .tracker
+            .needs_heartbeat(now_ms, crate::orphan::HEARTBEAT_INTERVAL_MS);
+        if stale.len() > HEARTBEAT_LIMIT {
+            // **조용히 자르지 않는다.** 잘린 항목은 임계를 넘으면 고아로 확정되므로,
+            // 왜 그랬는지가 로그에 남아야 한다.
+            tracing::warn!(
+                instance = %self.instance.id,
+                stale = stale.len(),
+                limit = HEARTBEAT_LIMIT,
+                "하트비트 상한에 걸렸다 — 오래된 것부터만 갱신한다 (남은 것은 고아로 확정될 수 있다)"
+            );
+            stale.truncate(HEARTBEAT_LIMIT);
+        }
+
+        for id in stale {
+            let Some(out) = self.tracker.get(id).map(|tracked| {
+                build(CaptureInput {
+                    instance: &self.instance,
+                    tracked,
+                    // 하트비트는 **새 사실을 만들지 않는다.** 갱신 시각만 올린다 —
+                    // `upsert_merged` 가 속성별로 병합하므로 이미 저장된 SQL·플랜은 남는다.
+                    full_sql: None,
+                    stmt: None,
+                    plan_json: None,
+                    plan_source: PlanSource::None,
+                    plan_error: None,
+                    plan_tree: None,
+                    policy: self.params.literal_policy,
+                    policy_at_ms: now_ms,
+                    state: SlowQueryState::InFlight,
+                    finalize_reason: None,
+                    now_ms,
+                    offset: &self.offset,
+                    owner_worker: &self.params.worker_id,
+                    owner_epoch: self.epoch,
+                })
+            }) else {
+                continue;
+            };
+            match self.store.upsert_merged(&out.query).await {
+                Ok(_) => {
+                    stats.heartbeats += 1;
+                    self.tracker.record_saved(id, now_ms);
+                }
+                Err(e) => {
+                    stats.store_errors += 1;
+                    tracing::warn!(
+                        instance = %self.instance.id,
+                        thread_id = id,
+                        error = %e,
+                        "하트비트 저장 실패 — 다음 tick 에 다시 시도한다"
+                    );
+                }
+            }
+        }
     }
 
     /// 필요하면 연결 풀을 채운다. **`detect_tick` 밖에서 호출한다** — 여기서
@@ -477,8 +565,11 @@ where
             self.tracker.record_plan_attempt(*id, plan.json.is_some());
 
             // **선행 저장** — 정규화·마스킹을 거친 형태로 (F2).
-            if let Some(tracked) = self.tracker.get(*id) {
-                let out = build(CaptureInput {
+            //
+            // `map` 으로 소유값을 만들어 **추적기 대여를 여기서 끝낸다** — 저장 성공을
+            // `record_saved` 로 표시해야 하므로(하트비트 기준) 뒤에서 가변 대여가 필요하다.
+            let Some(out) = self.tracker.get(*id).map(|tracked| {
+                build(CaptureInput {
                     instance: &self.instance,
                     tracked,
                     full_sql: f.and_then(|r| r.info.as_deref()),
@@ -495,20 +586,25 @@ where
                     offset: &self.offset,
                     owner_worker: &self.params.worker_id,
                     owner_epoch: self.epoch,
-                });
-                stats.masking_degraded += usize::from(out.masking_degraded);
-                stats.plan_redactions += out.plan_redactions;
-                match self.store.upsert_merged(&out.query).await {
-                    Ok(_) => stats.prefetch_saved += 1,
-                    Err(e) => {
-                        stats.store_errors += 1;
-                        tracing::warn!(
-                            instance = %self.instance.id,
-                            thread_id = id,
-                            error = %e,
-                            "선행 저장 실패"
-                        );
-                    }
+                })
+            }) else {
+                continue;
+            };
+            stats.masking_degraded += usize::from(out.masking_degraded);
+            stats.plan_redactions += out.plan_redactions;
+            match self.store.upsert_merged(&out.query).await {
+                Ok(_) => {
+                    stats.prefetch_saved += 1;
+                    self.tracker.record_saved(*id, now_ms);
+                }
+                Err(e) => {
+                    stats.store_errors += 1;
+                    tracing::warn!(
+                        instance = %self.instance.id,
+                        thread_id = id,
+                        error = %e,
+                        "선행 저장 실패"
+                    );
                 }
             }
         }
