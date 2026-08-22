@@ -1,34 +1,44 @@
 import { describe, expect, it } from "vitest";
 
-import { displayDurationMs, elapsedMs, isRunning, serverNow } from "./elapsed";
+import { displayDurationMs, isRunning, serverNow } from "./elapsed";
 
 const T0 = 1_787_147_400_000;
 
-describe("elapsedMs", () => {
-  it("진행 중이면 시계로 흐른다 — 저장값에 멈추지 않는다", () => {
-    // 저장은 2.0초에서 멈췄지만 실제로는 10분 돌고 있다.
-    expect(elapsedMs(T0, 2_000, T0 + 600_000)).toBe(600_000);
-  });
-
-  it("**저장값보다 작게 보여주지 않는다** — 브라우저 시계가 뒤처져도", () => {
-    // 브라우저가 5초 뒤처져 있다: now - started 가 저장값보다 작다.
-    expect(elapsedMs(T0, 30_000, T0 + 25_000)).toBe(30_000);
-    // 극단: 브라우저가 시작 시각보다 앞이다 → 음수가 나오면 안 된다.
-    expect(elapsedMs(T0, 30_000, T0 - 10_000)).toBe(30_000);
-  });
-});
-
 describe("displayDurationMs", () => {
-  const row = (state: string) => ({ state, started_at_ms: T0, duration_ms: 2_000 });
+  const running = (lastSeen: number | null) => ({
+    state: "inflight",
+    duration_ms: 2_000,
+    last_seen_at_ms: lastSeen,
+  });
 
-  it("진행 중 상태에서만 흐른다", () => {
-    expect(displayDurationMs(row("inflight"), T0 + 60_000)).toBe(60_000);
-    expect(displayDurationMs(row("in_flight"), T0 + 60_000)).toBe(60_000);
+  it("**관측 시각 이후 흐른 시간을 더한다** — 저장값에 멈추지 않는다", () => {
+    // 2초에서 관측됐고 그 뒤 10분이 흘렀다.
+    expect(displayDurationMs(running(T0), T0 + 600_000)).toBe(602_000);
+  });
+
+  it("**두 기계의 시계를 빼지 않는다.** `started_at_ms` 를 쓰지 않는 것이 요점이다", () => {
+    // DB 시계가 5분 뒤처져 있어도(started_at_ms 가 5분 이르게 보여도) 영향이 없다 —
+    // 이 함수는 그 값을 아예 받지 않는다.
+    const row = { state: "inflight", duration_ms: 2_000, last_seen_at_ms: T0 };
+    expect(displayDurationMs(row, T0 + 500)).toBe(2_500);
+  });
+
+  it("관측 시각을 모르면 저장값을 쓴다 (옛 API·슬로우로그 레코드)", () => {
+    expect(displayDurationMs(running(null), T0 + 600_000)).toBe(2_000);
+    expect(
+      displayDurationMs({ state: "inflight", duration_ms: 2_000 }, T0 + 600_000),
+    ).toBe(2_000);
+  });
+
+  it("서버 시각이 관측 시각보다 이르면 0 으로 본다 — 음수를 표시하지 않는다", () => {
+    expect(displayDurationMs(running(T0 + 5_000), T0)).toBe(2_000);
   });
 
   it("**끝난 쿼리의 시간은 늘어나지 않는다.** 그게 유령으로 보이는 화면이다", () => {
     for (const state of ["finalized", "abandoned"]) {
-      expect(displayDurationMs(row(state), T0 + 600_000)).toBe(2_000);
+      expect(
+        displayDurationMs({ state, duration_ms: 2_000, last_seen_at_ms: T0 }, T0 + 600_000),
+      ).toBe(2_000);
     }
   });
 
@@ -40,27 +50,21 @@ describe("displayDurationMs", () => {
 });
 
 describe("serverNow", () => {
-  const ref = { serverNowMs: T0, receivedAtMs: 9_000_000_000_000 }; // 브라우저가 한참 앞서 있다
+  // 응답을 받은 순간: 서버 시각 T0, 단조 시계 5_000.
+  const ref = { serverNowMs: T0, monotonicAtMs: 5_000 };
 
-  it("**브라우저 시계의 절대값을 쓰지 않는다** — 기준점 이후 경과만 더한다", () => {
-    // 브라우저 시계가 서버보다 훨씬 앞서지만, 경과는 3초다.
-    expect(serverNow(ref, ref.receivedAtMs + 3_000)).toBe(T0 + 3_000);
+  it("**단조 시계가 흐른 만큼만** 더한다", () => {
+    expect(serverNow(ref, 8_000, 0)).toBe(T0 + 3_000);
   });
 
-  it("브라우저 시계가 뒤로 가도 기준점보다 이전으로 돌아가지 않는다", () => {
-    expect(serverNow(ref, ref.receivedAtMs - 60_000)).toBe(T0);
+  it("**뒤로 가지 않는다** — NTP 가 벽시계를 당겨도 경과가 줄지 않는다", () => {
+    // 단조 시계는 뒤로 가지 않지만, 방어적으로 확인한다.
+    expect(serverNow(ref, 4_000, 0)).toBe(T0);
   });
 
-  it("**기준점이 없으면 브라우저 시계로 떨어진다** — 옛 API 와 만나도 표를 잃지 않는다", () => {
-    expect(serverNow({}, 12_345)).toBe(12_345);
-    expect(serverNow({ serverNowMs: T0 }, 12_345)).toBe(12_345);
-    expect(serverNow({ serverNowMs: Number.NaN, receivedAtMs: 1 }, 12_345)).toBe(12_345);
-  });
-
-  it("기준점과 결합하면 2초 쿼리가 5분으로 보이지 않는다", () => {
-    // 옛 계산: Date.now() - started = 브라우저가 5분 앞서면 약 300초.
-    const started = T0 - 2_000;
-    const now = serverNow(ref, ref.receivedAtMs + 500);
-    expect(displayDurationMs({ state: "inflight", started_at_ms: started, duration_ms: 2_000 }, now)).toBe(2_500);
+  it("기준점이 없으면 넘겨준 대체값을 쓴다 — 옛 API 와 만나도 표를 잃지 않는다", () => {
+    expect(serverNow({}, 8_000, 12_345)).toBe(12_345);
+    expect(serverNow({ serverNowMs: T0 }, 8_000, 12_345)).toBe(12_345);
+    expect(serverNow({ serverNowMs: Number.NaN, monotonicAtMs: 1 }, 8_000, 12_345)).toBe(12_345);
   });
 });

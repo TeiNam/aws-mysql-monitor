@@ -19,6 +19,8 @@ import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { PlanGraph } from "../components/PlanGraph";
 import { PlanTable } from "../components/PlanTable";
+import { displayDurationMs, isRunning } from "../lib/elapsed";
+import { useRunningNow } from "../lib/useRunningNow";
 import { TuningPanel } from "../components/TuningPanel";
 import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
@@ -120,6 +122,13 @@ export function PlanVisualizationPage() {
   }
 
   const items = plans.data?.items ?? [];
+  // 진행 중 행이 보일 때만 경과 타이머를 돈다 — 계획 목록에도 진행 중 행이 온다
+  // (`/api/plans` 는 상태로 걸러내지 않는다).
+  const nowMs = useRunningNow(
+    items.some((q) => isRunning(q.state)),
+    plans.data?.server_now_ms,
+    plans.dataUpdatedAt,
+  );
   // **결과가 줄면 페이지를 당긴다.** 안 당기면 빈 표가 나오고 이유가 화면에 없다.
   const lastPage = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
   const safePage = Math.min(page, lastPage);
@@ -130,7 +139,6 @@ export function PlanVisualizationPage() {
   const picked = selected === "" ? undefined : items.find((i) => i.record_id === selected);
   const missing = selected !== "" && picked === undefined && !plans.isPending;
   const current = picked ?? (selected === "" ? items[0] : undefined);
-  const nowMs = Date.now();
 
   return (
     <div className="space-y-6">
@@ -235,7 +243,8 @@ export function PlanVisualizationPage() {
                       <td className={`${TD_NUM} ${COL_TIGHT}`}>
                         <span className="flex items-center justify-end">
                           <Clock className={CELL_ICON} />
-                          {(q.duration_ms / 1000).toFixed(1)}s
+                          {/* 진행 중이면 경과가 흐른다 — 저장값은 관측 시점의 것이다. */}
+                          {(displayDurationMs(q, nowMs) / 1000).toFixed(1)}s
                         </span>
                       </td>
                       {/* 남는 폭을 전부 받는다. `max-w-0` + `truncate` 조합이 있어야
@@ -275,7 +284,7 @@ export function PlanVisualizationPage() {
           </button>
         </Card>
       ) : null}
-      {current === undefined ? null : <PlanDetail query={current} tz={tz} />}
+      {current === undefined ? null : <PlanDetail query={current} tz={tz} nowMs={nowMs} />}
       {plans.data?.has_more === true ? (
         <Note>
           플랜이 조회 상한을 넘었다 — 목록은 최근 것만 보여준다. 인스턴스로 좁히면 더
@@ -286,7 +295,15 @@ export function PlanVisualizationPage() {
   );
 }
 
-function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
+function PlanDetail({
+  query,
+  tz,
+  nowMs,
+}: {
+  query: SlowQueryView;
+  tz: Timezone;
+  nowMs: number;
+}) {
   const [downloading, setDownloading] = useState(false);
   const queryClient = useQueryClient();
   const plan = useQuery({
@@ -344,7 +361,9 @@ function PlanDetail({ query, tz }: { query: SlowQueryView; tz: Timezone }) {
             <StateBadge state={query.state} reason={query.abandoned_reason} />
           </Item>
           <Item label="Thread">{query.thread_id}</Item>
-          <Item label="Execution Time">{(query.duration_ms / 1000).toFixed(2)}s</Item>
+          <Item label="Execution Time">
+            {(displayDurationMs(query, nowMs) / 1000).toFixed(2)}s
+          </Item>
           <Item label="Started">{fmtListTime(query.started_at_ms, tz, Date.now())}</Item>
           <Item label="Schema">{query.schema_name ?? EMPTY}</Item>
           <Item label="DB User">{query.db_user ?? EMPTY}</Item>

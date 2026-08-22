@@ -254,6 +254,15 @@ impl InFlightTracker {
         self.entries.len() > self.max_entries
     }
 
+    /// 이 항목이 아직 플랜을 원하는가. **판정을 한 곳에 둔다** — 심층 조회 대상 선정과
+    /// 호출부의 "플랜을 다시 시도할까" 가 갈리면, 포기한 플랜을 매 tick 다시 시도하거나
+    /// 반대로 얻을 수 있는 플랜을 안 얻는다.
+    pub fn wants_plan(&self, thread_id: u64) -> bool {
+        self.entries
+            .get(&thread_id)
+            .is_some_and(|t| entry_wants_plan(t, self.max_plan_attempts))
+    }
+
     pub fn get(&self, thread_id: u64) -> Option<&Tracked> {
         self.entries.get(&thread_id)
     }
@@ -310,7 +319,15 @@ impl InFlightTracker {
                             existing.identity.digest = obs.identity.digest.clone();
                         }
                         // 플랜이 없으면 재시도 대상이다.
-                        if !existing.has_plan && existing.plan_attempts < self.max_plan_attempts {
+                        //
+                        // **자리를 모르는 항목도 대상이다.** 그 조건이 없으면 이렇게
+                        // 갇힌다: 첫 플랜은 성공했는데 저장이 실패했다 → `has_plan=true`
+                        // 라 다시 대상이 되지 않고 → 자리를 모르니 하트비트도 못 한다 →
+                        // 이전 리더가 남긴 **살아 있는 행**이 210초 뒤 버려진다
+                        // (교차 리뷰 26라운드). 플랜 시도 상한과 무관하게, 자리를 얻을
+                        // 때까지는 쓰기를 시도해야 한다.
+                        let wants_plan = entry_wants_plan(existing, self.max_plan_attempts);
+                        if wants_plan || existing.storage_key.is_none() {
                             result.needs_deep_probe.push(obs.thread_id);
                         }
                     } else {
@@ -510,6 +527,12 @@ impl InFlightTracker {
             .map(|t| (t, FinalizeReason::Shutdown))
             .collect()
     }
+}
+
+/// 이 항목이 아직 플랜을 원하는가. **자유 함수다** — `tick` 이 엔트리를 가변 대여한
+/// 상태에서도 불러야 한다.
+fn entry_wants_plan(t: &Tracked, max_plan_attempts: u8) -> bool {
+    !t.has_plan && t.plan_attempts < max_plan_attempts
 }
 
 fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Tracked {
@@ -727,10 +750,20 @@ mod tests {
         let mut t = InFlightTracker::default();
         t.tick(&[obs(100, 2, Some("d1"))], 10_000, &no_offset(), false);
         t.record_plan_attempt(100, true);
+        // **자리를 알아야 대상에서 빠진다.** 플랜만 있고 저장이 안 됐으면 하트비트를
+        // 할 수 없으므로 계속 쓰기를 시도해야 한다(26라운드).
         let r = t.tick(&[obs(100, 5, Some("d1"))], 13_000, &no_offset(), false);
+        assert_eq!(
+            r.needs_deep_probe,
+            vec![100],
+            "플랜은 있지만 자리를 모른다 — 쓰기를 계속 시도해야 한다"
+        );
+        t.record_saved(100, 13_000, crate::ports::StoredKey::new("row-100"));
+        // TIME 을 올리지 않는다 — 아래 단정이 관측된 최대값을 본다.
+        let r = t.tick(&[obs(100, 5, Some("d1"))], 14_000, &no_offset(), false);
         assert!(
             r.needs_deep_probe.is_empty(),
-            "플랜을 이미 얻었으면 재시도하지 않는다"
+            "플랜을 이미 얻었고 자리도 알면 재시도하지 않는다"
         );
         assert!(r.finalized.is_empty());
         let e = t.get(100).unwrap();
@@ -900,9 +933,24 @@ mod tests {
         let r = t.tick(&[obs(1, 3, Some("d"))], 1_000, &no_offset(), false);
         assert_eq!(r.needs_deep_probe, vec![1], "1회 실패 후에는 재시도한다");
         t.record_plan_attempt(1, false);
+        // 자리를 알려 준 뒤에야 대상에서 빠진다 — 자리를 모르면 쓰기를 계속 시도한다.
+        t.record_saved(1, 2_000, crate::ports::StoredKey::new("row-1"));
         let r = t.tick(&[obs(1, 4, Some("d"))], 2_000, &no_offset(), false);
         assert!(r.needs_deep_probe.is_empty(), "상한에 도달하면 포기한다");
         assert_eq!(t.get(1).unwrap().plan_attempts, 2);
+
+        // **자리를 모르면 상한과 무관하게 남는다.** 그게 없으면 인수인계 뒤 이전 리더가
+        // 남긴 살아 있는 행이 210초 뒤 버려진다(26라운드가 배포 차단으로 잡았다).
+        let mut t2 = InFlightTracker::new(DEFAULT_MAX_TRACKING_MS, 2);
+        t2.tick(&[obs(9, 2, Some("d"))], 0, &no_offset(), false);
+        t2.record_plan_attempt(9, false);
+        t2.record_plan_attempt(9, false);
+        let r = t2.tick(&[obs(9, 3, Some("d"))], 1_000, &no_offset(), false);
+        assert_eq!(
+            r.needs_deep_probe,
+            vec![9],
+            "플랜을 포기했는데 자리도 모른다 — 쓰기를 계속 시도해야 한다"
+        );
     }
 
     #[test]

@@ -29,6 +29,14 @@ pub struct SlowQueryView {
     pub started_at_ms: i64,
     pub duration_ms: i64,
     pub duration_source: String,
+    /// 이 소요를 **관측한 시각**(수집기 시계). 진행 중 행의 경과 계산에 쓴다.
+    ///
+    /// `started_at_ms` 는 **대상 DB 시계**이므로 여기서 빼면 두 기계의 시계를 섞는다 —
+    /// DB 시계가 5분 어긋난 환경에서 2초 쿼리가 5분으로 보인다(교차 리뷰 26라운드).
+    /// `duration_ms + (server_now_ms - last_seen_at_ms)` 는 **둘 다 우리 시계**다.
+    ///
+    /// 하트비트가 이 값과 `duration_ms` 를 **함께** 올리므로 짝이 어긋나지 않는다.
+    pub last_seen_at_ms: Option<EpochMs>,
     pub capture_source: String,
     pub app_digest: String,
     pub statement_type: String,
@@ -73,6 +81,7 @@ impl SlowQueryView {
             started_at_ms: q.started_at_ms,
             duration_ms: q.duration_ms,
             duration_source: format!("{:?}", q.duration_source).to_lowercase(),
+            last_seen_at_ms: q.last_seen_at_ms,
             capture_source: format!("{:?}", q.capture_source).to_lowercase(),
             app_digest: q.app_digest.clone(),
             statement_type: format!("{:?}", q.statement_type).to_lowercase(),

@@ -216,7 +216,12 @@ impl SlowQueryStore for FakeSlowQueryStore {
     /// 어댑터와 **같은 계약**을 지킨다: 쓰기가 알려 준 자리만 보고, 없으면 만들지 않고,
     /// 진행 중일 때만, 값을 되돌리지 않는다. 페이크가 느슨하면 통합 테스트만 통과하는
     /// 코드가 나온다(GSI 사영에서 한 번 데였다).
-    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool> {
+    async fn touch_in_flight(
+        &self,
+        key: &StoredKey,
+        last_seen_at_ms: EpochMs,
+        duration_ms: i64,
+    ) -> Result<bool> {
         let mut items = self.items.lock().unwrap();
         let Some(e) = items.get_mut(key.as_str()) else {
             return Ok(false);
@@ -226,7 +231,10 @@ impl SlowQueryStore for FakeSlowQueryStore {
         {
             return Ok(false);
         }
+        // 어댑터와 같이 **짝으로** 올린다 — 따로 쓰면 화면의 경과가 어긋난다.
         e.last_seen_at_ms = Some(last_seen_at_ms);
+        e.duration_ms = duration_ms;
+        e.duration_source = crate::slow_query::DurationSource::Polled;
         Ok(true)
     }
 }

@@ -641,6 +641,17 @@ impl Config {
                 "detect_limit 보다 클 수 없다 — 탐지되지 않은 후보를 심층 조회할 수 없다",
             ));
         }
+        // **0 은 저장 경로를 통째로 끈다.** 심층 조회가 없으면 선행 저장도 없고, 그러면
+        // 진행 중 레코드가 만들어지지 않으며 그 자리를 모르니 하트비트도 못 한다 —
+        // 인수인계 뒤 이전 리더가 남긴 살아 있는 행이 **영구히** 갱신되지 않는다
+        // (교차 리뷰 26라운드). "플랜을 끄고 싶다" 는 `try_for_connection` 과
+        // `literal_policy` 로 표현한다.
+        if c.deep_probe_limit == 0 {
+            return Err(err(
+                "collector.deep_probe_limit",
+                "1 이상이어야 한다 — 0 이면 선행 저장이 아예 일어나지 않는다",
+            ));
+        }
         dbmon_core::rollup::RollupConfig {
             top_n: c.digest_top_n,
             threshold_ms: c.digest_threshold_ms,

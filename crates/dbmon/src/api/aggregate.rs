@@ -580,6 +580,7 @@ mod tests {
             started_at_ms: 1_000,
             duration_ms: 2_000,
             duration_source: "slowlog".into(),
+            last_seen_at_ms: None,
             capture_source: "merged".into(),
             app_digest: "d1".into(),
             statement_type: "select".into(),

@@ -970,15 +970,26 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     ///
     /// 지금은 `upsert_merged_keyed` 가 알려 준 자리만 쓴다. 추측이 없으므로 잘못된 행을
     /// 갱신할 수 없고, 조회도 없다.
-    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool> {
+    async fn touch_in_flight(
+        &self,
+        key: &StoredKey,
+        last_seen_at_ms: EpochMs,
+        duration_ms: i64,
+    ) -> Result<bool> {
         let (pk, sk) = split_stored_key(key)?;
-        self.touch_at(pk, sk, last_seen_at_ms).await
+        self.touch_at(pk, sk, last_seen_at_ms, duration_ms).await
     }
 }
 
 impl DynamoSlowQueryStore {
     /// 물리 키를 알 때의 조건부 갱신. **조건 실패는 `Ok(false)`** 다.
-    async fn touch_at(&self, pk: &str, sk: &str, last_seen_at_ms: EpochMs) -> Result<bool> {
+    async fn touch_at(
+        &self,
+        pk: &str,
+        sk: &str,
+        last_seen_at_ms: EpochMs,
+        duration_ms: i64,
+    ) -> Result<bool> {
         use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 
         let res = self
@@ -994,9 +1005,12 @@ impl DynamoSlowQueryStore {
             // 쓰기는 조건에서 걸려 다시 읽고 병합한다(병합은 `max(last_seen)` 이다).
             //
             // 옛 항목에는 `rev` 가 없으므로 `if_not_exists` 로 0에서 시작한다.
+            // **관측한 소요도 함께 올린다.** 갱신 시각만 올리면 짝이 어긋나 화면이
+            // 10분째 도는 쿼리를 2초로 표시한다(포트 문서 참고). 소스도 그 관측의
+            // 것으로 맞춘다 — `timer` 로 남겨 두면 정밀도를 잘못 주장한다.
             .update_expression(
-                "SET last_seen_at_ms = :ls, GSI1SK = :g1sk, \
-                 #rev = if_not_exists(#rev, :zero) + :one",
+                "SET last_seen_at_ms = :ls, duration_ms = :dur, duration_source = :src, \
+                 GSI1SK = :g1sk, #rev = if_not_exists(#rev, :zero) + :one",
             )
             .condition_expression(
                 "attribute_exists(PK) AND #st = :in_flight \
@@ -1007,6 +1021,15 @@ impl DynamoSlowQueryStore {
             .expression_attribute_values(":zero", AttributeValue::N("0".into()))
             .expression_attribute_values(":one", AttributeValue::N("1".into()))
             .expression_attribute_values(":ls", AttributeValue::N(last_seen_at_ms.to_string()))
+            .expression_attribute_values(":dur", AttributeValue::N(duration_ms.to_string()))
+            .expression_attribute_values(
+                ":src",
+                AttributeValue::S(
+                    dbmon_core::slow_query::DurationSource::Polled
+                        .as_str()
+                        .to_string(),
+                ),
+            )
             .expression_attribute_values(":g1sk", AttributeValue::S(sort_key_ms(last_seen_at_ms)))
             .expression_attribute_values(
                 ":in_flight",
