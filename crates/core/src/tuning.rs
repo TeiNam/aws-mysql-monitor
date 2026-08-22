@@ -663,29 +663,34 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         "LOAD",
     ];
 
-    // ③-b **어디에 있어도 안 되는 것.** 함수·절이라서 선두에 오지 않는다.
+    // ③-b **절 키워드는 토큰만 보면 된다.** 선두에 오지 않는다.
+    const FORBIDDEN_CLAUSES: &[&str] = &["OUTFILE", "DUMPFILE"];
+    if FORBIDDEN_CLAUSES.iter().any(|k| has(k)) {
+        return false;
+    }
+
+    // ③-b-0 **함수는 호출 형태일 때만 막는다.**
     //
-    // 파일로 내보내거나 잠금을 잡는 것은 "튜닝된 조회" 가 아니다.
-    // **함수·절 이름은 선두에서만 보면 안 된다.**
-    const FORBIDDEN_ANYWHERE: &[&str] = &[
-        "OUTFILE",
-        "DUMPFILE",
+    // 이름만 보면 `SELECT o.sleep FROM t` 같은 한정 식별자를 잡는다 — MySQL 은 `.` 뒤의
+    // 이름에 제약이 없다(교차 리뷰 9회차가 오탐으로 지적). [`calls_function`] 이 뒤에
+    // `(` 가 오는지 본다.
+    //
+    // 선두 키워드 검사로는 잡히지 않는다: `_` 가 식별자 문자이므로 `LOAD_FILE` 은
+    // `LOAD` 로 쪼개지지 않는다.
+    const FORBIDDEN_FUNCTIONS: &[&str] = &[
+        // 잠금을 잡거나 놓는다 — 세션의 다른 문장에 영향을 준다.
         "GET_LOCK",
         "RELEASE_LOCK",
-        // **함수 이름은 선두 키워드 검사에 걸리지 않는다.** `_` 가 식별자 문자이므로
-        // `LOAD_FILE` 은 `LOAD` 로 쪼개지지 않는다 — 목록에 `LOAD` 가 있어도 통과한다.
-        //
-        // `LOAD_FILE` 은 서버 파일을 읽고, `BENCHMARK` 는 CPU 를 태운다. 둘 다 "같은
-        // 결과를 더 빠르게" 와 무관하므로 재작성에 나올 이유가 없다.
-        "LOAD_FILE",
-        "BENCHMARK",
-        // 세션 잠금을 전부 놓는다 — 다른 문장의 잠금까지 영향을 준다.
         "RELEASE_ALL_LOCKS",
+        // 서버 파일을 읽는다.
+        "LOAD_FILE",
+        // CPU 를 태운다.
+        "BENCHMARK",
         // **실행을 지연시킨다.** 원본에 `SLEEP` 이 있어도 그걸 유지한 재작성은 "같은
-        // 결과를 더 빠르게" 가 아니다. 실제 운영 쿼리에는 나오지 않는다(교차 리뷰 8회차).
+        // 결과를 더 빠르게" 가 아니다(교차 리뷰 8회차).
         "SLEEP",
     ];
-    if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
+    if FORBIDDEN_FUNCTIONS.iter().any(|f| calls_function(&up, f)) {
         return false;
     }
 
@@ -695,8 +700,12 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     // 실행하면 그 세션의 뒤 문장에 영향을 준다 — 조회 재작성이 할 일이 아니다
     // (교차 리뷰 8회차).
     //
+    // **대입만 막는다.** `SELECT @@sql_mode` 나 `SELECT @x` 는 읽기이고 부수효과가 없다 —
+    // 전부 막으면 정상 재작성을 거부한다(교차 리뷰 9회차가 오탐으로 지적).
     // `:=` 는 토큰 분리에서 사라지므로(구분자다) **인용을 덮은 사본에서 직접** 찾는다.
-    if up.contains(":=") || tokens.iter().any(|t| t.starts_with('@')) {
+    //
+    // `SET @x = 1` 형태의 대입은 선두 `SET` 검사가 잡는다.
+    if up.contains(":=") {
         return false;
     }
 
@@ -783,6 +792,41 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         }
     }
     true
+}
+
+/// `name(` 형태로 불리는가. **이름만으로 판정하지 않는다.**
+///
+/// `SELECT o.sleep FROM t` 처럼 한정 식별자로 쓰인 것을 함수 호출로 보면 정상 문장을
+/// 거부한다(교차 리뷰 9회차). 이름 뒤의 공백을 건너뛰고 `(` 인지 본다 — MySQL 은
+/// 기본 `sql_mode` 에서 내장 함수 이름과 `(` 사이의 공백을 허용한다.
+///
+/// 입력은 **인용을 덮은 대문자 사본**이다. 인용 안의 글자는 이미 `_` 로 덮여 있다.
+fn calls_function(up: &str, name: &str) -> bool {
+    let bytes = up.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = up[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        from = end;
+        // 앞이 식별자 문자면 다른 이름의 일부다 (`MY_SLEEP`).
+        let prev_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        if !prev_ok {
+            continue;
+        }
+        // 뒤의 공백을 건너뛰고 `(` 를 찾는다.
+        let mut k = end;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if bytes.get(k) == Some(&b'(') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'@'
 }
 
 /// 원본이 읽기 문장인가. `FOR UPDATE`·`INTO` 판정에 쓴다.
@@ -1679,7 +1723,6 @@ mod tests {
             "SELECT RELEASE_ALL_LOCKS()",
             "SELECT SLEEP(600)",
             "SELECT @x := 1 FROM orders",
-            "SELECT @@sort_buffer_size FROM orders",
             "PREPARE s FROM 'DELETE FROM orders'",
             // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
             // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).
@@ -1729,6 +1772,11 @@ mod tests {
             "SELECT o.lock FROM orders o WHERE o.id = ?",
             // `IN` 은 여기서 술어다 — `LOCK IN SHARE MODE` 가 아니다(8회차 nit).
             "SELECT o.lock IN (1, 2) FROM orders o",
+            // **한정 식별자와 읽기 전용 변수.** 이름만 보고 막으면 정상 문장을 거부한다
+            // (교차 리뷰 9회차).
+            "SELECT o.sleep, o.benchmark FROM orders o",
+            "SELECT @@sql_mode, @x FROM orders",
+            "SELECT my_sleep_ms FROM orders",
         ] {
             let raw = RawAdvice {
                 summary: "풀스캔이다".into(),
