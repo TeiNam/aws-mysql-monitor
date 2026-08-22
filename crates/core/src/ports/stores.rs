@@ -123,7 +123,8 @@ pub trait InstanceRegistry: Send + Sync {
     /// 수집 태스크가 든 `Instance` 는 태스크가 뜬 시점의 **사본**이다. 그걸 그대로
     /// `upsert` 하면 그 사이 탐색이 갱신한 값(`last_seen_ms`·태그·버전)을 되돌린다 —
     /// 되돌린 사실이 로그에도 안 남아 "왜 태그가 옛것으로 보이나" 로만 나타난다.
-    async fn set_state(&self, id: &InstanceId, state: crate::instance::InstanceState) -> Result<()>;
+    async fn set_state(&self, id: &InstanceId, state: crate::instance::InstanceState)
+    -> Result<()>;
 }
 
 /// 수집 정지 스코프 저장 ([`crate::pause`]).

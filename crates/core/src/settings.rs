@@ -33,14 +33,7 @@ pub const DEFAULT_MESSAGE_TEMPLATE: &str = "{emoji} [{env}] {title} · {instance
 /// **여기 없는 이름은 오타로 본다.** `{instnace}` 를 그대로 렌더하면 알림에 그 글자가
 /// 박혀 나가고, 아무도 그걸 "설정 오류" 로 읽지 않는다.
 pub const TEMPLATE_PLACEHOLDERS: &[&str] = &[
-    "emoji",
-    "severity",
-    "env",
-    "instance",
-    "title",
-    "detail",
-    "link",
-    "at",
+    "emoji", "severity", "env", "instance", "title", "detail", "link", "at",
 ];
 
 /// AssumeRole 대상 역할의 기본 이름. 계정마다 같은 이름으로 만드는 것이 관례다.
@@ -452,8 +445,7 @@ pub fn looks_like_secret_ref(s: &str) -> bool {
             s
         }
     };
-    body
-        .chars()
+    body.chars()
         .all(|c| c.is_ascii_alphanumeric() || "/_+=.@-:".contains(c))
 }
 
@@ -588,10 +580,16 @@ impl AppSettings {
         if self.auth.mode == AuthModeSetting::Cognito {
             let c = &self.auth.cognito;
             if c.user_pool_id.trim().is_empty() {
-                p.push(problem("auth.cognito.user_pool_id", "사용자 풀 ID 가 필요하다"));
+                p.push(problem(
+                    "auth.cognito.user_pool_id",
+                    "사용자 풀 ID 가 필요하다",
+                ));
             }
             if c.client_id.trim().is_empty() {
-                p.push(problem("auth.cognito.client_id", "앱 클라이언트 ID 가 필요하다"));
+                p.push(problem(
+                    "auth.cognito.client_id",
+                    "앱 클라이언트 ID 가 필요하다",
+                ));
             }
             if c.effective_region().is_none() {
                 p.push(problem(
@@ -723,7 +721,10 @@ mod tests {
             Some("arn:aws:iam::111111111111:role/dbmon-discovery")
         );
         assert!(
-            !t.iter().any(|x| x.account.as_ref().is_some_and(|a| a.account_id == "333333333333")),
+            !t.iter().any(|x| x
+                .account
+                .as_ref()
+                .is_some_and(|a| a.account_id == "333333333333")),
             "꺼진 계정을 탐색했다"
         );
 
@@ -746,15 +747,31 @@ mod tests {
                 ..Default::default()
             }],
         };
-        assert_eq!(d.known_regions(&["x-1".to_string()]), vec!["ap-northeast-2", "us-east-1"]);
+        assert_eq!(
+            d.known_regions(&["x-1".to_string()]),
+            vec!["ap-northeast-2", "us-east-1"]
+        );
     }
 
     #[test]
     fn region_shape_check_accepts_real_regions_and_rejects_junk() {
-        for ok in ["ap-northeast-2", "us-east-1", "eu-central-1", "il-central-1", "ap-southeast-4"] {
+        for ok in [
+            "ap-northeast-2",
+            "us-east-1",
+            "eu-central-1",
+            "il-central-1",
+            "ap-southeast-4",
+        ] {
             assert!(looks_like_region(ok), "{ok} 을 거부했다");
         }
-        for bad in ["", "ap-northeast", "AP-NORTHEAST-2", "ap--2", "ap-northeast-x", "seoul"] {
+        for bad in [
+            "",
+            "ap-northeast",
+            "AP-NORTHEAST-2",
+            "ap--2",
+            "ap-northeast-x",
+            "seoul",
+        ] {
             assert!(!looks_like_region(bad), "{bad} 를 통과시켰다");
         }
     }
@@ -786,7 +803,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.effective_mode(true), AuthModeSetting::Cognito);
-        assert_eq!(s.cognito.effective_region().as_deref(), Some("ap-northeast-2"));
+        assert_eq!(
+            s.cognito.effective_region().as_deref(),
+            Some("ap-northeast-2")
+        );
     }
 
     #[test]
@@ -799,7 +819,10 @@ mod tests {
 
     #[test]
     fn template_renders_known_vars_and_leaves_unknown_visible() {
-        let out = render_template("[{env}] {title} — {mystery}", &[("env", "prd"), ("title", "지연")]);
+        let out = render_template(
+            "[{env}] {title} — {mystery}",
+            &[("env", "prd"), ("title", "지연")],
+        );
         assert_eq!(out, "[prd] 지연 — {mystery}");
     }
 
@@ -857,7 +880,8 @@ mod tests {
             let p = s.validate();
             assert!(
                 p.iter()
-                    .any(|x| x.field == "notify.slack_secret" && x.message.contains("Secrets Manager")),
+                    .any(|x| x.field == "notify.slack_secret"
+                        && x.message.contains("Secrets Manager")),
                 "{pasted} 를 통과시켰다: {p:#?}"
             );
         }
@@ -890,7 +914,10 @@ mod tests {
         let fields: Vec<String> = s.validate().into_iter().map(|p| p.field).collect();
         assert!(fields.contains(&"discovery.accounts[0].account_id".to_string()));
         assert!(fields.contains(&"discovery.accounts[0].role_name".to_string()));
-        assert!(fields.contains(&"discovery.accounts".to_string()), "{fields:#?}");
+        assert!(
+            fields.contains(&"discovery.accounts".to_string()),
+            "{fields:#?}"
+        );
     }
 
     #[test]
@@ -904,7 +931,8 @@ mod tests {
     fn masked_secret_round_trip_keeps_the_original() {
         let stored = AppSettings {
             notify: NotifySettings {
-                slack_secret: "arn:aws:secretsmanager:ap-northeast-2:1:secret:dbmon/slack-AbCd".into(),
+                slack_secret: "arn:aws:secretsmanager:ap-northeast-2:1:secret:dbmon/slack-AbCd"
+                    .into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -938,11 +966,17 @@ mod tests {
         let s: AppSettings = serde_json::from_str(json).expect("옛 문서를 읽어야 한다");
         assert_eq!(s.version, 3);
         assert_eq!(s.notify.slack_channel, "#dba-alerts");
-        assert_eq!(s.ai.max_output_tokens, 4_000, "빠진 필드는 기본값이어야 한다");
+        assert_eq!(
+            s.ai.max_output_tokens, 4_000,
+            "빠진 필드는 기본값이어야 한다"
+        );
         assert_eq!(
             s.notify.message_template, DEFAULT_MESSAGE_TEMPLATE,
             "문구가 빈 문자열이면 알림이 빈 메시지로 나간다"
         );
-        assert!(s.validate().is_empty(), "옛 문서가 검증을 통과해야 화면이 열린다");
+        assert!(
+            s.validate().is_empty(),
+            "옛 문서가 검증을 통과해야 화면이 열린다"
+        );
     }
 }

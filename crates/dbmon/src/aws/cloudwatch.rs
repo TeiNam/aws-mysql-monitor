@@ -185,25 +185,25 @@ fn collect_page(
 ) {
     {
         for r in res.metric_data_results() {
-                // `label` 이 없으면 짝지을 수 없다 — 버리고 로그를 남긴다. 조용히
-                // 빈 값으로 두면 화면이 "데이터 없음" 으로 표시해 원인을 가린다.
-                let Some(key) = r.label().map(str::to_string) else {
-                    tracing::warn!("GetMetricData 결과에 label 이 없다 — 짝지을 수 없다");
-                    continue;
-                };
-                let timestamps: Vec<EpochMs> = r
-                    .timestamps()
-                    .iter()
-                    .map(|t| t.to_millis().unwrap_or(0))
-                    .collect();
-                let entry = out.entry(key.clone()).or_insert_with(|| Series {
-                    key,
-                    timestamps_ms: Vec::new(),
-                    values: Vec::new(),
-                });
-                entry.timestamps_ms.extend(timestamps);
-                entry.values.extend(r.values().iter().copied());
-            }
+            // `label` 이 없으면 짝지을 수 없다 — 버리고 로그를 남긴다. 조용히
+            // 빈 값으로 두면 화면이 "데이터 없음" 으로 표시해 원인을 가린다.
+            let Some(key) = r.label().map(str::to_string) else {
+                tracing::warn!("GetMetricData 결과에 label 이 없다 — 짝지을 수 없다");
+                continue;
+            };
+            let timestamps: Vec<EpochMs> = r
+                .timestamps()
+                .iter()
+                .map(|t| t.to_millis().unwrap_or(0))
+                .collect();
+            let entry = out.entry(key.clone()).or_insert_with(|| Series {
+                key,
+                timestamps_ms: Vec::new(),
+                values: Vec::new(),
+            });
+            entry.timestamps_ms.extend(timestamps);
+            entry.values.extend(r.values().iter().copied());
+        }
         // **부분 실패를 삼키지 않는다.** 메시지가 있으면 남긴다(잘못된 period,
         // 없는 메트릭 등이 여기로 온다).
         for m in res.messages() {

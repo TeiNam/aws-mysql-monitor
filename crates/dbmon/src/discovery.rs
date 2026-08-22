@@ -355,7 +355,9 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let s = reconcile(Arc::clone(&r), outcome, NOW).await.expect("재조정");
+        let s = reconcile(Arc::clone(&r), outcome, NOW)
+            .await
+            .expect("재조정");
 
         assert_eq!(s.out_of_scope, 2, "시야 밖 판정이 빠졌다: {s:?}");
         assert_eq!(s.missing, 0, "보지 않은 인스턴스를 미발견으로 찍었다");
@@ -369,7 +371,9 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let s = reconcile(Arc::clone(&r), outcome, NOW + 1_000).await.expect("재조정");
+        let s = reconcile(Arc::clone(&r), outcome, NOW + 1_000)
+            .await
+            .expect("재조정");
         assert_eq!(s.missing, 1, "시야 안에서 사라진 것을 놓쳤다: {s:?}");
         assert_eq!(s.out_of_scope, 2);
     }
@@ -393,7 +397,9 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let s = reconcile(Arc::clone(&r), outcome, NOW).await.expect("재조정");
+        let s = reconcile(Arc::clone(&r), outcome, NOW)
+            .await
+            .expect("재조정");
         assert_eq!(s.missing, 1, "성공한 범위의 삭제 감지가 막혔다: {s:?}");
         assert_eq!(s.out_of_scope, 1, "실패한 범위를 건드렸다: {s:?}");
     }
@@ -403,7 +409,9 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_scope_falls_back_to_the_old_behaviour() {
         let r = registry(&[inst("a")]);
-        let s = reconcile(Arc::clone(&r), found(&[]), NOW).await.expect("재조정");
+        let s = reconcile(Arc::clone(&r), found(&[]), NOW)
+            .await
+            .expect("재조정");
         assert_eq!(s.missing, 1);
         assert_eq!(s.out_of_scope, 0);
     }

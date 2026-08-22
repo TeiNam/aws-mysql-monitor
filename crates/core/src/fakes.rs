@@ -362,7 +362,11 @@ impl InstanceRegistry for FakeInstanceRegistry {
         Ok(inst.clone())
     }
 
-    async fn set_state(&self, id: &InstanceId, state: crate::instance::InstanceState) -> Result<()> {
+    async fn set_state(
+        &self,
+        id: &InstanceId,
+        state: crate::instance::InstanceState,
+    ) -> Result<()> {
         let mut m = self.items.lock().unwrap();
         // 프로덕션 구현이 `attribute_exists(PK)` 를 걸므로 없는 항목은 오류다.
         let inst = m

@@ -161,11 +161,9 @@ async fn generate_tuning(
             "튜닝 권고 생성 실패"
         );
         match detail {
-            Some(reason) => ApiError::with_body(
-                status,
-                code,
-                serde_json::json!({ "reason": reason }),
-            ),
+            Some(reason) => {
+                ApiError::with_body(status, code, serde_json::json!({ "reason": reason }))
+            }
             None => ApiError::new(status, code),
         }
     })?;

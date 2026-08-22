@@ -240,9 +240,12 @@ mod tests {
             allocated_storage_gb: Some(1),
             ..Default::default()
         };
-        let i = to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW)
-            .expect("매핑");
-        assert_eq!(i.allocated_storage_gb, None, "Aurora 자리표가 그대로 남았다");
+        let i =
+            to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW).expect("매핑");
+        assert_eq!(
+            i.allocated_storage_gb, None,
+            "Aurora 자리표가 그대로 남았다"
+        );
 
         // RDS 는 실제 할당량이므로 보존한다.
         let raw = RawDbInstance {
@@ -255,11 +258,10 @@ mod tests {
             allocated_storage_gb: Some(20),
             ..Default::default()
         };
-        let i = to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW)
-            .expect("매핑");
+        let i =
+            to_instance(&raw, ACCOUNT, &dbmon_core::env::EnvMapping::default(), NOW).expect("매핑");
         assert_eq!(i.allocated_storage_gb, Some(20));
     }
-
 
     fn raw(engine: &str, version: &str) -> RawDbInstance {
         RawDbInstance {

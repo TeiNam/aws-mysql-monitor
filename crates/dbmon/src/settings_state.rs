@@ -162,7 +162,11 @@ impl SettingsState {
 
     /// 한 번이라도 읽은 적이 있는가. 기동 직후 기본값과 "정말 비어 있음" 을 구분한다.
     pub fn is_loaded(&self) -> bool {
-        self.cache.lock().expect("settings cache").loaded_ms.is_some()
+        self.cache
+            .lock()
+            .expect("settings cache")
+            .loaded_ms
+            .is_some()
     }
 
     /// 마지막 조회가 실패했으면 그 사유. 성공했으면 `None`.
@@ -272,7 +276,11 @@ mod tests {
         assert_eq!(f.loads.load(Ordering::SeqCst), 1, "TTL 안인데 다시 읽었다");
 
         st.load(CACHE_TTL_MS + 1_000).await;
-        assert_eq!(f.loads.load(Ordering::SeqCst), 2, "TTL 이 지났는데 안 읽었다");
+        assert_eq!(
+            f.loads.load(Ordering::SeqCst),
+            2,
+            "TTL 이 지났는데 안 읽었다"
+        );
     }
 
     /// **조회 실패가 탐색 범위를 지우면 안 된다.**
@@ -346,7 +354,10 @@ mod tests {
         let saved = st.save(&next, 0, "admin", 5_000).await.expect("저장");
         assert_eq!(saved.version, 1);
         // TTL 안이지만 방금 저장한 값이 보여야 한다.
-        assert_eq!(st.load(5_001).await.discovery.regions, vec!["ap-northeast-2"]);
+        assert_eq!(
+            st.load(5_001).await.discovery.regions,
+            vec!["ap-northeast-2"]
+        );
         assert_eq!(f.loads.load(Ordering::SeqCst), 1, "저장 후 불필요한 재조회");
     }
 
@@ -401,9 +412,14 @@ mod tests {
     async fn a_stale_version_is_rejected() {
         let f = fake(false, AppSettings::default());
         let st = SettingsState::new(f);
-        st.save(&AppSettings::default(), 0, "a", 1).await.expect("첫 저장");
+        st.save(&AppSettings::default(), 0, "a", 1)
+            .await
+            .expect("첫 저장");
         // 같은 버전으로 두 번째 저장 — 다른 관리자가 먼저 저장한 상황이다.
-        let err = st.save(&AppSettings::default(), 0, "b", 2).await.expect_err("거부돼야 한다");
+        let err = st
+            .save(&AppSettings::default(), 0, "b", 2)
+            .await
+            .expect_err("거부돼야 한다");
         assert!(matches!(err, DomainError::Conflict(_)), "{err:?}");
     }
 }

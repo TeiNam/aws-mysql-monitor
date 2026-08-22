@@ -167,15 +167,15 @@ impl TuningService {
                 field: "endpoint".into(),
                 reason: "엔드포인트가 없다".into(),
             })?;
-        let provider = self
-            .auth
-            .for_region(instance.id.region())
-            .ok_or_else(|| DomainError::Unavailable {
-                dependency: "target-auth",
-                // **다른 리전 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
-                // 정책 오류처럼 보여 추적이 오래 걸린다.
-                reason: format!("{} 리전의 인증 공급자가 없다", instance.id.region()),
-            })?;
+        let provider =
+            self.auth
+                .for_region(instance.id.region())
+                .ok_or_else(|| DomainError::Unavailable {
+                    dependency: "target-auth",
+                    // **다른 리전 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
+                    // 정책 오류처럼 보여 추적이 오래 걸린다.
+                    reason: format!("{} 리전의 인증 공급자가 없다", instance.id.region()),
+                })?;
         let secret = provider.token(&host, instance.port, &db_user).await?;
         let via = self.config.collector.tunnel_for(instance.id.identifier());
         let opts = crate::mysql::connect::target_opts(
@@ -247,17 +247,19 @@ impl TuningService {
             let raw = tuning::extract_json(&reply.text)
                 .ok_or_else(|| "응답에 JSON 객체가 없다".to_string())
                 .and_then(|json| {
-                    serde_json::from_str::<RawAdvice>(json).map_err(|e| format!("JSON 파싱 실패: {e}"))
+                    serde_json::from_str::<RawAdvice>(json)
+                        .map_err(|e| format!("JSON 파싱 실패: {e}"))
                 });
 
             match raw {
                 Ok(raw) => {
-                    let advice = tuning::validate(raw, context, &ai.model_id, now_ms).map_err(
-                        |p| DomainError::Unavailable {
-                            dependency: "bedrock",
-                            reason: format!("모델 응답이 쓸 수 없다: {p:?}"),
-                        },
-                    )?;
+                    let advice =
+                        tuning::validate(raw, context, &ai.model_id, now_ms).map_err(|p| {
+                            DomainError::Unavailable {
+                                dependency: "bedrock",
+                                reason: format!("모델 응답이 쓸 수 없다: {p:?}"),
+                            }
+                        })?;
                     tracing::info!(
                         model = %ai.model_id,
                         region = %client.region(),
@@ -277,7 +279,10 @@ impl TuningService {
                 Err(reason) => {
                     // **잘렸는지 구분한다.** 출력 상한이 원인이면 사용자가 고칠 수 있다.
                     last_error = if reply.truncated {
-                        format!("{reason} (출력 토큰 상한 {} 에 걸려 잘렸다)", ai.max_output_tokens)
+                        format!(
+                            "{reason} (출력 토큰 상한 {} 에 걸려 잘렸다)",
+                            ai.max_output_tokens
+                        )
                     } else {
                         reason
                     };
@@ -348,7 +353,10 @@ fn model_safe_sql(record: &SlowQuery) -> (String, bool) {
     }
     // **힌트·주석을 지운다.** 정규화는 리터럴만 바꾸고 `/*+ QB_NAME(…) */` 안은
     // 그대로 두므로, 그 이름에 비밀이나 지시문이 있으면 모델로 나간다.
-    (tuning::strip_hints_and_comments(&normalized.canonical), false)
+    (
+        tuning::strip_hints_and_comments(&normalized.canonical),
+        false,
+    )
 }
 
 fn build_context(
@@ -435,11 +443,20 @@ mod tests {
     #[test]
     fn literals_are_masked_before_the_model_sees_them() {
         let mut q = record(&["shop.orders"], Some("shop"));
-        q.sql_text = Some("SELECT * FROM orders WHERE email = 'kim@example.com' AND id = 42".into());
+        q.sql_text =
+            Some("SELECT * FROM orders WHERE email = 'kim@example.com' AND id = 42".into());
         let ctx = build_context(&q, None, Vec::new());
-        assert!(!ctx.sql.contains("kim@example.com"), "리터럴이 새어 나갔다: {}", ctx.sql);
+        assert!(
+            !ctx.sql.contains("kim@example.com"),
+            "리터럴이 새어 나갔다: {}",
+            ctx.sql
+        );
         assert!(!ctx.sql.contains("42"), "숫자 리터럴이 남았다: {}", ctx.sql);
-        assert!(ctx.sql.contains("orders"), "테이블 이름은 남아야 한다: {}", ctx.sql);
+        assert!(
+            ctx.sql.contains("orders"),
+            "테이블 이름은 남아야 한다: {}",
+            ctx.sql
+        );
         assert!(!ctx.sql_has_literals);
     }
 
@@ -451,7 +468,11 @@ mod tests {
         q.sql_text =
             Some("SELECT /*+ QB_NAME(sk_live_abcdef) */ * FROM orders WHERE id = 1".into());
         let ctx = build_context(&q, None, Vec::new());
-        assert!(!ctx.sql.contains("sk_live"), "힌트 안의 문자열이 새어 나갔다: {}", ctx.sql);
+        assert!(
+            !ctx.sql.contains("sk_live"),
+            "힌트 안의 문자열이 새어 나갔다: {}",
+            ctx.sql
+        );
         assert!(!ctx.sql.contains("QB_NAME"), "{}", ctx.sql);
         assert!(ctx.sql.contains("orders"), "{}", ctx.sql);
     }
