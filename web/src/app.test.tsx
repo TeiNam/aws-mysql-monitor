@@ -501,7 +501,7 @@ describe("인증 거부", () => {
    */
   it.each([
     ["local-token", "docker compose logs dbmon | grep token=", "접속 토큰이 필요하다"],
-    ["shared-token", "/?token=<토큰>", "접속 토큰이 필요하다"],
+    ["shared-token", "값을 붙여넣는다", "접속 토큰이 필요하다"],
     [
       "unconfigured",
       "DBMON__HTTP__AUTH_TOKEN=$(openssl rand -hex 32)",
@@ -519,6 +519,43 @@ describe("인증 거부", () => {
     // 검사가 아직 기본 문구를 보고 실패했다.
     expect(await screen.findByText((t) => t.includes(hint))).toBeDefined();
     expect(screen.getByText(heading)).toBeDefined();
+  });
+
+  /**
+   * **붙여넣기 칸이 실제로 토큰을 저장한다.**
+   *
+   * 이게 없으면 배포에서 `?token=…` 이 유일한 경로가 되고, 그 값은 첫 요청이 나간
+   * 뒤에야 주소창에서 지워진다 — 그 사이 ALB 액세스 로그에 admin 자격증명이 남는다.
+   */
+  it("shared-token 모드에서 토큰을 붙여넣으면 세션에 저장된다", async () => {
+    authMode = "shared-token";
+    // 새로고침을 가로챈다 — jsdom 에서 실제로 다시 읽을 수는 없다.
+    let reloaded = false;
+    const loc = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...loc, reload: () => { reloaded = true; } },
+    });
+
+    await renderApp("/mysql");
+    unauthorized = true;
+    FakeSocket.latest().accept();
+    FakeSocket.latest().deliver({ t: "error", code: "unauthorized" });
+
+    // 401 을 받으면 낡은 토큰을 버린다 — 여기서 시작점이 비어 있어야 한다.
+    await waitFor(() => {
+      expect(sessionStorage.getItem("dbmon.token")).toBeNull();
+    });
+
+    const input = await screen.findByLabelText("접속 토큰");
+    fireEvent.change(input, { target: { value: "  " + "z".repeat(32) + "  " } });
+    fireEvent.click(screen.getByRole("button", { name: "저장하고 다시 읽기" }));
+
+    // **공백을 잘라서 저장한다.** 헤더에 공백이 들어가면 서버가 못 맞춘다.
+    expect(sessionStorage.getItem("dbmon.token")).toBe("z".repeat(32));
+    expect(reloaded).toBe(true);
+
+    Object.defineProperty(window, "location", { configurable: true, value: loc });
   });
 });
 

@@ -10,9 +10,10 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { ApiError, fetchAuthConfig, isUnauthorized, queryKeys } from "../lib/api";
-import { BTN_GHOST, CELL_X } from "./ui";
+import { saveToken } from "../lib/auth";
+import { BTN_GHOST, BTN_PRIMARY, CELL_X, SELECT } from "./ui";
 
 const MESSAGES: Record<string, string> = {
   unauthorized: "접속 토큰이 없거나 만료됐다.",
@@ -103,14 +104,15 @@ function TokenNotice() {
         /* 토큰은 있다 — 운영자가 가지고 있고, 우리는 값을 모른다. */
         <>
           <p className="mt-2 text-sm text-amber-800">
-            이 배포는 공유 토큰을 쓴다. 아래 형태로 한 번 들어오면 토큰이 세션에 저장된다.
+            이 배포는 공유 토큰을 쓴다. 배포 설정(
+            <span className="font-mono">http.auth_token</span>)의 값을 붙여넣는다 — 화면이나 로그에는
+            찍히지 않는다.
           </p>
-          <pre className="mt-3 overflow-x-auto rounded bg-white p-3 font-mono text-xs text-gray-800">
-            {`${window.location.origin}/?token=<토큰>`}
-          </pre>
+          <TokenForm />
           <p className="mt-2 text-xs text-amber-700">
-            토큰은 배포 설정(<span className="font-mono">http.auth_token</span>)에 있다 — 화면이나
-            로그에는 찍히지 않는다.
+            ⚠ <span className="font-mono">?token=…</span> 으로도 들어올 수 있지만 배포에서는 권하지
+            않는다. 그 값은 <strong>첫 요청이 나간 뒤에</strong> 주소창에서 지워지므로, 그 사이 ALB
+            액세스 로그에 남는다.
           </p>
         </>
       ) : (
@@ -130,6 +132,50 @@ function TokenNotice() {
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * 토큰 붙여넣기.
+ *
+ * 저장한 뒤 **새로고침한다.** React Query 캐시에는 실패한 쿼리가 그대로 있고, 그것들을
+ * 하나씩 무효화하는 코드를 두면 화면이 늘 때마다 빠뜨릴 자리가 생긴다. 토큰을 넣는
+ * 것은 한 세션에 한 번이므로 새로고침이 가장 단순하고 확실하다.
+ *
+ * `type="password"` 다 — 어깨너머로 읽히지 않게. `autoComplete="off"` 로 브라우저가
+ * 저장하려 들지 않게 한다(비밀번호 관리자에 들어가면 회수 경로가 하나 늘어난다).
+ */
+function TokenForm() {
+  const [value, setValue] = useState("");
+  const trimmed = value.trim();
+
+  return (
+    <form
+      className="mt-3 flex flex-wrap items-center gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (trimmed === "") return;
+        saveToken(trimmed);
+        window.location.reload();
+      }}
+    >
+      <label className="sr-only" htmlFor="dbmon-token">
+        접속 토큰
+      </label>
+      <input
+        id="dbmon-token"
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="토큰을 붙여넣는다"
+        className={`${SELECT} w-72 font-mono`}
+      />
+      <button type="submit" className={BTN_PRIMARY} disabled={trimmed === ""}>
+        저장하고 다시 읽기
+      </button>
+    </form>
   );
 }
 
