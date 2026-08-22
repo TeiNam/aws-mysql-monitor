@@ -1457,8 +1457,11 @@ mod mode_dispatch_tests {
     //! **실효 모드가 수단을 하나로 정한다** (교차 리뷰가 critical 로 잡은 결함).
     //!
     //! `context_from_token` 은 `ApiState` 를 요구하므로 여기서 직접 호출할 수 없다.
-    //! 대신 그 판정의 근거가 되는 두 함수의 계약을 고정한다 — 실제 디스패치는
-    //! `it_api` 통합 테스트가 확인한다.
+    //! 대신 그 판정의 근거가 되는 두 함수의 계약을 고정한다.
+    //!
+    //! **실제 디스패치는 `tests::cognito_mode_refuses_the_shared_token` 이 확인한다** —
+    //! 그 테스트가 `auth_by_mode` 를 직접 부른다. 한때 이 주석이 존재하지 않는
+    //! `it_api` 통합 테스트를 근거로 들었고, 교차 리뷰가 두 번 그걸 지적했다.
 
     use dbmon_core::settings::{AppSettings, AuthModeSetting as M, CognitoSettings};
 

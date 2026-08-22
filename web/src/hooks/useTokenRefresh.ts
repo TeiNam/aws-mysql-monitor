@@ -15,10 +15,15 @@
  * 만료 5분 전부터 갱신하고 1분마다 확인하면 창이 충분하다 — 탭이 백그라운드에 있어
  * 타이머가 늦게 깨어도 5분 안에는 돌아온다.
  *
- * # 갱신 실패는 로그아웃이다
+ * # 갱신 실패 중 **확실한 것만** 로그아웃이다
  *
- * 리프레시 토큰 재사용이 감지되면 Cognito 가 계보 전체를 무효화한다. 그때 계속
- * 재시도하면 안 되므로 [`refreshAccessToken`] 이 세션을 비운다.
+ * 리프레시 토큰 재사용이 감지되면 Cognito 가 계보 전체를 무효화하고 `invalid_grant`
+ * 를 돌려준다(회전은 `infra/layers/30-identity/cognito.tf` 의
+ * `refresh_token_rotation` 이 켠다). 그때는 계속 재시도하면 안 되므로
+ * [`refreshAccessToken`] 이 세션을 비운다.
+ *
+ * 반면 네트워크 실패·5xx·설정 오류(`invalid_client` 등)는 **세션을 유지한다** —
+ * 아직 유효한 액세스 토큰이 남아 있고 다음 주기에 다시 시도하면 된다.
  */
 
 import { useQuery } from "@tanstack/react-query";

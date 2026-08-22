@@ -2784,3 +2784,62 @@ single-flight 를 넣을 때 빠른 경로에서 `lookup` 을 불렀다. `lookup
 - `introspect` 두 번 읽기는 계정 상태만 비교하므로 정상 부하에서 `Conflict` 를 내지 않는다
 - `literal_mode_*` 는 렌더링·왕복 성질을 확인한다
 - 음수 `revoked_after_ms` 테스트는 실제 파서를 부른다
+
+
+---
+
+## 36라운드 — 6차 교차 리뷰 (2026-08-23)
+
+blocker 5건. **1번은 5라운드에서 내가 추가한 방어의 우회다** — 그 방어를 넣으면서
+IAM 조건 연산자를 잘못 썼다.
+
+### 1번 — `ForAllValues` 를 Deny 에 쓰면 우회가 된다
+
+35라운드에서 `USER#`·`AUDIT#` 쓰기를 막는 `Deny` 를 추가했다. 조건에
+`ForAllValues:StringLike` 를 썼는데, 그건 **요청의 모든 값이 일치할 때만 참**이다.
+
+`simulate-principal-policy` 로 재현했다:
+
+```
+LeadingKeys = ["USER#me", "CFG"]
+→ dynamodb:BatchWriteItem   allowed   ← Deny 가 적용되지 않는다
+```
+
+`USER#me` 와 `CFG` 를 한 배치에 섞으면 조건이 거짓이 되고, 넓은 `Allow` 가 그 배치를
+통째로 승인한다. **자기 권한을 admin 으로 올릴 수 있다.**
+
+`ForAnyValue:StringLike` 로 바꿨다 — "요청에 하나라도 있으면 거부". 섞인 배치는
+통째로 거부되고, 그게 안전한 방향이다. `AUDIT#` Deny 에는 `BatchWriteItem` 이
+빠져 있어서 배치 삭제가 가능했다 — 그것도 넣었다(앱은 감사에 배치를 쓰지 않는다).
+
+### blocker 표
+
+| # | 지적 | 고친 것 |
+|---|---|---|
+| 1 | `ForAllValues` 로 USER·AUDIT Deny 우회 | `ForAnyValue` + AUDIT 에 `BatchWriteItem` 추가. 시뮬레이터로 재현·검증 |
+| 2 | `is_loaded()` 게이트가 **루프백 우회**를 막고 `/readyz` 는 정상이라 한다 | 우회는 배포 사실이므로 게이트에서 제외. 설정 미로드를 `auth_mode_supported=false` 로 보고 |
+| 3 | `auth_mode_supported=false` 가 교체 루프를 만든다 | 컨테이너 헬스체크는 `/healthz` 를 보므로 태스크가 죽지 않는다(실측 확인). 다만 **구 리비전 워커에는 watcher 가 없다** — 롤링 배포의 본질적 한계로 문서에 적었다 |
+| 4 | 모든 400 을 `invalid_grant` 로 간주 | 본문의 `error` 를 읽는다. `invalid_client`·`invalid_request` 는 세션을 유지 — 클라이언트 ID 오타 하나로 전원 로그아웃되지 않는다 |
+| 5 | 주석이 약속한 재사용 감지가 없다 | `refresh_token_rotation { feature = "ENABLED" }`. `enable_token_revocation` 은 **다른 기능**이다(명시적 폐기 API) |
+
+### 5번 — 또 "주석이 약속한 방어가 없다"
+
+35라운드의 1번(IAM Deny 부재)과 같은 부류다. 주석은 이렇게 적혀 있었다:
+
+> 리프레시 토큰 재사용 감지. 훔친 토큰이 한 번 쓰이면 그 계보 전체가 무효화된다.
+
+그리고 `enable_token_revocation = true` 만 켰다. 그건 `RevokeToken` API 를 쓸 수 있게
+하는 것이고 회전·재사용 감지가 아니다. provider 스키마를 확인해
+`refresh_token_rotation` 블록이 있는 것을 보고 실제로 설정했다.
+
+**같은 실수를 두 라운드 연속 했다.** "X 로 막는다" 고 적을 때 X 가 존재하는지 확인하는
+습관이 아직 없다.
+
+### 3번의 남은 한계 — 정직하게 적는다
+
+`auth_mode_supported` 는 **이 리비전의 워커만** 보고한다. 롤링 배포에서 구 리비전
+워커에는 그 코드가 없으므로 계속 준비 상태를 보고하고 트래픽을 받는다. 즉 "혼합
+배포에서 부적합 워커를 뺀다" 는 **다음 배포부터** 성립한다.
+
+그 창을 줄이는 것은 배포 순서의 문제다(모드를 바꾸기 전에 이미지를 먼저 배포한다).
+문서 08 §2.9 에 그 순서를 적었다.

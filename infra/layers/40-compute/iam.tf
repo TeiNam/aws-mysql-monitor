@@ -119,7 +119,17 @@ resource "aws_iam_role_policy" "task_deny_authz_writes" {
         ]
         Resource = [local.foundation.config_table_arn]
         Condition = {
-          "ForAllValues:StringLike" = {
+          # ⚠ **`ForAnyValue` 다. `ForAllValues` 가 아니다.**
+          #
+          # `ForAllValues` 는 요청의 **모든** 값이 일치할 때만 참이다. Deny 에 쓰면
+          # 우회가 된다: `BatchWriteItem` 에 `USER#me` 와 `CFG` 를 섞으면 조건이
+          # 거짓이 되어 Deny 가 적용되지 않고, 넓은 Allow 가 그 배치를 통째로
+          # 승인한다. **`simulate-principal-policy` 로 재현했다** — 섞은 요청이
+          # `allowed` 였다(교차 리뷰 6차).
+          #
+          # `ForAnyValue` 는 "요청에 하나라도 있으면 거부" 다. 그게 우리가 원하는 것이고,
+          # 섞인 배치는 통째로 거부된다 — 안전한 방향이다.
+          "ForAnyValue:StringLike" = {
             "dynamodb:LeadingKeys" = ["USER#*"]
           }
         }
@@ -127,11 +137,17 @@ resource "aws_iam_role_policy" "task_deny_authz_writes" {
       {
         Sid    = "DenyAuditMutation"
         Effect = "Deny"
-        # **`PutItem` 은 빠져 있다** — 앱이 감사 레코드를 만든다. 수정·삭제만 막는다.
-        Action   = ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        # **`PutItem` 은 빠져 있다** — 앱이 감사 레코드를 만든다(단건).
+        #
+        # `BatchWriteItem` 은 **넣는다.** 그건 삭제도 할 수 있고, 앱은 감사에 배치를
+        # 쓰지 않는다(`store::audit` 은 `PutItem` 하나뿐이다). 빼 두면 배치로 감사
+        # 기록을 지울 수 있었다(교차 리뷰 6차).
+        Action = [
+          "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem",
+        ]
         Resource = [local.foundation.config_table_arn]
         Condition = {
-          "ForAllValues:StringLike" = {
+          "ForAnyValue:StringLike" = {
             "dynamodb:LeadingKeys" = ["AUDIT#*"]
           }
         }

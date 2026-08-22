@@ -387,9 +387,15 @@ pub(crate) async fn context_from_token(
     // 남아 있는 공유 토큰을 admin 으로 승인한다.
     //
     // "모르면 닫는다" 가 이 함수의 규칙이고, 여기가 그 규칙이 가장 필요한 자리다.
-    // `/readyz` 가 같은 사실을 보고하므로 ECS·ALB 가 이 워커로 트래픽을 보내지
-    // 않는다 — 즉 실제로 닫히는 창은 짧다.
-    if fresh.is_none() && !state.settings.is_loaded() {
+    // `/readyz` 가 같은 사실을 보고하므로(`auth_mode_supported`) ECS·ALB 가 이 워커로
+    // 트래픽을 보내지 않는다.
+    //
+    // # 로컬 우회는 **예외다** (교차 리뷰 6차)
+    //
+    // `dev` + 루프백 우회는 **배포 사실**에서 나오고 설정을 보지 않는다. 게이트가
+    // 그것까지 막으면 로컬 개발에서 설정 저장소가 느릴 때 화면을 못 쓴다 — 그리고
+    // 그 경로에는 새어 나갈 공유 토큰이 없다(우회는 토큰이 없을 때만 적용된다).
+    if fresh.is_none() && !state.settings.is_loaded() && !state.policy.allows_local_bypass() {
         return Err(auth::AuthError::NotConfigured);
     }
 

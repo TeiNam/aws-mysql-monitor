@@ -2237,13 +2237,23 @@ fn spawn_auth_mode_watch(
     readiness: Arc<Readiness>,
     shutdown: Arc<Shutdown>,
 ) {
-    const INTERVAL: Duration = Duration::from_secs(10);
+    // 기동 직후 창을 줄이려고 짧게 둔다. 캐시를 읽기만 하므로 비용이 없다.
+    const INTERVAL: Duration = Duration::from_secs(2);
     tokio::spawn(async move {
         use dbmon_core::settings::AuthModeSetting as M;
         loop {
-            // **한 번도 읽지 못했으면 판정하지 않는다.** 기본값(Token)을 근거로
-            // "수행할 수 있다" 고 보고하면 그게 곧 fail-open 이다.
-            if settings.is_loaded() {
+            // **설정을 못 읽었으면 "수행할 수 없다" 다** (교차 리뷰 6차).
+            //
+            // 예전에는 그때 아무것도 하지 않아 `auth_mode_supported` 가 초기값(참)에
+            // 머물렀다 — 그러면 `/readyz` 는 200 인데 API 는 전부 401 인 상태가 된다
+            // (`context_from_token` 이 모드를 몰라 거부한다). 준비 상태가 거짓말한다.
+            //
+            // `config_loaded` 는 **파일 설정**을 뜻하고 기동 즉시 참이므로 이 사실을
+            // 담지 못한다.
+            if !settings.is_loaded() {
+                readiness.set_auth_mode_supported(false);
+                tracing::warn!("운영 설정을 아직 읽지 못했다 — 준비 상태를 내린다");
+            } else {
                 let s = settings.cached();
                 let supported = match s.auth.effective_mode(allow_auth_disable) {
                     M::Cognito => has_cognito_verifier,
