@@ -47,6 +47,21 @@ variable "endpoint_route_table_ids" {
   }
 }
 
+variable "create_dynamodb_gateway_endpoint" {
+  description = <<-EOT
+    DynamoDB 게이트웨이 엔드포인트를 만든다.
+
+    **끄는 경우가 있다.** 태스크가 퍼블릭 서브넷에 있으면(NAT 가 없는 VPC) IGW 로 나가므로
+    이 엔드포인트를 쓰지 않는다. 그런데 엔드포인트는 `endpoint_route_table_ids` 의 라우트
+    테이블을 **공유하는 다른 워크로드의 경로까지** 바꾼다 — 우리가 쓰지도 않는데 남의
+    트래픽 경로를 바꾸는 것은 근거가 없다.
+
+    프라이빗 서브넷 + NAT 구성에서는 켜는 것이 맞다(NAT 데이터 처리 비용이 사라진다).
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "create_s3_gateway_endpoint" {
   description = <<-EOT
     S3 게이트웨이 엔드포인트를 **새로 만들 것인가.**
