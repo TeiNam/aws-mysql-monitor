@@ -120,8 +120,8 @@ jobs:
 
           # 8.4-wide 만 다이제스트 버퍼를 올린다 (M1-13 의 대조군).
           m 13307 -e "
-            SET PERSIST max_digest_length = 4096;
-            SET PERSIST performance_schema_max_digest_length = 4096;
+            SET PERSIST_ONLY max_digest_length = 4096;
+            SET PERSIST_ONLY performance_schema_max_digest_length = 4096;
             SET PERSIST performance_schema_max_sql_text_length = 4096;"
           docker restart "$(docker ps --filter publish=13307 -q)"
 
@@ -146,7 +146,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.10.5
+          # **1.11 이상이어야 한다.** `60-seed` 가 write-only 속성
+          # (`password_wo`, `secret_string_wo`)을 쓴다 — 그 아래 버전은
+          # "Write-only Attribute Not Allowed" 로 validate 에서 죽는다.
+          # 로컬 개발자가 쓰는 버전과 같은 값으로 고정한다.
+          terraform_version: 1.15.8
       - run: terraform fmt -recursive -check infra
       - name: 전 레이어 validate
         run: |

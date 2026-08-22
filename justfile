@@ -1,7 +1,7 @@
-# dbmon 개발 명령. `just` (https://github.com/casey/just)
+# dbmon 개발 명령. 'just' (https://github.com/casey/just)
 #
 # 설계 원칙: **AWS 없이 전부 돌아간다.** SSO 세션이 만료돼도 개발이 멈추지 않는다.
-# AWS 가 필요한 명령은 이름에 `aws-` 를 붙여 구분한다.
+# AWS 가 필요한 명령은 이름에 'aws-' 를 붙여 구분한다.
 
 set shell := ["bash", "-uc"]
 
@@ -56,7 +56,7 @@ sql *ARGS:
 seed:
     ./local/loadgen.sh all
 
-# 시나리오 하나만 실행. `just seed-one lock` 처럼 쓴다
+# 시나리오 하나만 실행. 'just seed-one lock' 처럼 쓴다
 seed-one SCENARIO:
     ./local/loadgen.sh {{SCENARIO}}
 
@@ -127,10 +127,10 @@ tf-check:
 
 # 로컬 설정으로 서버를 띄운다
 run *ARGS:
-    # **`DBMON_TARGET_PASSWORD` 가 없으면 dev 도 IAM DB Auth 폴백을 탄다.**
-    # 그러면 로컬 MySQL 접속에서 `caching_sha2_password` 가 ~1000바이트 토큰을
+    # **'DBMON_TARGET_PASSWORD' 가 없으면 dev 도 IAM DB Auth 폴백을 탄다.**
+    # 그러면 로컬 MySQL 접속에서 'caching_sha2_password' 가 ~1000바이트 토큰을
     # RSA 로 암호화하려다 드라이버가 패닉한다. 값은 local/seed/03-monitor-users.sql
-    # 의 `dbmon` 계정 비밀번호다.
+    # 의 'dbmon' 계정 비밀번호다.
     DBMON_TARGET_PASSWORD=dbmon-local-monitor \
       cargo run -p dbmon -- --config local/dbmon.toml --log-pretty serve {{ARGS}}
 
@@ -147,7 +147,7 @@ local-init:
 
     if ! ddb describe-table --table-name dbmon-data-local >/dev/null 2>&1; then
       # 스키마는 JSON 파일로 둔다. CLI 단축 문법은 중첩 JSON 을 받지 않고,
-      # `just` 는 `{{` 를 보간으로 해석하므로 인라인으로 쓰면 양쪽에서 깨진다.
+      # just 는 이중 중괄호를 보간으로 해석하므로 인라인으로 쓰면 양쪽에서 깨진다.
       ddb create-table --cli-input-json file://local/table.json >/dev/null
       echo "테이블 생성: dbmon-data-local"
     else
@@ -155,7 +155,7 @@ local-init:
     fi
 
     # 설정 테이블. **정지 스코프가 여기 산다** — 없으면 리더 루프가 매 tick
-    # `ResourceNotFoundException` 을 찍고 정지가 동작하지 않는다.
+    # 'ResourceNotFoundException' 을 찍고 정지가 동작하지 않는다.
     if ! ddb describe-table --table-name dbmon-config-local >/dev/null 2>&1; then
       ddb create-table --cli-input-json file://local/config-table.json >/dev/null
       echo "테이블 생성: dbmon-config-local"
@@ -163,8 +163,8 @@ local-init:
       echo "테이블 있음: dbmon-config-local"
     fi
 
-    # 로컬 MySQL 을 감시 대상으로 등록한다. `endpoint` 가 루프백이므로 평문 접속
-    # 경로를 탄다(`dev` + 루프백일 때만 허용된다 — `mysql::connect` 참고).
+    # 로컬 MySQL 을 감시 대상으로 등록한다. 'endpoint' 가 루프백이므로 평문 접속
+    # 경로를 탄다('dev' + 루프백일 때만 허용된다 — 'mysql::connect' 참고).
     ddb put-item --table-name dbmon-data-local --item file://local/instance.json >/dev/null
     echo "인스턴스 등록: mysql84-local (127.0.0.1:13306)"
     ddb delete-item --table-name dbmon-data-local       --key '{"PK":{"S":"LEASE#LEADER#collect"},"SK":{"S":"L"}}' >/dev/null 2>&1 || true
@@ -189,7 +189,7 @@ local-show:
 local-slow SECS="5":
     docker exec dbmon-dev-mysql84-1 mysql -uloadgen -pdbmon-local-loadgen -D shop       -e "SELECT /* demo */ COUNT(*) FROM orders o JOIN order_items i ON i.order_id=o.id WHERE SLEEP({{SECS}})=0;"
 
-# 전체 데모: 컨테이너 → 준비 → 기동. 다른 터미널에서 `just local-slow` 를 쏜다.
+# 전체 데모: 컨테이너 → 준비 → 기동. 다른 터미널에서 'just local-slow' 를 쏜다.
 demo: dev wait local-init
     @echo ""
     @echo "  준비됐다. 이 창은 서버가 점유한다."
@@ -222,7 +222,9 @@ image-test: image
     sleep 6
     echo "HEALTHCHECK: $(docker inspect dbmon-smoke --format '{{{{.State.Health.Status}}}}')"
     echo "healthcheck 종료코드: $(docker exec dbmon-smoke dbmon healthcheck; echo $?)"
-    # just 는 `{{` 를 보간으로 해석한다. 셸에 리터럴 `{`를 넘기려면 두 배로 쓴다.
+    # just 는 이중 중괄호를 보간으로 해석한다. 셸에 리터럴 중괄호를 넘기려면
+    # 두 배로 쓴다. 주석에도 이중 중괄호를 쓰면 안 된다 — just 가 주석 안에서도
+    # 그걸 보간 시작으로 읽고, 닫히지 않으면 한참 뒤 줄에서 파싱이 죽는다.
     echo "/healthz: $(curl -s -o /dev/null -w '%{{{{http_code}}}}' http://127.0.0.1:18080/healthz)"
     start=$(date +%s); docker stop -t 60 dbmon-smoke >/dev/null
     echo "SIGTERM 정지: $(( $(date +%s) - start ))초 (PID 1 이 dbmon 이면 즉시)"
@@ -260,6 +262,9 @@ docker-down:
 aws-whoami:
     aws sts get-caller-identity
 
-# 레이어를 plan 한다. `just aws-plan 10-foundation`
+# 주석 규칙: 백틱과 이중 중괄호를 쓰지 않는다. just 1.58 은 주석 안에서도 둘을
+# 렉싱하고, 닫히지 않으면 파일 전체 파싱이 (한참 뒤 줄에서) 실패한다.
+
+# 레이어를 plan 한다 (예: just aws-plan 10-foundation)
 aws-plan LAYER:
     cd infra/layers/{{LAYER}} && terraform init -input=false && terraform plan
