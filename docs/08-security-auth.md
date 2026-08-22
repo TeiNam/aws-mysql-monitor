@@ -141,10 +141,19 @@ Pre Token Generation Lambda 트리거에서 매핑 규칙에 따라 `cognito:gro
 
 `AdminDeleteUser`는 부여하지 않는다. 비활성화만 허용한다(감사 추적 보존).
 
-## 2.9 지금 구현된 것 — Cognito 는 아직 아니다
+## 2.9 지금 구현된 것 — Cognito 검증기가 들어왔다
 
-이 절 아래(§3)는 **설계**다. 실제 코드가 지금 하는 인증은 네 가지이고, 어느 것이
-적용되는지는 배포 사실에서 유도된다(`crates/dbmon/src/api/auth.rs`).
+**이 절 아래(§3)는 이제 구현이다.** `crates/dbmon/src/api/cognito.rs` 가 JWKS 조회 →
+`kid` 캐시 → RS256 서명 → 클레임 검증 → `USER` 레코드 교집합을 수행한다. 다섯 가지
+위조(`alg: none`, `alg: HS256` 혼동, 타 사용자 풀, ID 토큰 오용, 타 클라이언트)를
+각각 테스트로 고정했다.
+
+배선 여부는 **런타임 사실**이다 — `ApiState::cognito` 가 `Some` 인가로 판정한다.
+`COGNITO_READY` 상수는 없앴다: 상수로 두면 배선을 끝내고도 상수를 안 바꿔서 꺼져 있는
+상태가 가능하고, 실제로 그 상태가 한동안 있었다.
+
+토큰 수단(아래 표)은 **그대로 살아 있다.** 순서는 `off` → 토큰 → Cognito 이고, 토큰이
+앞인 이유는 전환 중에 화면이 닫히지 않아야 하기 때문이다.
 
 | 모드 | 자격증명 | 조건 | `subject` |
 |---|---|---|---|
@@ -218,6 +227,68 @@ Pre Token Generation Lambda를 거쳐 온다. 그 경로 중 하나라도 오작
 
 **access token vs id token** — 인증에는 **access token**을 쓴다. id token은 사용자 정보용이며
 API 인증에 쓰면 만료·스코프 의미가 어긋난다. `email`은 id token에서 읽어 프론트가 표시만 한다.
+
+### 3.1 `USER` 레코드 — 실제 항목 형식
+
+**이 레코드가 없으면 토큰이 유효해도 못 들어온다** (fail-closed). Cognito 를 켜고
+처음 로그인했을 때 401 이 나는 이유가 대개 이것이다.
+
+`dbmon-config` 테이블:
+
+| 속성 | 타입 | 값 |
+|---|---|---|
+| `PK` | S | `USER#<sub>` — Cognito 의 `sub`(UUID) |
+| `SK` | S | `PROFILE` |
+| `role` | S | `admin` / `operator` / `viewer` |
+| `env_scope` | SS | `["dev","stg","prd"]` 중 볼 수 있는 것 |
+| `can_see_literals` | BOOL | 리터럴 열람 |
+| `claims_version` | N | 권한을 바꿀 때마다 올린다 |
+| `revoked_after_ms` | N | 이 시각 **이전에 발급된** 토큰을 무효화 |
+| `disabled` | BOOL | 참이면 즉시 거부 |
+
+**없는 속성은 가장 낮은 권한으로 읽힌다** (`role` → `viewer`, `can_see_literals` →
+거짓). `env_scope` 는 예외로 **비어 있으면 아무것도 못 본다** — 전체 허용으로 접으면
+스코프를 지정하지 않은 레코드가 전 환경을 보게 된다.
+
+```bash
+# sub 확인
+SUB=$(aws cognito-idp admin-get-user --user-pool-id <pool> --username <email> \
+  --query 'UserAttributes[?Name==`sub`].Value' --output text)
+
+# 레코드 생성 (앱이 아니라 사람이 만든다 — 앱 Role 은 이 키 범위에 쓰기 Deny 다)
+aws dynamodb put-item --table-name dbmon-config-dev --item "{
+  \"PK\": {\"S\": \"USER#$SUB\"},
+  \"SK\": {\"S\": \"PROFILE\"},
+  \"role\": {\"S\": \"admin\"},
+  \"env_scope\": {\"SS\": [\"dev\", \"stg\", \"prd\"]},
+  \"can_see_literals\": {\"BOOL\": true},
+  \"claims_version\": {\"N\": \"0\"},
+  \"disabled\": {\"BOOL\": false}
+}"
+```
+
+#### `claims_version` 은 왜 토큰에 없는가
+
+문서 §3 5단계는 "토큰 발급 시점 버전과 대조" 라고 적었다. 그러려면 Pre Token
+Generation Lambda 가 버전을 클레임에 심어야 하는데, **그 Lambda 를 만들지 않기로
+했다** — `AuthContext::intersect` 가 토큰 그룹 없이도 동작하도록 설계했으므로 Lambda
+는 편의 기능이고 권한의 근거가 아니다(`infra/layers/30-identity/cognito.tf` 주석).
+
+그러면 버전 검사가 자동으로 통과하고 T-33 의 절반이 무력해진다. **남는 방어선은
+`revoked_after_ms` 다.** 그래서 운영 규칙이 하나 생긴다:
+
+> 권한을 바꿀 때는 `claims_version` 과 함께 **`revoked_after_ms = now` 를 세운다.**
+> 그것이 기존 액세스 토큰(최대 60분)을 즉시 무효화하는 유일한 수단이다.
+
+```bash
+# 강등 + 기존 토큰 폐기
+NOW=$(python3 -c 'import time;print(int(time.time()*1000))')
+aws dynamodb update-item --table-name dbmon-config-dev \
+  --key "{\"PK\":{\"S\":\"USER#$SUB\"},\"SK\":{\"S\":\"PROFILE\"}}" \
+  --update-expression "SET #r = :role, revoked_after_ms = :now ADD claims_version :one" \
+  --expression-attribute-names '{"#r":"role"}' \
+  --expression-attribute-values "{\":role\":{\"S\":\"viewer\"},\":now\":{\"N\":\"$NOW\"},\":one\":{\"N\":\"1\"}}"
+```
 
 ## 4. RBAC
 

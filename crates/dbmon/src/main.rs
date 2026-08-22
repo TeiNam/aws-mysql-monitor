@@ -157,6 +157,7 @@ async fn build_stores(config: &Config, hub: &dbmon::api::hub::Hub) -> anyhow::Re
     ));
 
     Ok(Stores {
+        dynamo: client.clone(),
         slow_query,
         lease: Arc::new(dbmon::store::lease::DynamoLeaseStore::new(
             client.clone(),
@@ -212,6 +213,9 @@ struct Stores {
     settings: Arc<dbmon::settings_state::SettingsState>,
     /// AI 튜닝 권고 저장소.
     advice: Arc<dbmon::store::tuning::DynamoTuningStore>,
+    /// 부트스트랩 감사가 쓸 클라이언트. **여기서 넘기는 이유는 로컬 엔드포인트다** —
+    /// `build_stores` 가 만든 것을 재사용하면 `endpoint_url` 설정이 그대로 적용된다.
+    dynamo: aws_sdk_dynamodb::Client,
 }
 
 /// CloudWatch 메트릭 서비스를 만든다.
@@ -2031,9 +2035,50 @@ fn random_cursor_key() -> Vec<u8> {
     }
 }
 
+/// 부트스트랩 서비스를 조립한다. **자격증명이 없으면 `None`.**
+///
+/// # 왜 여기서 SDK 클라이언트를 만드는가
+///
+/// 기존 조립(`build_discovery` 등)과 같은 자리다. `aws_config` 로드는 자격증명 체인을
+/// 탐색하므로 요청 경로에서 하면 안 된다 — 기동 시 한 번 만들고 공유한다.
+///
+/// 자격증명 자체는 **여기서 읽지 않는다.** 클라이언트를 만드는 것은 네트워크를 타지
+/// 않으므로, "부트스트랩이 가능한가" 는 실제 요청에서 판정된다
+/// (`BootstrapService::credential_route`).
+async fn build_bootstrap(
+    config: &dbmon::config::Config,
+    stores: &Stores,
+    dynamo: aws_sdk_dynamodb::Client,
+) -> Option<Arc<dbmon::bootstrap::BootstrapService>> {
+    // **로컬 도커에서는 만들지 않는다.** 엔드포인트 오버라이드가 있으면 DynamoDB Local
+    // 을 보고 있고, Secrets Manager·RDS 는 그 자리에 없다 — 버튼이 눌리는데 타임아웃
+    // 으로만 끝나는 상태가 된다.
+    if config.storage.endpoint_url.is_some() {
+        tracing::info!("부트스트랩 비활성: 로컬 엔드포인트 구성 (수동 스크립트만)");
+        return None;
+    }
+    let regions = config.target_regions();
+    if regions.is_empty() {
+        return None;
+    }
+    Some(Arc::new(
+        dbmon::bootstrap::BootstrapService::build(
+            &regions,
+            Arc::clone(&stores.settings),
+            Arc::new(dbmon::store::audit::DynamoAuditSink::new(
+                dynamo,
+                config.storage.config_table.clone(),
+            )),
+            config.deployment_env,
+            worker_id(config),
+        )
+        .await,
+    ))
+}
+
 fn read_entropy(buf: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf))
+    // 구현은 `dbmon::entropy` 에 있다 — 부트스트랩의 `plan_id` 도 같은 것을 쓴다.
+    dbmon::entropy::fill(buf)
 }
 
 /// 컨테이너에서 화면을 쓰기 위한 로컬 토큰을 발급하고 접속 URL 을 찍는다.
@@ -2340,6 +2385,23 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     auth: Arc::new(dbmon::aws::auth_token::build_target_auth(&config).await),
                     config: Arc::new(config.clone()),
                 })),
+                // **Cognito 검증기** (M5). HTTPS 클라이언트를 못 만들면 `None` 이고
+                // 화면이 "아직 준비되지 않았다" 를 말한다.
+                //
+                // 사용자 레코드는 config 테이블의 `USER#<sub>` 를 **읽기만** 한다 —
+                // 쓰기는 IAM 에서 Deny 되어 있다(08 §5.2).
+                cognito: dbmon::api::cognito::CognitoVerifier::with_https(Arc::new(
+                    dbmon::store::users::DynamoUserStore::new(
+                        stores.dynamo.clone(),
+                        config.storage.config_table.clone(),
+                    ),
+                ))
+                .map(Arc::new),
+                // **부트스트랩은 Secrets Manager 자격증명이 있을 때만 붙는다** (M3).
+                //
+                // 없으면 `None` 이고, 화면이 "수동 스크립트를 쓰라" 고 안내한다.
+                // 스텁으로 통과시키면 버튼이 눌리는데 아무 일도 일어나지 않는다.
+                bootstrap: build_bootstrap(&config, &stores, stores.dynamo.clone()).await,
                 // **파일 설정만이 인증 끄기를 허용할 수 있다.** 화면에서 두 번째
                 // 허용을 눌러야 실제로 꺼진다.
                 allow_auth_disable: config.http.allow_auth_disable,

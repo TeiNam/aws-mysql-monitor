@@ -18,6 +18,7 @@
 //! `endpoint_url` 을 주면 DynamoDB Local 에 붙는다. AWS 자격증명이 만료돼도 저장 경로를
 //! 개발·검증할 수 있다 — 이 프로젝트의 로컬 우선 원칙이다.
 
+pub mod audit;
 pub mod broadcast;
 pub mod checkpoint;
 pub mod keys;
@@ -26,6 +27,7 @@ pub mod pause;
 pub mod registry;
 pub mod settings;
 pub mod tuning;
+pub mod users;
 
 use std::collections::HashMap;
 

@@ -134,7 +134,7 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
     };
     let token = token.filter(|t| !t.trim().is_empty());
 
-    let mut ctx = match context_from_token(&state, token.as_deref()) {
+    let mut ctx = match context_from_token(&state, token.as_deref()).await {
         Ok(ctx) => ctx,
         Err(_) => {
             // 사유를 알린다. 못 보내도 어차피 아래에서 닫는다.
@@ -233,7 +233,7 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
 
             // 재인증 (T-33). 권한이 줄었으면 여기서 끊긴다.
             _ = reauth.tick() => {
-                match context_from_token(&state, token.as_deref()) {
+                match context_from_token(&state, token.as_deref()).await {
                     Ok(fresh) => {
                         // **스코프가 줄었으면 구독도 줄인다.** 재인증만 하고
                         // 기존 구독을 그대로 두면 강등이 반영되지 않는다.

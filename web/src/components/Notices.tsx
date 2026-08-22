@@ -13,6 +13,8 @@ import { RefreshCw } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { ApiError, fetchAuthConfig, isUnauthorized, queryKeys } from "../lib/api";
 import { saveToken } from "../lib/auth";
+import { beginLogin } from "../lib/cognito";
+import type { AuthConfig } from "../lib/types";
 import { BTN_GHOST, BTN_PRIMARY, CELL_X, SELECT } from "./ui";
 
 const MESSAGES: Record<string, string> = {
@@ -72,7 +74,7 @@ function TokenNotice() {
   const mode = config.data?.mode;
   const heading =
     mode === "cognito"
-      ? "이 환경은 아직 접속할 수 없다"
+      ? "로그인이 필요하다"
       : mode === "unconfigured"
         ? "이 배포에는 인증 수단이 없다"
         : "접속 토큰이 필요하다";
@@ -81,10 +83,7 @@ function TokenNotice() {
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-4" role="alert">
       <h2 className="text-sm font-medium text-amber-900">{heading}</h2>
       {mode === "cognito" ? (
-        <p className="mt-2 text-sm text-amber-800">
-          배포 환경({config.data?.deployment_env})은 Cognito JWT 검증이 아직 구현되지 않아
-          <strong> fail closed</strong> 다 — 토큰을 만들어도 통과하지 못한다.
-        </p>
+        <CognitoLogin config={config.data} />
       ) : mode === "unconfigured" ? (
         /* **찾을 토큰이 없다.** "로그를 보라" 를 말하면 없는 것을 찾게 만든다. */
         <>
@@ -211,5 +210,79 @@ export function TruncatedNote({ scanned }: { scanned: number }) {
       조회 상한에 걸려 <strong>{scanned.toLocaleString("ko-KR")}건까지만</strong> 접었다. 이
       표는 그 범위의 집계다 — 구간을 좁히거나 인스턴스를 지정해야 전체가 된다.
     </p>
+  );
+}
+
+/**
+ * Cognito 로그인 버튼.
+ *
+ * # 왜 버튼인가 — 자동 리다이렉트가 아닌 이유
+ *
+ * 화면을 여는 순간 Hosted UI 로 튕기면 **되돌아올 수 없는 상태**가 만들어진다:
+ * 설정이 틀려서 로그인이 실패하는 배포에서 사용자가 화면을 볼 기회조차 없고, 그러면
+ * 설정을 고칠 화면에 들어갈 방법이 사라진다(설정 화면도 인증 뒤에 있다).
+ *
+ * 그래서 사람이 누른다. 누르기 전에 무엇이 잘못됐는지 화면이 말할 수 있다.
+ */
+function CognitoLogin({ config }: { config: AuthConfig | undefined }) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const cognito = config?.cognito;
+  const ready = config?.cognito_configured === true;
+
+  if (!cognito) return null;
+
+  // **설정이 불완전하면 버튼을 주지 않는다.** 눌러도 아무 일이 없는 버튼은 고장이다.
+  if (!ready) {
+    const missing = [
+      !cognito.user_pool_id && "사용자 풀 ID",
+      !cognito.client_id && "앱 클라이언트 ID",
+      !cognito.domain && "Hosted UI 도메인",
+    ].filter(Boolean);
+    return (
+      <div className="mt-2 text-sm text-amber-800">
+        <p>
+          로그인 방식이 Cognito 인데 설정이 완전하지 않다 — 설정 화면에서 채운다.
+          {missing.length > 0 && <> 빠진 값: {missing.join(", ")}.</>}
+        </p>
+        <p className="mt-2 text-xs text-amber-700">
+          <span className="font-mono">terraform -chdir=infra/layers/30-identity output</span> 의
+          값을 넣는다. 로그인 뒤에도 401 이면 <span className="font-mono">USER#&lt;sub&gt;</span>{" "}
+          레코드가 없는 것이다(fail-closed) — docs/08-security-auth.md §3.1 참조.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2">
+      <p className="text-sm text-amber-800">
+        이 배포는 Cognito 를 쓴다. 로그인하면 역할·환경 범위가 서버 사용자 레코드에서 정해진다.
+      </p>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          setError(null);
+          try {
+            const ok = await beginLogin(cognito);
+            if (!ok) setError("로그인 주소를 만들 수 없다 — 도메인 설정을 확인한다.");
+          } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="mt-3 rounded bg-amber-900 px-4 py-2 text-sm font-medium text-white hover:bg-amber-800 disabled:opacity-50"
+      >
+        {busy ? "이동 중…" : "Cognito 로 로그인"}
+      </button>
+      {error && (
+        <p className="mt-2 text-sm text-red-700" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }

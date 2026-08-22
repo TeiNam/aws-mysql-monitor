@@ -191,22 +191,11 @@ pub fn show_create_table(schema: &str, name: &str) -> Option<String> {
     ))
 }
 
-/// MySQL 식별자 인용. **백틱을 이중화하고, 제어문자·개행이 있으면 거부한다.**
+/// MySQL 식별자 인용 — 구현은 [`dbmon_core::ident::quote_ident`] 에 있다.
 ///
-/// 거부가 중요하다: 백틱만 이중화하면 개행이 든 이름으로 주석(`/* … */`)을 닫고 다른
-/// 문장을 붙일 수 있다. RDS 식별자 규칙에 그런 이름은 없으므로 잃는 것이 없다.
-pub fn quote_ident(raw: &str) -> Option<String> {
-    // **문자 수로 센다.** MySQL 식별자 상한(64)은 문자 기준이라 바이트로 재면
-    // 한글·이모지 이름을 실재하는데도 거부한다(`raw.len()` 은 UTF-8 바이트다).
-    let chars = raw.chars().count();
-    if chars == 0 || chars > 64 {
-        return None;
-    }
-    if raw.chars().any(|c| c.is_control()) {
-        return None;
-    }
-    Some(format!("`{}`", raw.replace('`', "``")))
-}
+/// 부트스트랩이 **마스터 권한으로 실행할 SQL** 을 조립하면서 같은 규칙이 필요해졌다.
+/// 인용 규칙이 두 벌이 되면 한쪽만 고쳐지므로(T-18 이 경고한 자리) core 로 올렸다.
+pub use dbmon_core::ident::quote_ident;
 
 /// `(?, ?)` 쌍 자리표시자 — `(스키마, 이름) IN (…)` 용.
 fn pair_placeholders(count: usize) -> String {

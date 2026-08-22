@@ -59,7 +59,19 @@ variable "allowed_vpc_ids" {
 # 주석은 "dev 에서는 반드시 열거한다"고 했지만 코드가 그걸 강제하지 않았다.
 variable "db_auth_resource_ids" {
   description = <<-EOT
-    IAM DB 인증을 허용할 DbiResourceId 목록 (예: db-ABCDEFGH...).
+    IAM DB 인증을 허용할 리소스 id 목록.
+
+    ⚠ **엔진에 따라 다른 id 를 쓴다.** 이걸 틀리면 계정·플러그인·보안그룹이 모두 정상인데
+    접속만 `1045 Access denied` 로 실패한다 — 실측으로 걸렸다.
+
+    | 대상 | 넣을 값 | 얻는 방법 |
+    |---|---|---|
+    | RDS 단독 인스턴스 | `db-…` (`DbiResourceId`) | `aws rds describe-db-instances --query 'DBInstances[].DbiResourceId'` |
+    | **Aurora** | `cluster-…` (`DbClusterResourceId`) | `aws rds describe-db-clusters --query 'DBClusters[].DbClusterResourceId'` |
+
+    Aurora 는 인스턴스가 아니라 **클러스터 단위**로 `rds-db:connect` 를 판정한다. 인스턴스
+    id 를 넣으면 그 ARN 은 어떤 요청과도 매치되지 않는다.
+
     비어 있으면 `dbuser:*/<user>` 로 전체를 허용한다 — dev 에서는 반드시 열거한다.
   EOT
   type        = list(string)

@@ -47,7 +47,7 @@ pub async fn get_tuning(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<TuningView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     // **레코드를 먼저 확인한다** — 환경 스코프 밖이면 권고의 존재도 알리지 않는다.
     let record = record_for(&state, &ctx, id).await?;
     let now_ms = SystemClock.now_ms();
@@ -116,7 +116,7 @@ async fn generate_tuning(
     headers: HeaderMap,
     id: String,
 ) -> Result<Json<TuningView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     if !ctx.has_role(Role::Operator) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "operator_required"));

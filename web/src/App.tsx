@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router";
 import { Note } from "./components/Notices";
 import { Shell } from "./components/Shell";
+import { AuthCallbackPage } from "./pages/AuthCallbackPage";
 import { CloudWatchPage } from "./pages/CloudWatchPage";
 import { InstanceMetricsPage } from "./pages/InstanceMetricsPage";
 import { MetricsFleetPage } from "./pages/MetricsFleetPage";
@@ -23,6 +24,11 @@ import { StatisticsPage } from "./pages/StatisticsPage";
 export function App() {
   return (
     <Routes>
+      {/*
+       * **셸 밖이다.** 이 화면은 인증되기 전에 렌더되므로, 셸 안에 두면 셸의 데이터
+       * 조회가 전부 401 을 받으면서 교환이 끝나기 전에 "토큰이 필요하다" 배너가 뜬다.
+       */}
+      <Route path="auth/callback" element={<AuthCallbackPage />} />
       <Route element={<Shell />}>
         {/* 첫 탭과 같은 곳으로 보낸다 — 3번째 탭에서 열리면 실수처럼 보인다. */}
         <Route index element={<Navigate to="/metrics" replace />} />

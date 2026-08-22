@@ -153,6 +153,8 @@ terraform plan -var environment=dev -var vpc_id=vpc-... \
 | 2 | 화면 접속 경로가 없다 | `enable_alb=false`(dev 기본) 면 인바운드 규칙이 0개다 | `40-compute` 에 `admin_ingress_security_group_ids` 또는 `admin_ingress_cidrs` |
 | 3 | 태스크 SG 를 열었는데도 안 붙는다 | **Client VPN SG 의 이그레스가 DB·DNS 로만** 열려 있다 | `60-seed` 가 `task_security_group_id` 를 받으면 `vpn_to_tasks` 이그레스를 만든다 |
 | 4 | 그래도 안 붙는다 | **Client VPN 인가 규칙은 목적지 CIDR 로 판정**한다. DB 서브넷만 인가돼 있었다 | `60-seed` 에 `-var 'task_subnet_cidrs=["10.x.x.0/20", …]'` |
+| 5 | Aurora 만 `1045 Access denied` (계정·플러그인·SG 정상) | `db_auth_resource_ids` 에 **인스턴스** id(`db-…`)를 넣었다. **Aurora 는 클러스터 id(`cluster-…`)** 로 판정한다 | `describe-db-clusters --query 'DBClusters[].DbClusterResourceId'` 를 함께 넣는다 |
+| 6 | CloudWatch 타일이 빔 | `GetMetricData` 에 `cloudwatch:namespace` 조건이 붙어 있었다 — 그 조건 키는 이 액션에 실려 오지 않아 `implicitDeny` 다 | 조건 없이 허용(노출 범위는 `iam.tf` 주석에) |
 
 3·4 는 보안 그룹만 봐서는 진단할 수 없다 — `describe-client-vpn-authorization-rules` 를
 함께 봐야 한다. 순서는 이렇게 된다:

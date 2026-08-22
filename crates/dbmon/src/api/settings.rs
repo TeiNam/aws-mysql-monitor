@@ -67,7 +67,7 @@ fn view(state: &ApiState, settings: &AppSettings, can_edit: bool) -> SettingsVie
         own_region: state.aws_region.clone(),
         can_edit,
         allow_auth_disable: state.allow_auth_disable,
-        cognito_ready: super::auth::COGNITO_READY,
+        cognito_ready: state.cognito.is_some(),
         load_error: state.settings.last_error(),
         settings: settings.redacted(),
     }
@@ -77,7 +77,7 @@ pub async fn get_settings(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<SettingsView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let now_ms = SystemClock.now_ms();
     let settings = state.settings.load(now_ms).await;
     let can_edit = ctx.has_role(Role::Admin);
@@ -96,7 +96,7 @@ pub async fn put_settings(
     headers: HeaderMap,
     Json(body): Json<PutSettingsBody>,
 ) -> Result<Json<SettingsView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     if !ctx.has_role(Role::Admin) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "admin_required"));
