@@ -400,7 +400,12 @@ async fn close_in_flight_mine(
     // 고아 스윕은 `owner_worker`·`owner_epoch` 가 자기와 같은 것을 건너뛰므로
     // (그게 "내가 돌리는 중" 의 정의다) **아무도 닫지 않는다.** 다음 정지 전이까지
     // 남는다 — 이 함수는 전이에서만 불린다(교차 리뷰 3회차).
-    let in_flight = match store.list_in_flight(ORPHAN_SWEEP_LIMIT).await {
+    // **상한보다 하나 더 요청한다.**
+    //
+    // 정확히 상한만큼 오면 "더 있는가" 를 알 수 없어 잘린 것으로 봐야 했고, 그러면 딱
+    // 500건인 정상 상태에서 대상이 영구히 남아 매 라운드 다시 조회한다(교차 리뷰 9회차가
+    // nit 로 지적). 하나 더 받아 보면 그 모호함이 사라진다.
+    let in_flight = match store.list_in_flight(ORPHAN_SWEEP_LIMIT + 1).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -414,11 +419,11 @@ async fn close_in_flight_mine(
     // **상한을 채웠으면 관측이 불완전하다.** 그때 빈 `remaining` 을 돌려주면 호출부가
     // "끝났다" 로 읽고 대상을 지운다 — 페이지 밖에 남은 레코드는 그 뒤로 아무도 닫지
     // 않는다(고아 스윕이 같은 워커·epoch 를 `Mine` 으로 건너뛴다). 대상을 유지한다.
-    let truncated = in_flight.len() >= ORPHAN_SWEEP_LIMIT;
+    let truncated = in_flight.len() > ORPHAN_SWEEP_LIMIT;
     if truncated {
         tracing::warn!(
             limit = ORPHAN_SWEEP_LIMIT,
-            "진행 중 레코드가 상한을 채웠다 — 관측이 불완전하므로 대상을 유지한다"
+            "진행 중 레코드가 상한을 넘었다 — 관측이 불완전하므로 대상을 유지한다"
         );
     }
     let mut closed = 0usize;
@@ -500,6 +505,9 @@ async fn sweep_orphans(
     epoch: Option<u64>,
     now_ms: i64,
     config: &Config,
+    // **지금 도는 수집 태스크.** `Mine` 판정의 근거다 — 내 이름·내 epoch 인데 태스크가
+    // 없으면 살아 있을 수 없다(교차 리뷰 8·9회차가 지적한 정지 확정 누락의 근본).
+    running: &std::collections::BTreeSet<String>,
 ) {
     let threshold = dbmon::orphan::stale_threshold_ms(config.collector.detect_interval_ms);
     // **예산 안에서 돈다.** 리더 루프와 같은 태스크이므로 길어지면 `gate.refresh()`
@@ -513,6 +521,7 @@ async fn sweep_orphans(
         now_ms,
         threshold,
         ORPHAN_SWEEP_LIMIT,
+        Some(running),
     ))
     .await
     {
@@ -675,6 +684,31 @@ async fn backfill_round(
         // `Excludes.users` 로 이미 같은 일을 한다.
         let mut parsed =
             dbmon::slowlog::parse(&chunk.text, min_ms, &config.collector.monitor_db_user);
+
+        // **상한에 걸렸으면 마지막 엔트리를 버린다.**
+        //
+        // 슬로우로그 엔트리 하나가 CloudWatch 이벤트 여러 개에 걸칠 수 있고, 상한이 그
+        // 중간에서 멈추면 파서는 청크 끝에서 현재 엔트리를 **그대로 확정한다** — 잘린
+        // SQL 이 잘린 다이제스트로 저장되어 사전을 오염시킨다(교차 리뷰 8·9회차).
+        //
+        // 경계를 **파서의 엔트리**로 잡는다. 바이트에서 `# Time:` 을 찾는 방식은 SQL 본문
+        // 안의 그 문자열을 경계로 보므로 같은 오염을 다른 경로로 만든다(9회차가 그걸
+        // 실증했다) — 파서만이 무엇이 엔트리인지 안다.
+        //
+        // 버린 엔트리는 **다시 읽는다**: 체크포인트를 남긴 마지막 엔트리 기준으로 잡고
+        // 페이지 토큰을 버린다. 중복은 `record_id` 로 병합되므로 안전하다.
+        let capped_dropped = if chunk.has_more && parsed.entries.len() > 1 {
+            let dropped = parsed.entries.pop();
+            tracing::info!(
+                instance = %instance.id.as_str(),
+                "상한에서 마지막 엔트리를 버렸다 — 다음 라운드가 그 자리부터 다시 읽는다"
+            );
+            dropped.is_some()
+        } else {
+            // 엔트리가 하나뿐이면 버릴 수 없다(버리면 진행이 0 이다). 그 경우는 8MB 를
+            // 한 엔트리가 채운 것이고, 절단 위험을 안고 저장한다 — 멈추는 것보다 낫다.
+            false
+        };
         // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
         //
         // 파일 소스는 파일 전체를 준다. 그대로 병합하면 매 라운드 같은 수천 건을
@@ -719,19 +753,37 @@ async fn backfill_round(
                 // 실패한 엔트리가 있으면 옮기지 않는다 — 옮기면 그 엔트리는 영구히
                 // 다시 시도되지 않는다. 병합이 멱등이므로 다시 읽는 비용이 유실보다 싸다.
                 if s.errors == 0 {
-                    let position = chunk.next_since_ms.or_else(|| {
-                        parsed
+                    // **엔트리를 버렸으면 토큰을 쓰지 않는다.**
+                    //
+                    // 토큰은 우리가 읽은 페이지 **뒤**를 가리키므로, 버린 엔트리를 다시
+                    // 읽을 수 없다. 대신 처리한 마지막 엔트리 시각으로 위치를 잡아 그
+                    // 뒤부터 다시 읽는다 — 버린 엔트리가 거기 들어온다.
+                    let (position, token) = if capped_dropped {
+                        let pos = parsed
                             .entries
                             .iter()
                             .map(|e| e.ended_at_ms)
                             .max()
-                            .map(|t| t + 1)
-                    });
+                            .map(|t| t + 1);
+                        (pos, None)
+                    } else {
+                        (
+                            chunk.next_since_ms.or_else(|| {
+                                parsed
+                                    .entries
+                                    .iter()
+                                    .map(|e| e.ended_at_ms)
+                                    .max()
+                                    .map(|t| t + 1)
+                            }),
+                            chunk.next_token.clone(),
+                        )
+                    };
                     // **토큰을 함께 저장한다.** 시각만 저장하면 상한에 걸린 자리를
                     // 표현할 수 없어 건너뛰거나 멈춘다(교차 리뷰 4회차).
                     let cursor = position.map(|position_ms| dbmon::store::checkpoint::Cursor {
                         position_ms,
-                        next_token: chunk.next_token.clone(),
+                        next_token: token,
                     });
                     if let Some(c) = cursor
                         && let Err(e) = checkpoints.put(&job, &c).await
@@ -1639,6 +1691,10 @@ fn spawn_leader_loop(
                                 gate.epoch(),
                                 now_ms,
                                 &config,
+                                // **전체 정지 상태다** — 도는 태스크가 없다. 그래서 내
+                                // 이름·epoch 레코드도 걷어야 한다(그게 정지 확정이
+                                // 놓친 것을 자동으로 정리한다).
+                                &tasks.running(),
                             )
                             .await;
                             swept = true;
@@ -1874,6 +1930,7 @@ fn spawn_leader_loop(
                         gate.epoch(),
                         now_ms,
                         &config,
+                        &tasks.running(),
                     )
                     .await;
                 }
