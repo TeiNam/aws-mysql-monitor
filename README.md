@@ -203,7 +203,7 @@ docker build -t dbmon:dev .
 docker run --rm dbmon:dev --version
 ```
 
-## 2. Storage (DynamoDB + S3)
+## 2. Storage (DynamoDB)
 
 Two tables. **They must exist before the task starts** — the app does not create them
 (creating tables needs `dynamodb:CreateTable`, and a monitoring task should not hold that).
