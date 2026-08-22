@@ -44,6 +44,22 @@ export function currentToken(): string | null {
   return sessionStorage.getItem(STORAGE_KEY);
 }
 
+/**
+ * 토큰을 직접 넣는다 (화면의 붙여넣기 칸).
+ *
+ * # 왜 URL 대신 이 경로가 필요한가
+ *
+ * `?token=…` 은 **첫 요청이 나간 뒤에** 지워진다. `history.replaceState` 는 브라우저
+ * 주소창만 고치고, 그 사이 ALB·리버스 프록시의 액세스 로그에는 요청 대상이 그대로
+ * 남는다 — 공유 토큰은 admin 이고 만료도 없으므로 그 로그가 곧 자격증명이다.
+ *
+ * 붙여넣기는 요청을 만들지 않는다. 그래서 배포에서는 이쪽을 안내하고, `?token=`
+ * 경로는 로그가 로컬에만 남는 dev 컨테이너용으로 남겨 둔다.
+ */
+export function saveToken(token: string): void {
+  sessionStorage.setItem(STORAGE_KEY, token.trim());
+}
+
 /** 토큰을 버린다. 401 을 받았을 때 부른다 — 낡은 토큰으로 계속 재시도하지 않는다. */
 export function clearToken(): void {
   sessionStorage.removeItem(STORAGE_KEY);

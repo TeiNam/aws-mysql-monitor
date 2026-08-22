@@ -228,8 +228,14 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
                     Ok(fresh) => {
                         // **스코프가 줄었으면 구독도 줄인다.** 재인증만 하고
                         // 기존 구독을 그대로 두면 강등이 반영되지 않는다.
+                        //
+                        // 스코프가 **바뀌었는지**를 함께 넘긴다. 인스턴스 토픽은
+                        // 환경을 모르므로 그것만으로는 판정할 수 없다 — 바뀌면
+                        // 버리고 클라이언트가 다시 구독하게 한다(그때 등록부를 읽고
+                        // `authorize` 가 제대로 검사한다).
+                        let scope_changed = fresh.env_scope != ctx.env_scope;
                         subscribed.retain(|key| {
-                            Topic::parse(key).is_ok_and(|t| still_allowed(&t, &fresh))
+                            Topic::parse(key).is_ok_and(|t| still_allowed(&t, &fresh, scope_changed))
                         });
                         ctx = fresh;
                     }
@@ -245,16 +251,23 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
 
 /// 재인증 후에도 이 토픽을 유지할 수 있는가.
 ///
-/// 인스턴스 토픽은 등록부 조회가 필요하지만 재인증 경로에서 매번 등록부를
-/// 읽지는 않는다. 대신 **환경 스코프가 그대로면 유지, 줄었으면 버린다** —
-/// 인스턴스의 환경은 변하지 않는다고 가정하지 않고, 다음 `subscribe` 에서
-/// 다시 검사된다.
-fn still_allowed(topic: &Topic, ctx: &AuthContext) -> bool {
+/// 인스턴스 토픽은 환경을 알기 위해 등록부 조회가 필요한데, 재인증 경로에서 연결마다
+/// 5분 주기로 등록부를 읽지는 않는다. 그래서 **스코프가 바뀌었으면 버린다.**
+///
+/// # 유지하는 쪽이 "보수적" 이 아니다
+///
+/// 처음에는 "환경을 모르니 보수적으로 유지한다" 로 두었다. 보안 판정에서 보수적이라는
+/// 것은 **거부하는 쪽**이다 — 유지하면 `[dev, stg]` 에서 `[dev]` 로 강등된 사용자의
+/// `stg` 인스턴스 상태 스트림이 계속 흐른다. 재인증이 강등을 반영하려고 존재하는데
+/// 그 목적을 정확히 놓친다(교차 리뷰가 잡았다).
+///
+/// 버리면 클라이언트가 다시 구독하고, 그 경로는 등록부를 읽어
+/// [`super::topic::authorize`] 로 제대로 검사한다. 스코프가 바뀌는 일은 드물어서
+/// 정상 상태에서는 아무 비용이 없다.
+fn still_allowed(topic: &Topic, ctx: &AuthContext, scope_changed: bool) -> bool {
     match topic {
         Topic::SlowQueries(env) => ctx.is_env_allowed(*env),
-        // 인스턴스 환경을 모르므로 보수적으로 유지한다. 방송 시점에 키가
-        // 일치해야 전달되고, 스코프 축소는 다음 구독에서 반영된다.
-        Topic::InstanceStatus(_) => true,
+        Topic::InstanceStatus(_) => !scope_changed,
     }
 }
 
@@ -441,8 +454,25 @@ mod tests {
     #[test]
     fn a_narrowed_scope_drops_slow_query_subscriptions() {
         let prd = Topic::SlowQueries(Env::Prd);
-        assert!(still_allowed(&prd, &ctx(&[Env::Prd, Env::Dev])));
-        assert!(!still_allowed(&prd, &ctx(&[Env::Dev])));
+        assert!(still_allowed(&prd, &ctx(&[Env::Prd, Env::Dev]), false));
+        assert!(!still_allowed(&prd, &ctx(&[Env::Dev]), true));
+    }
+
+    /// **인스턴스 상태 구독도 스코프가 바뀌면 버린다** (T-33).
+    ///
+    /// 인스턴스 토픽은 환경을 모르므로 전에는 무조건 유지했다. 그러면
+    /// `[dev, stg]` → `[dev]` 로 강등된 사용자의 `stg` 인스턴스 스트림이 계속
+    /// 흐른다 — 재인증이 강등을 반영하려고 있는데 그 목적을 놓친다.
+    ///
+    /// 버려도 손해가 없다: 클라이언트가 다시 구독하고, 그 경로는 등록부를 읽어
+    /// `topic::authorize` 로 제대로 검사한다.
+    #[test]
+    fn a_changed_scope_drops_instance_status_subscriptions() {
+        let inst = Topic::InstanceStatus("123456789012/ap-northeast-2/orders-01".into());
+        // 스코프가 그대로면 유지한다 — 정상 상태에서 재구독 비용을 만들지 않는다.
+        assert!(still_allowed(&inst, &ctx(&[Env::Prd, Env::Dev]), false));
+        // 바뀌면 버린다.
+        assert!(!still_allowed(&inst, &ctx(&[Env::Dev]), true));
     }
 
     /// **유휴 종료를 `select!` 안의 `timeout` 으로 되돌리지 않는다.**

@@ -641,8 +641,13 @@ definition holds only a Secrets Manager ARN. Shorter than 32 characters or conta
 and **startup fails** — a weak token is worse than none, because it looks like authentication;
 whitespace gets cut at the header and produces "the token is right but I get 401".
 
-Open the UI once at `https://<alb>/?token=<token>`. The frontend moves it to `sessionStorage` and
-strips it from the address bar, so it does not stay in history or a `Referer` header.
+Open the UI, and the notice asks for the token — **paste it into the field.** It goes to
+`sessionStorage`, and pasting makes no HTTP request.
+
+`https://<alb>/?token=<token>` also works but is the wrong choice for a deployment: the token is
+stripped from the address bar only *after* the first request has gone out, so the ALB access log
+already recorded it. That log then holds a non-expiring admin credential. The URL form stays for
+the `dev` container case, where the log is local.
 
 **This token is admin.** One token has no subject, so there is nothing to base a role split on —
 whoever holds it can change settings and even turn authentication off. Audit logs record
