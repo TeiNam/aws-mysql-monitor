@@ -200,7 +200,7 @@ docker build -t dbmon:dev .
 docker run --rm dbmon:dev --version
 ```
 
-## 2. 저장소 (DynamoDB + S3)
+## 2. 저장소 (DynamoDB)
 
 테이블 두 개. **태스크가 뜨기 전에 있어야 한다** — 앱이 만들지 않는다(만들려면
 `dynamodb:CreateTable` 이 필요하고, 모니터링 태스크가 그 권한을 들고 있어서는 안 된다).
