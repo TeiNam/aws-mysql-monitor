@@ -1214,6 +1214,24 @@ config_table = "dbmon-config"
         assert!(c.role.runs_collector() && !c.role.runs_api());
     }
 
+    /// 컨테이너에는 설정 파일이 없다 — 리터럴 정책은 **환경변수로만** 바꿀 수 있다.
+    /// 이 경로가 없어서 dev 배포가 기본값 `masked` 로 돌며 `?` 만 저장했다.
+    #[test]
+    fn env_overrides_literal_policy() {
+        use dbmon_core::slow_query::LiteralPolicy;
+
+        // 파일에 아무것도 없으면 코드 기본값 — 안전한 쪽이다.
+        let c = load_str(minimal_toml(), &[]).unwrap();
+        assert_eq!(c.collector.literal_policy, LiteralPolicy::Masked);
+
+        let c = load_str(
+            minimal_toml(),
+            &[("DBMON__COLLECTOR__LITERAL_POLICY", "full_restricted")],
+        )
+        .unwrap();
+        assert_eq!(c.collector.literal_policy, LiteralPolicy::FullRestricted);
+    }
+
     #[test]
     fn env_comma_list_becomes_array() {
         let c = load_str(
