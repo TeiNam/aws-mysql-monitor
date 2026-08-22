@@ -284,6 +284,24 @@ pub const COLLECT_LEADER_KEY: &str = "LEADER#collect";
 /// cron 리더 리스 키. 수집 리더와 **별도**다 (스케일 축이 다르다).
 pub const CRON_LEADER_KEY: &str = "LEADER#cron";
 
+/// 사용자 레코드 저장소 — **RBAC 의 권위값** (T-20, [08 §3](../../../docs/08-security-auth.md)).
+///
+/// # 왜 토큰만으로 인가하지 않는가
+///
+/// `cognito:groups` 는 IdP 속성 매핑과 Pre Token Generation Lambda 를 거쳐 온다. 그
+/// 경로 중 하나라도 오작동하면 임의의 그룹이 클레임에 들어올 수 있다. 서버 레코드와
+/// 교집합해야 토큰이 권한을 **올릴 수 없다**.
+///
+/// # 레코드가 없으면 권한이 없다 (fail-closed)
+///
+/// IdP 로 처음 로그인한 사용자는 레코드가 없다. 그 상태는 "기본 권한" 이 아니라
+/// **승인 대기**다 — admin 이 레코드를 만들어야 들어온다.
+#[async_trait]
+pub trait UserStore: Send + Sync {
+    /// `sub` 로 레코드를 읽는다. 없으면 `None` (권한 없음).
+    async fn get(&self, subject: &str) -> Result<Option<crate::rbac::UserRecord>>;
+}
+
 #[async_trait]
 pub trait LeaseStore: Send + Sync {
     /// 조건부 획득: 소유자가 없거나 만료됐을 때만 성공한다.

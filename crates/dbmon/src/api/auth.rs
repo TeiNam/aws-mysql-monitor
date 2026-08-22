@@ -72,10 +72,13 @@
 //! 셋 다 역할이 `admin` 이다. 주체가 하나뿐인 자격증명으로 역할을 나눌 근거가 없다 —
 //! 사람마다 나누는 것이 Cognito 를 넣는 이유다.
 //!
-//! # Cognito 검증은 아직 없다 — 그리고 조용히 통과시키지 않는다
+//! # Cognito 는 이 모듈이 아니라 [`super::cognito`] 가 검증한다
 //!
-//! JWT 검증(JWKS 조회·kid 캐시·클레임 교집합)은 M5 의 남은 작업이다. 설정에서
-//! `cognito` 를 고르면 [`COGNITO_READY`] 가 거짓이라 **공유 토큰 방식으로
+//! 이 모듈은 **토큰 수단**(로컬 우회·발급 토큰·공유 토큰)만 판정한다. JWT 검증은
+//! 비동기(JWKS 조회·`USER` 레코드 조회)라 여기 들어올 수 없고, 두 판정을 엮는 곳은
+//! [`super::context_from_token`] 이다.
+//!
+//! 검증기가 배선되지 않은 배포에서는 설정에서 `cognito` 를 골라도 **토큰 방식으로
 //! 떨어진다** — 즉 토큰을 넣어 둔 배포는 계속 동작하고, 넣지 않은 배포는 401 이다.
 //! 스텁으로 통과시키지 않는 이유는 그게 인증이 있는 것처럼 보이면서 없는 상태이기
 //! 때문이다.
@@ -188,7 +191,7 @@ pub enum AuthError {
     Missing,
     /// 토큰이 왔지만 맞지 않는다.
     Invalid,
-    /// 이 배포에서는 인증 수단이 구성되지 않았다 (Cognito 미배선).
+    /// 이 배포에서는 인증 수단이 구성되지 않았다.
     NotConfigured,
 }
 
@@ -215,15 +218,12 @@ fn local_dev_context() -> AuthContext {
     }
 }
 
-/// Cognito 토큰 **검증기가 배선돼 있는가.**
-///
-/// `false` 인 동안 설정에서 `cognito` 를 골라도 적용되지 않는다
-/// ([`AppSettings`](dbmon_core::settings::AppSettings) 는 저장하되
-/// `effective_mode` 가 토큰 방식으로 떨어뜨린다). 검증 없이 통과시키는 것보다 낫고,
-/// 화면이 이 값을 받아 "아직 준비되지 않았다" 를 말한다.
-///
-/// M5 에서 JWKS 조회 → 서명 검증 → `AuthContext::intersect` 가 들어오면 `true` 다.
-pub const COGNITO_READY: bool = false;
+// **`COGNITO_READY` 상수는 없앴다.**
+//
+// 검증기가 배선됐는지는 **런타임 사실**이다 — `ApiState::cognito` 가 `Some` 인가로
+// 판정한다. 상수로 두면 배선을 끝내고도 상수를 안 바꿔서 꺼져 있는 상태가 가능하고,
+// 실제로 그 상태가 한동안 있었다(설정 화면이 `cognito` 를 제공하는데 들어올 수단이
+// 없었다). 사실을 한 곳에서만 읽으면 그 어긋남이 생기지 않는다.
 
 /// **인증을 끈 배포**의 문맥 (`settings.auth.mode = off`).
 ///
@@ -258,7 +258,7 @@ pub fn no_auth_context() -> AuthContext {
 ///
 /// `subject` 를 `shared-token` 으로 두는 이유: 감사 로그에서 "루프백 개발"
 /// (`local-dev`)·"인증 없음"(`anonymous`)·"공유 토큰" 은 전혀 다른 사실이다.
-/// 사람별로 나누려면 Cognito 가 필요하다([`COGNITO_READY`]).
+/// 사람별로 나누려면 Cognito 가 필요하다([`super::cognito`]).
 fn shared_token_context() -> AuthContext {
     AuthContext {
         subject: "shared-token".into(),

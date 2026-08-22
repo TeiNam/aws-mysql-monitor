@@ -258,7 +258,10 @@ impl Excludes {
     /// 커버리지·계정 롤업을 전부 오염시킨다 ([05 §10](../../../docs/05-collector.md)).
     pub fn with_defaults(monitor_user: &str) -> Self {
         Self {
-            schemas: ["mysql", "sys", "performance_schema", "information_schema"]
+            // **목록을 여기 리터럴로 두지 않는다.** 부트스트랩과 화면이 같은 판정을
+            // 필요로 하므로 `bootstrap::schemas` 가 유일한 정의다 — 두 벌이 되면
+            // 한쪽만 갱신되는 결함이 생긴다.
+            schemas: crate::bootstrap::schemas::SYSTEM_SCHEMAS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),

@@ -2377,3 +2377,35 @@ DynamoDB 쓰기까지 유지된다는 점, 세 카운터가 서로 겹치지 않
 - **슬로우로그 파서 대 실제 CloudWatch 내용** — 시드 로그 그룹은 있지만 이벤트가 0건이다
   (트래픽이 없다). 확인하려면 SSM 터널로 시드 DB 에 붙어 느린 쿼리를 만들어야 하고,
   그건 **대상을 지정한 명시적 승인**이 필요한 작업이다.
+
+---
+
+## Aurora IAM DB 인증이 `1045` 로 막혔다 (2026-08-23, dev 실배포)
+
+**증상:** 계정·플러그인·보안그룹이 전부 정상인데 Aurora 인스턴스만 `unreachable` 이었고
+로그는 `[mysql 1045] Access denied` 하나만 남겼다.
+
+**확인 순서 (전부 읽기 전용):**
+
+| 의심 | 확인 방법 | 결과 |
+|---|---|---|
+| DB 계정이 없다 | 마스터로 `SELECT user,host,plugin FROM mysql.user` | ❌ `dbmon@10.1.%` / `AWSAuthenticationPlugin` 존재 |
+| 권한이 모자라다 | `SHOW GRANTS` | ❌ 문서(07)의 모드 B 집합과 일치 |
+| 보안그룹 | `db_from_tasks` 규칙 | ❌ 존재 |
+| **IAM 리소스 ARN** | `task_db_auth` 정책 본문 대조 | ✅ **원인** |
+
+**원인:** 정책에 `dbuser:db-…`(인스턴스 `DbiResourceId`)가 들어가 있었다. **Aurora 는
+`rds-db:connect` 를 클러스터 단위로 판정**하므로 `dbuser:cluster-…`
+(`DbClusterResourceId`)가 필요하다. 인스턴스 id 를 넣으면 그 ARN 은 어떤 요청과도
+매치되지 않고, 실패는 IAM 이 아니라 **MySQL 인증 실패로 보인다** — 그래서 DB 쪽을
+세 번 뒤졌다.
+
+**고친 것:**
+
+- `infra/layers/40-compute/variables.tf` — `db_auth_resource_ids` 설명에 엔진별 표를 넣었다.
+  기존 설명은 `DbiResourceId` 만 말해서 이 실수를 유도했다.
+- `infra/README.md` 실배포 실패 표에 5·6행 추가.
+- 정책 재적용 + `--force-new-deployment`(IAM 캐시 갱신) → **4개 전부 `collecting`**.
+
+**남는 것:** 이 오류를 코드가 미리 못 잡는다. `describe-db-clusters` 로 Aurora 를 골라
+클러스터 id 를 자동으로 채우면 변수 자체가 사라진다 — M3 부트스트랩 작업과 함께 볼 자리다.

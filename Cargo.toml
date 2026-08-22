@@ -57,6 +57,24 @@ aws-sdk-rds = "1"
 aws-sdk-cloudwatch = "1"
 aws-sdk-cloudwatchlogs = "1"
 aws-sdk-bedrockruntime = "1"
+aws-sdk-secretsmanager = "1"
+# JWKS 조회 전용. `rustls`·`webpki-roots` 는 mysql_async 를 통해 이미 트리에 있어서
+# 추가 비용이 거의 없다. `default-features = false` 로 native-tls 를 배제한다 —
+# 시스템 OpenSSL 을 요구하면 ARM64 컨테이너 이미지가 커진다.
+#
+# ⚠ **`-no-provider` 를 써야 한다.** 그냥 `rustls-tls-webpki-roots` 는 rustls 의
+# `ring` feature 를 켜고, `mysql_async` 는 `aws-lc-rs` 를 켠다 — 둘이 함께 있으면
+# rustls 가 프로세스 기본 프로바이더를 정하지 못해 **첫 TLS 연결에서 패닉한다**
+# ("Could not automatically determine the process-level CryptoProvider").
+# 통합 테스트 8개가 그렇게 죽었다.
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls-webpki-roots-no-provider",
+  "json",
+] }
+# RSA 서명 검증(JWKS RS256). **`ring` 이 아니라 이것을 쓴다** — AWS SDK·mysql_async 가
+# 이미 이 프로바이더를 쓰므로, `ring` 을 더하면 위와 같은 프로바이더 충돌이 된다.
+# API 는 `ring` 과 호환된다(aws-lc-rs 가 그렇게 설계됐다).
+aws-lc-rs = "1"
 aws-sigv4 = { version = "1", features = ["http1"] }
 percent-encoding = "2"
 aws-credential-types = "1"

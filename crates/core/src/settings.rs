@@ -49,6 +49,7 @@ pub struct AppSettings {
     pub discovery: DiscoverySettings,
     pub auth: AuthSettings,
     pub ai: AiSettings,
+    pub bootstrap: BootstrapSettings,
     pub updated_at_ms: EpochMs,
     /// 마지막으로 저장한 주체(감사용). 비어 있으면 아직 저장된 적이 없다.
     pub updated_by: String,
@@ -353,6 +354,76 @@ impl AuthSettings {
             AuthModeSetting::Cognito if !self.cognito.is_complete() => AuthModeSetting::Token,
             m => m,
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 부트스트랩 (M3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 모니터링 계정 부트스트랩 설정 ([07](../../../docs/07-credentials-bootstrap.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BootstrapSettings {
+    /// 만들 계정 이름.
+    pub monitor_user: String,
+    /// 계정의 호스트 패턴. **`%` 를 기본값으로 두지 않는다** (T-04).
+    ///
+    /// 기본값이 비어 있는 이유: 이 값은 **앱 서브넷 CIDR** 이라 배포마다 다르다.
+    /// 그럴듯한 기본값(`10.0.%`)을 넣으면 다른 서브넷에 배포된 곳에서 조용히
+    /// 접속 실패가 되고, 원인이 호스트 패턴이라는 사실이 드러나지 않는다.
+    /// 비어 있으면 계획 생성이 거부되고 화면이 값을 요구한다.
+    pub monitor_host: String,
+    /// 권한 모드. 기본 `broad` — 근거는
+    /// [`PrivilegeMode`](crate::bootstrap::PrivilegeMode) 문서에 있다.
+    pub privilege_mode: crate::bootstrap::PrivilegeMode,
+    /// 모드 `least` 의 스키마 화이트리스트.
+    pub schemas: Vec<String>,
+    /// 인스턴스별 마스터 시크릿 ARN (경로 b). 키는 인스턴스 식별자다.
+    ///
+    /// RDS 관리형 시크릿(경로 a)이 있으면 이 표를 보지 않는다 — 관리형이 우선이다.
+    pub master_secret_arns: std::collections::BTreeMap<String, String>,
+    /// 앱이 `ModifyDBInstance` 를 호출해도 되는가.
+    ///
+    /// **기본 `false`.** 프로덕션 RDS 를 바꿀 권한을 앱이 기본으로 갖지 않는다
+    /// (NFR-S-09). 꺼져 있으면 계획이 CLI 명령을 보여준다.
+    pub allow_rds_modify: bool,
+}
+
+impl Default for BootstrapSettings {
+    fn default() -> Self {
+        Self {
+            monitor_user: "dbmon".into(),
+            // **빈 값이 기본이다.** 위 필드 문서에 이유를 적었다.
+            monitor_host: String::new(),
+            privilege_mode: crate::bootstrap::PrivilegeMode::default(),
+            schemas: Vec::new(),
+            master_secret_arns: std::collections::BTreeMap::new(),
+            allow_rds_modify: false,
+        }
+    }
+}
+
+impl BootstrapSettings {
+    /// 이 인스턴스에 등록된 시크릿 ARN (경로 b).
+    pub fn secret_arn_for(&self, instance_id: &str) -> Option<&str> {
+        self.master_secret_arns.get(instance_id).map(String::as_str)
+    }
+
+    /// 계획을 만들 수 있는 설정인가. **호스트 패턴이 비어 있으면 안 된다.**
+    pub fn is_ready(&self) -> Result<(), String> {
+        if self.monitor_host.is_empty() {
+            return Err("monitor_host 가 비어 있다 — 앱 서브넷 CIDR(예: 10.1.%)을 설정한다".into());
+        }
+        crate::bootstrap::Desired {
+            user: self.monitor_user.clone(),
+            host: self.monitor_host.clone(),
+            auth: crate::bootstrap::AuthMethod::default(),
+            mode: self.privilege_mode,
+            schemas: self.schemas.clone(),
+        }
+        .validate()
+        .map_err(|e| e.to_string())
     }
 }
 

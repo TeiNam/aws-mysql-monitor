@@ -32,6 +32,7 @@
 //! | [`ports`] | trait 정의 |
 //! | `fakes` | 테스트용 인메모리 구현 = **두 번째 구현** |
 
+pub mod bootstrap;
 pub mod clock_offset;
 pub mod cw_metrics;
 pub mod digest;
@@ -40,6 +41,7 @@ pub mod error;
 // **프로덕션 빌드에서는 컴파일되지 않는다.** 이유는 Cargo.toml 의 `testing` 피처 설명에 있다.
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes;
+pub mod ident;
 pub mod ids;
 pub mod inflight;
 pub mod instance;

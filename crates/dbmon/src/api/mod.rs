@@ -21,6 +21,8 @@
 
 pub mod aggregate;
 pub mod auth;
+pub mod bootstrap;
+pub mod cognito;
 pub mod cursor;
 pub mod hub;
 pub mod metrics;
@@ -150,6 +152,18 @@ pub struct ApiState {
     /// 두 곳의 명시적 허용이 필요하다: 이 값과 운영 설정(`auth.mode = off`).
     /// 한 곳으로 끌 수 있게 하면 실수 한 번으로 인증이 사라진다.
     pub allow_auth_disable: bool,
+    /// Cognito 토큰 검증기 (M5).
+    ///
+    /// **`None` 이면 Cognito 로 들어올 수 없다.** 그 사실이 `/api/auth/config` 의
+    /// `cognito_ready` 로 화면에 나가고, 설정에서 `cognito` 를 골라도 토큰 방식으로
+    /// 떨어진다. 스텁으로 통과시키면 인증이 있는 것처럼 보이면서 없는 상태가 된다.
+    pub cognito: Option<Arc<crate::api::cognito::CognitoVerifier>>,
+    /// 모니터링 계정 부트스트랩 (M3).
+    ///
+    /// **`None` 이면 이 워커에 Secrets Manager 자격증명이 없다** — 계정을 만들 수
+    /// 없고, 화면은 수동 스크립트 경로를 안내한다. 스텁으로 통과시키지 않는 것은
+    /// `tuning`·Cognito 와 같은 판단이다.
+    pub bootstrap: Option<Arc<crate::bootstrap::BootstrapService>>,
     /// 이 프로세스가 수집 루프를 도는가 (`role` 이 collector·all).
     ///
     /// **즉시 탐색·백필은 `false` 면 받지 않는다.** 그 요청은 프로세스 원자값을
@@ -174,6 +188,15 @@ pub fn router(state: ApiState) -> axum::Router {
         .route(
             "/api/instances/{id}/start",
             axum::routing::post(instance_start),
+        )
+        .route("/api/instances/{id}/bootstrap", get(bootstrap::capability))
+        .route(
+            "/api/instances/{id}/bootstrap/plan",
+            axum::routing::post(bootstrap::plan),
+        )
+        .route(
+            "/api/instances/{id}/bootstrap/apply",
+            axum::routing::post(bootstrap::apply),
         )
         .route("/api/metrics/fleet", get(metrics_fleet))
         .route("/api/metrics/instance/{id}", get(metrics_instance))
@@ -208,13 +231,17 @@ fn effective_auth_mode(
 ) -> dbmon_core::settings::AuthModeSetting {
     use dbmon_core::settings::AuthModeSetting as M;
     let mode = settings.auth.effective_mode(state.allow_auth_disable);
-    if mode == M::Cognito && !auth::COGNITO_READY {
+    if mode == M::Cognito && state.cognito.is_none() {
         return M::Token;
     }
     mode
 }
 
 /// API 오류. **내부 사정을 노출하지 않는다.**
+///
+/// `Debug` 는 테스트가 코드·상태 매핑을 검증하는 데 쓴다. 응답 본문은
+/// [`IntoResponse`] 가 만들고 `Debug` 를 쓰지 않는다.
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -281,22 +308,59 @@ impl IntoResponse for ApiError {
 ///
 /// 그래서 [`SettingsState::cached_fresh`] 를 쓴다. 캐시가 비었거나(기동 직후) TTL 이
 /// 지났으면 **인증이 켜진 쪽으로 떨어진다.** 방향이 이래야 한다: 모르면 닫는다.
-pub(crate) fn context_from_token(
+/// # Cognito 는 왜 여기서 갈리는가
+///
+/// 인증 수단이 셋이다: (1) 인증 없음 (2) 토큰(로컬·공유) (3) Cognito. **셋을 한 곳에서
+/// 고르지 않으면** 핸들러마다 다른 순서로 검사하게 되고, 순서가 다르면 어느 배포에서
+/// 어느 수단이 이기는지 알 수 없다.
+///
+/// 순서는 이렇다:
+///
+/// 1. 운영 설정이 `off` 이고 파일 설정이 허용하면 → 익명 admin
+/// 2. 토큰 수단(로컬 우회·발급 토큰·공유 토큰)이 맞으면 → 그 문맥
+/// 3. Cognito 검증기가 있고 설정이 완전하면 → JWT 검증 + `USER` 교집합
+/// 4. 아니면 거부
+///
+/// **2번이 3번보다 앞이다.** 공유 토큰을 넣어 둔 배포에 Cognito 를 붙이는 중이라면
+/// 두 수단이 함께 살아 있어야 한다 — 앞의 것부터 시도하지 않으면 전환 중에 화면이
+/// 닫힌다. JWT 는 형태(`a.b.c`)로 구분되므로 오인할 여지가 없다.
+pub(crate) async fn context_from_token(
     state: &ApiState,
     token: Option<&str>,
 ) -> Result<AuthContext, auth::AuthError> {
-    let fresh = state.settings.cached_fresh(SystemClock.now_ms());
-    let off = fresh.is_some_and(|s| {
-        effective_auth_mode(state, &s) == dbmon_core::settings::AuthModeSetting::Off
-    });
-    if off {
+    let now_ms = SystemClock.now_ms();
+    let fresh = state.settings.cached_fresh(now_ms);
+    if fresh.as_ref().is_some_and(|s| {
+        effective_auth_mode(state, s) == dbmon_core::settings::AuthModeSetting::Off
+    }) {
         return Ok(auth::no_auth_context());
     }
-    authenticate(&state.policy, token)
+
+    match authenticate(&state.policy, token) {
+        Ok(ctx) => Ok(ctx),
+        Err(token_err) => {
+            // 토큰 수단이 맞지 않았다. Cognito 를 시도한다.
+            let Some(verifier) = state.cognito.as_ref() else {
+                return Err(token_err);
+            };
+            // **설정이 불완전하면 Cognito 를 쓰지 않는다.** 그 상태에서 통과시키면
+            // 발급자·클라이언트를 검증하지 않는 것이고, 그건 인증이 아니다.
+            let settings = fresh.ok_or(token_err.clone())?;
+            let verification = cognito::Verification::from_settings(&settings.auth.cognito)
+                .ok_or(token_err.clone())?;
+            let Some(jwt) = token else {
+                return Err(token_err);
+            };
+            verifier.authenticate(jwt, &verification, now_ms).await
+        }
+    }
 }
 
 /// `Authorization: Bearer …` 에서 토큰을 뽑고 인증한다.
-pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+pub(crate) async fn context_of(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiError> {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -304,7 +368,9 @@ pub(crate) fn context_of(state: &ApiState, headers: &HeaderMap) -> Result<AuthCo
         .map(str::trim)
         .filter(|t| !t.is_empty());
 
-    context_from_token(state, bearer).map_err(|e| ApiError::new(e.status(), "unauthorized"))
+    context_from_token(state, bearer)
+        .await
+        .map_err(|e| ApiError::new(e.status(), "unauthorized"))
 }
 
 /// 프론트가 로그인 방식을 알기 위한 엔드포인트.
@@ -343,7 +409,7 @@ async fn auth_config(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "mode": mode,
         // 검증기가 배선됐고 설정도 완전한가. **둘 다여야 참이다.**
-        "cognito_configured": auth::COGNITO_READY && c.is_complete(),
+        "cognito_configured": state.cognito.is_some() && c.is_complete(),
         // 로그인 화면을 만들 재료. **공개 값이다** — 브라우저가 로그인 전에 알아야 한다.
         "cognito": {
             "user_pool_id": c.user_pool_id,
@@ -373,7 +439,7 @@ async fn list_slow_queries(
     headers: HeaderMap,
     Query(p): Query<ListParams>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let now_ms = SystemClock.now_ms();
 
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -455,7 +521,7 @@ async fn get_query(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<SlowQueryView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     // `TryFrom<String>` 이 형식을 검증한다 — 임의 문자열로 키를 만들 수 없다.
     let record_id = dbmon_core::ids::RecordId::try_from(id)
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_record_id"))?;
@@ -517,7 +583,7 @@ async fn list_instances(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<InstanceView>>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let all = dbmon_core::ports::InstanceRegistry::list(&*state.registry)
         .await
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))?;
@@ -624,7 +690,7 @@ async fn aws_info(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // **인증을 요구한다.** 계정 ID 는 비밀이 아니지만 인증 없이 답할 이유도 없다
     // (`/api/auth/config` 만 그 예외를 갖는다).
-    let _ctx = context_of(&state, &headers)?;
+    let _ctx = context_of(&state, &headers).await?;
     Ok(Json(serde_json::json!({
         "account_id": state.aws_account_id,
         "region": state.aws_region,
@@ -982,7 +1048,7 @@ async fn list_digests(
     headers: HeaderMap,
     Query(p): Query<AggregateParams>,
 ) -> Result<Json<AggregateEnvelope<aggregate::DigestRow>>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
     let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
     let (views, truncated) = (got.views, got.truncated);
@@ -1003,7 +1069,7 @@ async fn instance_statistics(
     headers: HeaderMap,
     Query(p): Query<AggregateParams>,
 ) -> Result<Json<AggregateEnvelope<aggregate::InstanceStats>>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
     let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
     let (views, truncated) = (got.views, got.truncated);
@@ -1024,7 +1090,7 @@ async fn user_statistics(
     headers: HeaderMap,
     Query(p): Query<AggregateParams>,
 ) -> Result<Json<AggregateEnvelope<aggregate::UserStats>>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
     let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
     let (views, truncated) = (got.views, got.truncated);
@@ -1046,7 +1112,7 @@ async fn list_plans(
     headers: HeaderMap,
     Query(p): Query<AggregateParams>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let range = aggregate_range(&p, SystemClock.now_ms())?;
     let got = collect_for_aggregate(&state, &ctx, &p, range).await?;
     let (mut views, truncated) = (got.views, got.truncated);
@@ -1093,7 +1159,7 @@ async fn get_query_plan(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<view::PlanView>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let found = record_for(&state, &ctx, id).await?;
     Ok(Json(view::PlanView::from_record(&found)))
 }
@@ -1109,7 +1175,7 @@ async fn get_query_markdown(
 ) -> Result<Response, ApiError> {
     use std::fmt::Write as _;
 
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let found = record_for(&state, &ctx, id).await?;
     // **뷰를 거친다.** 마크다운도 SQL 을 담으므로 리터럴 통제를 지나야 한다.
     let v = SlowQueryView::from_record(&found, &ctx);
@@ -1270,7 +1336,7 @@ fn controllable_envs(ctx: &AuthContext) -> Vec<Env> {
 /// 인스턴스 스코프는 그 인스턴스의 **적용 환경**으로 판정한다. 등록부에 없는
 /// 인스턴스는 `404` 다 — 없는 것을 멈춰 두면 나중에 그 이름으로 인스턴스가 생길 때
 /// 조용히 수집되지 않는다.
-async fn require_scope_control(
+pub(crate) async fn require_scope_control(
     state: &ApiState,
     ctx: &AuthContext,
     scope: &PauseScope,
@@ -1394,7 +1460,7 @@ async fn collector_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     // **저장소가 진실이다.** 이 워커가 수집기가 아니어도 같은 정지 상태를 말한다.
     let pause = state.pause.load(SystemClock.now_ms()).await;
     Ok(Json(status_body(&state, &ctx, &pause)))
@@ -1426,7 +1492,7 @@ async fn collector_pause(
     headers: HeaderMap,
     Json(body): Json<ScopeBody>,
 ) -> Result<Json<CollectorStatus>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     let scope = parse_scope(&body)?;
     require_scope_control(&state, &ctx, &scope).await?;
@@ -1450,7 +1516,7 @@ async fn collector_resume(
     headers: HeaderMap,
     Json(body): Json<ScopeBody>,
 ) -> Result<Json<CollectorStatus>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     let scope = parse_scope(&body)?;
     require_scope_control(&state, &ctx, &scope).await?;
@@ -1493,7 +1559,7 @@ async fn metrics_fleet(
 ) -> Result<Json<FleetMetricsResponse>, ApiError> {
     use dbmon_core::ports::InstanceRegistry as _;
 
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let svc = &state.metrics;
 
     let all = state
@@ -1562,7 +1628,7 @@ async fn metrics_instance(
 ) -> Result<Json<InstanceMetricsResponse>, ApiError> {
     use dbmon_core::ports::InstanceRegistry as _;
 
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     let svc = &state.metrics;
 
     let instance_id = dbmon_core::ids::InstanceId::parse(&id)
@@ -1629,7 +1695,7 @@ async fn instance_start(
     use dbmon_core::instance::InstanceState as S;
     use dbmon_core::ports::InstanceRegistry as _;
 
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     let instance_id = dbmon_core::ids::InstanceId::parse(&id)
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_instance_id"))?;
@@ -1694,7 +1760,7 @@ async fn discovery_run(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
@@ -1712,7 +1778,7 @@ async fn backfill_run(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<CollectorStatus>, ApiError> {
-    let ctx = context_of(&state, &headers)?;
+    let ctx = context_of(&state, &headers).await?;
     require_control_header(&headers)?;
     require_global_control(&ctx)?;
     require_collector_worker(&state)?;
