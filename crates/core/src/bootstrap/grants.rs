@@ -32,11 +32,19 @@ impl GrantScope {
     ///
     /// 식별자가 인용될 수 없으면(제어문자 등) `None` — **거부가 기본값이다.**
     pub fn render(&self) -> Option<String> {
-        use crate::ident::quote_ident;
+        use crate::ident::{quote_grant_schema, quote_ident};
         match self {
             Self::Global => Some("*.*".to_string()),
-            Self::Schema(db) => Some(format!("{}.*", quote_ident(db)?)),
-            Self::Table(db, tbl) => Some(format!("{}.{}", quote_ident(db)?, quote_ident(tbl)?)),
+            // **스키마 이름은 패턴이다** — `_`·`%` 를 이스케이프한다. 안 하면
+            // `order_items` 가 `orderXitems` 까지 부여한다(실측).
+            Self::Schema(db) => Some(format!("{}.*", quote_grant_schema(db)?)),
+            Self::Table(db, tbl) => Some(format!(
+                "{}.{}",
+                quote_grant_schema(db)?,
+                // 테이블 이름은 패턴이 아니다 — `GRANT` 문법에서 와일드카드는
+                // 데이터베이스 자리에만 적용된다.
+                quote_ident(tbl)?
+            )),
         }
     }
 
@@ -391,18 +399,37 @@ fn contains_top_level_keywords(s: &str, kws: &[&str]) -> bool {
     true
 }
 
+/// 컬럼 단위 `GRANT` 를 표시하는 접미어.
+///
+/// # 왜 이름을 바꿔서 기록하는가 (교차 리뷰가 잡은 결함)
+///
+/// 처음에는 컬럼 목록을 버리고 `SELECT` 로 기록했다. 그러면
+/// `GRANT SELECT (last_update) ON mysql.innodb_table_stats` 가 **테이블 전체
+/// `SELECT` 로 읽힌다** — [`GrantSet::covers`] 가 참을 주고, 우리가 필요한 전체
+/// `SELECT` 를 부여하지 않는다. 그러면 통계 신선도 조회가 조용히 실패한다.
+///
+/// 이름을 바꿔 기록하면 두 가지가 동시에 맞는다:
+/// - `covers("SELECT")` 가 거짓이므로 필요한 GRANT 를 건너뛰지 않는다
+/// - 우리가 요구하지 않은 권한이므로 **초과 권한으로 보고된다** (정확하다)
+pub const COLUMN_SUFFIX: &str = "(COLUMNS)";
+
 /// 권한 목록 파싱 — `PROCESS, REPLICATION CLIENT, SELECT (a, b)`.
 ///
-/// 컬럼 목록(`(a, b)`)은 **버린다.** 컬럼 단위 `GRANT` 는 이 프로젝트가 채택하지
-/// 않았고([07 §2.3](../../../../docs/07-credentials-bootstrap.md)), 남아 있으면
-/// 초과 권한으로 세는 것이 맞다 — 권한 이름만 보면 그렇게 된다.
+/// 컬럼 목록이 붙은 권한은 [`COLUMN_SUFFIX`] 를 달아 **다른 권한으로** 기록한다.
 fn parse_privilege_list(s: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
+    // 현재 이름에 컬럼 목록이 붙었는가.
+    let mut has_columns = false;
     for c in s.chars() {
         match c {
-            '(' => depth += 1,
+            '(' => {
+                depth += 1;
+                if depth == 1 {
+                    has_columns = true;
+                }
+            }
             ')' => {
                 depth -= 1;
                 if depth < 0 {
@@ -410,7 +437,7 @@ fn parse_privilege_list(s: &str) -> Option<Vec<String>> {
                 }
             }
             ',' if depth == 0 => {
-                push_privilege(&mut out, &mut cur);
+                push_privilege(&mut out, &mut cur, &mut has_columns);
             }
             // 인용부호는 권한 이름에 올 수 없다 — 오면 우리가 모르는 형태다.
             '\'' | '"' | '`' => return None,
@@ -418,25 +445,35 @@ fn parse_privilege_list(s: &str) -> Option<Vec<String>> {
             _ => {}
         }
     }
-    push_privilege(&mut out, &mut cur);
+    push_privilege(&mut out, &mut cur, &mut has_columns);
     if depth != 0 || out.is_empty() {
         return None;
     }
     Some(out)
 }
 
-fn push_privilege(out: &mut Vec<String>, cur: &mut String) {
+fn push_privilege(out: &mut Vec<String>, cur: &mut String, has_columns: &mut bool) {
     let name = normalize_privilege(cur);
     cur.clear();
-    if !name.is_empty() {
-        out.push(name);
+    let columns = std::mem::take(has_columns);
+    if name.is_empty() {
+        return;
     }
+    // **컬럼 GRANT 는 다른 권한이다.** 이유는 `COLUMN_SUFFIX` 문서에 있다.
+    out.push(if columns {
+        format!("{name} {COLUMN_SUFFIX}")
+    } else {
+        name
+    });
 }
 
 /// 범위 파싱 — `*.*` / `` `db`.* `` / `db.*` / `` `db`.`tbl` ``.
 fn parse_scope(s: &str) -> Option<GrantScope> {
     let (db_raw, tbl_raw) = split_scope_parts(s)?;
-    let db = unquote_name(&db_raw)?;
+    // **데이터베이스 이름은 패턴이므로 이스케이프를 벗긴다.** 벗기지 않으면
+    // 우리가 부여한 `` `a\_b` `` 를 이름이 `a\_b` 인 스키마로 읽고, 차집합이
+    // 매번 같은 `GRANT` 를 다시 요구한다(멱등성이 깨진다).
+    let db = crate::ident::unescape_grant_pattern(&unquote_name(&db_raw)?);
     let tbl = unquote_name(&tbl_raw)?;
     match (db.as_str(), tbl.as_str()) {
         ("*", "*") => Some(GrantScope::Global),
@@ -607,11 +644,59 @@ mod tests {
         assert!(set.is_empty(), "USAGE 만 있으면 권한이 없는 것이다");
     }
 
+    /// **컬럼 GRANT 는 테이블 전체 GRANT 가 아니다.**
+    ///
+    /// 교차 리뷰가 잡은 결함: 컬럼 목록을 버리고 `SELECT` 로 기록하면
+    /// `covers("SELECT")` 가 참이 되어 **필요한 전체 GRANT 를 건너뛴다.**
+    /// 그러면 통계 신선도 조회가 조용히 실패한다.
     #[test]
-    fn column_grants_keep_the_privilege_name_and_drop_the_columns() {
+    fn a_column_grant_does_not_satisfy_a_table_grant() {
         let (scope, p) = privs("GRANT SELECT (a, b) ON `shop`.`t` TO `dbmon`@`10.1.%`");
         assert_eq!(scope, GrantScope::Table("shop".into(), "t".into()));
-        assert_eq!(p, vec!["SELECT"]);
+        assert_eq!(p, vec!["SELECT (COLUMNS)"], "컬럼 GRANT 를 구분하지 않았다");
+
+        let (set, unparsed) = parse_grants([
+            "GRANT SELECT (last_update) ON `mysql`.`innodb_table_stats` TO `dbmon`@`10.1.%`",
+        ]);
+        assert!(unparsed.is_empty(), "파싱은 돼야 한다");
+        let tbl = GrantScope::Table("mysql".into(), "innodb_table_stats".into());
+        assert!(
+            !set.covers(&tbl, "SELECT"),
+            "컬럼 GRANT 가 테이블 전체 SELECT 를 만족시켰다"
+        );
+
+        // 그리고 **초과 권한으로 보고된다** — 우리가 요구하지 않은 권한이다.
+        let mut desired = GrantSet::default();
+        desired.add(tbl.clone(), ["SELECT".to_string()]);
+        assert!(
+            set.excess_over(&desired)
+                .iter()
+                .any(|(_, p)| p.contains("COLUMNS")),
+            "컬럼 GRANT 가 초과 권한에 안 잡혔다"
+        );
+        // 부족한 권한으로도 잡힌다 (전체 SELECT 가 필요하다).
+        assert!(!set.missing_from(&desired).is_empty());
+    }
+
+    /// **스키마 이름의 `_`·`%` 를 이스케이프하고, 파싱이 그것을 벗긴다.**
+    ///
+    /// 왕복이 깨지면 차집합이 매번 같은 GRANT 를 요구한다(멱등성).
+    #[test]
+    fn schema_pattern_escaping_round_trips() {
+        let scope = GrantScope::Schema("order_items".into());
+        let rendered = scope.render().expect("렌더");
+        assert_eq!(rendered, "`order\\_items`.*", "이스케이프가 없다");
+
+        // MySQL 이 `SHOW GRANTS` 로 되돌려 주는 형태.
+        let line = format!("GRANT SELECT ON {rendered} TO `dbmon`@`10.1.%`");
+        let (set, unparsed) = parse_grants([line.as_str()]);
+        assert!(unparsed.is_empty(), "{unparsed:?}");
+        assert!(
+            set.covers(&scope, "SELECT"),
+            "왕복이 깨졌다 — 같은 GRANT 를 다시 요구한다"
+        );
+        // 와일드카드로 해석된 이름은 **다른** 스키마다.
+        assert!(!set.covers(&GrantScope::Schema("orderXitems".into()), "SELECT"));
     }
 
     #[test]

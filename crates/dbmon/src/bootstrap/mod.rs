@@ -15,6 +15,6 @@ pub mod run;
 pub mod secret;
 pub mod service;
 
-pub use run::{ApplyOutcome, BootstrapError, Bootstrapper, PlanOutcome};
+pub use run::{ApplyOutcome, ApplyReport, BootstrapError, Bootstrapper, PlanOutcome};
 pub use secret::{CredentialSource, MasterCredentials};
 pub use service::{AuditSink, BootstrapService};

@@ -96,20 +96,33 @@ impl AuthContext {
         // 서버 버전이 되돌아간 상황(백업 복원, 레코드 재생성)에서 폐기했어야 할
         // 토큰이 살아난다. 이 검사의 의도는 "발급 시점과 현재가 같다" 이므로 그대로
         // 쓴다.
-        if token.claims_version != server.claims_version {
-            return None;
+        //
+        // 토큰이 버전을 **주장하지 않으면**(`None`) 이 검사를 건너뛴다 — 없는 정보로
+        // 판정을 흉내내지 않는다. 그때 남는 폐기 수단은 `revoked_after_ms` 다.
+        if let Some(v) = token.claims_version {
+            if v != server.claims_version {
+                return None;
+            }
         }
         if let Some(revoked_after) = server.revoked_after_ms {
             if token.issued_at_ms <= revoked_after {
                 return None;
             }
         }
-        let token_role = Role::highest_from_groups(&token.groups);
-        // 토큰에 그룹이 없어도 서버 레코드만으로 동작한다 — 트리거가 불필요해진다.
-        let role = match token_role {
-            Some(t) => t.min(server.role),
-            None => server.role,
-        };
+        // **그룹이 비어 있으면 권한이 없다** (교차 리뷰가 잡은 결함).
+        //
+        // 처음에는 `None` 을 "토큰이 좁히지 않는다" 로 읽어 서버 역할을 그대로 썼다.
+        // 그러면 사용자를 `dbmon-admin` 그룹에서 빼도 **여전히 admin** 이다 —
+        // 교집합이라고 적어 놓고 교집합이 아니었다.
+        //
+        // Cognito 는 네이티브 사용자의 그룹 멤버십을 `cognito:groups` 에 **자동으로**
+        // 넣는다(트리거가 필요 없다). 그래서 빈 목록은 "정보 없음" 이 아니라 "그룹이
+        // 없다" 이고, 그건 권한이 없다는 뜻이다(FR-AUT-08, fail-closed).
+        //
+        // IdP 페더레이션은 이 프로젝트가 아직 배선하지 않았다. 붙일 때는 Pre Token
+        // Generation 트리거로 그룹을 주입하거나(문서 08 §2.3) 이 판정을 설정으로
+        // 갈라야 한다 — 그 사실을 문서에 적어 둔다.
+        let role = Role::highest_from_groups(&token.groups)?.min(server.role);
         let env_scope: Vec<Env> = server
             .env_scope
             .iter()
@@ -167,7 +180,19 @@ pub struct TokenClaims {
     pub groups: Vec<String>,
     pub env_scope: Vec<Env>,
     pub issued_at_ms: i64,
-    pub claims_version: u32,
+    /// 토큰이 주장하는 클레임 버전. **`None` 은 "주장하지 않는다"** 다.
+    ///
+    /// # 왜 `Option` 인가 (교차 리뷰가 잡은 결함)
+    ///
+    /// `u32` 였을 때 검증기가 서버 값을 그대로 넣었다 — 그러면 아래 버전 검사가
+    /// **항상 통과**하고 T-33 의 독립적인 폐기 수단이 사라진다. 0 을 넣으면 반대로
+    /// 모든 토큰이 거부된다(서버가 0이 아니면).
+    ///
+    /// `Option` 이면 사실을 그대로 표현한다: Pre Token Generation 트리거가 없는
+    /// 배포는 `None` 이고 그 검사를 건너뛴다(그때 남는 방어선은
+    /// [`UserRecord::revoked_after_ms`] 다). 트리거를 붙이면 `Some` 이 되고 검사가
+    /// 살아난다. **가짜로 통과시키지 않는다.**
+    pub claims_version: Option<u32>,
 }
 
 /// 서버 측 `USER` 레코드 — **권위값이다.**
@@ -206,7 +231,7 @@ mod tests {
             groups: groups.iter().map(|s| s.to_string()).collect(),
             env_scope: vec![],
             issued_at_ms: 1_000,
-            claims_version: 3,
+            claims_version: Some(3),
         }
     }
 
@@ -218,11 +243,41 @@ mod tests {
         assert!(!ctx.has_role(Role::Operator));
     }
 
+    /// **그룹이 비어 있으면 권한이 없다** (교차 리뷰가 잡은 결함).
+    ///
+    /// 이전에는 빈 그룹을 "토큰이 좁히지 않는다" 로 읽어 서버 역할을 그대로 썼다.
+    /// 그러면 사용자를 Cognito 그룹에서 빼도 여전히 admin 이다 — 교집합이라고
+    /// 적어 놓고 교집합이 아니었다.
+    ///
+    /// Cognito 는 네이티브 사용자의 그룹을 자동으로 클레임에 넣으므로, 빈 목록은
+    /// "정보 없음" 이 아니라 "그룹이 없다" 다.
     #[test]
-    fn server_role_alone_is_enough() {
-        // 토큰에 그룹이 없어도 동작한다 → Pre Token Generation 트리거가 불필요하다.
-        let ctx = AuthContext::intersect(&token(&[]), &server(Role::Operator)).unwrap();
+    fn an_empty_group_claim_grants_nothing() {
+        assert!(
+            AuthContext::intersect(&token(&[]), &server(Role::Admin)).is_none(),
+            "그룹이 없는 토큰이 admin 으로 통과했다"
+        );
+        // 그룹이 있으면 서버 역할과 교집합된다.
+        let ctx = AuthContext::intersect(&token(&["dbmon-operator"]), &server(Role::Admin))
+            .expect("인가");
         assert_eq!(ctx.role, Role::Operator);
+    }
+
+    /// **토큰이 버전을 주장하지 않으면 그 검사를 건너뛴다.**
+    ///
+    /// 서버 값을 토큰에 채워 넣어 "항상 같다" 로 만들면 검사가 죽은 코드가 된다 —
+    /// 교차 리뷰가 잡은 자리다. `None` 은 사실을 그대로 표현한다.
+    #[test]
+    fn a_token_without_a_claims_version_skips_that_check() {
+        let mut t = token(&["dbmon-admin"]);
+        t.claims_version = None;
+        let s = server(Role::Admin); // claims_version = 3
+        let ctx = AuthContext::intersect(&t, &s).expect("인가");
+        assert_eq!(ctx.claims_version, 3, "문맥은 서버 값을 쓴다");
+
+        // 주장하면 대조한다.
+        t.claims_version = Some(2);
+        assert!(AuthContext::intersect(&t, &s).is_none());
     }
 
     #[test]
@@ -269,14 +324,14 @@ mod tests {
     #[test]
     fn a_claims_version_mismatch_is_rejected_in_both_directions() {
         let mut older = token(&["admin"]);
-        older.claims_version = 2; // 서버는 3
+        older.claims_version = Some(2); // 서버는 3
         assert!(
             AuthContext::intersect(&older, &server(Role::Admin)).is_none(),
             "강등 전 토큰이 통과했다"
         );
 
         let mut newer = token(&["admin"]);
-        newer.claims_version = 4; // 서버보다 높다
+        newer.claims_version = Some(4); // 서버보다 높다
         assert!(
             AuthContext::intersect(&newer, &server(Role::Admin)).is_none(),
             "서버보다 높은 버전을 주장하는 토큰이 통과했다"
@@ -286,12 +341,22 @@ mod tests {
         assert!(AuthContext::intersect(&same, &server(Role::Admin)).is_some());
     }
 
+    /// 인식하지 못하는 그룹만 있으면 **권한이 없다.**
     #[test]
     fn unknown_groups_grant_nothing() {
-        let ctx = AuthContext::intersect(&token(&["superuser", "root"]), &server(Role::Operator))
-            .unwrap();
-        assert_eq!(ctx.role, Role::Operator, "인식 못하는 그룹은 무시한다");
+        assert!(
+            AuthContext::intersect(&token(&["superuser", "root"]), &server(Role::Operator))
+                .is_none(),
+            "인식 못하는 그룹이 권한을 줬다"
+        );
         assert_eq!(Role::highest_from_groups(&["nope".into()]), None);
+        // 인식하는 그룹이 하나라도 있으면 그것으로 판정한다.
+        let ctx = AuthContext::intersect(
+            &token(&["superuser", "dbmon-viewer"]),
+            &server(Role::Operator),
+        )
+        .expect("인가");
+        assert_eq!(ctx.role, Role::Viewer);
     }
 
     /// T-33 — 강등 후 기존 토큰이 계속 통하면 안 된다.
@@ -300,7 +365,7 @@ mod tests {
         let mut s = server(Role::Admin);
         s.claims_version = 4; // 강등 등으로 서버가 버전을 올렸다
         let mut t = token(&["admin"]);
-        t.claims_version = 3; // 구 토큰
+        t.claims_version = Some(3); // 구 토큰
         assert!(AuthContext::intersect(&t, &s).is_none());
     }
 

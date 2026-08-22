@@ -76,6 +76,25 @@ pub struct PlanOutcome {
     pub manual_script: String,
 }
 
+/// 실행 보고 — **감사 레코드가 항상 있다.**
+///
+/// # 왜 `Result` 로 감싸지 않는가
+///
+/// 처음에는 `apply` 가 `Result<(ApplyOutcome, AuditRecord), BootstrapError>` 였다.
+/// 그러면 **문장 중간에 실패했을 때 레코드가 버려진다** — 계정은 만들어졌고 권한은
+/// 반쪽인 상태인데 감사 기록이 없다. 그게 감사 기록이 가장 필요한 순간이다
+/// (FR-CRD-10).
+///
+/// 그래서 대상 DB 에 닿은 뒤의 실패는 `Err` 가 아니라 이 구조체의 `result` 로 온다.
+/// DB 에 닿기 **전에** 거부된 경우(계획 만료·확인 불일치)는 여전히 `Err` 다 —
+/// 그때는 아무 일도 일어나지 않았으므로 남길 것이 없다.
+pub struct ApplyReport {
+    /// 무엇을 했는지. 실패해도 채워진다.
+    pub record: AuditRecord,
+    /// 성공했으면 결과, 실패했으면 사유.
+    pub result: Result<ApplyOutcome, BootstrapError>,
+}
+
 /// 실행 결과.
 #[derive(Debug, serde::Serialize)]
 pub struct ApplyOutcome {
@@ -95,6 +114,9 @@ struct Pending {
     fingerprint: String,
     /// 계획 시점에 계정이 있었는가 — §2.6.1 (b) 판정에 쓴다.
     user_existed: bool,
+    /// 계획 시점의 **보안 상태 지문.** 액션 지문이 못 잡는 변화(비밀번호 교체 등)를
+    /// 여기서 잡는다 ([`CurrentState::security_digest`]).
+    state_digest: String,
     expires_at_ms: EpochMs,
 }
 
@@ -150,6 +172,7 @@ impl Bootstrapper {
                 is_production,
                 fingerprint: plan.fingerprint(),
                 user_existed: current.user_exists,
+                state_digest: current.security_digest(),
                 expires_at_ms,
             },
             now_ms,
@@ -228,7 +251,7 @@ impl Bootstrapper {
         iam_auth_enabled: bool,
         confirmation: Option<&str>,
         now_ms: EpochMs,
-    ) -> Result<(ApplyOutcome, AuditRecord), BootstrapError> {
+    ) -> Result<ApplyReport, BootstrapError> {
         let pending = self
             .take(plan_id, now_ms)
             .ok_or_else(|| BootstrapError::PlanNotFound(plan_id.to_string()))?;
@@ -263,11 +286,36 @@ impl Bootstrapper {
             pending.is_production,
             &pending.fingerprint,
             pending.user_existed,
+            &pending.state_digest,
         ) {
             Ok(p) => p,
             Err(blockers) => {
                 conn.close().await;
-                return Err(BootstrapError::Blocked(blockers));
+                // **차단도 감사 대상이다.** 대상 DB 를 읽었고, "왜 실행하지
+                // 않았는가" 가 나중에 필요한 정보다 — 특히 T-28 시나리오
+                // (계획 이후에 누가 계정을 만들었다)에서 그렇다.
+                let record = AuditRecord {
+                    event: AuditEvent::BootstrapApply,
+                    actor: String::new(),
+                    at_ms: now_ms,
+                    instance_id: instance.id.as_str().to_string(),
+                    env: instance.env.effective,
+                    credential_source: Some(credentials.source),
+                    privilege_mode: pending.desired.mode.as_str(),
+                    monitor_user: pending.desired.user.clone(),
+                    monitor_host: pending.desired.host.clone(),
+                    actions: vec![],
+                    before: StateSnapshot::of(&before),
+                    after: None,
+                    result: AuditResult::Blocked,
+                    confirmation_typed: pending.is_production,
+                    blockers: audit::blocker_messages(&blockers),
+                    excess_privileges: vec![],
+                };
+                return Ok(ApplyReport {
+                    record,
+                    result: Err(BootstrapError::Blocked(blockers)),
+                });
             }
         };
 
@@ -328,8 +376,9 @@ impl Bootstrapper {
             excess_privileges: plan.excess.clone(),
         };
 
-        if let Some(reason) = failure {
-            return Err(BootstrapError::Domain(
+        // **레코드를 버리지 않는다.** 실패했으면 사유를 `result` 에 담아 함께 돌려준다.
+        let result = match failure {
+            Some(reason) => Err(BootstrapError::Domain(
                 dbmon_core::error::DomainError::Unavailable {
                     dependency: "target-mysql",
                     reason: format!(
@@ -339,19 +388,16 @@ impl Bootstrapper {
                         total
                     ),
                 },
-            ));
-        }
-
-        Ok((
-            ApplyOutcome {
+            )),
+            None => Ok(ApplyOutcome {
                 instance_id: instance.id.as_str().to_string(),
                 executed,
                 total,
                 after,
                 credential_source: credentials.source,
-            },
-            record,
-        ))
+            }),
+        };
+        Ok(ApplyReport { record, result })
     }
 
     /// 계획을 보관한다. 만료된 것을 먼저 치운다.
@@ -465,6 +511,7 @@ mod tests {
             is_production: false,
             fingerprint: "fp".into(),
             user_existed: false,
+            state_digest: "sd".into(),
             expires_at_ms: expires,
         }
     }
@@ -529,6 +576,45 @@ mod tests {
         let taken = b.take("p1", 0).expect("보관됨");
         assert_eq!(taken.instance_id, "123456789012/ap-northeast-2/dev-01");
         // `apply` 가 이 값을 대상 인스턴스와 비교한다 (같지 않으면 PlanNotFound).
+    }
+
+    /// **차단됐을 때도 감사 레코드가 나온다.**
+    ///
+    /// 첫 구현은 `Err(Blocked)` 만 돌려주고 레코드를 만들지 않았다. 그러면 T-28
+    /// 시나리오(계획 이후에 누가 계정을 만들었다)가 감사 로그에 남지 않는다 —
+    /// 그게 가장 남아야 하는 사건이다.
+    ///
+    /// 여기서는 타입으로 그 성질을 확인한다: `ApplyReport` 는 `record` 를
+    /// `Option` 이 아닌 값으로 갖는다.
+    #[test]
+    fn the_apply_report_always_carries_an_audit_record() {
+        fn assert_record_is_not_optional(r: &ApplyReport) -> &AuditRecord {
+            &r.record
+        }
+        let record = AuditRecord {
+            event: AuditEvent::BootstrapApply,
+            actor: "t".into(),
+            at_ms: 1,
+            instance_id: "i".into(),
+            env: Env::Dev,
+            credential_source: None,
+            privilege_mode: "broad",
+            monitor_user: "dbmon".into(),
+            monitor_host: "10.1.%".into(),
+            actions: vec![],
+            before: StateSnapshot::of(&dbmon_core::bootstrap::CurrentState::default()),
+            after: None,
+            result: AuditResult::Blocked,
+            confirmation_typed: false,
+            blockers: vec!["막혔다".into()],
+            excess_privileges: vec![],
+        };
+        let report = ApplyReport {
+            record,
+            result: Err(BootstrapError::Blocked(vec![Blocker::SslNotRequired])),
+        };
+        assert_eq!(assert_record_is_not_optional(&report).blockers.len(), 1);
+        assert!(report.result.is_err());
     }
 
     /// 계획은 **한 번만** 쓸 수 있다.

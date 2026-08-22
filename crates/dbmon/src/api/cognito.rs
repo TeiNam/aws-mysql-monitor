@@ -273,13 +273,13 @@ pub fn validate_claims(
         // 있다. 빈 목록은 `intersect` 에서 "토큰이 좁히지 않는다" 로 읽힌다.
         env_scope: Vec::new(),
         issued_at_ms: claims.iat.saturating_mul(1_000),
-        // `claims_version` 은 커스텀 클레임이 아니라 **서버 레코드에서 온다.**
+        // **토큰이 버전을 주장하지 않는다.**
         //
-        // Pre Token Generation 트리거로 토큰에 심을 수도 있지만, 그러면 트리거가
-        // 없는 배포에서 항상 0 이 되고 `intersect` 가 모든 토큰을 거부한다.
-        // 서버 값을 그대로 쓰면 그 검사가 무력해지므로, 여기서는 0 을 두고
-        // 호출부가 서버 레코드의 값으로 채운다 — 아래 `verify_token` 참조.
-        claims_version: 0,
+        // Pre Token Generation 트리거를 요구하지 않기로 했으므로 이 클레임이 없다.
+        // `None` 은 사실을 그대로 표현하고, `intersect` 가 그 검사를 건너뛴다 —
+        // 서버 값을 채워 넣어 "항상 같다" 로 만들면 검사가 죽은 코드가 된다
+        // (교차 리뷰가 잡았다). 그때 남는 폐기 수단은 `revoked_after_ms` 다.
+        claims_version: None,
     })
 }
 
@@ -346,6 +346,22 @@ impl JwksSource for HttpJwksSource {
     }
 }
 
+/// [`JwksCache::lookup`] 의 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyLookup {
+    /// 신선한 캐시 히트. 갱신하지 않는다.
+    Fresh(RsaKey),
+    /// 캐시에 있지만 TTL 이 지났다. **갱신하고, 실패하면 이 키를 쓴다.**
+    Stale(RsaKey),
+    /// 캐시에 없다. 갱신한다.
+    Missing,
+    /// 없거나 낡았지만 **레이트 리밋에 걸렸다.** 갱신하지 않는다.
+    ///
+    /// 담긴 값이 있으면 그것으로 검증한다(낡은 키가 유효할 수 있다). 없으면 거부다 —
+    /// 무작위 `kid` 공격이 여기로 떨어지고, 그때 외부 호출이 나가지 않는 것이 요점이다.
+    RateLimited(Option<RsaKey>),
+}
+
 /// `kid` → 키 캐시.
 pub struct JwksCache {
     source: Box<dyn JwksSource>,
@@ -373,43 +389,44 @@ impl JwksCache {
         self.state.read().ok()?.keys.get(kid).cloned()
     }
 
-    /// 키를 얻는다. 없거나 TTL 이 지났으면 **한 번** 갱신한다.
+    /// 키를 찾고 **갱신이 필요한지 함께 말한다.**
     ///
-    /// # 갱신 실패는 치명적이지 않다
+    /// # 왜 `Option<RsaKey>` 가 아닌가
     ///
-    /// 캐시된 키로 계속 검증한다(08 §3 — Cognito 장애 내성). 키 회전은 드물고,
-    /// 회전 직후 몇 분간 예전 키로 서명된 토큰이 남아 있다.
-    pub async fn key(&self, kid: &str, now_ms: EpochMs) -> Option<RsaKey> {
-        let (cached, stale) = {
-            let s = self.state.read().ok()?;
-            (
-                s.keys.get(kid).cloned(),
-                now_ms.saturating_sub(s.fetched_at_ms) > JWKS_TTL_MS,
-            )
+    /// 처음에는 `Option` 을 돌려주고 호출부가 `None` 일 때 갱신했다. 그러면 두 가지가
+    /// 조용히 깨진다:
+    ///
+    /// 1. **TTL 이 무한이 된다** — `kid` 가 캐시에 있으면 낡았어도 그 값을 돌려주므로
+    ///    갱신이 일어나지 않는다. 키 회전을 영구히 못 따라간다.
+    /// 2. **레이트 리밋이 없는 것과 같다** — 호출부는 "없다" 만 보고 갱신하므로,
+    ///    무작위 `kid` 로 요청을 쏟으면 요청마다 JWKS 를 가져온다. 인증 실패 경로가
+    ///    외부 호출 증폭기가 된다.
+    ///
+    /// 판정을 값으로 만들어 호출부가 무시할 수 없게 한다.
+    pub fn lookup(&self, kid: &str, now_ms: EpochMs) -> KeyLookup {
+        let Ok(mut s) = self.state.write() else {
+            // 락이 깨졌다. 통과시키지 않는다.
+            return KeyLookup::RateLimited(None);
         };
+        let cached = s.keys.get(kid).cloned();
+        let stale = now_ms.saturating_sub(s.fetched_at_ms) > JWKS_TTL_MS;
+
         if let Some(k) = cached.clone() {
             if !stale {
-                return Some(k);
+                return KeyLookup::Fresh(k);
             }
         }
-        // **레이트 리밋.** 없는 `kid` 로 요청이 쏟아지면 Cognito 를 두드린다.
-        if !self.may_attempt(kid, now_ms) {
-            return cached;
-        }
-        cached
-    }
 
-    /// 갱신을 시도해도 되는가 — 시도 시각을 기록한다.
-    fn may_attempt(&self, kid: &str, now_ms: EpochMs) -> bool {
-        let Ok(mut s) = self.state.write() else {
-            return false;
-        };
+        // 캐시에 없거나 낡았다 — 갱신을 시도해도 되는가.
         let last = s.last_attempt.get(kid).copied().unwrap_or(i64::MIN);
         if now_ms.saturating_sub(last) < JWKS_REFRESH_MIN_INTERVAL_MS {
-            return false;
+            return KeyLookup::RateLimited(cached);
         }
         s.last_attempt.insert(kid.to_string(), now_ms);
-        true
+        match cached {
+            Some(k) => KeyLookup::Stale(k),
+            None => KeyLookup::Missing,
+        }
     }
 
     /// JWKS 를 다시 읽어 캐시를 갈아 끼운다.
@@ -505,27 +522,35 @@ impl CognitoVerifier {
 
         // ── 4. 교집합 ──
         //
-        // `claims_version` 은 토큰에 없으므로(트리거를 요구하지 않기로 했다) 서버
-        // 값을 쓴다. 그러면 `intersect` 의 버전 검사가 항상 통과하고 T-33 의 절반이
-        // 무력해진다 — 그래서 **`revoked_after_ms` 가 남는 방어선이다.** 권한을
-        // 바꿀 때 `revoked_after_ms = now` 를 함께 세우는 것이 운영 규칙이고,
-        // 그 사실을 문서와 이 주석에 적어 둔다.
-        let mut claims = claims;
-        claims.claims_version = record.claims_version;
-
+        // **클레임을 손대지 않는다.** 예전에는 `claims_version` 을 서버 값으로 덮어
+        // `intersect` 의 버전 검사를 통과시켰다 — 그러면 그 검사가 죽은 코드가 되고
+        // T-33 의 독립적인 폐기 수단이 사라진다(교차 리뷰가 HIGH 로 잡았다).
+        //
+        // 이제 토큰은 `None` 을 주장하고 `intersect` 가 그 검사를 건너뛴다. 남는
+        // 폐기 수단은 `revoked_after_ms` 이고, 권한을 바꿀 때 그것을 함께 세우는
+        // 것이 운영 규칙이다(docs/08-security-auth.md §3.1).
         dbmon_core::rbac::AuthContext::intersect(&claims, &record).ok_or(AuthError::Invalid)
     }
 
-    /// 키를 얻는다 — 캐시 → (필요하면) 갱신 1회.
+    /// 키를 얻는다 — 캐시 판정에 따라 갱신을 **한 번만** 한다.
     async fn key_for(&self, kid: &str, v: &Verification, now_ms: EpochMs) -> Option<RsaKey> {
-        if let Some(k) = self.jwks.key(kid, now_ms).await {
-            return Some(k);
-        }
-        // 캐시 미스. 레이트 리밋을 통과했다면 한 번 갱신한다.
+        let fallback = match self.jwks.lookup(kid, now_ms) {
+            // 신선하다. 외부 호출이 없다.
+            KeyLookup::Fresh(k) => return Some(k),
+            // **레이트 리밋에 걸렸다 — 갱신하지 않는다.** 무작위 `kid` 로 오는
+            // 요청이 여기로 떨어지고, 그때 JWKS 를 가져오지 않는 것이 요점이다.
+            KeyLookup::RateLimited(cached) => return cached,
+            // 갱신하고, 실패하면 낡은 키로 계속한다 (Cognito 장애 내성).
+            KeyLookup::Stale(k) => Some(k),
+            KeyLookup::Missing => None,
+        };
+
         if let Err(e) = self.jwks.refresh(&v.jwks_url(), now_ms).await {
-            tracing::warn!(error = %e, %kid, "JWKS 갱신 실패 — 캐시된 키로 계속한다");
+            tracing::warn!(error = %e, %kid, "JWKS 갱신 실패");
+            return fallback;
         }
-        self.jwks.cached(kid)
+        // 갱신 후 다시 본다. 새 JWKS 에도 없으면 그 `kid` 는 우리 풀의 것이 아니다.
+        self.jwks.cached(kid).or(fallback)
     }
 
     /// 캐시된 키 수 (진단용).
@@ -965,23 +990,208 @@ mod tests {
             calls: Default::default(),
             fail: false,
         }));
-        assert!(cache.may_attempt("k9", NOW_MS), "첫 시도는 허용");
-        assert!(!cache.may_attempt("k9", NOW_MS), "즉시 재시도는 거부");
-        assert!(
-            !cache.may_attempt("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS - 1),
+        assert_eq!(
+            cache.lookup("k9", NOW_MS),
+            KeyLookup::Missing,
+            "첫 시도는 허용"
+        );
+        assert_eq!(
+            cache.lookup("k9", NOW_MS),
+            KeyLookup::RateLimited(None),
+            "즉시 재시도는 거부"
+        );
+        assert_eq!(
+            cache.lookup("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS - 1),
+            KeyLookup::RateLimited(None),
             "1분 미만은 거부"
         );
-        assert!(
-            cache.may_attempt("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS),
+        assert_eq!(
+            cache.lookup("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS),
+            KeyLookup::Missing,
             "1분 뒤는 허용"
         );
         // 다른 `kid` 는 자기 예산을 갖는다.
-        assert!(cache.may_attempt("k8", NOW_MS));
+        assert_eq!(cache.lookup("k8", NOW_MS), KeyLookup::Missing);
+    }
+
+    /// **TTL 이 지난 키는 갱신 대상이다.**
+    ///
+    /// 이걸 놓치면 TTL 이 무한이 된다 — `kid` 가 캐시에 있으면 낡았어도 그대로
+    /// 돌려주게 되고, 키 회전을 영구히 따라가지 못한다. 첫 구현이 그랬다.
+    #[tokio::test]
+    async fn a_stale_key_is_reported_as_refreshable_not_fresh() {
+        let cache = JwksCache::new(Box::new(FakeSource {
+            doc: jwks_doc(&["k1"]),
+            calls: Default::default(),
+            fail: false,
+        }));
+        cache.refresh("url", NOW_MS).await.expect("갱신");
+
+        // TTL 안에서는 신선하다.
+        assert!(matches!(
+            cache.lookup("k1", NOW_MS + JWKS_TTL_MS),
+            KeyLookup::Fresh(_)
+        ));
+        // TTL 을 넘으면 **낡은 것으로 보고**한다 — 호출부가 갱신할 근거가 된다.
+        assert!(
+            matches!(
+                cache.lookup("k1", NOW_MS + JWKS_TTL_MS + 1),
+                KeyLookup::Stale(_)
+            ),
+            "낡은 키를 신선하다고 보고했다 — TTL 이 무한이다"
+        );
+    }
+
+    /// **레이트 리밋에 걸린 낡은 키는 그대로 쓴다.** 갱신은 안 하지만 검증은 된다 —
+    /// Cognito 장애 중에 전체 인증이 죽지 않아야 한다.
+    #[tokio::test]
+    async fn a_rate_limited_stale_key_is_still_usable() {
+        let cache = JwksCache::new(Box::new(FakeSource {
+            doc: jwks_doc(&["k1"]),
+            calls: Default::default(),
+            fail: false,
+        }));
+        cache.refresh("url", NOW_MS).await.expect("갱신");
+        let late = NOW_MS + JWKS_TTL_MS + 1;
+
+        // 첫 조회는 갱신 예산을 쓴다.
+        assert!(matches!(cache.lookup("k1", late), KeyLookup::Stale(_)));
+        // 두 번째는 리밋에 걸리지만 **키는 담겨 온다.**
+        match cache.lookup("k1", late) {
+            KeyLookup::RateLimited(Some(_)) => {}
+            other => panic!("낡은 키를 잃었다: {other:?}"),
+        }
+    }
+
+    /// **검증기가 레이트 리밋을 실제로 지킨다.**
+    ///
+    /// 무작위 `kid` 로 오는 요청마다 JWKS 를 가져오면 인증 실패 경로가 외부 호출
+    /// 증폭기가 된다. 첫 구현이 그랬다 — `key()` 가 리밋 판정을 버렸다.
+    #[tokio::test]
+    async fn the_verifier_does_not_fetch_jwks_on_every_unknown_kid() {
+        use std::sync::atomic::Ordering;
+
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl JwksSource for Counting {
+            async fn fetch(&self, _url: &str) -> Result<JwksDocument, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(JwksDocument {
+                    keys: vec![Jwk {
+                        kid: "real".into(),
+                        kty: "RSA".into(),
+                        n: URL_SAFE_NO_PAD.encode([0xAB; 256]),
+                        e: URL_SAFE_NO_PAD.encode([1u8, 0, 1]),
+                        alg: Some("RS256".into()),
+                    }],
+                })
+            }
+        }
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cache = JwksCache::new(Box::new(Counting(std::sync::Arc::clone(&calls))));
+        let users: std::sync::Arc<dyn dbmon_core::ports::UserStore> = std::sync::Arc::new(NoUsers);
+        let verifier = CognitoVerifier::new(cache, users);
+        let v = verification();
+
+        // **같은** 알 수 없는 `kid` 로 20번.
+        for _ in 0..20 {
+            assert!(verifier.key_for("attacker-kid", &v, NOW_MS).await.is_none());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "알 수 없는 kid 하나에 JWKS 를 여러 번 가져왔다"
+        );
+
+        // 서로 **다른** kid 20개는 각자 예산을 갖는다 — 그건 의도한 동작이다.
+        // (`kid` 별 리밋이므로) 다만 캐시가 채워진 뒤에는 새 kid 도 캐시에서
+        // 못 찾으면 리밋 전까지 한 번씩 시도한다.
+        let before = calls.load(Ordering::SeqCst);
+        for i in 0..5 {
+            let _ = verifier.key_for(&format!("kid-{i}"), &v, NOW_MS).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            5,
+            "kid 별 예산이 서로 간섭한다"
+        );
+    }
+
+    struct NoUsers;
+    #[async_trait::async_trait]
+    impl dbmon_core::ports::UserStore for NoUsers {
+        async fn get(
+            &self,
+            _subject: &str,
+        ) -> dbmon_core::error::Result<Option<dbmon_core::rbac::UserRecord>> {
+            Ok(None)
+        }
     }
 
     #[test]
     fn the_ttl_and_rate_limit_are_what_the_document_says() {
         assert_eq!(JWKS_TTL_MS, 3_600_000, "08 §3 — 1시간");
         assert_eq!(JWKS_REFRESH_MIN_INTERVAL_MS, 60_000, "08 §3 — kid 당 1분");
+    }
+}
+
+#[cfg(test)]
+mod mode_dispatch_tests {
+    //! **실효 모드가 수단을 하나로 정한다** (교차 리뷰가 critical 로 잡은 결함).
+    //!
+    //! `context_from_token` 은 `ApiState` 를 요구하므로 여기서 직접 호출할 수 없다.
+    //! 대신 그 판정의 근거가 되는 두 함수의 계약을 고정한다 — 실제 디스패치는
+    //! `it_api` 통합 테스트가 확인한다.
+
+    use dbmon_core::settings::{AppSettings, AuthModeSetting as M, CognitoSettings};
+
+    fn settings(mode: M, complete: bool) -> AppSettings {
+        let mut s = AppSettings::default();
+        s.auth.mode = mode;
+        if complete {
+            s.auth.cognito = CognitoSettings {
+                user_pool_id: "ap-northeast-2_AbCdEf".into(),
+                client_id: "cid".into(),
+                region: String::new(),
+                domain: "dbmon-dev".into(),
+            };
+        }
+        s
+    }
+
+    /// **설정이 불완전한 Cognito 는 토큰 모드로 떨어진다.**
+    ///
+    /// 그래야 "Cognito 를 골랐는데 들어올 방법이 없다" 는 상태가 만들어지지 않는다.
+    #[test]
+    fn incomplete_cognito_settings_fall_back_to_token_mode() {
+        assert_eq!(
+            settings(M::Cognito, false).auth.effective_mode(false),
+            M::Token
+        );
+        assert_eq!(
+            settings(M::Cognito, true).auth.effective_mode(false),
+            M::Cognito
+        );
+    }
+
+    /// **`off` 는 파일 설정이 허용해야 적용된다.** 화면 하나로 인증을 끌 수 없다.
+    #[test]
+    fn off_requires_the_file_setting_too() {
+        assert_eq!(settings(M::Off, false).auth.effective_mode(false), M::Token);
+        assert_eq!(settings(M::Off, false).auth.effective_mode(true), M::Off);
+    }
+
+    /// **모드는 셋 중 하나로 결정된다** — "여러 수단을 순서대로 시도" 가 아니다.
+    ///
+    /// 순서대로 시도하면 `cognito` 로 바꿔도 남아 있는 공유 토큰이 계속 admin 으로
+    /// 통과한다. 사람마다 권한을 나누려고 Cognito 를 붙였는데 옆문이 열린 상태다.
+    #[test]
+    fn the_mode_selects_exactly_one_credential_family() {
+        let complete = settings(M::Cognito, true);
+        // Cognito 모드에서 실효 모드는 `Cognito` 다 — `Token` 이 아니다.
+        assert_eq!(complete.auth.effective_mode(true), M::Cognito);
+        // 즉 `context_from_token` 의 `match` 가 토큰 분기에 가지 않는다.
+        assert_ne!(complete.auth.effective_mode(true), M::Token);
     }
 }

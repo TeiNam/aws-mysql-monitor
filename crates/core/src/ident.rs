@@ -47,6 +47,62 @@ pub fn quote_literal(raw: &str) -> Option<String> {
     Some(format!("'{}'", raw.replace('\'', "''")))
 }
 
+/// `GRANT ... ON <여기>` 자리의 **스키마 이름**을 인용한다.
+///
+/// # 왜 `quote_ident` 로는 부족한가 (실측으로 확인한 결함)
+///
+/// `GRANT` 의 데이터베이스 이름은 식별자가 아니라 **패턴**이다. `partial_revokes` 가
+/// 꺼져 있으면(RDS MySQL 8.4.11 기본값) `_` 와 `%` 가 와일드카드로 해석된다 —
+/// 백틱으로 감싸도 그렇다:
+///
+/// ```text
+/// GRANT SELECT ON `dbmon_wild_a`.* TO 'u'@'10.1.%';
+/// → 그 계정이 `dbmon_wildXa` 도 읽는다 (실측)
+/// ```
+///
+/// 즉 `order_items` 같은 흔한 이름 하나가 **의도하지 않은 스키마까지 열어 준다.**
+/// 모드 B(화이트리스트)의 요점이 정확히 그것을 막는 것이므로 치명적이다.
+///
+/// 백슬래시로 이스케이프하면 리터럴이 된다(실측: 이스케이프 후 의도한 스키마만 보였다):
+///
+/// ```text
+/// GRANT SELECT ON `dbmon_wild\_a`.* → `dbmon_wild_a` 만
+/// ```
+///
+/// `SHOW GRANTS` 는 이스케이프된 형태를 그대로 되돌려 주므로, 파서도 그것을 벗겨야
+/// 한다([`unescape_grant_pattern`]).
+pub fn quote_grant_schema(raw: &str) -> Option<String> {
+    // 먼저 식별자 규칙을 통과해야 한다 (제어문자·길이).
+    quote_ident(raw)?;
+    // 백틱 이중화 + 패턴 문자 이스케이프.
+    let escaped = raw
+        .replace('\\', "\\\\")
+        .replace('_', "\\_")
+        .replace('%', "\\%")
+        .replace('`', "``");
+    Some(format!("`{escaped}`"))
+}
+
+/// [`quote_grant_schema`] 의 역함수 — `SHOW GRANTS` 가 돌려준 이름에서 이스케이프를 벗긴다.
+///
+/// 벗기지 않으면 우리가 부여한 `` `a\_b` `` 를 이름이 `a\_b` 인 스키마로 읽고,
+/// 그러면 차집합이 **매번 같은 GRANT 를 다시 요구한다**(멱등성이 깨진다).
+pub fn unescape_grant_pattern(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// 생성된 문장에 **문자열·식별자 리터럴 밖의 문장 구분자**가 있는가 (T-18 3중 방어의 3번).
 ///
 /// 참이면 실행하지 않는다. 인용 유틸을 통과했으면 여기 걸릴 값이 없어야 하지만,
@@ -154,6 +210,52 @@ mod tests {
             "GRANT PROCESS ON *.* TO 'dbmon'@'10.1.%'",
         ] {
             assert!(!has_statement_break(sql), "거짓 양성: {sql}");
+        }
+    }
+
+    /// **`GRANT` 의 스키마 이름에서 `_`·`%` 를 이스케이프한다.**
+    ///
+    /// 실측: `GRANT SELECT ON `dbmon_wild_a`.*` 가 `dbmon_wildXa` 까지 부여했고,
+    /// 이스케이프 후에는 의도한 스키마만 부여했다.
+    #[test]
+    fn grant_schema_names_escape_pattern_wildcards() {
+        assert_eq!(
+            quote_grant_schema("order_items").as_deref(),
+            Some("`order\\_items`"),
+            "밑줄이 와일드카드로 남았다"
+        );
+        assert_eq!(quote_grant_schema("a%b").as_deref(), Some("`a\\%b`"));
+        // 백슬래시 자체도 이스케이프한다 — 안 하면 사용자 이름의 `\` 가 다음 문자를
+        // 삼킨다.
+        assert_eq!(quote_grant_schema("a\\b").as_deref(), Some("`a\\\\b`"));
+        // 백틱은 여전히 이중화한다.
+        assert_eq!(quote_grant_schema("a`b").as_deref(), Some("`a``b`"));
+        // 패턴 문자가 없으면 `quote_ident` 와 같다.
+        assert_eq!(
+            quote_grant_schema("shop").as_deref(),
+            quote_ident("shop").as_deref()
+        );
+        // 식별자 규칙을 통과하지 못하면 거부한다.
+        assert_eq!(quote_grant_schema("a\nb"), None);
+        assert_eq!(quote_grant_schema(""), None);
+    }
+
+    /// **왕복이 원래 이름을 준다.** 안 그러면 차집합이 매번 같은 GRANT 를 요구한다.
+    #[test]
+    fn escaping_round_trips_through_show_grants() {
+        for name in ["shop", "order_items", "a%b", "a_b_c", "we`ird", "한글_이름"] {
+            let quoted = quote_grant_schema(name).expect("인용");
+            // `SHOW GRANTS` 가 돌려주는 형태: 백틱을 벗긴 안쪽.
+            let inner = quoted
+                .strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .expect("백틱")
+                .replace("``", "`");
+            assert_eq!(
+                unescape_grant_pattern(&inner),
+                name,
+                "{name}: 왕복이 깨졌다 (인용: {quoted})"
+            );
         }
     }
 

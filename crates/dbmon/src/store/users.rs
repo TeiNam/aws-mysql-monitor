@@ -95,31 +95,95 @@ fn parse_record(
     subject: &str,
     item: &std::collections::HashMap<String, AttributeValue>,
 ) -> Result<UserRecord> {
-    let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).map(String::as_str);
-    let n = |k: &str| {
-        item.get(k)
-            .and_then(|v| v.as_n().ok())
-            .and_then(|v| v.parse::<i64>().ok())
+    // **없는 것과 타입이 틀린 것을 구분한다** (교차 리뷰가 잡은 fail-open).
+    //
+    // 처음에는 둘 다 기본값으로 접었다. 그러면 `disabled` 가 `S:"true"` 인 admin
+    // 레코드가 `disabled = false` 로 읽히고, 비활성화한 사용자가 계속 통과한다.
+    // `revoked_after_ms` 가 문자열이면 폐기가 무효가 된다.
+    //
+    // 타입이 틀린 것은 **오류다.** 그러면 인증이 실패하고(fail-closed) 로그가 사유를
+    // 말한다 — 조용히 권한을 주는 것보다 낫다.
+    let wrong_type = |k: &str, want: &str| DomainError::InvalidInput {
+        field: format!("USER#{subject}.{k}"),
+        reason: format!("타입이 {want} 가 아니다 — 권한을 판정할 수 없다"),
     };
-    let b = |k: &str| item.get(k).and_then(|v| v.as_bool().ok()).copied();
 
-    let role = s("role").and_then(Role::parse).unwrap_or(Role::Viewer);
-    let env_scope: Vec<Env> = item
-        .get("env_scope")
-        .and_then(|v| v.as_ss().ok())
-        .map(|list| list.iter().filter_map(|e| Env::parse(e)).collect())
-        .unwrap_or_default();
+    let opt_s = |k: &str| -> Result<Option<&str>> {
+        match item.get(k) {
+            None => Ok(None),
+            Some(v) => v
+                .as_s()
+                .map(|s| Some(s.as_str()))
+                .map_err(|_| wrong_type(k, "문자열")),
+        }
+    };
+    let opt_n = |k: &str| -> Result<Option<i64>> {
+        match item.get(k) {
+            None => Ok(None),
+            Some(v) => {
+                let raw = v.as_n().map_err(|_| wrong_type(k, "숫자"))?;
+                raw.parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| wrong_type(k, "정수"))
+            }
+        }
+    };
+    let opt_b = |k: &str| -> Result<Option<bool>> {
+        match item.get(k) {
+            None => Ok(None),
+            Some(v) => v
+                .as_bool()
+                .copied()
+                .map(Some)
+                .map_err(|_| wrong_type(k, "불리언")),
+        }
+    };
+
+    // 역할 이름을 **읽을 수 없으면 오류다.** `viewer` 로 접으면 admin 이 조용히
+    // 강등돼 화면이 "권한 없음" 만 보여주고, 원인이 오타라는 사실이 드러나지 않는다.
+    let role = match opt_s("role")? {
+        None => Role::Viewer,
+        Some(raw) => Role::parse(raw).ok_or_else(|| DomainError::InvalidInput {
+            field: format!("USER#{subject}.role"),
+            reason: format!("알 수 없는 역할 {raw:?} — admin/operator/viewer 중 하나여야 한다"),
+        })?,
+    };
+
+    let env_scope: Vec<Env> = match item.get("env_scope") {
+        None => Vec::new(),
+        Some(v) => {
+            let list = v
+                .as_ss()
+                .map_err(|_| wrong_type("env_scope", "문자열 집합"))?;
+            let mut out = Vec::with_capacity(list.len());
+            for raw in list {
+                out.push(Env::parse(raw).ok_or_else(|| DomainError::InvalidInput {
+                    field: format!("USER#{subject}.env_scope"),
+                    reason: format!("알 수 없는 환경 {raw:?}"),
+                })?);
+            }
+            out
+        }
+    };
+
+    let claims_version = match opt_n("claims_version")? {
+        None => 0,
+        Some(v) => u32::try_from(v).map_err(|_| DomainError::InvalidInput {
+            field: format!("USER#{subject}.claims_version"),
+            reason: "음수이거나 u32 범위를 넘는다".into(),
+        })?,
+    };
 
     Ok(UserRecord {
         subject: subject.to_string(),
         role,
         env_scope,
-        can_see_literals: b("can_see_literals").unwrap_or(false),
-        // **버전이 없으면 0 이다.** 토큰의 값과 같아야 통과하므로, 레코드를 만들 때
-        // 명시하지 않으면 `claims_version=0` 인 토큰만 들어온다 — 안전한 방향이다.
-        claims_version: n("claims_version").unwrap_or(0).max(0) as u32,
-        revoked_after_ms: n("revoked_after_ms"),
-        disabled: b("disabled").unwrap_or(false),
+        can_see_literals: opt_b("can_see_literals")?.unwrap_or(false),
+        // 버전이 없으면 0 이다. 토큰이 버전을 주장하지 않으면 그 검사를 건너뛰므로
+        // (`TokenClaims::claims_version` 이 `Option`) 이 값은 문맥에만 실린다.
+        claims_version,
+        revoked_after_ms: opt_n("revoked_after_ms")?,
+        disabled: opt_b("disabled")?.unwrap_or(false),
     })
 }
 
@@ -181,39 +245,87 @@ mod tests {
         );
     }
 
-    /// 읽을 수 없는 역할 이름도 `viewer` 다.
+    /// **읽을 수 없는 역할 이름은 오류다.**
+    ///
+    /// `viewer` 로 접으면 admin 이 조용히 강등돼 화면이 "권한 없음" 만 보여주고,
+    /// 원인이 오타라는 사실이 드러나지 않는다.
     #[test]
-    fn an_unknown_role_falls_to_viewer() {
+    fn an_unknown_role_is_an_error_not_a_silent_downgrade() {
         for bad in ["superuser", "ADMIN", "", "root"] {
-            let r = parse_record("s", &item(vec![("role", AttributeValue::S(bad.into()))]))
-                .expect("파싱");
-            assert_eq!(r.role, Role::Viewer, "{bad:?} 가 승격됐다");
+            assert!(
+                parse_record("s", &item(vec![("role", AttributeValue::S(bad.into()))])).is_err(),
+                "{bad:?} 를 조용히 넘겼다"
+            );
         }
     }
 
-    /// 읽을 수 없는 환경 이름은 **버린다** (전체 허용으로 접지 않는다).
+    /// **타입이 틀린 보안 필드는 오류다** (교차 리뷰가 잡은 fail-open).
+    ///
+    /// `disabled` 가 `S:"true"` 이면 `as_bool()` 이 실패한다. 그걸 `false` 로 접으면
+    /// **비활성화한 admin 이 계속 통과한다.** `revoked_after_ms` 가 문자열이면 폐기가
+    /// 무효가 된다.
     #[test]
-    fn unknown_environments_are_dropped_not_expanded() {
+    fn a_wrongly_typed_security_field_fails_closed() {
+        let cases: Vec<(&str, AttributeValue)> = vec![
+            ("disabled", AttributeValue::S("true".into())),
+            ("disabled", AttributeValue::N("1".into())),
+            (
+                "revoked_after_ms",
+                AttributeValue::S("1700000000000".into()),
+            ),
+            ("claims_version", AttributeValue::S("3".into())),
+            ("can_see_literals", AttributeValue::S("true".into())),
+            ("role", AttributeValue::Bool(true)),
+            ("env_scope", AttributeValue::S("dev".into())),
+        ];
+        for (k, v) in cases {
+            let err = parse_record("s", &item(vec![(k, v.clone())]))
+                .expect_err(&format!("{k} 의 잘못된 타입을 통과시켰다: {v:?}"));
+            assert!(format!("{err}").contains(k), "{err}");
+        }
+    }
+
+    /// 음수·범위 초과 `claims_version` 은 오류다 — `u32` 캐스팅이 감싸지 않게.
+    #[test]
+    fn an_out_of_range_claims_version_is_an_error() {
+        for bad in ["-1", "4294967296", "99999999999999999999"] {
+            assert!(
+                parse_record(
+                    "s",
+                    &item(vec![("claims_version", AttributeValue::N(bad.into()))])
+                )
+                .is_err(),
+                "{bad} 를 통과시켰다"
+            );
+        }
+    }
+
+    /// **읽을 수 없는 환경 이름은 오류다.**
+    ///
+    /// 버리면 스코프가 조용히 좁아지고(화면이 비어 보인다), 전체 허용으로 접으면
+    /// 반대로 넓어진다. 둘 다 사람이 모르는 채로 일어나므로 오류가 맞다.
+    #[test]
+    fn an_unknown_environment_is_an_error() {
+        assert!(
+            parse_record(
+                "s",
+                &item(vec![(
+                    "env_scope",
+                    AttributeValue::Ss(vec!["dev".into(), "nonsense".into()]),
+                )]),
+            )
+            .is_err()
+        );
+        // 정상 값은 그대로 읽는다.
         let r = parse_record(
             "s",
             &item(vec![(
                 "env_scope",
-                AttributeValue::Ss(vec!["dev".into(), "nonsense".into()]),
+                AttributeValue::Ss(vec!["dev".into(), "prd".into()]),
             )]),
         )
         .expect("파싱");
-        assert_eq!(r.env_scope, vec![Env::Dev]);
-    }
-
-    /// 음수 `claims_version` 은 0 으로 접는다 — `u32` 캐스팅이 감싸지 않게.
-    #[test]
-    fn a_negative_claims_version_does_not_wrap() {
-        let r = parse_record(
-            "s",
-            &item(vec![("claims_version", AttributeValue::N("-1".into()))]),
-        )
-        .expect("파싱");
-        assert_eq!(r.claims_version, 0, "음수가 u32 로 감쌌다");
+        assert_eq!(r.env_scope, vec![Env::Dev, Env::Prd]);
     }
 
     /// `disabled` 가 참이면 [`AuthContext::intersect`] 가 거부한다 — 여기서는
@@ -228,7 +340,7 @@ mod tests {
             groups: vec!["dbmon-admin".into()],
             env_scope: vec![],
             issued_at_ms: 1,
-            claims_version: 0,
+            claims_version: None,
         };
         assert!(
             dbmon_core::rbac::AuthContext::intersect(&token, &r).is_none(),

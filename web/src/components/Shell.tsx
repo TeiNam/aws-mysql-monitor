@@ -14,6 +14,7 @@ import {
 import { useEffect, useMemo } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 import { useInstances } from "../hooks/useInstances";
+import { useTokenRefresh } from "../hooks/useTokenRefresh";
 import { useLive } from "../hooks/useLive";
 import { fetchAwsInfo, queryKeys } from "../lib/api";
 import { liveClient } from "../lib/live";
@@ -88,6 +89,9 @@ const NAV = [
  */
 export function Shell() {
   useScrollToTopOnTabChange();
+  // **Cognito 세션을 살려 둔다.** 없으면 60분 뒤 화면이 401 로 닫히고, 리프레시
+  // 토큰(8시간)이 세션에 남아 있는데도 다시 로그인해야 한다.
+  useTokenRefresh();
 
   return (
     <div className="flex min-h-screen flex-col bg-gray-100">
