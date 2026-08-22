@@ -122,13 +122,18 @@ pub trait SlowQueryStore: Send + Sync {
     /// 따로 쓰면 짝이 어긋나 **10분째 도는 쿼리가 2초로** 보인다(하트비트만 올리면
     /// 갱신 시각은 신선한데 소요는 첫 저장에서 굳어 있다). 둘은 같은 관측이므로 같이 쓴다.
     ///
-    /// 관측된 소요는 단조 증가한다(`max_time_secs` 의 `max`). 그리고 조건이 통과하려면
-    /// 갱신 시각이 올라가야 하므로, 소요가 뒤로 가는 조합은 쓰이지 않는다.
+    /// # 소요는 줄어들지 않는다 — 다만 **그 보장은 호출부에 있다**
+    ///
+    /// 처음에는 `max_time_secs × 1000` 을 넘겼다. `PROCESSLIST.TIME` 은 "현재 상태에 머문
+    /// 시간" 이라 상태 전이에서 리셋되므로, 102초 도는 문장의 저장된 정밀값을 **17초로
+    /// 줄였다**(교차 리뷰 27라운드). 지금은 추적기가 모든 관측 증거의 최대값
+    /// (`Tracked::duration_ms`)을 들고 있고 그 값과 출처를 함께 넘긴다.
     async fn touch_in_flight(
         &self,
         key: &StoredKey,
         last_seen_at_ms: EpochMs,
         duration_ms: i64,
+        duration_source: crate::slow_query::DurationSource,
     ) -> Result<bool>;
 }
 

@@ -289,6 +289,7 @@ async fn a_heartbeat_only_refreshes_liveness_at_the_key_the_write_returned() {
             &StoredKey::new("SQ#nope\u{1}0000000000000#1"),
             T0 + 5_000,
             5_000,
+            DurationSource::Polled,
         )
         .await
         .expect("호출");
@@ -307,7 +308,7 @@ async fn a_heartbeat_only_refreshes_liveness_at_the_key_the_write_returned() {
     let (_, key) = s.upsert_merged_keyed(&saved).await.expect("선행 저장");
 
     assert!(
-        s.touch_in_flight(&key, T0 + 20_000, 20_000)
+        s.touch_in_flight(&key, T0 + 20_000, 20_000, DurationSource::Polled)
             .await
             .expect("호출"),
         "쓰기가 알려 준 자리를 갱신하지 못했다"
@@ -334,7 +335,7 @@ async fn a_heartbeat_only_refreshes_liveness_at_the_key_the_write_returned() {
 
     // ③ 값을 되돌리지 않는다.
     assert!(
-        !s.touch_in_flight(&key, T0 + 10_000, 10_000)
+        !s.touch_in_flight(&key, T0 + 10_000, 10_000, DurationSource::Polled)
             .await
             .expect("호출"),
         "뒤늦게 도착한 갱신이 값을 되돌렸다"
@@ -344,7 +345,7 @@ async fn a_heartbeat_only_refreshes_liveness_at_the_key_the_write_returned() {
     let done = sample(2010, T0); // 같은 record_id, Finalized
     s.upsert_merged(&done).await.expect("확정");
     assert!(
-        !s.touch_in_flight(&key, T0 + 30_000, 30_000)
+        !s.touch_in_flight(&key, T0 + 30_000, 30_000, DurationSource::Polled)
             .await
             .expect("호출"),
         "확정된 자리에 하트비트가 성공했다"
@@ -407,7 +408,7 @@ async fn the_write_returns_the_row_it_actually_merged_into() {
 
     // 그 자리에 하트비트가 올라간다.
     assert!(
-        s.touch_in_flight(&new_key, T0 + 40_000, 40_000)
+        s.touch_in_flight(&new_key, T0 + 40_000, 40_000, DurationSource::Polled)
             .await
             .expect("호출"),
         "반환된 자리에 하트비트가 실패했다"
@@ -436,7 +437,7 @@ async fn a_heartbeat_makes_a_stale_full_write_retry() {
 
     // 하트비트가 생존 신호를 올린다.
     assert!(
-        s.touch_in_flight(&key, T0 + 50_000, 50_000)
+        s.touch_in_flight(&key, T0 + 50_000, 50_000, DurationSource::Polled)
             .await
             .expect("호출")
     );

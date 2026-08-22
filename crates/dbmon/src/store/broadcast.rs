@@ -97,9 +97,10 @@ impl<S: SlowQueryStore> SlowQueryStore for BroadcastingStore<S> {
         key: &StoredKey,
         last_seen_at_ms: EpochMs,
         duration_ms: i64,
+        duration_source: dbmon_core::slow_query::DurationSource,
     ) -> Result<bool> {
         self.inner
-            .touch_in_flight(key, last_seen_at_ms, duration_ms)
+            .touch_in_flight(key, last_seen_at_ms, duration_ms, duration_source)
             .await
     }
 }

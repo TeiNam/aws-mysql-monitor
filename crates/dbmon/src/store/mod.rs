@@ -975,9 +975,11 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         key: &StoredKey,
         last_seen_at_ms: EpochMs,
         duration_ms: i64,
+        duration_source: dbmon_core::slow_query::DurationSource,
     ) -> Result<bool> {
         let (pk, sk) = split_stored_key(key)?;
-        self.touch_at(pk, sk, last_seen_at_ms, duration_ms).await
+        self.touch_at(pk, sk, last_seen_at_ms, duration_ms, duration_source)
+            .await
     }
 }
 
@@ -989,6 +991,7 @@ impl DynamoSlowQueryStore {
         sk: &str,
         last_seen_at_ms: EpochMs,
         duration_ms: i64,
+        duration_source: dbmon_core::slow_query::DurationSource,
     ) -> Result<bool> {
         use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 
@@ -1024,11 +1027,7 @@ impl DynamoSlowQueryStore {
             .expression_attribute_values(":dur", AttributeValue::N(duration_ms.to_string()))
             .expression_attribute_values(
                 ":src",
-                AttributeValue::S(
-                    dbmon_core::slow_query::DurationSource::Polled
-                        .as_str()
-                        .to_string(),
-                ),
+                AttributeValue::S(duration_source.as_str().to_string()),
             )
             .expression_attribute_values(":g1sk", AttributeValue::S(sort_key_ms(last_seen_at_ms)))
             .expression_attribute_values(
