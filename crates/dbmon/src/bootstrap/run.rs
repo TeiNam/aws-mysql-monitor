@@ -210,6 +210,7 @@ impl Bootstrapper {
         let record = AuditRecord {
             event: AuditEvent::BootstrapPlan,
             actor: String::new(), // 호출부가 채운다
+            worker_id: String::new(),
             at_ms: now_ms,
             instance_id: instance.id.as_str().to_string(),
             env: instance.env.effective,
@@ -297,6 +298,7 @@ impl Bootstrapper {
                 let record = AuditRecord {
                     event: AuditEvent::BootstrapApply,
                     actor: String::new(),
+                    worker_id: String::new(),
                     at_ms: now_ms,
                     instance_id: instance.id.as_str().to_string(),
                     env: instance.env.effective,
@@ -347,6 +349,7 @@ impl Bootstrapper {
                 let record = AuditRecord {
                     event: AuditEvent::BootstrapApply,
                     actor: String::new(),
+                    worker_id: String::new(),
                     at_ms: now_ms,
                     instance_id: instance.id.as_str().to_string(),
                     env: instance.env.effective,
@@ -412,7 +415,9 @@ impl Bootstrapper {
 
         let record = AuditRecord {
             event: AuditEvent::BootstrapApply,
+            // 호출부(`BootstrapService`)가 요청자와 워커를 채운다.
             actor: String::new(),
+            worker_id: String::new(),
             at_ms: now_ms,
             instance_id: instance.id.as_str().to_string(),
             env: instance.env.effective,
@@ -647,6 +652,7 @@ mod tests {
         let record = AuditRecord {
             event: AuditEvent::BootstrapApply,
             actor: "t".into(),
+            worker_id: "w".into(),
             at_ms: 1,
             instance_id: "i".into(),
             env: Env::Dev,

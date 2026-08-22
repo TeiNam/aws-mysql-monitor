@@ -67,8 +67,16 @@ pub struct AuditAction {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRecord {
     pub event: AuditEvent,
-    /// 주체. 지금은 `shared-token` 같은 값이고, Cognito 가 붙으면 `sub` 다.
+    /// 주체 — **식별자 그대로다.** Cognito 면 `sub`, 공유 토큰이면 `shared-token`.
+    ///
+    /// # 워커 id 를 여기 섞지 않는다 (교차 리뷰 4차)
+    ///
+    /// 한때 `"<sub> via <worker>"` 로 합쳤다. 그러면 같은 사용자가 다른 워커를 거칠 때
+    /// actor 가 갈리고, `actor = <sub>` 조회가 실패하며 사용자별 집계가 워커별로
+    /// 쪼개진다. `actor` 는 조회·정렬 키다([13 §8](../../../../docs/13-api-spec.md)).
     pub actor: String,
+    /// 어느 워커가 실행했는가. 진단용이고 **조회 키가 아니다.**
+    pub worker_id: String,
     pub at_ms: EpochMs,
     pub instance_id: String,
     pub env: Env,
@@ -226,6 +234,7 @@ mod tests {
         let record = AuditRecord {
             event: AuditEvent::BootstrapApply,
             actor: "shared-token".into(),
+            worker_id: "all-ip-10-1-1-1".into(),
             at_ms: 1_755_527_391_000,
             instance_id: "acct/ap-northeast-2/orders-prd-01".into(),
             env: Env::Prd,

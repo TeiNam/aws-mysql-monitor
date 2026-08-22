@@ -191,21 +191,68 @@ export function refreshBody(
   });
 }
 
+/**
+ * 토큰 교환 실패의 종류.
+ *
+ * # 왜 구분하는가 (교차 리뷰 4차가 잡은 결함)
+ *
+ * 처음에는 모든 오류를 "리프레시 토큰 재사용 감지" 와 같이 취급해 세션을 버렸다.
+ * 그러면 **DNS 오류·5xx·네트워크 단절 한 번으로 아직 유효한 액세스 토큰과 리프레시
+ * 토큰까지 지워지고 사용자가 로그아웃된다.**
+ *
+ * 되돌릴 수 없는 것만 세션을 버린다:
+ *
+ * | 응답 | 뜻 | 세션 |
+ * |---|---|---|
+ * | 400·401 | `invalid_grant` — 토큰이 무효하거나 폐기됐다 | **버린다** |
+ * | 그 외 4xx | 우리 요청이 잘못됐다 (설정 오류) | 유지 (고칠 수 있다) |
+ * | 5xx·네트워크 | 일시적이다 | 유지 — 다음 주기에 재시도 |
+ */
+export class TokenExchangeError extends Error {
+  constructor(
+    message: string,
+    /** 참이면 리프레시 토큰이 확실히 무효다 — 세션을 버려야 한다. */
+    readonly definitive: boolean,
+  ) {
+    super(message);
+    this.name = "TokenExchangeError";
+  }
+}
+
+/** HTTP 상태가 "리프레시 토큰이 확실히 무효" 를 뜻하는가. */
+export function isDefinitiveAuthFailure(status: number): boolean {
+  return status === 400 || status === 401;
+}
+
 /** Cognito 토큰 엔드포인트를 호출한다. */
 async function postToken(
   config: CognitoConfig,
   body: URLSearchParams,
 ): Promise<TokenResponse> {
   const base = hostedUiBase(config);
-  if (!base) throw new Error("Cognito 도메인이 설정되지 않았다");
-  const res = await fetch(`${base}/oauth2/token`, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body,
-  });
+  if (!base) throw new TokenExchangeError("Cognito 도메인이 설정되지 않았다", false);
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}/oauth2/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    });
+  } catch (e) {
+    // 네트워크 실패. **세션을 버리지 않는다.**
+    throw new TokenExchangeError(
+      `토큰 엔드포인트에 닿을 수 없다: ${e instanceof Error ? e.message : String(e)}`,
+      false,
+    );
+  }
+
   if (!res.ok) {
     // **응답 본문을 그대로 노출하지 않는다.** 오류에 코드·리다이렉트가 실릴 수 있다.
-    throw new Error(`토큰 교환 실패 (HTTP ${res.status})`);
+    throw new TokenExchangeError(
+      `토큰 교환 실패 (HTTP ${res.status})`,
+      isDefinitiveAuthFailure(res.status),
+    );
   }
   return (await res.json()) as TokenResponse;
 }
@@ -254,10 +301,15 @@ export async function refreshAccessToken(
     const tokens = await postToken(config, refreshBody(config, refresh));
     storeTokens(tokens);
     return tokens.access_token;
-  } catch {
-    // **리프레시 실패는 로그아웃이다.** 재사용 감지에 걸렸을 수 있고, 그때는
-    // 계보 전체가 무효다 — 계속 재시도하면 안 된다.
-    clearSession();
+  } catch (e) {
+    // **확실한 인증 실패만 로그아웃이다.** 재사용 감지에 걸렸으면 계보 전체가
+    // 무효이므로 계속 재시도하면 안 된다.
+    //
+    // 일시적 실패(네트워크·5xx)는 세션을 유지한다 — 아직 유효한 액세스 토큰이
+    // 남아 있고, 다음 주기에 다시 시도하면 된다(교차 리뷰 4차).
+    if (e instanceof TokenExchangeError && e.definitive) {
+      clearSession();
+    }
     return null;
   }
 }

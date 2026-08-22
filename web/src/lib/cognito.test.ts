@@ -12,6 +12,8 @@ import {
   readCallback,
   refreshBody,
   REFRESH_MARGIN_MS,
+  isDefinitiveAuthFailure,
+  refreshAccessToken,
   stateMatches,
   tokenExchangeBody,
   type CognitoConfig,
@@ -208,5 +210,65 @@ describe("콜백 주소", () => {
     expect(callbackUrl("http://localhost:5173")).toBe(
       "http://localhost:5173/auth/callback",
     );
+  });
+});
+
+describe("갱신 실패 처리", () => {
+  /**
+   * **일시적 실패로 세션을 버리지 않는다** (교차 리뷰 4차가 잡은 결함).
+   *
+   * 만료 5분 전 DNS 오류나 5xx 가 한 번 나면, 아직 유효한 액세스 토큰과 8시간짜리
+   * 리프레시 토큰까지 지워져 사용자가 로그아웃됐다.
+   */
+  it("확실한 인증 실패만 세션을 버린다", () => {
+    expect(isDefinitiveAuthFailure(400)).toBe(true);
+    expect(isDefinitiveAuthFailure(401)).toBe(true);
+    for (const transient of [403, 404, 429, 500, 502, 503, 504]) {
+      expect(isDefinitiveAuthFailure(transient)).toBe(false);
+    }
+  });
+
+  it("네트워크 실패는 세션을 유지한다", async () => {
+    sessionStorage.setItem("dbmon.token", "still-valid");
+    sessionStorage.setItem("dbmon.cognito.refresh", "refresh-token");
+    const original = globalThis.fetch;
+    globalThis.fetch = (() => Promise.reject(new TypeError("network down"))) as typeof fetch;
+    try {
+      const result = await refreshAccessToken(config);
+      expect(result).toBeNull();
+      // **세션이 남아 있어야 한다.**
+      expect(sessionStorage.getItem("dbmon.token")).toBe("still-valid");
+      expect(sessionStorage.getItem("dbmon.cognito.refresh")).toBe("refresh-token");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("400 은 세션을 버린다 — 리프레시 토큰이 무효다", async () => {
+    sessionStorage.setItem("dbmon.token", "stale");
+    sessionStorage.setItem("dbmon.cognito.refresh", "revoked-token");
+    const original = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response("{}", { status: 400 }))) as typeof fetch;
+    try {
+      expect(await refreshAccessToken(config)).toBeNull();
+      expect(sessionStorage.length).toBe(0);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("5xx 는 세션을 유지한다", async () => {
+    sessionStorage.setItem("dbmon.token", "still-valid");
+    sessionStorage.setItem("dbmon.cognito.refresh", "refresh-token");
+    const original = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response("{}", { status: 503 }))) as typeof fetch;
+    try {
+      expect(await refreshAccessToken(config)).toBeNull();
+      expect(sessionStorage.getItem("dbmon.cognito.refresh")).toBe("refresh-token");
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

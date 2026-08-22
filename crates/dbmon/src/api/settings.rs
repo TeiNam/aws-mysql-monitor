@@ -118,7 +118,22 @@ pub async fn put_settings(
     let mut next = body.settings;
     next.merge_secrets_from(&current);
 
-    let problems = next.validate();
+    // **잠기는 설정을 저장하지 않는다** (교차 리뷰 4차).
+    //
+    // `cognito` 를 골랐는데 검증기가 배선되지 않았으면, 저장 후 실효 모드가 Cognito
+    // 이고 검증기가 없어 **모든 보호 API 가 거부된다** — 되돌릴 설정 화면까지 닫힌다.
+    //
+    // fail-closed 자체는 맞지만 복구 경로를 남겨야 한다. 그래서 저장을 거부한다:
+    // 그 상태를 만들지 않으면 잠길 일이 없다.
+    let mut problems = next.validate();
+    if next.auth.mode == dbmon_core::settings::AuthModeSetting::Cognito && state.cognito.is_none() {
+        problems.push(dbmon_core::settings::SettingsProblem {
+            field: "auth.mode".into(),
+            message: "이 워커에 Cognito 검증기가 배선되지 않았다 — 저장하면 아무도 \
+                      들어올 수 없다. 검증기가 준비된 배포에서 바꾼다"
+                .into(),
+        });
+    }
     if !problems.is_empty() {
         // 검증 실패는 **저장하지 않는다.** 어느 필드가 왜 틀렸는지 함께 돌려준다 —
         // "invalid" 하나만 주면 화면이 무엇을 고칠지 모른다.

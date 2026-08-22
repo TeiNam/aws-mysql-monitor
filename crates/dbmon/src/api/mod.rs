@@ -33,7 +33,6 @@ pub mod view;
 pub mod ws;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -153,12 +152,6 @@ pub struct ApiState {
     /// 두 곳의 명시적 허용이 필요하다: 이 값과 운영 설정(`auth.mode = off`).
     /// 한 곳으로 끌 수 있게 하면 실수 한 번으로 인증이 사라진다.
     pub allow_auth_disable: bool,
-    /// **이 배포가 Cognito 로 전환한 적이 있는가.**
-    ///
-    /// 설정 캐시가 낡았을 때 어느 모드로 볼지 정한다. 한 방향으로만 움직인다
-    /// (false → true) — 되돌아가면 그 순간이 권한 상승 창이 된다
-    /// ([`context_from_token`]).
-    pub cognito_engaged: Arc<std::sync::atomic::AtomicBool>,
     /// Cognito 토큰 검증기 (M5).
     ///
     /// **`None` 이면 Cognito 로 들어올 수 없다.** 그 사실이 `/api/auth/config` 의
@@ -251,16 +244,38 @@ fn effective_auth_mode(
     state: &ApiState,
     settings: &dbmon_core::settings::AppSettings,
 ) -> dbmon_core::settings::AuthModeSetting {
-    use dbmon_core::settings::AuthModeSetting as M;
-    let mode = settings.auth.effective_mode(state.allow_auth_disable);
     // **검증기가 없어도 `Cognito` 를 유지한다.** `auth_by_mode` 가 `NotConfigured` 로
     // 거부하고, 화면은 `cognito_ready: false` 로 사유를 말한다.
-    if mode == M::Cognito {
-        // 이 배포가 Cognito 로 전환했다는 사실을 기억한다 — 설정 캐시가 낡았을 때
-        // 토큰 모드로 떨어지지 않기 위해서다.
-        state.cognito_engaged.store(true, Ordering::Relaxed);
+    //
+    // 저장 시점에 거부하므로(`settings::put_settings`) 이 상태는 배포가 Cognito 를
+    // 쓰던 중 검증기 조립이 실패한 경우에만 생긴다 — 그때 토큰으로 내려가면 상승이다.
+    settings.auth.effective_mode(state.allow_auth_disable)
+}
+
+/// 설정 캐시가 **낡았을 때** 적용할 모드.
+///
+/// # 왜 원자 플래그를 없앴나 (교차 리뷰 4차)
+///
+/// 처음에는 "Cognito 를 한 번이라도 봤으면 영구히 Cognito" 인 한 방향 플래그였다.
+/// 그러면 **Cognito 를 시험해 본 뒤 토큰으로 정상 롤백한 배포가 잠긴다** — 설정
+/// 저장소가 죽는 순간 다시 Cognito 로 판정되고 공유 토큰 사용자가 들어올 수 없다.
+///
+/// 필요한 것은 "마지막으로 **권위 있게** 읽은 모드" 이고, 그건 캐시가 이미 들고 있다.
+/// [`SettingsState::cached`] 는 조회 실패 때 마지막 값을 유지한다.
+///
+/// # `off` 는 **낡은 캐시로 살아남지 못한다**
+///
+/// `cached()` 를 인증 판정에 쓰는 것이 위험한 이유가 그것이다: `off` 가 캐시된 워커에서
+/// 인증을 다시 켠 뒤 저장소가 죽으면 익명 admin 이 무기한 계속된다. 그래서 여기서는
+/// **`Token` 과 `Cognito` 만** 돌려주고 `off` 는 `Token` 으로 접는다.
+fn stale_fallback_mode(state: &ApiState) -> dbmon_core::settings::AuthModeSetting {
+    use dbmon_core::settings::AuthModeSetting as M;
+    let cached = state.settings.cached();
+    match cached.auth.mode {
+        // 설정이 완전할 때만 Cognito 로 본다 — 불완전하면 들어올 수단이 없다.
+        M::Cognito if cached.auth.cognito.is_complete() => M::Cognito,
+        _ => M::Token,
     }
-    mode
 }
 
 /// API 오류. **내부 사정을 노출하지 않는다.**
@@ -365,28 +380,33 @@ pub(crate) async fn context_from_token(
     let now_ms = SystemClock.now_ms();
     let fresh = state.settings.cached_fresh(now_ms);
 
-    // 캐시가 비었거나 낡았을 때 **어느 모드로 볼 것인가.**
-    //
-    // 이 배포가 Cognito 로 전환한 적이 있으면 `Cognito` 다 — 그러면 JWT 없이는
-    // 거부된다. 그러지 않고 `Token` 으로 떨어지면 남아 있는 공유 토큰이 admin 으로
-    // 통과하고, 설정 저장소가 죽어 있는 동안 그 상태가 계속된다(교차 리뷰 3차).
-    //
-    // 전환한 적이 없으면 `Token` 이다. 그 배포에는 Cognito 로 들어올 수단이 애초에
-    // 없으므로 `Cognito` 로 두면 아무도 못 들어온다.
-    //
-    // 플래그는 **한 방향으로만** 움직인다(false → true). 되돌아가면 그 순간이 상승
-    // 창이 된다.
-    let fallback = if state.cognito_engaged.load(Ordering::Relaxed) {
-        M::Cognito
-    } else {
-        M::Token
+    // 캐시가 낡았으면 **마지막으로 권위 있게 읽은 모드**를 쓴다
+    // ([`stale_fallback_mode`]). `off` 는 그 경로로 살아남지 못한다.
+    let mode = match fresh.as_ref() {
+        Some(s) => effective_auth_mode(state, s),
+        None => stale_fallback_mode(state),
     };
-    let mode = fresh
-        .as_ref()
-        .map(|s| effective_auth_mode(state, s))
-        .unwrap_or(fallback);
 
-    auth_by_mode(state, token, mode, fresh.as_ref(), now_ms).await
+    // 낡은 캐시로는 Cognito 검증에 필요한 `iss`·`client_id` 를 신뢰할 수 없다.
+    // 그래도 `cached()` 의 값을 쓴다 — 그것이 마지막으로 저장된 사실이고, 틀렸다면
+    // `iss` 대조가 거부한다(통과시키는 방향으로 틀리지 않는다).
+    let settings_for_verify = fresh.clone().or_else(|| {
+        if mode == M::Cognito {
+            Some(state.settings.cached())
+        } else {
+            None
+        }
+    });
+
+    auth_by_mode(
+        &state.policy,
+        state.cognito.as_deref(),
+        token,
+        mode,
+        settings_for_verify.as_ref(),
+        now_ms,
+    )
+    .await
 }
 
 /// 모드가 정한 **하나의** 수단으로 인증한다.
@@ -399,7 +419,8 @@ pub(crate) async fn context_from_token(
 /// 고쳤다고 보고했지만 실제로는 편집이 반영되지 않았고, 그 위에 쓴 테스트는
 /// `effective_mode` 값만 봤기 때문에 통과했다. 2차 리뷰가 다시 잡았다.
 pub(crate) async fn auth_by_mode(
-    state: &ApiState,
+    policy: &AuthPolicy,
+    verifier: Option<&cognito::CognitoVerifier>,
     token: Option<&str>,
     mode: dbmon_core::settings::AuthModeSetting,
     settings: Option<&dbmon_core::settings::AppSettings>,
@@ -409,12 +430,12 @@ pub(crate) async fn auth_by_mode(
     match mode {
         M::Off => Ok(auth::no_auth_context()),
         // **토큰 모드에서는 Cognito 를 시도하지 않는다.** 그 반대도 마찬가지다.
-        M::Token => authenticate(&state.policy, token),
+        M::Token => authenticate(policy, token),
         M::Cognito => {
-            // 여기 왔다는 것은 검증기가 있고 설정이 완전하다는 뜻이다
-            // (`effective_auth_mode` 가 그렇지 않으면 `Token` 으로 떨어뜨린다).
-            // 그래도 단정하지 않는다 — 두 판정이 어긋나면 거부가 맞다.
-            let (Some(verifier), Some(settings)) = (state.cognito.as_ref(), settings) else {
+            // 검증기나 설정이 없으면 거부한다. `ApiState` 전체가 아니라 이 둘만
+            // 받는 이유는 **테스트가 이 함수를 직접 부를 수 있어야** 해서다 —
+            // 소스 문자열을 검사하는 테스트로는 배선을 확인할 수 없다(교차 리뷰 4차).
+            let (Some(verifier), Some(settings)) = (verifier, settings) else {
                 return Err(auth::AuthError::NotConfigured);
             };
             let Some(verification) = cognito::Verification::from_settings(&settings.auth.cognito)

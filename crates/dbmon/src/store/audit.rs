@@ -56,6 +56,8 @@ impl AuditSink for DynamoAuditSink {
             .item("SK", AttributeValue::S(sk.to_string()))
             .item("event", AttributeValue::S(format!("{:?}", record.event)))
             .item("actor", AttributeValue::S(record.actor.clone()))
+            // **워커는 별도 속성이다.** `actor` 에 섞으면 사용자별 조회가 깨진다.
+            .item("worker_id", AttributeValue::S(record.worker_id.clone()))
             .item("at_ms", AttributeValue::N(record.at_ms.to_string()))
             .item("instance_id", AttributeValue::S(record.instance_id.clone()))
             .item("body", AttributeValue::S(body))
