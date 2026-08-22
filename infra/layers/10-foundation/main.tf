@@ -348,6 +348,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "plans" {
 # 라우트 테이블은 **호출자가 명시한다.** VPC 의 전체 목록을 쓰면 남의 서브넷 라우트까지
 # 건드리고, destroy 가 그 워크로드의 유일한 S3 경로를 끊는다 (`endpoint_route_table_ids`).
 resource "aws_vpc_endpoint" "dynamodb" {
+  count             = var.create_dynamodb_gateway_endpoint ? 1 : 0
   vpc_id            = data.aws_vpc.target.id
   service_name      = "com.amazonaws.${data.aws_region.current.region}.dynamodb"
   vpc_endpoint_type = "Gateway"

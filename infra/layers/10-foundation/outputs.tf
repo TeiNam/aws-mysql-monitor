@@ -48,5 +48,6 @@ output "s3_gateway_endpoint_id" {
 }
 
 output "dynamodb_gateway_endpoint_id" {
-  value = aws_vpc_endpoint.dynamodb.id
+  description = "만들지 않았으면 `null` 이다 (`create_dynamodb_gateway_endpoint`)."
+  value       = one(aws_vpc_endpoint.dynamodb[*].id)
 }
