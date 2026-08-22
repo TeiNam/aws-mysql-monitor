@@ -108,8 +108,7 @@ impl DynamoSlowQueryStore {
     /// 조회가 프로덕션에서 실패한다. `it_store` 가 두 정의를 대조한다.
     pub async fn create_table_for_local(&self) -> Result<()> {
         use aws_sdk_dynamodb::types::{
-            AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
-            ProjectionType, ScalarAttributeType,
+            AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
         };
 
         let attr = |n: &str| {
@@ -126,29 +125,6 @@ impl DynamoSlowQueryStore {
                 .build()
                 .expect("키 정의")
         };
-        // **프로덕션과 같은 사영을 쓴다.**
-        //
-        // 여기가 `ALL` 이었고 프로덕션은 `INCLUDE` 였다. 그 차이 때문에 인덱스 항목을
-        // 완전한 레코드로 역직렬화하는 버그가 통합 테스트를 통과했고, 프로덕션에서만
-        // 고아 정리가 죽어 있었다(교차 리뷰 2회차). 테스트 테이블이 프로덕션과 다르면
-        // 테스트가 무엇을 보증하는지 알 수 없다.
-        let gsi = |name: &str, pk: &str, sk: &str, projected: &[&str]| {
-            GlobalSecondaryIndex::builder()
-                .index_name(name)
-                .key_schema(key(pk, KeyType::Hash))
-                .key_schema(key(sk, KeyType::Range))
-                .projection(
-                    Projection::builder()
-                        .projection_type(ProjectionType::Include)
-                        .set_non_key_attributes(Some(
-                            projected.iter().map(|s| s.to_string()).collect(),
-                        ))
-                        .build(),
-                )
-                .build()
-                .expect("GSI 정의")
-        };
-
         let res = self
             .client
             .create_table()
@@ -162,8 +138,8 @@ impl DynamoSlowQueryStore {
             .attribute_definitions(attr("GSI2SK"))
             .key_schema(key("PK", KeyType::Hash))
             .key_schema(key("SK", KeyType::Range))
-            .global_secondary_indexes(gsi("GSI1", "GSI1PK", "GSI1SK", GSI1_PROJECTED))
-            .global_secondary_indexes(gsi("GSI2", "GSI2PK", "GSI2SK", GSI2_PROJECTED))
+            .global_secondary_indexes(gsi_definition("GSI1"))
+            .global_secondary_indexes(gsi_definition("GSI2"))
             .send()
             .await;
         match res {
@@ -970,6 +946,44 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     }
 }
 
+/// 인덱스 이름 → GSI 정의. **테이블 생성과 테스트가 같은 코드를 쓴다.**
+///
+/// 전에는 생성 코드 안의 클로저였고, 테스트는 상수와 Terraform 파일만 대조했다.
+/// 그러면 **호출부에서 목록을 잘못 넘겨도 테스트가 통과한다** — 실제로 GSI2 에 GSI1 의
+/// 목록을 넘긴 상태가 그렇게 살아남았다(교차 리뷰 4회차). 정의를 함수로 빼서 테스트가
+/// **만들어진 요청**을 본다.
+fn gsi_definition(name: &str) -> aws_sdk_dynamodb::types::GlobalSecondaryIndex {
+    use aws_sdk_dynamodb::types::{
+        GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection, ProjectionType,
+    };
+    let projected: &[&str] = match name {
+        "GSI1" => GSI1_PROJECTED,
+        "GSI2" => GSI2_PROJECTED,
+        other => panic!("알 수 없는 인덱스: {other}"),
+    };
+    let key = |n: &str, t: KeyType| {
+        KeySchemaElement::builder()
+            .attribute_name(n)
+            .key_type(t)
+            .build()
+            .expect("키 정의")
+    };
+    GlobalSecondaryIndex::builder()
+        .index_name(name)
+        .key_schema(key(&format!("{name}PK"), KeyType::Hash))
+        .key_schema(key(&format!("{name}SK"), KeyType::Range))
+        .projection(
+            Projection::builder()
+                // **프로덕션과 같은 `INCLUDE` 다.** `ALL` 로 두면 인덱스 항목을 완전한
+                // 레코드로 역직렬화하는 버그가 테스트를 통과한다(교차 리뷰 2회차).
+                .projection_type(ProjectionType::Include)
+                .set_non_key_attributes(Some(projected.iter().map(|s| s.to_string()).collect()))
+                .build(),
+        )
+        .build()
+        .expect("GSI 정의")
+}
+
 /// 프로덕션 GSI1 이 사영하는 속성 (`infra/layers/10-foundation/main.tf` 와 같아야 한다).
 ///
 /// 여기서 빠진 속성은 인덱스 조회 결과에 **없다.** 인덱스를 읽는 코드는 그 사실을
@@ -1128,6 +1142,40 @@ pub(crate) mod tests {
         // 그랬다(둘에 GSI1 의 목록을 줬다, 교차 리뷰 3회차).
         assert_eq!(sorted(super::GSI1_PROJECTED), from_tf("GSI1"), "GSI1");
         assert_eq!(sorted(super::GSI2_PROJECTED), from_tf("GSI2"), "GSI2");
+
+        // **만들어진 요청을 본다.** 상수만 대조하면 호출부에서 목록을 잘못 넘겨도
+        // 통과한다 — GSI2 에 GSI1 의 목록을 넘긴 상태가 그렇게 살아남았다
+        // (교차 리뷰 4회차).
+        for idx in ["GSI1", "GSI2"] {
+            let g = super::gsi_definition(idx);
+            let proj = g.projection().expect("사영");
+            assert_eq!(
+                proj.projection_type(),
+                Some(&aws_sdk_dynamodb::types::ProjectionType::Include),
+                "{idx} 의 사영 방식이 INCLUDE 가 아니다"
+            );
+            let mut built: Vec<String> = proj.non_key_attributes().to_vec();
+            built.sort();
+            assert_eq!(built, from_tf(idx), "{idx} 정의가 Terraform 과 다르다");
+            // 키 스키마도 이름 규칙을 따라야 한다.
+            let keys: Vec<&str> = g.key_schema().iter().map(|k| k.attribute_name()).collect();
+            assert_eq!(
+                keys,
+                vec![format!("{idx}PK"), format!("{idx}SK")],
+                "{idx} 키"
+            );
+        }
+
+        // Terraform 쪽 `projection_type` 도 확인한다 — 거기서 `ALL` 로 바꾸면 이 테스트가
+        // 잡아야 한다.
+        for idx in ["GSI1", "GSI2"] {
+            let after = &tf[tf.find(&format!(r#"name = "{idx}""#)).expect("정의")..];
+            let head = &after[..after.find("non_key_attributes").expect("목록")];
+            assert!(
+                head.contains(r#"projection_type = "INCLUDE""#),
+                "{idx} 의 Terraform 사영 방식이 INCLUDE 가 아니다"
+            );
+        }
         assert_ne!(
             super::GSI1_PROJECTED.len(),
             super::GSI2_PROJECTED.len(),

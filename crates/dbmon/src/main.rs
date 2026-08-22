@@ -365,13 +365,16 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
 ///
 /// `only` 가 `None` 이면 내 것 전부(전체 정지), `Some(ids)` 면 그 인스턴스 것만
 /// 확정한다(부분 정지 — 멈추지 않은 인스턴스의 실행 중 쿼리를 끊으면 안 된다).
+/// 반환값은 **완전히 끝냈는가**다. 거짓이면 호출부가 다음 tick 에 다시 시도해야 한다 —
+/// 실패를 로그로만 남기면 그 레코드는 다음 정지 변경이나 리더 교체까지 유령으로 남는다
+/// (교차 리뷰 4회차).
 async fn close_in_flight_mine(
     store: &Arc<dbmon::store::AppSlowQueryStore>,
     worker_id: &str,
     epoch: Option<u64>,
     now_ms: i64,
     only: Option<&std::collections::BTreeSet<String>>,
-) {
+) -> bool {
     use dbmon_core::ports::SlowQueryStore as _;
     // **실패를 조용히 버리지 않는다.** 여기서 못 닫으면 그 레코드는 진행 중으로 남고,
     // 고아 스윕은 `owner_worker`·`owner_epoch` 가 자기와 같은 것을 건너뛰므로
@@ -382,9 +385,9 @@ async fn close_in_flight_mine(
         Err(e) => {
             tracing::warn!(
                 error = %telemetry::Scrubbed(&e),
-                "정지 확정을 위한 진행 중 목록을 읽지 못했다 — 내 레코드가 진행 중으로 남는다"
+                "정지 확정을 위한 진행 중 목록을 읽지 못했다 — 다음 tick 에 다시 시도한다"
             );
-            return;
+            return false;
         }
     };
     if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
@@ -421,7 +424,7 @@ async fn close_in_flight_mine(
         tracing::warn!(
             failed,
             closed,
-            "정지 확정이 일부 실패했다 — 남은 레코드는 다음 정지 전이까지 진행 중이다"
+            "정지 확정이 일부 실패했다 — 다음 tick 에 다시 시도한다"
         );
     }
     if closed > 0 {
@@ -430,6 +433,7 @@ async fn close_in_flight_mine(
             "정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
         );
     }
+    failed == 0
 }
 
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
@@ -567,8 +571,20 @@ async fn backfill_round(
             );
             None
         });
-        let (since_ms, skipped_ms) =
-            resume_from(checkpoint, now_ms, initial_lookback_ms, max_lookback_ms);
+        // **토큰이 있으면 그 창을 유지한다.** 창을 바꾸면 CloudWatch 가 토큰을 거부한다.
+        let resume_token = checkpoint.as_ref().and_then(|c| c.next_token.clone());
+        let (since_ms, skipped_ms) = resume_from(
+            checkpoint.as_ref().map(|c| c.position_ms),
+            now_ms,
+            initial_lookback_ms,
+            max_lookback_ms,
+        );
+        // 창이 잘렸으면 토큰도 버린다 — 다른 `start_time` 의 토큰은 무효다.
+        let resume_token = if skipped_ms.is_some() {
+            None
+        } else {
+            resume_token
+        };
         if let Some(gap_ms) = skipped_ms {
             // **조용히 건너뛰지 않는다.** 그 구간은 정확 지표가 영구히 없다.
             tracing::warn!(
@@ -577,7 +593,10 @@ async fn backfill_round(
                 "백필 재개 지점이 너무 오래됐다 — 구간을 건너뛴다 (그만큼 정확 지표가 없다)"
             );
         }
-        let chunk = match fetcher.fetch(&instance.id, since_ms).await {
+        let chunk = match fetcher
+            .fetch(&instance.id, since_ms, resume_token.as_deref())
+            .await
+        {
             Ok(c) => c,
             // **원천이 없는 것과 장애를 구분한다.**
             //
@@ -668,8 +687,14 @@ async fn backfill_round(
                             .max()
                             .map(|t| t + 1)
                     });
-                    if let Some(pos) = position
-                        && let Err(e) = checkpoints.put(&job, pos).await
+                    // **토큰을 함께 저장한다.** 시각만 저장하면 상한에 걸린 자리를
+                    // 표현할 수 없어 건너뛰거나 멈춘다(교차 리뷰 4회차).
+                    let cursor = position.map(|position_ms| dbmon::store::checkpoint::Cursor {
+                        position_ms,
+                        next_token: chunk.next_token.clone(),
+                    });
+                    if let Some(c) = cursor
+                        && let Err(e) = checkpoints.put(&job, &c).await
                     {
                         tracing::warn!(
                             instance = %instance.id.as_str(),
@@ -1421,6 +1446,8 @@ fn spawn_leader_loop(
         let mut fetcher: Option<Arc<dyn dbmon::slowlog::SlowLogFetcher>> = None;
         // **마지막으로 본 정지 집합.** 바뀐 순간을 알아야 즉시 반영할 수 있다.
         let mut last_pause = dbmon_core::pause::PauseSet::default();
+        // **정지 확정이 남았는가.** 실패하면 참으로 남아 다음 tick 이 다시 시도한다.
+        let mut pending_pause_close = false;
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -1438,7 +1465,11 @@ fn spawn_leader_loop(
             }
 
             gate.refresh().await;
-            readiness.set_collect_leader(gate.is_leader());
+            // 취임 시각을 함께 넘긴다 — `collect_stale` 유예의 기준이다.
+            readiness.set_collect_leader_at(gate.is_leader(), {
+                use dbmon_core::time::Clock as _;
+                dbmon_core::time::SystemClock.now_ms()
+            });
 
             // **가장 오래된 인스턴스의 성공 시각**을 신선도로 올린다 (FR-OPS-09).
             // 한 대라도 밀리면 신선도가 밀린다.
@@ -1489,6 +1520,8 @@ fn spawn_leader_loop(
                 // Describe 까지 부른다). 토글은 사람 손이고 같은 경로가 이미 "인스턴스
                 // 수집" 버튼으로 노출돼 있어 새 분기를 만들지 않았다. 자동 토글이
                 // 생기면 태스크 재조정만 떼어낸다.
+                // **실패가 남아 있으면 다음 tick 에 다시 시도한다.** 정지 변경에서만
+                // 돌리면 일시적 실패가 유령 "실행 중" 으로 굳는다(교차 리뷰 4회차).
                 let pause_changed = pause != last_pause;
                 if pause_changed {
                     let scopes: Vec<&str> = pause.entries().map(|(k, _)| k).collect();
@@ -1705,7 +1738,7 @@ fn spawn_leader_loop(
                                 // 태스크의 마지막 쓰기가 겹칠 좁은 틈이 있다. 전체 정지
                                 // 경로도 같은 틈을 갖고 있고(먼저 abort 하고 확정한다),
                                 // 그 경우 다음 리더 교체 때 epoch 가 달라져 스윕이 걷어간다.
-                                if pause_changed && !paused.is_empty() {
+                                if (pause_changed || pending_pause_close) && !paused.is_empty() {
                                     let closed = run_in_budget(close_in_flight_mine(
                                         &stores.slow_query,
                                         gate.worker_id(),
@@ -1714,10 +1747,16 @@ fn spawn_leader_loop(
                                         Some(&paused),
                                     ))
                                     .await;
-                                    if closed.is_err() {
-                                        tracing::warn!(
-                                            "정지 인스턴스의 진행 중 레코드 확정이 예산을 넘겼다 — 남은 것은 다음 정지 변경이나 리더 교체가 걷어간다"
-                                        );
+                                    match closed {
+                                        // 완전히 끝냈다 — 재시도 상태를 내린다.
+                                        Ok(true) => pending_pause_close = false,
+                                        Ok(false) => pending_pause_close = true,
+                                        Err(_) => {
+                                            pending_pause_close = true;
+                                            tracing::warn!(
+                                                "정지 인스턴스의 진행 중 레코드 확정이 예산을 넘겼다 — 다음 tick 에 다시 시도한다"
+                                            );
+                                        }
                                     }
                                 }
                             }

@@ -308,19 +308,41 @@ impl DigestTextEntry {
 
 // ── InstanceRegistry ────────────────────────────────────────────────────────
 
-#[derive(Default)]
 pub struct FakeInstanceRegistry {
     items: Mutex<BTreeMap<String, Instance>>,
+    /// 중복 미발견 방지 간격. **프로덕션은 탐색 주기에서 유도한다** — 페이크가 고정값을
+    /// 쓰면 짧은 주기를 쓰는 배포의 테스트가 거짓말을 한다(교차 리뷰 4회차).
+    /// 기본은 기본 주기(300초) 기준이고 [`Self::with_discovery_interval`] 로 바꾼다.
+    missing_min_gap_ms: Mutex<i64>,
     /// 마지막으로 미발견을 센 시각. **실제 어댑터의 `missing_at_ms` 속성과 같은 역할**
     /// 이다 — 한 라운드를 두 번 세지 않기 위한 것이고, `Instance` 필드가 아니므로
     /// 여기 따로 둔다.
     missing_at: Mutex<BTreeMap<String, EpochMs>>,
 }
 
+/// **파생 `Default` 를 쓰지 않는다.** 그러면 `missing_min_gap_ms` 가 0 이 되어 중복
+/// 미발견 방지가 꺼지고, 페이크로 그 규칙을 검증하는 테스트가 전부 무의미해진다.
+impl Default for FakeInstanceRegistry {
+    fn default() -> Self {
+        Self {
+            items: Mutex::new(BTreeMap::new()),
+            missing_at: Mutex::new(BTreeMap::new()),
+            missing_min_gap_ms: Mutex::new(crate::instance::missing_min_gap_ms(300)),
+        }
+    }
+}
+
 impl FakeInstanceRegistry {
     pub fn new() -> Self {
         Self::default()
     }
+    /// 어댑터와 같은 함수로 간격을 유도한다.
+    pub fn with_discovery_interval(self, interval_secs: u64) -> Self {
+        *self.missing_min_gap_ms.lock().unwrap() =
+            crate::instance::missing_min_gap_ms(interval_secs);
+        self
+    }
+
     pub fn seed(&self, instances: Vec<Instance>) {
         let mut m = self.items.lock().unwrap();
         for i in instances {
@@ -360,8 +382,13 @@ impl InstanceRegistry for FakeInstanceRegistry {
         // 코드가 실제와 다른 동작을 본다 — `deleted_at_ms` 계약에서 이미 겪었다.
         let last = self.missing_at.lock().unwrap().get(id.as_str()).copied();
         if let Some(prev) = last {
-            // 페이크는 기본 주기(300초)를 가정한다 — 어댑터와 같은 함수를 쓴다.
-            if now_ms - prev < crate::instance::missing_min_gap_ms(300) {
+            // **어댑터와 같은 비교다.**
+            //
+            // DynamoDB 조건은 `missing_at_ms < :cutoff` 이고 `cutoff = now - gap` 이므로
+            // 세는 조건은 `prev < now - gap` ⟺ `now - prev > gap` 이다. 즉 **경계(같은
+            // 값)는 거부된다.** 페이크가 `<` 로 두면 경계에서 세고 계약이 갈린다 —
+            // 교차 리뷰 4회차가 지적하고 계약 테스트가 실증했다.
+            if now_ms - prev <= *self.missing_min_gap_ms.lock().unwrap() {
                 return Ok(inst.clone());
             }
         }

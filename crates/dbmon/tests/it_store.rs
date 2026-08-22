@@ -654,6 +654,52 @@ async fn one_missed_discovery_does_not_delete_the_instance() {
 }
 
 /// 2회 연속이면 `deleted_at` 을 찍는다. **항목은 남는다.**
+/// **체크포인트가 페이지 토큰을 왕복시킨다.**
+///
+/// 시각만 저장하면 상한에 걸린 자리를 표현할 수 없어 **건너뛰거나 멈춘다**(교차 리뷰
+/// 4회차). 토큰을 함께 저장하고, 다 읽었을 때는 **지워야** 한다 — 남으면 낡은 토큰으로
+/// 재개하려 하고 CloudWatch 가 거부하면 그 라운드가 통째로 실패한다.
+#[tokio::test]
+async fn the_checkpoint_round_trips_the_page_token() {
+    use dbmon::store::checkpoint::{Cursor, DynamoCheckpointStore};
+
+    let table = "dbmon-test-cursor";
+    let store = DynamoCheckpointStore::new(client(), table);
+    // 데이터 테이블 스키마를 그대로 쓴다(체크포인트는 config 테이블이지만 키가 같다).
+    let seed = DynamoSlowQueryStore::new(client(), table);
+    if seed.reset_table_for_local().await.is_err() {
+        return; // DynamoDB Local 이 없으면 건너뛴다
+    }
+
+    let job = "slowlog/orders-01";
+    assert_eq!(
+        store.get(job).await.expect("조회"),
+        None,
+        "처음은 비어 있다"
+    );
+
+    // 상한에 걸린 상태: 위치는 그대로, 토큰이 있다.
+    let capped = Cursor {
+        position_ms: T0,
+        next_token: Some("page-token-abc".into()),
+    };
+    store.put(job, &capped).await.expect("저장");
+    assert_eq!(store.get(job).await.expect("조회"), Some(capped));
+
+    // 다 읽은 상태: 위치가 전진하고 **토큰이 지워진다.**
+    let done = Cursor {
+        position_ms: T0 + 5_000,
+        next_token: None,
+    };
+    store.put(job, &done).await.expect("저장");
+    let got = store.get(job).await.expect("조회").expect("있다");
+    assert_eq!(got.position_ms, T0 + 5_000);
+    assert_eq!(
+        got.next_token, None,
+        "낡은 토큰이 남았다 — 다음 라운드가 무효한 토큰으로 재개를 시도한다"
+    );
+}
+
 /// **`set_state` 는 "수집하지 않는다" 는 결정을 덮지 않는다.**
 ///
 /// 수집 태스크는 자기가 뜰 때 읽은 사본으로 첫 판정을 쓴다. 그 사이 탐색이

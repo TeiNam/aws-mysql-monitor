@@ -36,6 +36,26 @@ pub fn slowlog_job(instance: &dbmon_core::ids::InstanceId) -> String {
     format!("cwlog#{}", instance.as_str())
 }
 
+/// 재개 지점. **시각만으로는 표현할 수 없는 상태가 있다.**
+///
+/// # 왜 토큰이 필요한가
+///
+/// CloudWatch `FilterLogEvents` 는 페이지를 끊는다. 한 라운드에 다 못 읽었을 때, 시각만
+/// 저장하면 두 선택뿐이고 **둘 다 틀리다**:
+///
+/// - `last_ts + 1` → 같은 밀리초에 남은 이벤트를 **영구히 건너뛴다**
+/// - `last_ts` → 다음 라운드가 같은 자리에서 시작해 **진행이 0 이 된다**
+///
+/// 페이지 토큰을 함께 저장하면 정확히 멈춘 자리에서 이어받는다(교차 리뷰 4회차).
+/// 토큰이 있는 동안 `position_ms` 는 **움직이지 않는다** — CloudWatch 가 토큰과 함께
+/// 같은 `start_time` 을 요구하기 때문이다.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cursor {
+    pub position_ms: EpochMs,
+    /// 페이지 중간에서 멈췄을 때의 재개 토큰. 다 읽었으면 `None`.
+    pub next_token: Option<String>,
+}
+
 impl DynamoCheckpointStore {
     pub fn new(client: Client, table: impl Into<String>) -> Self {
         Self {
@@ -44,8 +64,8 @@ impl DynamoCheckpointStore {
         }
     }
 
-    /// 마지막 처리 시각. 없으면 `None` — 호출부가 초기 창을 정한다.
-    pub async fn get(&self, job: &str) -> Result<Option<EpochMs>> {
+    /// 재개 커서. 없으면 `None` — 호출부가 초기 창을 정한다.
+    pub async fn get(&self, job: &str) -> Result<Option<Cursor>> {
         let out = self
             .client
             .get_item()
@@ -55,26 +75,48 @@ impl DynamoCheckpointStore {
             .send()
             .await
             .map_err(map_sdk_err)?;
-        Ok(out
-            .item
-            .as_ref()
-            .and_then(|i| i.get("position_ms"))
+        let Some(item) = out.item.as_ref() else {
+            return Ok(None);
+        };
+        let Some(position_ms) = item
+            .get("position_ms")
             .and_then(|v| v.as_n().ok())
-            .and_then(|s| s.parse().ok()))
+            .and_then(|s| s.parse().ok())
+        else {
+            // 시각이 없으면 커서가 아니다 — 옛 항목이거나 손상됐다.
+            return Ok(None);
+        };
+        Ok(Some(Cursor {
+            position_ms,
+            next_token: item
+                .get("next_token")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned(),
+        }))
     }
 
-    /// 재개 지점을 저장한다.
-    pub async fn put(&self, job: &str, position_ms: EpochMs) -> Result<()> {
-        self.client
+    /// 재개 커서를 저장한다.
+    ///
+    /// 토큰이 없으면 속성을 **지운다** — 남겨 두면 다 읽은 뒤에도 낡은 토큰으로
+    /// 재개하려 하고, CloudWatch 가 그걸 거부하면 그 라운드가 통째로 실패한다.
+    pub async fn put(&self, job: &str, cursor: &Cursor) -> Result<()> {
+        let mut req = self
+            .client
             .update_item()
             .table_name(&self.table)
             .key("PK", AttributeValue::S(PK.to_string()))
             .key("SK", AttributeValue::S(job.to_string()))
-            .update_expression("SET position_ms = :p, updated_at_ms = :p")
-            .expression_attribute_values(":p", AttributeValue::N(position_ms.to_string()))
-            .send()
-            .await
-            .map_err(map_sdk_err)?;
+            .expression_attribute_values(":p", AttributeValue::N(cursor.position_ms.to_string()));
+        req = match &cursor.next_token {
+            Some(t) => req
+                .update_expression("SET position_ms = :p, updated_at_ms = :p, next_token = :t")
+                .expression_attribute_values(":t", AttributeValue::S(t.clone())),
+            None => {
+                req.update_expression("SET position_ms = :p, updated_at_ms = :p REMOVE next_token")
+            }
+        };
+        req.send().await.map_err(map_sdk_err)?;
         Ok(())
     }
 }

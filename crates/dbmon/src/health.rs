@@ -56,6 +56,11 @@ pub struct Readiness {
     draining: AtomicBool,
     /// 마지막으로 수집 tick 이 성공한 시각.
     last_collect_ok_ms: AtomicI64,
+    /// 수집 리더가 된 시각. **유예 기간의 기준이다.**
+    ///
+    /// 성공 기록이 없는 것(`0`)을 그대로 정지로 보면 리더 취임 직후·배포 직후·수집 대상이
+    /// 0개인 배포에서 즉시 경보가 뜬다(교차 리뷰 4회차). 취임부터 유예를 준다.
+    became_leader_ms: AtomicI64,
 }
 
 /// 수집이 **멈춘 것으로 볼** 무응답 시간 (밀리초).
@@ -80,6 +85,7 @@ impl Readiness {
             requires_leadership: serves_api && runs_collector,
             draining: AtomicBool::new(false),
             last_collect_ok_ms: AtomicI64::new(0),
+            became_leader_ms: AtomicI64::new(0),
         })
     }
 
@@ -94,7 +100,21 @@ impl Readiness {
         self.kms_denied.store(v, Ordering::Relaxed);
     }
     pub fn set_collect_leader(&self, v: bool) {
-        self.collect_leader.store(v, Ordering::Relaxed);
+        self.set_collect_leader_at(v, 0);
+    }
+
+    /// 리더 여부를 세우고, **새로 리더가 됐으면 그 시각을 기록한다.**
+    ///
+    /// `collect_stale` 유예의 기준이다 — 취임 직후를 정지로 보면 배포마다 경보가 뜬다.
+    /// `now_ms = 0` 이면 시각을 기록하지 않는다(테스트·종료 경로).
+    pub fn set_collect_leader_at(&self, v: bool, now_ms: i64) {
+        let was = self.collect_leader.swap(v, Ordering::Relaxed);
+        if v && !was && now_ms > 0 {
+            self.became_leader_ms.store(now_ms, Ordering::Relaxed);
+        }
+        if !v {
+            self.became_leader_ms.store(0, Ordering::Relaxed);
+        }
     }
     pub fn begin_draining(&self) {
         self.draining.store(true, Ordering::Relaxed);
@@ -143,10 +163,19 @@ impl Readiness {
 
         // **수집해야 하는 워커에서만** 의미가 있다. api 전용 워커는 성공 시각이 늘 0 이다.
         let last_ok = self.last_collect_ok_ms.load(Ordering::Relaxed);
+        // **성공 기록이 없으면 취임 시각부터 센다.** `0` 을 그대로 정지로 보면 리더
+        // 취임 직후·배포 직후·수집 대상이 0개인 배포에서 즉시 경보가 뜬다
+        // (교차 리뷰 4회차). 취임 시각도 없으면(테스트·구식 경로) 판정하지 않는다.
+        let since = if last_ok > 0 {
+            Some(last_ok)
+        } else {
+            let became = self.became_leader_ms.load(Ordering::Relaxed);
+            (became > 0).then_some(became)
+        };
         let collect_stale = self.runs_collector
             && collect_leader
             && !draining
-            && (last_ok == 0 || now_ms - last_ok > COLLECT_STALE_AFTER_MS);
+            && since.is_some_and(|t| now_ms - t > COLLECT_STALE_AFTER_MS);
 
         ReadyReport {
             ready,
@@ -370,11 +399,17 @@ mod tests {
     fn collection_staleness_is_reported_without_dropping_ready() {
         const NOW: i64 = 1_787_000_000_000;
         let r = ready_worker(true);
-        r.set_collect_leader(true);
+        // **취임 직후는 정지가 아니다.** 유예를 취임 시각부터 센다.
+        r.set_collect_leader_at(true, NOW);
+        let fresh = r.snapshot_at(NOW);
+        assert!(
+            !fresh.collect_stale,
+            "취임 직후를 정지로 봤다 — 배포마다 경보가 뜬다"
+        );
 
-        // 한 번도 성공하지 못했다 → 정지로 본다.
-        let s = r.snapshot_at(NOW);
-        assert!(s.collect_stale, "성공 기록이 없는데 정지로 보지 않았다");
+        // 취임 뒤 유예를 넘겼는데 성공 기록이 없다 → 정지다.
+        let s = r.snapshot_at(NOW + COLLECT_STALE_AFTER_MS + 1);
+        assert!(s.collect_stale, "유예를 넘겼는데 정지로 보지 않았다");
         assert!(s.ready, "정지가 ready 를 내렸다 — 무한 교체가 된다");
 
         // 방금 성공했다 → 정지가 아니다.
@@ -406,7 +441,7 @@ mod tests {
     fn draining_is_not_reported_as_stale() {
         const NOW: i64 = 1_787_000_000_000;
         let r = ready_worker(true);
-        r.set_collect_leader(true);
+        r.set_collect_leader_at(true, NOW);
         r.begin_draining();
         assert!(!r.snapshot_at(NOW).collect_stale);
     }
