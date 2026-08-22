@@ -215,6 +215,7 @@ impl Readiness {
             config_loaded,
             storage_ok,
             kms_denied,
+            auth_mode_supported,
             collect_leader,
             serves_api: self.serves_api,
             last_collect_ok_ms: self.last_collect_ok_ms.load(Ordering::Relaxed),
@@ -275,6 +276,11 @@ pub struct ReadyReport {
     pub config_loaded: bool,
     pub storage_ok: bool,
     pub kms_denied: bool,
+    /// 저장된 인증 모드를 이 워커가 수행할 수 있는가.
+    ///
+    /// 거짓이면 `reason` 이 `auth_mode_unsupported` 다 — 롤링 배포 중 검증기 없는
+    /// 워커가 남아 있다는 뜻이고, ECS 가 교체할 때까지 트래픽을 받지 않는다.
+    pub auth_mode_supported: bool,
     pub collect_leader: bool,
     pub serves_api: bool,
     pub last_collect_ok_ms: i64,
