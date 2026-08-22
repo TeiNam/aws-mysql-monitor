@@ -279,6 +279,25 @@ struct Scanned {
     /// `sql_mode` 에 `ANSI_QUOTES` 가 있으면 그건 **식별자**이고 없으면 **문자열**이다.
     /// 우리는 사람이 어디서 실행할지 모르므로, 해석이 갈리는 문장은 판정하지 않는다.
     double_quoted: bool,
+    /// 인용 안에 `\` 가 쓰였는가.
+    ///
+    /// # 왜 이것도 판정을 포기하는 근거인가
+    ///
+    /// 이 스캐너는 `\` 가 다음 문자를 이스케이프한다고 본다. `sql_mode` 에
+    /// `NO_BACKSLASH_ESCAPES` 가 있으면 **그렇지 않다** — 그러면 문자열이 더 일찍 끝나고
+    /// 뒤가 별개의 문장이 된다:
+    ///
+    /// ```text
+    /// SELECT 'x\'; DELETE FROM orders
+    ///   기본 sql_mode      → 문자열 하나, 문장 하나
+    ///   NO_BACKSLASH_ESCAPES → 문자열이 `x\` 에서 끝나고 DELETE 가 별개 문장
+    /// ```
+    ///
+    /// `"` 인용과 **같은 부류**다(교차 리뷰 5회차가 잡았다). 해석이 갈리는 문장은
+    /// "검증됨" 으로 보여주지 않는다.
+    backslash_in_quote: bool,
+    /// 인용이 닫히지 않았다. 그러면 이 스캔의 경계 판정 전부를 믿을 수 없다.
+    unterminated_quote: bool,
 }
 
 fn scan(sql: &str) -> Scanned {
@@ -290,6 +309,7 @@ fn scan(sql: &str) -> Scanned {
     let mut comma = false;
     let mut exec_comment = false;
     let mut double_quoted = false;
+    let mut backslash_in_quote = false;
     // 인용 밖 세미콜론의 위치(주석을 지운 문장 기준). 뒤에 내용이 있는지는 나중에 본다.
     let mut semicolons: Vec<usize> = Vec::new();
     let mut i = 0;
@@ -302,6 +322,9 @@ fn scan(sql: &str) -> Scanned {
             // **키워드 검사용 사본에서는 내용을 덮는다.** 인용 안의 글자는 토큰이 아니다.
             masked.push('_');
             if c == '\\' && quote != Quote::Backtick && i + 1 < chars.len() {
+                // **`sql_mode` 에 따라 해석이 갈리는 지점이다.** `NO_BACKSLASH_ESCAPES`
+                // 에서는 이스케이프가 아니므로 문자열이 여기서 끝날 수 있다.
+                backslash_in_quote = true;
                 out.push(chars[i + 1]);
                 masked.push('_');
                 i += 2;
@@ -398,6 +421,9 @@ fn scan(sql: &str) -> Scanned {
         top_level_comma: comma,
         executable_comment: exec_comment,
         double_quoted,
+        backslash_in_quote,
+        // 루프가 끝났는데 인용 안이면 닫히지 않은 것이다.
+        unterminated_quote: quote != Quote::None,
     }
 }
 
@@ -478,6 +504,11 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
     if scanned.double_quoted {
         return false;
     }
+    // ③-b `\` 나 닫히지 않은 인용도 같은 이유로 판정하지 않는다 — `sql_mode` 에 따라
+    // 경계가 달라진다(교차 리뷰 5회차).
+    if scanned.backslash_in_quote || scanned.unterminated_quote {
+        return false;
+    }
     // **키워드는 인용을 덮은 사본에서 찾는다.** 인용 안의 글자는 토큰이 아니다.
     let flat = scanned
         .keywords_only
@@ -554,7 +585,18 @@ pub fn is_index_creation_ddl(ddl: &str) -> bool {
 /// 완전한 파서가 아니다. 목적은 형태를 좁히는 것이고 실행은 사람이 검토한 뒤에 한다.
 pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     let scanned = scan(sql);
-    if scanned.executable_comment || scanned.multi_statement || scanned.double_quoted {
+    // **해석이 갈리는 문장은 판정하지 않는다.**
+    //
+    // `"` 인용은 `ANSI_QUOTES` 에 따라 식별자/문자열이 갈리고, 인용 안의 `\` 는
+    // `NO_BACKSLASH_ESCAPES` 에 따라 문자열의 끝이 갈린다 — 후자에서는
+    // `SELECT 'x\'; DELETE FROM orders` 가 **두 문장**이 되는데 이 스캐너는 하나로 본다
+    // (교차 리뷰 5회차). 닫히지 않은 인용은 경계 판정 전부를 못 믿는다.
+    if scanned.executable_comment
+        || scanned.multi_statement
+        || scanned.double_quoted
+        || scanned.backslash_in_quote
+        || scanned.unterminated_quote
+    {
         return false;
     }
     let flat = scanned
@@ -580,8 +622,14 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     let has = |kw: &str| tokens.contains(&kw);
     let count = |kw: &str| tokens.iter().filter(|t| **t == kw).count();
 
-    // 스키마·권한을 바꾸거나 부수효과가 있는 것. 재작성에는 나올 이유가 없다.
-    const FORBIDDEN: &[&str] = &[
+    // ③-a **문장 단위 키워드는 선두에서만 본다.**
+    //
+    // 전에는 어디에 있든 거부했는데, 셋 다 MySQL 비예약어라서 정상 SQL 을 거부했다 —
+    // `SELECT start FROM jobs`, `UPDATE t SET session = 1` 이 그렇다(교차 리뷰 5회차).
+    //
+    // 선두만 봐도 안전한 이유: 두 번째 문장은 위의 `multi_statement` 가 이미 거부하고,
+    // 실행 주석도 거부한다. CTE 뒤에 숨는 DML 은 아래 ④가 잡는다.
+    const STATEMENT_HEADS: &[&str] = &[
         "DROP",
         "TRUNCATE",
         "ALTER",
@@ -601,48 +649,50 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         "ROLLBACK",
         "START",
         "BEGIN",
-        "GET_LOCK",
-        "RELEASE_LOCK",
-        "OUTFILE",
-        "DUMPFILE",
+        "SET",
+        "USE",
+        "SHOW",
+        "DESCRIBE",
+        "EXPLAIN",
+        "ANALYZE",
+        "OPTIMIZE",
+        "REPAIR",
+        "CHECK",
+        "FLUSH",
+        "RESET",
+        "KILL",
         "LOAD",
     ];
-    if FORBIDDEN.iter().any(|k| has(k)) {
+
+    // ③-b **어디에 있어도 안 되는 것.** 함수·절이라서 선두에 오지 않는다.
+    //
+    // 파일로 내보내거나 잠금을 잡는 것은 "튜닝된 조회" 가 아니다.
+    const FORBIDDEN_ANYWHERE: &[&str] = &["OUTFILE", "DUMPFILE", "GET_LOCK", "RELEASE_LOCK"];
+    if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
         return false;
     }
-    // **`SET` 은 목록에 넣을 수 없다** — `UPDATE t SET x = ?` 의 필수 부분이다.
-    // 문장 단위 `SET`(전역·세션 변수 변경)만 막는다.
-    const SET_SCOPES: &[&str] = &[
-        "GLOBAL",
-        "SESSION",
-        "PERSIST",
-        "PERSIST_ONLY",
-        "NAMES",
-        "CHARACTER",
-        "TRANSACTION",
-    ];
-    for (i, t) in tokens.iter().enumerate() {
-        if *t != "SET" {
-            continue;
+
+    // ③-c **읽기인데 부수효과가 있는 절.** 원본이 select 일 때만 본다.
+    //
+    // `FOR UPDATE`·`FOR SHARE` 는 잠금을 잡고, `SELECT … INTO` 는 변수·파일에 쓴다.
+    // "같은 결과를 더 빠르게" 가 아니므로 재작성으로 제시하지 않는다.
+    //
+    // **인접 토큰으로 본다.** `FOR` 와 `SHARE` 가 문장 어디에든 있으면 거부하는 방식은
+    // 정상 문장을 잡을 수 있다.
+    if want_is_select(statement_type) {
+        for (i, t) in tokens.iter().enumerate() {
+            if *t == "FOR"
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|n| *n == "UPDATE" || *n == "SHARE")
+            {
+                return false;
+            }
         }
-        // 선두가 `SET` 이면 그 자체가 문장이다.
-        if i == 0 {
+        // `INTO` 는 예약어라 select 문에 나오면 `SELECT … INTO` 뿐이다.
+        if has("INTO") {
             return false;
         }
-        if tokens
-            .get(i + 1)
-            .is_some_and(|n| SET_SCOPES.contains(n) || n.starts_with('@'))
-        {
-            return false;
-        }
-    }
-    // `SELECT … FOR UPDATE` / `FOR SHARE` 는 잠금을 잡는다 — 읽기 재작성이 아니다.
-    if has("FOR") && (has("UPDATE") || has("SHARE")) && want_is_select(statement_type) {
-        return false;
-    }
-    // `INTO @var` / `INTO OUTFILE` 은 부수효과다. `INSERT … INTO` 는 선두 검사가 받는다.
-    if has("INTO") && want_is_select(statement_type) {
-        return false;
     }
 
     // ② 선두 키워드가 원본과 같아야 한다.
@@ -652,6 +702,10 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     let want = statement_type.trim().to_ascii_uppercase();
     // **빈 문장 종류는 거부한다.** 무엇과 같아야 하는지 알 수 없으면 통과시키지 않는다.
     if want.is_empty() {
+        return false;
+    }
+    // 선두가 문장 단위 키워드면 거부한다(원본과 같을 수 없다 — 원본은 select/dml 이다).
+    if STATEMENT_HEADS.contains(&head) {
         return false;
     }
     let head_ok = match head {
@@ -1567,6 +1621,11 @@ mod tests {
             "SET SESSION sort_buffer_size = 1",
             "LOCK TABLES orders READ",
             "PREPARE s FROM 'DELETE FROM orders'",
+            // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
+            // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).
+            r"SELECT 'x\'; DELETE FROM orders",
+            // 닫히지 않은 인용 — 경계 판정 전부를 못 믿는다.
+            "SELECT 'x FROM orders",
         ];
         for sql in bad {
             let raw = RawAdvice {
@@ -1600,6 +1659,11 @@ mod tests {
             "WITH s AS (SELECT id FROM orders) SELECT * FROM s",
             // 세미콜론 하나로 끝나는 것은 다중 문장이 아니다.
             "SELECT 1 FROM orders;",
+            // **비예약어를 문맥 없이 거부하지 않는다.** `start`·`session`·`global` 은
+            // MySQL 비예약어라 컬럼 이름이 될 수 있다(교차 리뷰 5회차가 오탐으로 잡았다).
+            "SELECT start FROM orders WHERE id = ?",
+            "SELECT o.session, o.global FROM orders o",
+            "SELECT COUNT(*) FROM orders WHERE `check` = ?",
         ] {
             let raw = RawAdvice {
                 summary: "풀스캔이다".into(),
@@ -1612,6 +1676,31 @@ mod tests {
             let advice =
                 validate(raw, &context(vec![spec("shop", "orders")]), "m", 1).expect("검증");
             assert!(advice.rewrite.is_some(), "{sql:?} 가 버려졌다");
+        }
+    }
+
+    /// **DML 원본의 정상 재작성이 오탐으로 거부되지 않는다.**
+    ///
+    /// `UPDATE t SET session = 1` 처럼 비예약어가 `SET` 뒤에 오는 형태를 문장 단위
+    /// `SET SESSION` 으로 읽으면 정상 재작성이 버려진다(교차 리뷰 5회차).
+    #[test]
+    fn a_non_reserved_word_after_set_is_not_a_scope_change() {
+        let mut c = context(vec![spec("shop", "orders")]);
+        c.statement_type = "update".into();
+        for sql in [
+            "UPDATE orders SET session = 1 WHERE id = ?",
+            "UPDATE orders SET global = ?, status = ? WHERE id = ?",
+        ] {
+            let raw = RawAdvice {
+                summary: "…".into(),
+                rewrite: Some(Rewrite {
+                    sql: sql.into(),
+                    rationale: "…".into(),
+                }),
+                ..Default::default()
+            };
+            let advice = validate(raw, &c, "m", 1).expect("검증");
+            assert!(advice.rewrite.is_some(), "{sql:?} 가 오탐으로 버려졌다");
         }
     }
 

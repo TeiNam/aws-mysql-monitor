@@ -365,16 +365,21 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
 ///
 /// `only` 가 `None` 이면 내 것 전부(전체 정지), `Some(ids)` 면 그 인스턴스 것만
 /// 확정한다(부분 정지 — 멈추지 않은 인스턴스의 실행 중 쿼리를 끊으면 안 된다).
-/// 반환값은 **완전히 끝냈는가**다. 거짓이면 호출부가 다음 tick 에 다시 시도해야 한다 —
-/// 실패를 로그로만 남기면 그 레코드는 다음 정지 변경이나 리더 교체까지 유령으로 남는다
-/// (교차 리뷰 4회차).
+/// 반환값은 **아직 못 닫은 인스턴스 집합**이다. 비어 있으면 끝났다.
+///
+/// # 왜 bool 이 아닌가
+///
+/// 처음에는 "완전히 끝냈는가" 를 bool 로 돌렸다. 그러면 호출부가 재시도할 때 **그 시점의
+/// 정지 집합**을 다시 쓰는데, 실패한 인스턴스를 그 사이 재개하면 대상에서 빠져 **영구히
+/// 안 닫힌다** — 이미 끝난 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는 고아
+/// 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차). 남은 **대상**을 그대로 들고 있어야 한다.
 async fn close_in_flight_mine(
     store: &Arc<dbmon::store::AppSlowQueryStore>,
     worker_id: &str,
     epoch: Option<u64>,
     now_ms: i64,
     only: Option<&std::collections::BTreeSet<String>>,
-) -> bool {
+) -> std::collections::BTreeSet<String> {
     use dbmon_core::ports::SlowQueryStore as _;
     // **실패를 조용히 버리지 않는다.** 여기서 못 닫으면 그 레코드는 진행 중으로 남고,
     // 고아 스윕은 `owner_worker`·`owner_epoch` 가 자기와 같은 것을 건너뛰므로
@@ -387,7 +392,8 @@ async fn close_in_flight_mine(
                 error = %telemetry::Scrubbed(&e),
                 "정지 확정을 위한 진행 중 목록을 읽지 못했다 — 다음 tick 에 다시 시도한다"
             );
-            return false;
+            // 목록을 못 읽었으면 **대상 전체**가 남은 것으로 본다.
+            return only.cloned().unwrap_or_default();
         }
     };
     if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
@@ -397,7 +403,7 @@ async fn close_in_flight_mine(
         );
     }
     let mut closed = 0usize;
-    let mut failed = 0usize;
+    let mut remaining: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for q in &in_flight {
         if q.owner_worker.as_deref() != Some(worker_id) || q.owner_epoch != epoch {
             continue;
@@ -410,7 +416,7 @@ async fn close_in_flight_mine(
             Ok(_) => closed += 1,
             // 같은 이유로 개별 실패도 남긴다 — 몇 건이 남았는지 알아야 한다.
             Err(e) => {
-                failed += 1;
+                remaining.insert(q.instance_id.as_str().to_string());
                 tracing::warn!(
                     instance = %q.instance_id.as_str(),
                     thread_id = q.thread_id,
@@ -420,11 +426,11 @@ async fn close_in_flight_mine(
             }
         }
     }
-    if failed > 0 {
+    if !remaining.is_empty() {
         tracing::warn!(
-            failed,
+            failed = remaining.len(),
             closed,
-            "정지 확정이 일부 실패했다 — 다음 tick 에 다시 시도한다"
+            "정지 확정이 일부 실패했다 — 그 인스턴스를 계속 들고 다음 tick 에 다시 시도한다"
         );
     }
     if closed > 0 {
@@ -433,7 +439,7 @@ async fn close_in_flight_mine(
             "정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
         );
     }
-    failed == 0
+    remaining
 }
 
 /// 한 스윕에서 볼 진행 중 레코드 상한. 폭주 방어.
@@ -1446,8 +1452,11 @@ fn spawn_leader_loop(
         let mut fetcher: Option<Arc<dyn dbmon::slowlog::SlowLogFetcher>> = None;
         // **마지막으로 본 정지 집합.** 바뀐 순간을 알아야 즉시 반영할 수 있다.
         let mut last_pause = dbmon_core::pause::PauseSet::default();
-        // **정지 확정이 남았는가.** 실패하면 참으로 남아 다음 tick 이 다시 시도한다.
-        let mut pending_pause_close = false;
+        // **정지 확정이 남은 인스턴스.** bool 로 두면 재시도 시점의 정지 집합을 다시
+        // 써서, 그 사이 재개된 인스턴스가 대상에서 빠져 영구히 안 닫힌다
+        // (교차 리뷰 5회차).
+        let mut pending_pause_close: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -1565,7 +1574,11 @@ fn spawn_leader_loop(
                     let mut swept = false;
                     let maintenance = run_in_budget(async {
                         // 남은 진행 중 레코드를 확정한다. **전체 정지이므로 내 것 전부다.**
-                        close_in_flight_mine(
+                        //
+                        // 남은 집합을 버려도 된다 — 이 분기는 멈춰 있는 **매 tick** 돌므로
+                        // 다음 tick 이 자동으로 재시도한다. 부분 정지는 정지 변경에서만
+                        // 돌기 때문에 거기서는 집합을 들고 다닌다.
+                        let _ = close_in_flight_mine(
                             &stores.slow_query,
                             gate.worker_id(),
                             gate.epoch(),
@@ -1738,26 +1751,37 @@ fn spawn_leader_loop(
                                 // 태스크의 마지막 쓰기가 겹칠 좁은 틈이 있다. 전체 정지
                                 // 경로도 같은 틈을 갖고 있고(먼저 abort 하고 확정한다),
                                 // 그 경우 다음 리더 교체 때 epoch 가 달라져 스윕이 걷어간다.
-                                if (pause_changed || pending_pause_close) && !paused.is_empty() {
+                                // **대상은 "지금 멈춘 것 ∪ 아직 못 닫은 것" 이다.**
+                                //
+                                // 후자를 빼면, 확정에 실패한 인스턴스를 그 사이 재개했을
+                                // 때 대상에서 사라져 **영구히 안 닫힌다** — 이미 끝난
+                                // 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는
+                                // 고아 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차).
+                                let close_targets: std::collections::BTreeSet<String> = paused
+                                    .iter()
+                                    .cloned()
+                                    .chain(pending_pause_close.iter().cloned())
+                                    .collect();
+                                if (pause_changed || !pending_pause_close.is_empty())
+                                    && !close_targets.is_empty()
+                                {
                                     let closed = run_in_budget(close_in_flight_mine(
                                         &stores.slow_query,
                                         gate.worker_id(),
                                         gate.epoch(),
                                         now_ms,
-                                        Some(&paused),
+                                        Some(&close_targets),
                                     ))
                                     .await;
-                                    match closed {
-                                        // 완전히 끝냈다 — 재시도 상태를 내린다.
-                                        Ok(true) => pending_pause_close = false,
-                                        Ok(false) => pending_pause_close = true,
+                                    pending_pause_close = match closed {
+                                        Ok(remaining) => remaining,
                                         Err(_) => {
-                                            pending_pause_close = true;
                                             tracing::warn!(
-                                                "정지 인스턴스의 진행 중 레코드 확정이 예산을 넘겼다 — 다음 tick 에 다시 시도한다"
+                                                "정지 인스턴스의 진행 중 레코드 확정이 예산을 넘겼다 — 대상을 유지하고 다음 tick 에 다시 시도한다"
                                             );
+                                            close_targets
                                         }
-                                    }
+                                    };
                                 }
                             }
                             Err(e) => tracing::warn!(

@@ -198,7 +198,10 @@ async fn run(mut socket: WebSocket, state: super::ApiState) -> Result<(), &'stat
             // 화면에 영구히 안 나타난다.
             got = slowq_rx.recv() => match got {
                 Ok(Broadcast { key, data }) if subscribed.contains(&key) => {
-                    send(&mut socket, ServerMsg::Slowq { data }).await;
+                    // **대체되지 않는다.** 버리면 그 쿼리는 다음 방송으로 다시 오지
+                    // 않고 `stream_lagged` 도 뜨지 않는다 — 화면에 영구히 안 나타난다
+                    // (교차 리뷰 5회차). 못 보내면 닫아서 다시 붙게 한다.
+                    send_or_close(&mut socket, ServerMsg::Slowq { data }).await?;
                 }
                 Ok(_) => {}
                 Err(RecvError::Lagged(n)) => {
@@ -303,14 +306,17 @@ async fn handle_client_msg(
             for raw in &topics {
                 subscribed.remove(raw);
             }
-            send(
+            // **구독 확인은 대체되지 않는다.** 클라이언트는 요청을 보낸 뒤 `sent` 로
+            // 표시하고 재전송하지 않으므로, 이걸 잃으면 화면과 서버의 구독 집합이
+            // 영구히 어긋난다(교차 리뷰 5회차).
+            send_or_close(
                 socket,
                 ServerMsg::Subscribed {
                     topics: subscribed.iter().cloned().collect(),
                     denied: Vec::new(),
                 },
             )
-            .await;
+            .await?;
         }
         Ok(ClientMsg::Subscribe { topics }) => {
             let envs = instance_envs(state).await;
@@ -340,14 +346,15 @@ async fn handle_client_msg(
                     Err(TopicError::Malformed | TopicError::Denied) => denied.push(raw.clone()),
                 }
             }
-            send(
+            // 거부 목록도 여기서만 온다 — 잃으면 화면이 거부된 토픽을 표시하지 못한다.
+            send_or_close(
                 socket,
                 ServerMsg::Subscribed {
                     topics: subscribed.iter().cloned().collect(),
                     denied,
                 },
             )
-            .await;
+            .await?;
         }
         Err(_) => send(socket, ServerMsg::Error { code: "malformed" }).await,
     }

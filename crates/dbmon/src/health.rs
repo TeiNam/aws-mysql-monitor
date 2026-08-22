@@ -163,14 +163,20 @@ impl Readiness {
 
         // **수집해야 하는 워커에서만** 의미가 있다. api 전용 워커는 성공 시각이 늘 0 이다.
         let last_ok = self.last_collect_ok_ms.load(Ordering::Relaxed);
-        // **성공 기록이 없으면 취임 시각부터 센다.** `0` 을 그대로 정지로 보면 리더
-        // 취임 직후·배포 직후·수집 대상이 0개인 배포에서 즉시 경보가 뜬다
-        // (교차 리뷰 4회차). 취임 시각도 없으면(테스트·구식 경로) 판정하지 않는다.
-        let since = if last_ok > 0 {
-            Some(last_ok)
-        } else {
-            let became = self.became_leader_ms.load(Ordering::Relaxed);
-            (became > 0).then_some(became)
+        // **기준은 "성공 시각과 취임 시각 중 나중" 이다.**
+        //
+        // 성공 기록이 없을 때 `0` 을 그대로 정지로 보면 취임 직후·배포 직후·수집 대상이
+        // 0개인 배포에서 즉시 경보가 뜬다(교차 리뷰 4회차).
+        //
+        // 그리고 **성공 시각만 보면 재취임이 깨진다**: 5분 넘게 비리더였다가 다시 리더가
+        // 되면 이전 임기의 성공 시각이 이미 낡아 있어 첫 수집 전에 정지로 판정된다
+        // (교차 리뷰 5회차). 새 임기의 유예는 취임 시각부터다.
+        let became = self.became_leader_ms.load(Ordering::Relaxed);
+        let since = match (last_ok, became) {
+            (0, 0) => None,
+            (ok, 0) => Some(ok),
+            (0, b) => Some(b),
+            (ok, b) => Some(ok.max(b)),
         };
         let collect_stale = self.runs_collector
             && collect_leader
@@ -424,6 +430,38 @@ mod tests {
         );
         // 경계에서는 아직 아니다.
         assert!(!r.snapshot_at(NOW + COLLECT_STALE_AFTER_MS).collect_stale);
+    }
+
+    /// **재취임도 유예를 새로 받는다.**
+    ///
+    /// 5분 넘게 비리더였다가 다시 리더가 되면 이전 임기의 성공 시각이 이미 낡아 있다.
+    /// 성공 시각만 보면 첫 수집 전에 정지로 판정된다 — 리더가 오갈 때마다 경보가 뜬다
+    /// (교차 리뷰 5회차).
+    #[test]
+    fn reacquiring_leadership_restarts_the_grace_period() {
+        const NOW: i64 = 1_787_000_000_000;
+        let r = ready_worker(true);
+
+        // 1차 임기: 수집이 잘 됐다.
+        r.set_collect_leader_at(true, NOW);
+        r.record_collect_ok(NOW);
+
+        // 리더를 잃고 오래 지났다.
+        r.set_collect_leader_at(false, NOW);
+        let much_later = NOW + 10 * COLLECT_STALE_AFTER_MS;
+
+        // 2차 임기 취임 — 이전 임기의 성공 시각은 이미 낡았다.
+        r.set_collect_leader_at(true, much_later);
+        assert!(
+            !r.snapshot_at(much_later).collect_stale,
+            "재취임 직후를 정지로 봤다 — 리더가 오갈 때마다 경보가 뜬다"
+        );
+
+        // 새 임기에서도 유예를 넘기면 정지다.
+        assert!(
+            r.snapshot_at(much_later + COLLECT_STALE_AFTER_MS + 1)
+                .collect_stale
+        );
     }
 
     /// **api 전용 워커는 정지로 보지 않는다.** 수집 성공 시각이 늘 0 이다.

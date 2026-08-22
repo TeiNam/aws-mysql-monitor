@@ -325,13 +325,20 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // 라운드가 같은 자리에서 시작해 **영원히 같은 것을 읽는다**(진행 0). 한
             // 밀리초에 상한을 넘는 이벤트가 있다는 뜻이므로, 그때는 넘기고 그 사실을
             // 크게 남긴다 — 멈춰 있는 것이 건너뛰는 것보다 나쁘다.
-            // **토큰이 있으면 위치를 올리지 않는다.** 다음 라운드가 같은 `start_time`
-            // 과 토큰으로 정확히 이어받는다 — 건너뛰지도, 멈추지도 않는다.
-            next_since_ms: if token.is_some() {
-                Some(since_ms)
-            } else {
-                last_ts.map(|t| t + 1)
-            },
+            // **항상 위치를 돌려준다.**
+            //
+            // 전에는 이벤트가 없으면 `None` 이었고, 호출부는 위치가 없으면 체크포인트를
+            // 쓰지 않았다 — 그래서 **재개 후 빈 페이지로 끝나면 저장된 낡은 토큰이
+            // 지워지지 않고** 다음 라운드가 그걸로 또 재개한다(교차 리뷰 5회차).
+            //
+            // 토큰이 있으면 위치를 올리지 않는다: 다음 라운드가 같은 `start_time` 과
+            // 토큰으로 정확히 이어받는다. 다 읽었으면 마지막 이벤트 다음으로 올리고,
+            // 이벤트가 없었으면 그 자리에 둔다(그리고 토큰이 지워진다).
+            next_since_ms: Some(match (token.is_some(), last_ts) {
+                (true, _) => since_ms,
+                (false, Some(t)) => t + 1,
+                (false, None) => since_ms,
+            }),
             has_more: hit_cap,
             // 상한에 걸려 남은 토큰. 다 읽었으면 `None` 이고 위치가 전진한다.
             next_token: token,
@@ -504,6 +511,31 @@ mod tests {
             (),
         );
         assert!(!is_bad_token(&not_found));
+    }
+
+    /// **빈 페이지로 끝나도 커서를 갱신한다.**
+    ///
+    /// 재개 후 이벤트가 없는 마지막 페이지를 받으면 전에는 `next_since_ms = None` 이었고,
+    /// 호출부는 위치가 없으면 체크포인트를 쓰지 않았다 — 저장된 **낡은 토큰이 영구히
+    /// 남아** 매 라운드 그걸로 재개한다(교차 리뷰 5회차). CloudWatch 는 빈 페이지를
+    /// 정상적으로 돌려준다.
+    #[test]
+    fn an_empty_final_page_still_produces_a_cursor() {
+        // 계약: 다 읽었고 이벤트가 없으면 위치는 그대로, 토큰은 없다.
+        let chunk = LogChunk {
+            text: String::new(),
+            next_since_ms: Some(1_000),
+            has_more: false,
+            next_token: None,
+        };
+        assert!(
+            chunk.next_since_ms.is_some(),
+            "위치가 없으면 호출부가 체크포인트를 쓰지 않아 낡은 토큰이 남는다"
+        );
+        assert!(
+            chunk.next_token.is_none(),
+            "다 읽었으면 토큰이 지워져야 한다"
+        );
     }
 
     /// **커서가 없으면 전진과 무손실을 동시에 만족할 수 없다.**
