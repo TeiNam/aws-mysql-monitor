@@ -181,7 +181,28 @@ resource "aws_cognito_user_pool_client" "spa" {
     refresh_token = "hours"
   }
 
-  # 리프레시 토큰 재사용 감지. 훔친 토큰이 한 번 쓰이면 그 계보 전체가 무효화된다.
+  # **리프레시 토큰 회전 + 재사용 감지.**
+  #
+  # # `enable_token_revocation` 은 이게 아니다 (교차 리뷰 6차)
+  #
+  # 한때 주석이 "리프레시 토큰 재사용 감지. 훔친 토큰이 한 번 쓰이면 그 계보 전체가
+  # 무효화된다" 고 적고 `enable_token_revocation = true` 만 켰다. **그 둘은 다른
+  # 기능이다**: `enable_token_revocation` 은 `RevokeToken` API 로 **명시적으로** 폐기할
+  # 수 있게 하는 것이고, 회전·재사용 감지가 아니다.
+  #
+  # 회전을 켜면 갱신마다 새 리프레시 토큰이 나오고 이전 것이 무효가 된다. 탈취된
+  # 토큰을 정상 사용자가 한 번 갱신하면 공격자의 토큰이 죽는다 — 주석이 약속한
+  # 동작이 그것이다.
+  #
+  # `retry_grace_period_seconds` 는 **네트워크 재시도를 위한 창**이다. 0 이면 응답을
+  # 못 받고 재시도한 정상 요청이 "재사용" 으로 판정돼 세션이 죽는다. 프론트가
+  # 만료 5분 전부터 갱신하므로 짧게 둘 수 있지만, 0 은 위험하다.
+  refresh_token_rotation {
+    feature                    = "ENABLED"
+    retry_grace_period_seconds = 60
+  }
+
+  # `RevokeToken` API 를 쓸 수 있게 한다 (로그아웃 시 명시적 폐기).
   enable_token_revocation       = true
   prevent_user_existence_errors = "ENABLED"
 

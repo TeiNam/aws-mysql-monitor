@@ -219,9 +219,29 @@ export class TokenExchangeError extends Error {
   }
 }
 
-/** HTTP 상태가 "리프레시 토큰이 확실히 무효" 를 뜻하는가. */
-export function isDefinitiveAuthFailure(status: number): boolean {
-  return status === 400 || status === 401;
+/**
+ * 이 응답이 **리프레시 토큰이 확실히 무효** 임을 뜻하는가.
+ *
+ * # 상태 코드만으로는 판정할 수 없다 (교차 리뷰 6차)
+ *
+ * Cognito 는 여러 OAuth 오류를 **400** 으로 돌려준다:
+ *
+ * | `error` | 뜻 | 세션 |
+ * |---|---|---|
+ * | `invalid_grant` | 리프레시 토큰이 무효·폐기됐다 | **버린다** |
+ * | `invalid_client` | 클라이언트 ID 가 틀렸다 (설정 오류) | 유지 — 설정을 고치면 된다 |
+ * | `invalid_request` | 요청 형식이 틀렸다 (우리 버그) | 유지 |
+ * | `unauthorized_client` | 그랜트가 허용되지 않았다 (설정 오류) | 유지 |
+ *
+ * 400 을 전부 무효로 보면 **클라이언트 ID 전환 실수 하나로 모든 사용자가 로그아웃된다.**
+ * 그래서 본문의 `error` 를 읽는다. 읽을 수 없으면(본문이 없거나 JSON 이 아니면)
+ * 보수적으로 **유지**한다 — 잘못 버리는 것이 잘못 남기는 것보다 나쁘다(남겨도 다음
+ * 요청이 401 을 받아 화면이 사유를 말한다).
+ */
+export function isDefinitiveAuthFailure(status: number, oauthError?: string): boolean {
+  if (status === 401) return true;
+  if (status !== 400) return false;
+  return oauthError === "invalid_grant";
 }
 
 /** Cognito 토큰 엔드포인트를 호출한다. */
@@ -248,10 +268,18 @@ async function postToken(
   }
 
   if (!res.ok) {
-    // **응답 본문을 그대로 노출하지 않는다.** 오류에 코드·리다이렉트가 실릴 수 있다.
+    // OAuth 오류 코드를 읽는다 — 400 안에서 갈라야 한다(위 함수 참조).
+    // **본문 전체를 노출하지 않는다.** 오류에 코드·리다이렉트가 실릴 수 있다.
+    let oauthError: string | undefined;
+    try {
+      const body = (await res.json()) as { error?: unknown };
+      if (typeof body.error === "string") oauthError = body.error;
+    } catch {
+      // 본문이 없거나 JSON 이 아니다. 보수적으로 유지한다.
+    }
     throw new TokenExchangeError(
-      `토큰 교환 실패 (HTTP ${res.status})`,
-      isDefinitiveAuthFailure(res.status),
+      `토큰 교환 실패 (HTTP ${res.status}${oauthError ? `, ${oauthError}` : ""})`,
+      isDefinitiveAuthFailure(res.status, oauthError),
     );
   }
   return (await res.json()) as TokenResponse;

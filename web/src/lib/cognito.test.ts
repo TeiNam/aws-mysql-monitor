@@ -221,10 +221,39 @@ describe("갱신 실패 처리", () => {
    * 리프레시 토큰까지 지워져 사용자가 로그아웃됐다.
    */
   it("확실한 인증 실패만 세션을 버린다", () => {
-    expect(isDefinitiveAuthFailure(400)).toBe(true);
+    // 401 은 코드 없이도 확실하다.
     expect(isDefinitiveAuthFailure(401)).toBe(true);
+    // **400 은 `error` 를 봐야 한다** (교차 리뷰 6차). Cognito 는 여러 OAuth
+    // 오류를 400 으로 돌려주고, 그중 설정 오류로 세션을 버리면 안 된다.
+    expect(isDefinitiveAuthFailure(400, "invalid_grant")).toBe(true);
+    for (const cfgError of [
+      "invalid_client",
+      "invalid_request",
+      "unauthorized_client",
+      "unsupported_grant_type",
+    ]) {
+      expect(isDefinitiveAuthFailure(400, cfgError)).toBe(false);
+    }
+    // 코드를 읽을 수 없으면 보수적으로 유지한다.
+    expect(isDefinitiveAuthFailure(400)).toBe(false);
     for (const transient of [403, 404, 429, 500, 502, 503, 504]) {
       expect(isDefinitiveAuthFailure(transient)).toBe(false);
+    }
+  });
+
+  it("400 + invalid_client 는 세션을 유지한다 — 설정 오류다", async () => {
+    sessionStorage.setItem("dbmon.token", "still-valid");
+    sessionStorage.setItem("dbmon.cognito.refresh", "refresh-token");
+    const original = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: "invalid_client" }), { status: 400 }),
+      )) as typeof fetch;
+    try {
+      expect(await refreshAccessToken(config)).toBeNull();
+      expect(sessionStorage.getItem("dbmon.cognito.refresh")).toBe("refresh-token");
+    } finally {
+      globalThis.fetch = original;
     }
   });
 
@@ -244,12 +273,14 @@ describe("갱신 실패 처리", () => {
     }
   });
 
-  it("400 은 세션을 버린다 — 리프레시 토큰이 무효다", async () => {
+  it("400 + invalid_grant 는 세션을 버린다 — 리프레시 토큰이 무효다", async () => {
     sessionStorage.setItem("dbmon.token", "stale");
     sessionStorage.setItem("dbmon.cognito.refresh", "revoked-token");
     const original = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response("{}", { status: 400 }))) as typeof fetch;
+      Promise.resolve(
+        new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }),
+      )) as typeof fetch;
     try {
       expect(await refreshAccessToken(config)).toBeNull();
       expect(sessionStorage.length).toBe(0);
