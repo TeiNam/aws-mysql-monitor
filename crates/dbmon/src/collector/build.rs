@@ -216,9 +216,19 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
 
     // 종료를 관측하지 못했으면 `ended_at_ms` 를 남기지 않는다 — 추측한 시각을
     // 사실처럼 저장하면 리포트가 틀린다.
+    //
+    // # 종료 시각은 **마지막으로 본 시각**이다 (사라진 것을 알아챈 시각이 아니다)
+    //
+    // 우리가 아는 것은 "그때는 있었고 지금은 없다" 뿐이고, 실제 종료는 그 사이에 있다.
+    // 알아챈 시각을 쓰면 **tick 간격만큼 부풀린다** — `detect_interval_ms` 를 60초로 두면
+    // 2.1초 쿼리가 62초로 저장되고, `merge_duration` 이 구간(`Span`)을 가장 정확한 것으로
+    // 보므로 타이머 증거(2.1초)를 덮는다(교차 리뷰 28라운드).
+    //
+    // 마지막 관측 시각은 **하한**이다 — 최대 tick 한 번만큼 짧게 잡는다. 없는 시간을
+    // 만들어 내는 것보다 관측한 만큼만 적는 편이 이 프로젝트의 규칙에 맞다.
     let ended_at_ms = finalize_reason
         .filter(|r| r.observed_end())
-        .map(|_| offset.to_db_time(now_ms));
+        .map(|_| offset.to_db_time(tracked.last_seen_at_ms));
 
     let stats = stmt.map(exec_stats).unwrap_or_default();
 
@@ -688,6 +698,42 @@ mod tests {
         // 값으로 떨어졌다(확정 경로가 그 상태였다, 교차 리뷰 27라운드).
         assert_eq!(out.query.duration_ms, 4_213);
         assert_eq!(out.query.duration_source, DurationSource::Timer);
+    }
+
+    /// **종료 시각은 마지막으로 본 시각이다.**
+    ///
+    /// 사라진 것을 알아챈 시각을 쓰면 tick 간격만큼 부풀린다. `detect_interval_ms` 를
+    /// 60초로 두면 2.1초 쿼리가 62초로 저장되고, `merge_duration` 이 구간을 가장 정확한
+    /// 것으로 보므로 타이머 증거를 덮는다(교차 리뷰 28라운드).
+    #[test]
+    fn the_end_time_is_the_last_observation_not_the_discovery() {
+        let (i, mut t, o) = (instance(), tracked(), ClockOffset::restored(0));
+        t.last_seen_at_ms = 1_004_000;
+        // 사라진 것을 60초 뒤에 알아챘다.
+        let discovered_ms = t.last_seen_at_ms + 60_000;
+        let out = build(CaptureInput {
+            instance: &i,
+            tracked: &t,
+            full_sql: Some(RAW),
+            stmt: None,
+            plan_json: None,
+            plan_source: PlanSource::None,
+            plan_error: None,
+            plan_tree: None,
+            policy: LiteralPolicy::Full,
+            policy_at_ms: 1_000_000,
+            state: SlowQueryState::Finalized,
+            finalize_reason: Some(FinalizeReason::Disappeared),
+            now_ms: discovered_ms,
+            offset: &o,
+            owner_worker: "w1",
+            owner_epoch: Some(1),
+        });
+        assert_eq!(
+            out.query.ended_at_ms,
+            Some(1_004_000),
+            "알아챈 시각을 종료로 적었다 — tick 간격만큼 부풀린다"
+        );
     }
 
     #[test]

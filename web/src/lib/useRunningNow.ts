@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { serverNow } from "./elapsed";
 
@@ -8,15 +8,22 @@ import { serverNow } from "./elapsed";
  * # 왜 훅으로 두는가
  *
  * 진행 중 소요를 보여주는 화면이 둘(모니터·계획)이고, 배관을 각자 두면 한쪽만 고쳐진다 —
- * 실제로 계획 화면이 24라운드 수정에서 빠져 10분째 도는 쿼리를 `2.0s` 로 표시하고 있었다
+ * 실제로 계획 화면이 한 라운드 동안 빠져 10분째 도는 쿼리를 `2.0s` 로 표시했다
  * (교차 리뷰 26라운드).
  *
- * # 두 가지를 지킨다
+ * # 기준점을 어떻게 잡는가
  *
- * - **기준점은 서버 시각**이다. 브라우저 시계로 DB 시계 값을 빼면 시계가 어긋난 환경에서
- *   경과가 완전히 틀린다([`serverNow`]·[`displayDurationMs`](./elapsed.ts)).
- * - **단조 시계로 흐른다.** `performance.now()` 는 NTP 보정에 뒤로 가지 않는다.
- *   `Date.now()` 나 react-query 의 `dataUpdatedAt`(벽시계)을 쓰면 경과가 줄어들 수 있다.
+ * ```text
+ * 기준 = server_now_ms + (기준을 잡는 순간의 벽시계 − 응답을 받은 벽시계)
+ * 지금 = 기준 + (단조 시계가 그 뒤로 흐른 시간)
+ * ```
+ *
+ * 두 항이 각각 다른 문제를 막는다:
+ *
+ * | 항 | 없으면 |
+ * |---|---|
+ * | 응답 나이(`Date.now() − dataUpdatedAt`) | **캐시된 응답**을 지금 것으로 취급해 10분 전 데이터가 경과를 10분 적게 보고한다(28라운드) |
+ * | 단조 시계(`performance.now()`) | NTP 보정에 경과가 **줄어든다**(27라운드) |
  *
  * `hasRunning` 이 거짓이면 타이머를 돌리지 않는다 — 정적인 표에서 매초 리렌더할 이유가 없다.
  */
@@ -32,21 +39,26 @@ export function useRunningNow(
     return () => window.clearInterval(id);
   }, [hasRunning]);
 
-  // **기준점을 렌더 중에 잡는다.**
+  // **기준점을 렌더 중에 다시 계산한다.**
   //
-  // effect 에서 잡으면 첫 페인트가 기준점 없이 그려져 벽시계로 떨어진다 — 브라우저 시계가
-  // 5분 빠른 기계에서 2초 쿼리가 **처음 1초 동안 302초로** 보인다(교차 리뷰 27라운드).
-  // ref 쓰기를 렌더 중에 하는 것은 보통 피하지만, 여기서는 같은 입력에 같은 결과이고
-  // (멱등) 외부에 영향을 주지 않으므로 안전하다.
-  const anchor = useRef<{
+  // effect 로 미루면 첫 페인트가 기준점 없이 그려져 벽시계로 떨어진다 — 브라우저 시계가
+  // 5분 빠른 기계에서 2초 쿼리가 처음 1초 동안 302초로 보인다(27라운드). 상태를 렌더
+  // 중에 조정하는 것은 React 가 문서화한 패턴이다(입력이 바뀔 때 즉시 재렌더한다).
+  const [anchor, setAnchor] = useState<{
     stamp: number;
     serverNowMs: number;
     monotonicAtMs: number;
   } | null>(null);
-  if (serverNowMs != null && anchor.current?.stamp !== dataUpdatedAt) {
-    anchor.current = { stamp: dataUpdatedAt, serverNowMs, monotonicAtMs: performance.now() };
+  if (serverNowMs != null && anchor?.stamp !== dataUpdatedAt) {
+    setAnchor({
+      stamp: dataUpdatedAt,
+      // **응답이 얼마나 낡았는지를 여기서 흡수한다.** 캐시에서 온 응답이면 그 나이만큼
+      // 서버 시각을 앞당겨야 한다.
+      serverNowMs: serverNowMs + Math.max(0, Date.now() - dataUpdatedAt),
+      monotonicAtMs: performance.now(),
+    });
   }
 
   // 기준점이 없으면(옛 API 응답) 벽시계로 떨어진다 — 그래도 표는 그려야 한다.
-  return serverNow(anchor.current ?? {}, tickMs, Date.now());
+  return serverNow(anchor ?? {}, tickMs, Date.now());
 }
