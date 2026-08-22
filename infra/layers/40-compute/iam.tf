@@ -187,19 +187,32 @@ resource "aws_iam_role_policy" "task_discovery" {
         }
       },
       {
-        # **`GetMetricData` 는 리소스 수준 권한을 지원하지 않는다** — `rds:Describe*` 와
-        # 같은 사정이다. 대신 네임스페이스 조건으로 좁힌다: 이 롤은 `AWS/RDS` 메트릭만
-        # 읽는다. 조건이 없으면 계정의 모든 메트릭(비용·보안 지표 포함)이 읽힌다.
+        # **`GetMetricData` 는 리소스 수준 권한도, 네임스페이스 조건도 쓸 수 없다.**
         #
-        # `ListMetrics` 는 주지 않는다 — 카탈로그는 코드가 갖고 있다
-        # (`dbmon_core::cw_metrics`). 목록을 조회할 이유가 없다.
+        # 전에는 `StringEquals { "cloudwatch:namespace" = "AWS/RDS" }` 조건이 붙어 있었다.
+        # 그 조건 키는 **이 액션의 요청에 실려 오지 않는다**(`PutMetricData` 와 다르다).
+        # 그래서 문이 절대 매치되지 않고 결과는 `implicitDeny` 였다 — 좁히려고 쓴 조건이
+        # 기능을 끄고 있었다.
+        #
+        # 실제 배포에서 드러났다: 화면이 "CloudWatch 값을 가져오지 못했다 — 태스크 롤에
+        # cloudwatch:GetMetricData" 를 표시했고, `aws iam simulate-principal-policy` 로
+        # 확인했다(조건 컨텍스트를 손으로 주면 `allowed`, 안 주면 `implicitDeny`).
+        # 로컬 개발에서는 관리자 자격증명으로 돌아 보이지 않는 부류다.
+        #
+        # **노출 범위를 정직하게 적는다.** 이 롤은 계정의 **모든** CloudWatch 지표를 읽을
+        # 수 있다. IAM 정책으로는 좁힐 수 없으므로, 좁혀야 하면 **권한 경계나 SCP** 를
+        # 쓴다 — 이 레이어 밖의 결정이다. 코드가 조회하는 목록은
+        # `dbmon_core::cw_metrics` 의 카탈로그가 전부이고 `AWS/RDS` 만 있다.
+        #
+        # 대안은 `GetMetricStatistics`(네임스페이스 조건이 실제로 걸린다)인데 배치 조회를
+        # 잃어 지표당 1호출이 된다 — 500대 × 지표 수만큼 호출이 늘어난다.
+        #
+        # `ListMetrics` 는 여전히 주지 않는다 — 카탈로그가 코드에 있으므로 목록을 조회할
+        # 이유가 없다.
         Sid      = "MetricsRead"
         Effect   = "Allow"
         Action   = ["cloudwatch:GetMetricData"]
         Resource = "*"
-        Condition = {
-          StringEquals = { "cloudwatch:namespace" = "AWS/RDS" }
-        }
       },
       {
         Sid    = "SlowLogRead"
