@@ -206,7 +206,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
         let mut hit_cap = false;
 
         for page in 0..MAX_PAGES {
-            let out = self
+            let sent = self
                 .client
                 .filter_log_events()
                 .log_group_name(&group)
@@ -214,36 +214,69 @@ impl SlowLogFetcher for CloudWatchFetcher {
                 .limit(self.max_events)
                 .set_next_token(token.clone())
                 .send()
-                .await
-                .map_err(|e| {
-                    use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata as _;
-                    // **로그 그룹이 없는 것은 장애가 아니다.**
+                .await;
+
+            // **낡은 토큰이 인스턴스를 막지 않게 한다.**
+            //
+            // CloudWatch 페이지 토큰은 만료된다(그리고 로그 그룹이 재생성되면 무효다).
+            // 저장한 토큰이 거부되면 그 오류를 그대로 올리는데, 그러면 체크포인트에
+            // 토큰이 남아 **매 라운드 같은 오류가 나고 그 인스턴스는 영구히 백필되지
+            // 않는다** — 토큰을 도입한 수정이 만들 수 있는 반대 방향 실패다.
+            //
+            // 그래서 토큰이 문제일 때는 **한 번 버리고 위치부터 다시 읽는다.** 이미 읽은
+            // 구간을 다시 읽을 수 있지만 병합이 멱등이므로 안전하고, 막히는 것보다 낫다.
+            let sent = match (sent, token.is_some()) {
+                (Err(e), true) if is_bad_token(&e) => {
+                    tracing::warn!(
+                        instance = %instance.as_str(),
+                        since_ms,
+                        "저장된 페이지 토큰이 거부됐다 — 버리고 위치부터 다시 읽는다"
+                    );
+                    // `token` 을 여기서 비우지 않는다 — 루프 끝에서 **응답의 토큰으로
+                    // 덮인다.** 재시도가 새 토큰을 주면 그게 저장되고, 안 주면 `None` 이
+                    // 되어 위치가 전진한다. 둘 다 옳다.
                     //
-                    // 슬로우로그가 한 번도 쓰이지 않았거나(RDS 는 첫 기록 때 그룹을
-                    // 만든다) 로그 내보내기가 꺼져 있으면 `ResourceNotFoundException` 이
-                    // 온다. 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가
-                    // 쌓이고** 재시도 대상으로 분류된다 — 없는 그룹을 계속 두드린다.
-                    if e.code() == Some("ResourceNotFoundException") {
-                        return dbmon_core::error::DomainError::Unsupported {
-                            what: "slowlog_group".into(),
-                            // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게
-                            // 유일한 단서다.
-                            reason: format!(
-                                "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 \
+                    // 같은 페이지 번호로 다시 시도한다(상한 안이다).
+                    self.client
+                        .filter_log_events()
+                        .log_group_name(&group)
+                        .start_time(since_ms)
+                        .limit(self.max_events)
+                        .send()
+                        .await
+                }
+                (other, _) => other,
+            };
+
+            let out = sent.map_err(|e| {
+                use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata as _;
+                // **로그 그룹이 없는 것은 장애가 아니다.**
+                //
+                // 슬로우로그가 한 번도 쓰이지 않았거나(RDS 는 첫 기록 때 그룹을
+                // 만든다) 로그 내보내기가 꺼져 있으면 `ResourceNotFoundException` 이
+                // 온다. 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가
+                // 쌓이고** 재시도 대상으로 분류된다 — 없는 그룹을 계속 두드린다.
+                if e.code() == Some("ResourceNotFoundException") {
+                    return dbmon_core::error::DomainError::Unsupported {
+                        what: "slowlog_group".into(),
+                        // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게
+                        // 유일한 단서다.
+                        reason: format!(
+                            "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 \
                                  않았거나 로그 내보내기가 꺼져 있다"
-                            ),
-                        };
-                    }
-                    dbmon_core::error::DomainError::Unavailable {
-                        dependency: "cloudwatchlogs",
-                        // 서비스 메시지를 살린다(스크럽 통과). `Debug` 만 넘기면 정작
-                        // 필요한 문장이 `Some('?')` 가 된다 — Bedrock 에서 같은 것을 겪었다.
-                        reason: e
-                            .message()
-                            .map(crate::telemetry::scrub)
-                            .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}"))),
-                    }
-                })?;
+                        ),
+                    };
+                }
+                dbmon_core::error::DomainError::Unavailable {
+                    dependency: "cloudwatchlogs",
+                    // 서비스 메시지를 살린다(스크럽 통과). `Debug` 만 넘기면 정작
+                    // 필요한 문장이 `Some('?')` 가 된다 — Bedrock 에서 같은 것을 겪었다.
+                    reason: e
+                        .message()
+                        .map(crate::telemetry::scrub)
+                        .unwrap_or_else(|| crate::telemetry::scrub(&format!("{e:?}"))),
+                }
+            })?;
 
             // **이벤트 메시지를 줄바꿈으로 잇는다.**
             //
@@ -303,6 +336,34 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // 상한에 걸려 남은 토큰. 다 읽었으면 `None` 이고 위치가 전진한다.
             next_token: token,
         })
+    }
+}
+
+/// 페이지 토큰이 거부된 오류인가.
+///
+/// **문자열 코드가 아니라 타입 변형을 본다.** `ProvideErrorMetadata::code()` 는 응답에서
+/// 채워지므로 손으로 만든 오류에는 없고, 그러면 이 판정을 테스트할 수 없다.
+/// `FilterLogEventsError` 는 변형이 타입으로 있으니 그걸 쓴다.
+///
+/// 메시지에 토큰이 언급될 때만 참이다 — 다른 파라미터 오류(잘못된 `start_time` 등)를
+/// 토큰 탓으로 돌리면 토큰만 버리고 같은 오류가 반복되어 **진짜 원인을 가린다.**
+fn is_bad_token<R>(
+    err: &aws_sdk_cloudwatchlogs::error::SdkError<
+        aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsError,
+        R,
+    >,
+) -> bool {
+    use aws_sdk_cloudwatchlogs::error::SdkError;
+    use aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsError as E;
+
+    let SdkError::ServiceError(svc) = err else {
+        return false;
+    };
+    match svc.err() {
+        E::InvalidParameterException(e) => e
+            .message()
+            .is_some_and(|m| m.to_ascii_lowercase().contains("token")),
+        _ => false,
     }
 }
 
@@ -400,6 +461,49 @@ mod tests {
             slowquery_log_group(&instance()).expect("이름"),
             "/aws/rds/instance/orders-01/slowquery"
         );
+    }
+
+    /// **낡은 토큰이 인스턴스를 영구히 막지 않는다.**
+    ///
+    /// CloudWatch 페이지 토큰은 만료된다. 저장한 토큰이 거부될 때 그 오류를 그대로
+    /// 올리면 체크포인트에 토큰이 남아 **매 라운드 같은 오류**가 나고 그 인스턴스는
+    /// 다시는 백필되지 않는다 — 토큰을 도입한 수정이 만들 수 있는 반대 방향 실패다.
+    ///
+    /// 판정을 순수 함수로 뽑아 AWS 없이 검증한다. 다른 파라미터 오류를 토큰 탓으로
+    /// 돌리면 진짜 원인을 가리므로, 메시지에 토큰이 언급될 때만 참이다.
+    #[test]
+    fn only_token_errors_trigger_the_token_reset() {
+        use aws_sdk_cloudwatchlogs::error::SdkError;
+        use aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsError;
+        use aws_sdk_cloudwatchlogs::types::error::InvalidParameterException;
+
+        let invalid = |msg: &str| {
+            SdkError::<FilterLogEventsError, ()>::service_error(
+                FilterLogEventsError::InvalidParameterException(
+                    InvalidParameterException::builder().message(msg).build(),
+                ),
+                (),
+            )
+        };
+
+        // 토큰이 언급되면 참.
+        assert!(is_bad_token(&invalid(
+            "The specified nextToken is invalid."
+        )));
+        assert!(is_bad_token(&invalid("Invalid Token")));
+        // 다른 파라미터 문제는 거짓 — 토큰을 버려도 낫지 않고 원인을 가린다.
+        assert!(!is_bad_token(&invalid("startTime must be before endTime")));
+        assert!(!is_bad_token(&invalid("limit must be between 1 and 10000")));
+        // 그룹이 없는 것은 별 경로다(`check_scope` 위의 `Unsupported`).
+        let not_found = SdkError::<FilterLogEventsError, ()>::service_error(
+            FilterLogEventsError::ResourceNotFoundException(
+                aws_sdk_cloudwatchlogs::types::error::ResourceNotFoundException::builder()
+                    .message("group not found")
+                    .build(),
+            ),
+            (),
+        );
+        assert!(!is_bad_token(&not_found));
     }
 
     /// **커서가 없으면 전진과 무손실을 동시에 만족할 수 없다.**
