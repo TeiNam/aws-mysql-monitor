@@ -134,6 +134,26 @@ resource "aws_vpc_security_group_egress_rule" "vpn_dns_tcp" {
   ip_protocol       = "tcp"
 }
 
+# **VPN → ECS 태스크(화면).**
+#
+# `40-compute` 를 `enable_alb = false` 로 올리면 인바운드 경로가 없어서 배포한 화면을 볼
+# 방법이 없다. 태스크는 VPC 사설 IP 를 가지므로 VPN 에서 컨테이너 포트로 나갈 수 있으면
+# `http://<태스크 사설 IP>:8080` 으로 바로 붙는다.
+#
+# ⚠ 이 이그레스가 없으면 **태스크 쪽 인바운드를 열어도 안 된다.** Client VPN 은 클라이언트
+# 트래픽을 VPN ENI 로 NAT 하므로 출처가 이 SG 이고, 이 SG 의 이그레스가 DB·DNS 로만
+# 열려 있었다 — 실측으로 그 조합에 걸렸다(태스크 SG 를 열었는데도 연결이 안 됐다).
+resource "aws_vpc_security_group_egress_rule" "vpn_to_tasks" {
+  count = var.task_security_group_id == "" ? 0 : 1
+
+  security_group_id            = aws_security_group.vpn.id
+  description                  = "to dbmon tasks (web UI)"
+  referenced_security_group_id = var.task_security_group_id
+  from_port                    = var.task_container_port
+  to_port                      = var.task_container_port
+  ip_protocol                  = "tcp"
+}
+
 resource "aws_vpc_security_group_ingress_rule" "db_from_vpn" {
   security_group_id            = aws_security_group.db.id
   description                  = "MySQL from Client VPN"
@@ -201,6 +221,22 @@ resource "aws_ec2_client_vpn_authorization_rule" "db_subnets" {
   target_network_cidr    = each.value
   authorize_all_groups   = true
   description            = "seed DB subnets"
+}
+
+# **ECS 태스크 서브넷 인가.**
+#
+# 인가 규칙은 목적지 CIDR 로 판정한다 — DB 서브넷만 인가하면 같은 VPC 라도 태스크
+# 서브넷으로는 못 간다(실측: 3306 은 되는데 태스크 8080 이 막혔고, 태스크·VPN 양쪽
+# 보안 그룹을 다 열어도 그대로였다). 화면을 VPN 으로 보려면 이 인가가 필요하다.
+#
+# 비워 두면 규칙이 생기지 않는다 — `40-compute` 를 올리지 않은 환경에서는 그게 맞다.
+resource "aws_ec2_client_vpn_authorization_rule" "task_subnets" {
+  for_each = var.vpn_enabled ? toset(var.task_subnet_cidrs) : toset([])
+
+  client_vpn_endpoint_id = aws_ec2_client_vpn_endpoint.seed.id
+  target_network_cidr    = each.value
+  authorize_all_groups   = true
+  description            = "dbmon ECS task subnets (web UI)"
 }
 
 # DNS 리졸버 인가 — 이게 없으면 인가 규칙이 DNS 질의를 막아 호스트네임 해석이 죽는다.

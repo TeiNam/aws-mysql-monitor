@@ -141,6 +141,39 @@ terraform plan -var environment=dev -var vpc_id=vpc-... \
 
 `terraform workspace` 는 쓰지 않는다 — 이유는 각 레이어의 `backend.tf` 주석에 있다.
 
+## 실제 배포에서 걸린 것 (2026-08-22, dev 계정)
+
+문서만 따라가면 **화면이 안 열리고 수집도 안 된다.** 네 자리에서 막혔고 네 개 다
+"레이어를 따로 올릴 수 있다" 의 이면이었다 — 뒤에 올린 레이어를 앞 레이어가 모른다.
+
+| # | 증상 | 원인 | 필요한 것 |
+|---|---|---|---|
+| 0 | `terraform init` 이 `NoSuchBucket` | `backends/dev.hcl` 의 버킷이 **공개 스크럽으로 예시 계정**이다 | `-backend-config="bucket=dbmon-tfstate-<실계정>"` 으로 덮는다 |
+| 1 | 수집이 `연결 획득 타임아웃` | 시드 DB SG 가 베스천·VPN SG 만 허용한다. ECS 태스크 SG 는 그 뒤에 생겼다 | `60-seed` 에 `-var task_security_group_id=<40-compute 의 SG>` |
+| 2 | 화면 접속 경로가 없다 | `enable_alb=false`(dev 기본) 면 인바운드 규칙이 0개다 | `40-compute` 에 `admin_ingress_security_group_ids` 또는 `admin_ingress_cidrs` |
+| 3 | 태스크 SG 를 열었는데도 안 붙는다 | **Client VPN SG 의 이그레스가 DB·DNS 로만** 열려 있다 | `60-seed` 가 `task_security_group_id` 를 받으면 `vpn_to_tasks` 이그레스를 만든다 |
+| 4 | 그래도 안 붙는다 | **Client VPN 인가 규칙은 목적지 CIDR 로 판정**한다. DB 서브넷만 인가돼 있었다 | `60-seed` 에 `-var 'task_subnet_cidrs=["10.x.x.0/20", …]'` |
+
+3·4 는 보안 그룹만 봐서는 진단할 수 없다 — `describe-client-vpn-authorization-rules` 를
+함께 봐야 한다. 순서는 이렇게 된다:
+
+```bash
+# 40-compute 를 올린 뒤 그 SG·서브넷으로 60-seed 를 다시 apply 한다 (규칙만 대상 지정)
+cd infra/layers/60-seed
+terraform apply -refresh=false   -target=aws_vpc_security_group_ingress_rule.db_from_tasks   -target=aws_vpc_security_group_egress_rule.vpn_to_tasks   -target=aws_ec2_client_vpn_authorization_rule.task_subnets   -var task_security_group_id=sg-… -var 'task_subnet_cidrs=["10.1.48.0/20","10.1.64.0/20"]'   <나머지 필수 변수>
+```
+
+⚠ `60-seed` 전체 plan 은 시드 리소스가 많아 **10분을 넘긴다.** 규칙만 고칠 때는
+`-target` + `-refresh=false` 를 쓴다.
+
+### NAT 이 없는 VPC 라면
+
+이 계정의 `dev-vpc-01` 에는 NAT 도, ECR·logs 인터페이스 엔드포인트도 없다. 그래서 태스크는
+**퍼블릭 서브넷 + 퍼블릭 IP**(변수 기본값)로만 이미지를 받고 로그를 보낼 수 있다. 그 상태에서
+DynamoDB 게이트웨이 엔드포인트는 **쓰이지도 않으면서** 공유 라우트 테이블을 바꾸므로
+`-var create_dynamodb_gateway_endpoint=false` 로 끈다(그러면 `10-foundation` 은 네트워킹
+리소스를 하나도 만들지 않는다 — 9개 생성).
+
 ## destroy 로는 되돌아가지 않는다
 
 "레이어 destroy 로 되돌린다"는 서술은 사실이 아니다. 다음이 **의도적으로** 막는다:

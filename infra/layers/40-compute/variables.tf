@@ -114,9 +114,61 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "active 1 + standby 1 이 기본 (ADR-018). dev 는 1로 줄여도 된다."
+  description = <<-EOT
+    태스크 수. **기본값은 1이다.**
+
+    수집은 리스로 **한 태스크만** 한다(ADR-018: "1단계는 단일 워커로 시작"). 두 번째
+    태스크가 하는 일은 조회 API 서빙과 웜 스탠바이뿐이고, 한 워커가 인스턴스 500대를
+    보도록 설계했으므로(01 의 NFR) dev 에서 API 용량이 부족할 이유가 없다.
+
+    기본값이 2였는데 그건 위 ADR 과 어긋났다 — 실측으로 드러났다(ECS 태스크 2개 중
+    하나만 리더가 되고 나머지는 기동 로그만 남기고 조용했다).
+
+    | 값 | 대가 |
+    |---|---|
+    | 1 | Spot 회수·AZ 장애 시 ECS 가 교체하는 1~2분 동안 **수집 공백** |
+    | 2 | 그 공백이 리스 인수 시간(≤60초)으로 줄고, 비용은 두 배 |
+
+    prd 는 2 이상을 쓴다. 안 쓰는 기간에는 0 으로 두면 컴퓨트 비용이 0 이다.
+  EOT
   type        = number
-  default     = 2
+  default     = 1
+}
+
+variable "admin_ingress_security_group_ids" {
+  description = <<-EOT
+    컨테이너 포트로 **인바운드를 허용할 보안 그룹**(예: Client VPN 의 SG).
+
+    `enable_alb = false` 인 dev 에서 화면을 보는 경로다 — 태스크는 VPC 사설 IP 를 가지므로
+    VPN 으로 들어오면 `http://<사설 IP>:8080` 으로 바로 붙는다. ALB·ACM·공개 DNS 가 필요
+    없다.
+
+    ⚠ 이 목록이 비어 있지 않으면 **인증이 유일한 방어선**이다. ECS 에서는 dev 토큰 발급이
+    꺼지므로(`api::auth`) `auth_token_secret_arn` 을 함께 넣어야 한다. 안 넣으면 모든
+    요청이 401 이라 규칙만 켠 의미가 없다.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "admin_ingress_cidrs" {
+  description = <<-EOT
+    컨테이너 포트로 인바운드를 허용할 **CIDR** 목록.
+
+    `admin_ingress_security_group_ids` 와 같은 목적인데 출처가 SG 가 아닌 경우다 — 사내
+    VPN·TGW·피어링으로 들어오면 트래픽에 우리 VPC 의 SG 가 붙지 않고 클라이언트 CIDR 로
+    도착한다(실측: dbmon Client VPN 이 아니라 다른 VPN 으로 들어오는 환경이 그랬다).
+
+    ⚠ 인터넷 대역(`0.0.0.0/0`)을 넣지 않는다. 태스크는 퍼블릭 서브넷에 있고 퍼블릭 IP 를
+    가지므로 그 순간 공개된다 — 그때는 ALB + WAF 를 쓰는 것이 맞다.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = !contains(var.admin_ingress_cidrs, "0.0.0.0/0")
+    error_message = "0.0.0.0/0 은 허용하지 않는다 — 퍼블릭 IP 태스크가 인터넷에 열린다."
+  }
 }
 
 variable "container_port" {

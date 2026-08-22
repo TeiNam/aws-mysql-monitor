@@ -205,6 +205,23 @@ variable "task_security_group_id" {
   default     = ""
 }
 
+variable "task_subnet_cidrs" {
+  description = <<-EOT
+    `40-compute` 태스크가 사는 서브넷의 CIDR 목록. **VPN 인가 규칙**에 쓴다.
+
+    Client VPN 인가는 목적지 CIDR 로 판정하므로 DB 서브넷만 인가하면 같은 VPC 안이라도
+    태스크로 못 간다 — 보안 그룹을 다 열어도 막힌다(실측).
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "task_container_port" {
+  description = "`40-compute` 의 컨테이너 포트. VPN 에서 화면을 여는 이그레스에 쓴다."
+  type        = number
+  default     = 8080
+}
+
 variable "backup_retention_days" {
   description = <<-EOT
     0 이면 PITR 이 꺼지고 **RDS 리드 리플리카 생성도 불가**하다(원본에 백업 필수).
