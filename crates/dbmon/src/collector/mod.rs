@@ -49,8 +49,11 @@ pub struct TickStats {
     /// `LIMIT` 에 걸려 잘렸다 → `detect_overflow`.
     pub detect_truncated: bool,
     pub deep_probed: usize,
-    /// 심층 조회 상한에 걸려 지표만 받은 후보 수.
+    /// 심층 조회 **상한**에 걸려 플랜을 못 본 후보 수.
     pub deep_probe_skipped: usize,
+    /// **시간 예산**을 넘겨 플랜을 못 본 수. 상한 초과와 섞지 않는다 — 원인이 다르면
+    /// 처방도 다르다(상한은 설정, 예산은 대상 DB 의 응답 지연이다).
+    pub plan_budget_exceeded: usize,
     /// **심층 조회 자체가 실패했다** (권한·타임아웃). 0 이 아니면 이 tick 의 레코드에는
     /// SQL·지표가 없다 — "SQL 을 못 읽는 느린 쿼리" 와 "권한이 빠진 상태" 는 다르다.
     pub deep_probe_failed: usize,
@@ -91,6 +94,17 @@ pub struct TickStats {
 /// 배치 조회는 목록이 커도 왕복 수가 같으므로 이 상한은 DynamoDB 쓰기 예산이다.
 /// `deep_probe_limit`(플랜 예산)와 나눠 두는 이유는 `detect_tick` 의 표에 있다.
 const ACQUIRE_LIMIT: usize = 200;
+
+/// 그중 **자리 없는 항목에 반드시 남겨 두는 몫.**
+///
+/// 플랜 대상에게 쓰기 자리를 보장했더니(28라운드) 반대 방향이 열렸다: 플랜 대상 200개가
+/// 자리를 다 예약하는데 `EXPLAIN` 이 락을 기다려 tick 당 한두 개만 실제로 시도된다 —
+/// 나머지 자리는 **예약만 되고 쓰이지 않고**, 자리 없는 항목은 한 tick 에 하나도 얻지
+/// 못해 210초를 넘긴다(29라운드가 400행으로 재현했다).
+///
+/// 그래서 두 몫을 다 보장한다. 플랜은 나머지 안에서만 예약하고, 쓰지 않은 자리는 자리
+/// 없는 항목이 가져간다.
+const ACQUIRE_RESERVED_FOR_KEYLESS: usize = ACQUIRE_LIMIT / 2;
 
 /// tick 당 하트비트 쓰기 상한. 동시 슬로우 쿼리가 폭주해도 쓰기 예산을 묶는다.
 ///
@@ -332,7 +346,6 @@ where
             .collect();
         let picked = select_targets(&candidates, self.params.deep_probe_limit);
         stats.deep_probe_skipped = picked.plan_skipped;
-        stats.deep_probed = picked.plan.len();
         if picked.write_skipped > 0 {
             // **조용히 자르지 않는다.** 잘린 항목은 이번 tick 에 자리를 못 얻는다.
             tracing::warn!(
@@ -635,9 +648,12 @@ where
             // **예산을 넘기면 플랜을 건너뛴다.** 자리 획득은 계속한다.
             let plan_allowed = std::time::Instant::now() < plan_deadline;
             if plan_targets.contains(id) && !plan_allowed {
-                stats.deep_probe_skipped += 1;
+                stats.plan_budget_exceeded += 1;
             }
             let plan = if plan_targets.contains(id) && plan_allowed {
+                // **실제로 시도한 것만 센다.** 대상 수를 세면 예산에 걸려 시도하지 않은
+                // 것까지 "조회했다" 로 보고한다(29라운드에서 200 대 1 이었다).
+                stats.deep_probed += 1;
                 let plan = self.collect_plan(*id, f, s, stats).await;
                 // **시도만 기록한다.** "얻었다" 는 저장이 성공한 뒤에 센다 — 그러지 않으면
                 // 플랜을 들고 있는데 저장이 실패한 실행이 계획 없이 남는다(27라운드).
@@ -904,9 +920,13 @@ struct Candidate {
 /// 선정 결과.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Selection {
-    /// 플랜을 조회할 대상.
+    /// 플랜을 조회할 대상. **멤버십 판정용**이다.
     plan: std::collections::BTreeSet<u64>,
-    /// 레코드를 쓸 대상. **플랜 대상이 앞에 온다.**
+    /// 레코드를 쓸 대상. **플랜 대상이 소요 큰 순으로 앞에 온다.**
+    ///
+    /// 순서가 규칙이다 — 집합으로만 들고 순회하면 `BTreeSet` 이 스레드 id 순으로 바꿔
+    /// 우선순위가 사라진다. 시간 예산이 중간에 끊기므로 **앞자리가 실제로 조회되는
+    /// 자리**다(교차 리뷰 29라운드).
     write: Vec<u64>,
     /// 플랜 상한에 걸려 못 본 수.
     plan_skipped: usize,
@@ -938,7 +958,8 @@ fn select_targets(candidates: &[Candidate], plan_limit: usize) -> Selection {
     plan.sort_by_key(|c| (std::cmp::Reverse(c.duration_ms), c.id));
     // 플랜 상한은 쓰기 상한도 넘지 못한다 — 넘으면 뒤쪽 플랜 대상이 쓰기 목록에서 잘려
     // 지표만 부풀고 실제로는 조회되지 않는다.
-    let plan_cap = plan_limit.min(ACQUIRE_LIMIT);
+    // 플랜 예약은 **자리 없는 항목의 몫을 침범할 수 없다.**
+    let plan_cap = plan_limit.min(ACQUIRE_LIMIT - ACQUIRE_RESERVED_FOR_KEYLESS);
     let plan_skipped = plan.len().saturating_sub(plan_cap);
     plan.truncate(plan_cap);
     let plan_ids: std::collections::BTreeSet<u64> = plan.iter().map(|c| c.id).collect();
@@ -953,9 +974,10 @@ fn select_targets(candidates: &[Candidate], plan_limit: usize) -> Selection {
     keyless.truncate(room);
 
     Selection {
-        write: plan_ids
+        // **정렬된 순서 그대로** 이어 붙인다(집합이 아니라 벡터에서 가져온다).
+        write: plan
             .iter()
-            .copied()
+            .map(|c| c.id)
             .chain(keyless.iter().map(|c| c.id))
             .collect(),
         plan: plan_ids,
@@ -1024,9 +1046,53 @@ mod select_tests {
     fn the_plan_budget_never_exceeds_the_write_budget() {
         let cands: Vec<Candidate> = (1..=1_000).map(|id| c(id, 1_000, true, true)).collect();
         let picked = select_targets(&cands, 10_000);
-        assert_eq!(picked.plan.len(), ACQUIRE_LIMIT);
-        assert_eq!(picked.plan_skipped, 1_000 - ACQUIRE_LIMIT);
+        // 플랜은 **자리 없는 항목의 몫을 뺀 나머지**까지만 예약한다.
+        let cap = ACQUIRE_LIMIT - ACQUIRE_RESERVED_FOR_KEYLESS;
+        assert_eq!(picked.plan.len(), cap);
+        assert_eq!(picked.plan_skipped, 1_000 - cap);
+        // 자리를 아는 항목뿐이므로 쓰기 목록은 플랜 대상만이다.
+        assert_eq!(picked.write.len(), cap);
+    }
+
+    /// **플랜이 자리 없는 항목의 몫을 먹지 않는다.**
+    ///
+    /// `EXPLAIN` 이 락을 기다리면 tick 당 한두 개만 실제로 시도된다. 그런데 플랜 대상이
+    /// 쓰기 자리를 전부 예약해 두면 자리 없는 항목은 **한 tick 에 하나도** 얻지 못하고,
+    /// 인수인계로 물려받은 살아 있는 행이 210초를 넘긴다(교차 리뷰 29라운드).
+    #[test]
+    fn keyless_entries_keep_their_reserved_capacity() {
+        let mut cands: Vec<Candidate> = (1..=500).map(|id| c(id, 5_000, true, true)).collect();
+        for id in 1_000..1_400 {
+            cands.push(c(id, 9_000, false, false));
+        }
+        let picked = select_targets(&cands, 10_000);
+        let keyless_written = picked.write.iter().filter(|id| **id >= 1_000).count();
+        assert_eq!(
+            keyless_written, ACQUIRE_RESERVED_FOR_KEYLESS,
+            "플랜 예약이 자리 없는 항목의 몫을 먹었다 — 살아 있는 행이 버려진다"
+        );
         assert_eq!(picked.write.len(), ACQUIRE_LIMIT);
+    }
+
+    /// **순회 순서가 우선순위다.** 집합으로만 들고 돌면 스레드 id 순이 된다.
+    ///
+    /// 시간 예산이 중간에 끊기므로 앞자리가 실제로 조회되는 자리다 — 소요가 큰 쿼리가
+    /// 뒤로 밀리면 `EXPLAIN` 이 3초씩 걸리는 상황에서 영구히 계획을 못 얻는다
+    /// (교차 리뷰 29라운드).
+    #[test]
+    fn the_write_order_follows_duration_not_thread_id() {
+        // 스레드 id 는 오름차순, 소요는 그 반대로 둔다.
+        let cands = [
+            c(1, 1_000, true, true),
+            c(2, 9_000, true, true),
+            c(3, 5_000, true, true),
+        ];
+        let picked = select_targets(&cands, 10);
+        assert_eq!(
+            picked.write,
+            vec![2, 3, 1],
+            "소요 큰 순이 아니다 — 집합의 id 순으로 돌고 있다"
+        );
     }
 
     /// 자리를 아는데 플랜도 필요 없으면 아무것도 안 한다 — 하트비트가 맡는다.

@@ -352,10 +352,11 @@ impl<'a> ExecutionSpan<'a> {
     ///    실행이다. 시간 창만 보면 `long_query_time` 이 창보다 작을 때 **연속한 두
     ///    실행**이 합쳐져 하나가 사라진다.
     ///
-    /// ⚠ **겹침은 완벽한 증거가 아니다.** 종료를 관측하지 못한 레코드
-    /// (`Disappeared`)의 끝은 "사라진 것을 알아챈 폴링" 까지 늘어나므로, 같은 커넥션이
-    /// 곧바로 같은 쿼리를 다시 돌리면 최대 한 폴링 주기만큼 겹쳐 보일 수 있다. 조회
-    /// 경로는 그래서 시작 시각 차이까지 함께 본다([`Self::is_same_execution_within`]).
+    /// ⚠ **겹침은 완벽한 증거가 아니다.** 종료 시각은 **마지막으로 본 시각**이므로
+    /// (교차 리뷰 28라운드에 "알아챈 시각" 에서 바꿨다) 실제 종료보다 최대 한 폴링 주기
+    /// 짧다. 그래서 연속한 두 실행이 겹쳐 보이지는 않게 됐지만, 반대로 **한 실행이
+    /// 갈려 보일** 수 있다. 조회 경로는 그래서 시작 시각 차이까지 함께 본다
+    /// ([`Self::is_same_execution_within`]).
     pub fn is_same_execution(&self, other: &Self) -> bool {
         let placeholder = |d: &str| d.starts_with(UNKNOWN_DIGEST_PREFIX);
         let digest_ok =
