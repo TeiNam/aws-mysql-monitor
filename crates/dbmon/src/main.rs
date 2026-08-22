@@ -1400,6 +1400,10 @@ fn spawn_instance_collector(
                         instance = %label,
                         candidates = stats.candidates,
                         finalized = stats.finalized,
+                        heartbeats = stats.heartbeats,
+                        // 0 이 아니면 "그 자리에 진행 중 레코드가 없었다" 는 뜻이다.
+                        // 계속 0 이 아니면 키가 어긋난 것을 의심한다(F4 오판의 전조).
+                        heartbeats_absent = stats.heartbeats_absent,
                         "수집 tick"
                     );
                 }

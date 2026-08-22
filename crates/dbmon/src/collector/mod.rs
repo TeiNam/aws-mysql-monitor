@@ -77,6 +77,13 @@ pub struct TickStats {
     pub store_errors: usize,
     /// **아직 관측 중이라고 다시 쓴 레코드 수** (고아 오판 방지 — `heartbeat` 참조).
     pub heartbeats: usize,
+    /// 하트비트의 **조건이 깨진 수** — 그 자리에 진행 중 레코드가 없었다.
+    ///
+    /// 정상적으로도 발생한다(슬로우로그가 먼저 확정한 실행의 스레드가 아직 살아 있을 때).
+    /// 그런데 **레코드가 우리가 계산한 키에 없는 경우**도 같은 값으로 보인다 — 그때 그
+    /// 레코드는 하트비트를 못 받아 임계 뒤에 고아로 확정된다. 세지 않으면 그 차이를
+    /// 나중에 조사할 방법이 없다.
+    pub heartbeats_absent: usize,
 }
 
 /// tick 당 하트비트 쓰기 상한. 동시 슬로우 쿼리가 폭주해도 쓰기 예산을 묶는다.
@@ -418,6 +425,7 @@ where
             {
                 Ok(updated) => {
                     stats.heartbeats += usize::from(updated);
+                    stats.heartbeats_absent += usize::from(!updated);
                     // **조건이 깨졌어도 저장 시각을 갱신한다.** 레코드가 이미 확정됐거나
                     // (슬로우로그가 먼저 닫았다) 없는 경우인데, 그때 매 tick 다시 시도하면
                     // 스레드가 사라질 때까지 호출을 낭비한다.
