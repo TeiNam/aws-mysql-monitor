@@ -115,6 +115,18 @@ pub struct CollectParams {
     pub monitor_db_user: String,
     /// 이 워커의 식별자. 고아 `in_flight` 정리에 쓴다 (F4).
     pub worker_id: String,
+    /// **플랜 수집에 쓸 수 있는 시간**(ms). tick 예산에서 온다.
+    ///
+    /// # 왜 필요한가
+    ///
+    /// `EXPLAIN` 은 대상 DB 에서 메타데이터 락을 기다릴 수 있고 타임아웃(기본 3초)까지
+    /// 간다. 상한만큼(최대 200건) 직렬로 시도하면 **한 tick 이 600초**가 되고, 그 뒤에야
+    /// 자리 획득과 하트비트가 돈다 — 인수인계로 물려받은 살아 있는 행이 210초를 넘겨
+    /// 버려진다(교차 리뷰 28라운드).
+    ///
+    /// 예산을 넘기면 **플랜만 건너뛴다.** 선행 저장(자리 획득)은 계속한다 — 그게 살아
+    /// 있는 행을 지키는 쪽이다.
+    pub plan_budget_ms: u64,
 }
 
 impl Default for CollectParams {
@@ -126,6 +138,8 @@ impl Default for CollectParams {
             literal_policy: LiteralPolicy::Masked,
             monitor_db_user: "dbmon".into(),
             worker_id: "unknown".into(),
+            // 기본 tick(1초)의 80% — `config.rs` 의 tick 예산과 같은 규칙이다.
+            plan_budget_ms: 800,
         }
     }
 }
@@ -303,55 +317,32 @@ where
         // **자리를 못 얻은 항목이 210초 안에 저장되지 못했다** — 리더 교체 직후 이전
         // 리더가 남긴 살아 있는 행이 버려진다(교차 리뷰 27라운드가 10행으로 재현했다).
         // 반대로 자리 없는 것을 먼저 보게만 하면 플랜 재시도가 굶는다(같은 라운드).
-        let mut plan_targets: Vec<u64> = tick
+        let candidates: Vec<Candidate> = tick
             .needs_deep_probe
             .iter()
-            .copied()
-            .filter(|id| self.tracker.wants_plan(*id))
-            .collect();
-        // 플랜은 비싸므로 느린 것부터.
-        plan_targets.sort_by_key(|id| {
-            std::cmp::Reverse(self.tracker.get(*id).map(|t| t.max_time_secs).unwrap_or(0))
-        });
-        if plan_targets.len() > self.params.deep_probe_limit {
-            stats.deep_probe_skipped = plan_targets.len() - self.params.deep_probe_limit;
-            plan_targets.truncate(self.params.deep_probe_limit);
-        }
-        // **`deep_probed` 는 이름대로 플랜 조회 수다.** 쓰기 대상 수를 여기 넣으면
-        // `deep_probe_limit` 과 비교할 수 없고, 지표가 상한을 넘긴 것처럼 보인다.
-        stats.deep_probed = plan_targets.len();
-
-        // 쓰기 대상 = 자리를 얻어야 하는 것 ∪ 플랜을 방금 얻은 것.
-        let mut targets: Vec<u64> = tick
-            .needs_deep_probe
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.tracker
-                    .get(*id)
-                    .is_some_and(|t| t.storage_key.is_none())
-                    || plan_targets.contains(id)
+            .filter_map(|id| {
+                let t = self.tracker.get(*id)?;
+                Some(Candidate {
+                    id: *id,
+                    duration_ms: t.duration_ms(),
+                    has_key: t.storage_key.is_some(),
+                    wants_plan: self.tracker.wants_plan(*id),
+                })
             })
             .collect();
-        // 자리 없는 것부터 — 상한에 걸리면 그쪽이 살아 있는 행을 지킨다.
-        targets.sort_by_key(|id| {
-            let t = self.tracker.get(*id);
-            (
-                t.is_some_and(|t| t.storage_key.is_some()),
-                std::cmp::Reverse(t.map(|t| t.max_time_secs).unwrap_or(0)),
-            )
-        });
-        if targets.len() > ACQUIRE_LIMIT {
+        let picked = select_targets(&candidates, self.params.deep_probe_limit);
+        stats.deep_probe_skipped = picked.plan_skipped;
+        stats.deep_probed = picked.plan.len();
+        if picked.write_skipped > 0 {
             // **조용히 자르지 않는다.** 잘린 항목은 이번 tick 에 자리를 못 얻는다.
             tracing::warn!(
                 instance = %self.instance.id,
-                pending = targets.len(),
+                skipped = picked.write_skipped,
                 limit = ACQUIRE_LIMIT,
-                "선행 저장 상한에 걸렸다 — 자리 없는 것부터 처리한다"
+                "선행 저장 상한에 걸렸다 — 다음 tick 에 다시 시도한다"
             );
-            targets.truncate(ACQUIRE_LIMIT);
         }
-        let plan_targets: std::collections::BTreeSet<u64> = plan_targets.into_iter().collect();
+        let (plan_targets, targets) = (picked.plan, picked.write);
 
         if !targets.is_empty() {
             // **실패해도 아래 확정 루프는 반드시 돈다.**
@@ -623,6 +614,8 @@ where
         let full = self.db.full_sql(targets).await?;
         let stmts = self.db.stmt_current(targets).await?;
 
+        let plan_deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.params.plan_budget_ms);
         for id in targets {
             let f = full.iter().find(|r| r.id == *id);
             let s = stmts.iter().find(|r| r.processlist_id == *id);
@@ -639,7 +632,12 @@ where
             // 자리를 얻기 위해 대상에 남은 항목이 있으므로(위 `wants_plan` 참고),
             // 여기서 걸러야 이미 포기한 플랜을 매 tick 다시 시도하지 않는다 — 그건
             // 대상 DB 에 실제 부하다.
-            let plan = if plan_targets.contains(id) {
+            // **예산을 넘기면 플랜을 건너뛴다.** 자리 획득은 계속한다.
+            let plan_allowed = std::time::Instant::now() < plan_deadline;
+            if plan_targets.contains(id) && !plan_allowed {
+                stats.deep_probe_skipped += 1;
+            }
+            let plan = if plan_targets.contains(id) && plan_allowed {
                 let plan = self.collect_plan(*id, f, s, stats).await;
                 // **시도만 기록한다.** "얻었다" 는 저장이 성공한 뒤에 센다 — 그러지 않으면
                 // 플랜을 들고 있는데 저장이 실패한 실행이 계획 없이 남는다(27라운드).
@@ -892,7 +890,163 @@ impl PlanResult {
     }
 }
 
+/// 심층 조회 대상 선정의 입력. **한 tick 의 후보 하나.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Candidate {
+    id: u64,
+    /// 관측된 소요(모든 증거의 최대값). 플랜 우선순위의 기준이다.
+    duration_ms: i64,
+    /// 저장소의 자리를 아는가. 모르면 하트비트를 할 수 없다.
+    has_key: bool,
+    wants_plan: bool,
+}
+
+/// 선정 결과.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Selection {
+    /// 플랜을 조회할 대상.
+    plan: std::collections::BTreeSet<u64>,
+    /// 레코드를 쓸 대상. **플랜 대상이 앞에 온다.**
+    write: Vec<u64>,
+    /// 플랜 상한에 걸려 못 본 수.
+    plan_skipped: usize,
+    /// 쓰기 상한에 걸려 자리를 못 얻는 수.
+    write_skipped: usize,
+}
+
+/// 무엇을 조회하고 무엇을 쓸지 고른다. **순수 함수** — 상한 규칙을 여기서 전수 검증한다.
+///
+/// # 두 예산을 나눈다
+///
+/// | 무엇 | 비용 | 상한 |
+/// |---|---|---|
+/// | 자리 얻기(선행 저장) | 배치 조회 2회 + 항목당 쓰기 1회 | `ACQUIRE_LIMIT` |
+/// | 플랜 얻기(`EXPLAIN`) | **항목당 왕복**(락 대기 시 초 단위) | `deep_probe_limit` |
+///
+/// 배치 조회는 `ID IN (…)` 이라 목록이 커도 왕복 수가 같다. 전에는 두 일이 상한 하나를
+/// 나눠 써서, 상한이 작으면 **자리를 못 얻은 항목이 210초 안에 저장되지 못했다**(27라운드).
+///
+/// # 순서가 규칙이다
+///
+/// - 플랜은 **관측된 소요**가 큰 것부터. `max_time_secs` 로 정렬하면 `TIME` 이 리셋된
+///   긴 쿼리가 영구히 밀린다(28라운드).
+/// - 쓰기 목록에는 **플랜 대상을 먼저** 넣는다. 자리 없는 항목으로 상한을 채우면 방금 얻은
+///   플랜을 저장할 자리가 없다(28라운드).
+/// - 그다음 자리 없는 항목을, 역시 소요가 큰 것부터.
+fn select_targets(candidates: &[Candidate], plan_limit: usize) -> Selection {
+    let mut plan: Vec<&Candidate> = candidates.iter().filter(|c| c.wants_plan).collect();
+    plan.sort_by_key(|c| (std::cmp::Reverse(c.duration_ms), c.id));
+    // 플랜 상한은 쓰기 상한도 넘지 못한다 — 넘으면 뒤쪽 플랜 대상이 쓰기 목록에서 잘려
+    // 지표만 부풀고 실제로는 조회되지 않는다.
+    let plan_cap = plan_limit.min(ACQUIRE_LIMIT);
+    let plan_skipped = plan.len().saturating_sub(plan_cap);
+    plan.truncate(plan_cap);
+    let plan_ids: std::collections::BTreeSet<u64> = plan.iter().map(|c| c.id).collect();
+
+    let mut keyless: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| !c.has_key && !plan_ids.contains(&c.id))
+        .collect();
+    keyless.sort_by_key(|c| (std::cmp::Reverse(c.duration_ms), c.id));
+    let room = ACQUIRE_LIMIT.saturating_sub(plan_ids.len());
+    let write_skipped = keyless.len().saturating_sub(room);
+    keyless.truncate(room);
+
+    Selection {
+        write: plan_ids
+            .iter()
+            .copied()
+            .chain(keyless.iter().map(|c| c.id))
+            .collect(),
+        plan: plan_ids,
+        plan_skipped,
+        write_skipped,
+    }
+}
+
 /// 시각을 계산할 때 쓰는 상수. 테스트가 참조한다.
 pub const fn db_time_refresh_ticks() -> u64 {
     DB_TIME_REFRESH_TICKS
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    fn c(id: u64, duration_ms: i64, has_key: bool, wants_plan: bool) -> Candidate {
+        Candidate {
+            id,
+            duration_ms,
+            has_key,
+            wants_plan,
+        }
+    }
+
+    /// **플랜 우선순위는 관측된 소요다** — `TIME` 이 리셋된 긴 쿼리가 밀리지 않는다.
+    ///
+    /// `max_time_secs` 로 정렬하면 102초 도는 쿼리(`TIME=2`)가 3초 쿼리에게 매 tick
+    /// 밀려 영구히 계획 없이 남는다(교차 리뷰 28라운드).
+    #[test]
+    fn plans_go_to_the_longest_observed_execution() {
+        let cands = [
+            // TIME 이 리셋돼 max_time_secs 는 2초지만 타이머가 102.9초를 봤다.
+            c(1, 102_900, true, true),
+            c(2, 3_000, true, true),
+        ];
+        let picked = select_targets(&cands, 1);
+        assert_eq!(picked.plan.iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(picked.plan_skipped, 1);
+    }
+
+    /// **플랜 대상이 자리 없는 항목에게 밀리지 않는다.**
+    ///
+    /// 쓰기 상한을 자리 없는 항목으로 채우면 방금 얻은 플랜을 저장할 자리가 없다 —
+    /// 그러면 `EXPLAIN` 비용만 쓰고 결과를 버린다(28라운드).
+    #[test]
+    fn plan_targets_keep_their_write_slot() {
+        let mut cands = vec![c(1, 5_000, true, true)];
+        for id in 2..(ACQUIRE_LIMIT as u64 + 50) {
+            cands.push(c(id, 9_000, false, false));
+        }
+        let picked = select_targets(&cands, 10);
+        assert!(picked.plan.contains(&1), "플랜 대상이 빠졌다");
+        assert_eq!(picked.write[0], 1, "플랜 대상이 앞에 오지 않았다");
+        assert_eq!(picked.write.len(), ACQUIRE_LIMIT);
+        assert!(picked.write_skipped > 0, "자른 사실을 보고하지 않았다");
+    }
+
+    /// **플랜 상한은 쓰기 상한을 넘지 못한다.**
+    ///
+    /// 설정은 `deep_probe_limit = 10_000` 을 허용한다. 그 값을 그대로 쓰면 지표는
+    /// 10,000건을 조회했다고 보고하는데 쓰기 목록은 200으로 잘린다 — 지표가 50배 부풀고
+    /// 뒤쪽은 실제로 조회되지 않는다(28라운드).
+    #[test]
+    fn the_plan_budget_never_exceeds_the_write_budget() {
+        let cands: Vec<Candidate> = (1..=1_000).map(|id| c(id, 1_000, true, true)).collect();
+        let picked = select_targets(&cands, 10_000);
+        assert_eq!(picked.plan.len(), ACQUIRE_LIMIT);
+        assert_eq!(picked.plan_skipped, 1_000 - ACQUIRE_LIMIT);
+        assert_eq!(picked.write.len(), ACQUIRE_LIMIT);
+    }
+
+    /// 자리를 아는데 플랜도 필요 없으면 아무것도 안 한다 — 하트비트가 맡는다.
+    #[test]
+    fn a_settled_entry_is_not_a_target() {
+        let picked = select_targets(&[c(1, 1_000, true, false)], 10);
+        assert!(picked.plan.is_empty());
+        assert!(picked.write.is_empty());
+        assert_eq!(picked.write_skipped, 0);
+    }
+
+    /// 상한이 0 이면(설정이 막지만) 플랜은 없고 자리 획득은 계속된다.
+    #[test]
+    fn a_zero_plan_limit_still_acquires_keys() {
+        let picked = select_targets(&[c(1, 1_000, false, true)], 0);
+        assert!(picked.plan.is_empty());
+        assert_eq!(
+            picked.write,
+            vec![1],
+            "자리 획득까지 멈추면 살아 있는 행이 버려진다"
+        );
+    }
 }

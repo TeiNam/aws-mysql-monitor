@@ -1285,6 +1285,9 @@ fn spawn_instance_collector(
             literal_policy: deps.config.collector.literal_policy,
             monitor_db_user: db_user.clone(),
             worker_id: deps.worker_id.clone(),
+            // tick 예산과 같은 규칙(주기의 80%). 넘기면 플랜만 건너뛰고 자리 획득은
+            // 계속한다 — 그게 살아 있는 행을 지킨다.
+            plan_budget_ms: deps.config.collector.detect_interval_ms * 80 / 100,
         };
         let mut collector = InstanceCollector::new(
             instance.clone(),
