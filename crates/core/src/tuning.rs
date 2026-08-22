@@ -680,6 +680,13 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         "RELEASE_LOCK",
         "LOCK",
         "UNLOCK",
+        // **함수 이름은 선두 키워드 검사에 걸리지 않는다.** `_` 가 식별자 문자이므로
+        // `LOAD_FILE` 은 `LOAD` 로 쪼개지지 않는다 — 목록에 `LOAD` 가 있어도 통과한다.
+        //
+        // `LOAD_FILE` 은 서버 파일을 읽고, `BENCHMARK` 는 CPU 를 태운다. 둘 다 "같은
+        // 결과를 더 빠르게" 와 무관하므로 재작성에 나올 이유가 없다.
+        "LOAD_FILE",
+        "BENCHMARK",
     ];
     if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
         return false;
@@ -1636,6 +1643,10 @@ mod tests {
             // **선두는 SELECT 인 잠금 읽기.** 문장 단위 키워드를 선두로 옮기면서
             // 열렸던 구멍이다(교차 리뷰 6회차).
             "SELECT id FROM orders LOCK IN SHARE MODE",
+            // **함수 이름은 선두 키워드로 쪼개지지 않는다.** `LOAD_FILE` 은 한 토큰이라
+            // 목록의 `LOAD` 에 걸리지 않는다.
+            "SELECT LOAD_FILE('/etc/passwd') FROM orders",
+            "SELECT BENCHMARK(1000000, MD5('x')) FROM orders",
             "PREPARE s FROM 'DELETE FROM orders'",
             // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
             // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).

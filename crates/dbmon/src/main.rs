@@ -373,21 +373,28 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
 /// 정지 집합**을 다시 쓰는데, 실패한 인스턴스를 그 사이 재개하면 대상에서 빠져 **영구히
 /// 안 닫힌다** — 이미 끝난 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는 고아
 /// 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차). 남은 **대상**을 그대로 들고 있어야 한다.
-/// `started_before_ms` 는 **끊을 레코드의 상한**이다.
+/// `targets` 는 **인스턴스별 상한**이다 (`인스턴스 id → 그 인스턴스가 멈춘 시각`).
 ///
-/// 없으면(전체 정지) 내 것 전부다. 있으면 그 시각 이전에 시작된 것만 끊는다 — 부분 정지의
-/// 재시도가 다음 라운드로 밀린 사이 그 인스턴스를 **재개하면 새 수집 태스크가 새 레코드를
-/// 만드는데**, 대상이 인스턴스 id 뿐이면 그 새 레코드까지 `abandoned` 로 닫는다.
-/// 병합에서 `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수 없다
-/// (교차 리뷰 6회차).
+/// `None` 이면 전체 정지 — 내 것 전부를 끊는다(태스크를 모두 내렸으므로 새로 만들어질
+/// 레코드도 없다).
+///
+/// # 왜 상한이 인스턴스별인가
+///
+/// 확정이 실패하면 대상을 들고 다음 라운드에 재시도한다. 그 사이 그 인스턴스를 **재개하면
+/// 새 수집 태스크가 새 레코드를 만드는데**, 대상이 id 뿐이면 그 새 레코드까지
+/// `abandoned` 로 닫는다 — 병합에서 `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴
+/// 수 없다(교차 리뷰 6회차).
+///
+/// 상한을 **하나의 스칼라**로 두면 그것도 부족하다. A 가 남아 있는 동안 B 가 멈추면 상한이
+/// B 의 시각으로 넓어져 A 의 새 레코드가 다시 그 안에 들어온다 — 같은 결함이 한 라운드
+/// 뒤에 재발한다. 각 대상이 **자기를 멈춘 시각**을 들고 있어야 한다.
 async fn close_in_flight_mine(
     store: &Arc<dbmon::store::AppSlowQueryStore>,
     worker_id: &str,
     epoch: Option<u64>,
     now_ms: i64,
-    only: Option<&std::collections::BTreeSet<String>>,
-    started_before_ms: Option<i64>,
-) -> std::collections::BTreeSet<String> {
+    targets: Option<&std::collections::BTreeMap<String, i64>>,
+) -> std::collections::BTreeMap<String, i64> {
     use dbmon_core::ports::SlowQueryStore as _;
     // **실패를 조용히 버리지 않는다.** 여기서 못 닫으면 그 레코드는 진행 중으로 남고,
     // 고아 스윕은 `owner_worker`·`owner_epoch` 가 자기와 같은 것을 건너뛰므로
@@ -401,7 +408,7 @@ async fn close_in_flight_mine(
                 "정지 확정을 위한 진행 중 목록을 읽지 못했다 — 다음 tick 에 다시 시도한다"
             );
             // 목록을 못 읽었으면 **대상 전체**가 남은 것으로 본다.
-            return only.cloned().unwrap_or_default();
+            return targets.cloned().unwrap_or_default();
         }
     };
     // **상한을 채웠으면 관측이 불완전하다.** 그때 빈 `remaining` 을 돌려주면 호출부가
@@ -415,24 +422,31 @@ async fn close_in_flight_mine(
         );
     }
     let mut closed = 0usize;
-    let mut remaining: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut remaining: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     for q in &in_flight {
         if q.owner_worker.as_deref() != Some(worker_id) || q.owner_epoch != epoch {
             continue;
         }
-        if only.is_some_and(|ids| !ids.contains(q.instance_id.as_str())) {
-            continue;
-        }
-        // **재개 후 새로 만들어진 레코드는 건드리지 않는다.**
-        if started_before_ms.is_some_and(|cut| q.started_at_ms >= cut) {
-            continue;
+        // 대상이 정해져 있으면 그 목록에 있어야 하고, **자기 상한 이전**이어야 한다.
+        if let Some(map) = targets {
+            let Some(&cutoff) = map.get(q.instance_id.as_str()) else {
+                continue;
+            };
+            // **재개 후 새로 만들어진 레코드는 건드리지 않는다.**
+            if q.started_at_ms >= cutoff {
+                continue;
+            }
         }
         let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
         match store.upsert_merged(&marked).await {
             Ok(_) => closed += 1,
             // 같은 이유로 개별 실패도 남긴다 — 몇 건이 남았는지 알아야 한다.
             Err(e) => {
-                remaining.insert(q.instance_id.as_str().to_string());
+                // 상한을 그대로 들고 남긴다 — 재시도가 창을 넓히지 않게.
+                let cutoff = targets
+                    .and_then(|m| m.get(q.instance_id.as_str()).copied())
+                    .unwrap_or(now_ms);
+                remaining.insert(q.instance_id.as_str().to_string(), cutoff);
                 tracing::warn!(
                     instance = %q.instance_id.as_str(),
                     thread_id = q.thread_id,
@@ -457,7 +471,7 @@ async fn close_in_flight_mine(
     }
     if truncated {
         // 관측이 불완전하므로 대상 전체를 남긴다.
-        return only.cloned().unwrap_or_default();
+        return targets.cloned().unwrap_or_default();
     }
     remaining
 }
@@ -1472,14 +1486,15 @@ fn spawn_leader_loop(
         let mut fetcher: Option<Arc<dyn dbmon::slowlog::SlowLogFetcher>> = None;
         // **마지막으로 본 정지 집합.** 바뀐 순간을 알아야 즉시 반영할 수 있다.
         let mut last_pause = dbmon_core::pause::PauseSet::default();
-        // **정지 확정이 남은 인스턴스.** bool 로 두면 재시도 시점의 정지 집합을 다시
-        // 써서, 그 사이 재개된 인스턴스가 대상에서 빠져 영구히 안 닫힌다
-        // (교차 리뷰 5회차).
-        let mut pending_pause_close: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        // **정지가 반영된 시각.** 그 이전에 시작된 레코드만 끊는다 — 재시도가 밀린 사이
-        // 재개된 인스턴스의 새 레코드를 닫지 않기 위한 상한이다(교차 리뷰 6회차).
-        let mut pause_close_cutoff_ms: i64 = 0;
+        // **정지 확정이 남은 인스턴스 → 그 인스턴스가 멈춘 시각.**
+        //
+        // 집합(bool)이면 재시도가 그 시점의 정지 집합을 다시 써서, 그 사이 재개된
+        // 인스턴스가 대상에서 빠져 영구히 안 닫힌다(교차 리뷰 5회차). 상한을 **하나의
+        // 스칼라**로 두면 다른 인스턴스가 멈출 때 창이 넓어져 재개된 인스턴스의 새
+        // 레코드가 다시 그 안에 들어온다(6회차 수정의 반대 방향). 대상마다 자기 시각을
+        // 들고 있어야 한다.
+        let mut pending_pause_close: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -1606,7 +1621,6 @@ fn spawn_leader_loop(
                             gate.worker_id(),
                             gate.epoch(),
                             now_ms,
-                            None,
                             // 전체 정지는 내 것 전부다 — 새로 만들어질 레코드도 없다
                             // (모든 태스크를 내렸다).
                             None,
@@ -1783,16 +1797,13 @@ fn spawn_leader_loop(
                                 // 때 대상에서 사라져 **영구히 안 닫힌다** — 이미 끝난
                                 // 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는
                                 // 고아 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차).
-                                let close_targets: std::collections::BTreeSet<String> = paused
-                                    .iter()
-                                    .cloned()
-                                    .chain(pending_pause_close.iter().cloned())
-                                    .collect();
-                                // 정지 집합이 바뀐 시점을 상한으로 고정한다. 재시도는
-                                // 그 시점을 유지해야 한다 — 매번 `now` 로 갱신하면 새
-                                // 레코드가 상한 안에 들어온다.
-                                if pause_changed {
-                                    pause_close_cutoff_ms = now_ms;
+                                //
+                                // 상한은 **대상마다**다. 남아 있던 것은 자기 시각을
+                                // 유지하고(그 뒤에 만들어진 레코드를 지킨다), 새로 멈춘
+                                // 것은 지금을 쓴다.
+                                let mut close_targets = pending_pause_close.clone();
+                                for id in &paused {
+                                    close_targets.entry(id.clone()).or_insert(now_ms);
                                 }
                                 if (pause_changed || !pending_pause_close.is_empty())
                                     && !close_targets.is_empty()
@@ -1803,11 +1814,6 @@ fn spawn_leader_loop(
                                         gate.epoch(),
                                         now_ms,
                                         Some(&close_targets),
-                                        // **이 시각 이전에 시작된 것만 끊는다.** 재시도가
-                                        // 밀린 사이 재개된 인스턴스의 **새** 레코드까지
-                                        // 닫으면 되돌릴 수 없다(`Abandoned` 가 나중의
-                                        // `InFlight` 를 이긴다).
-                                        Some(pause_close_cutoff_ms),
                                     ))
                                     .await;
                                     pending_pause_close = match closed {
@@ -2464,6 +2470,40 @@ mod tests {
         assert!(skips_for_cutoff(PAUSED_AT + 1, Some(PAUSED_AT)));
         // 상한이 없으면(전체 정지) 전부 닫는다.
         assert!(!skips_for_cutoff(PAUSED_AT + 1, None));
+    }
+
+    /// **두 번째 정지가 첫 대상의 상한을 넓히지 않는다.**
+    ///
+    /// 상한을 하나의 스칼라로 두면 A 가 남아 있는 동안 B 가 멈출 때 상한이 B 의 시각으로
+    /// 넓어지고, 그 사이 재개된 A 의 새 레코드가 다시 그 안에 들어온다 — 6회차 수정이
+    /// 막은 것과 **같은 결함이 한 라운드 뒤에** 재발한다.
+    #[test]
+    fn a_later_pause_does_not_widen_an_earlier_targets_cutoff() {
+        use std::collections::BTreeMap;
+        const T1: i64 = 1_787_000_000_000; // A 가 멈춘 시각
+        const T4: i64 = T1 + 600_000; // B 가 멈춘 시각
+
+        // 루프의 대상 계산과 **같은 식**이다.
+        let mut pending: BTreeMap<String, i64> = BTreeMap::new();
+        pending.insert("A".into(), T1); // A 확정 실패로 남았다
+
+        let paused = ["B".to_string()]; // 지금은 B 만 멈춰 있다(A 는 재개됐다)
+        let mut targets = pending.clone();
+        for id in &paused {
+            targets.entry(id.clone()).or_insert(T4);
+        }
+
+        assert_eq!(targets.get("A"), Some(&T1), "A 의 상한이 넓어졌다");
+        assert_eq!(targets.get("B"), Some(&T4));
+
+        // A 를 재개한 뒤(T2) 만들어진 레코드(T3)는 A 의 상한 밖이다.
+        let t3 = T1 + 60_000;
+        assert!(
+            skips_for_cutoff(t3, targets.get("A").copied()),
+            "새 레코드를 닫는다"
+        );
+        // A 가 멈추기 전에 시작된 레코드는 닫는다.
+        assert!(!skips_for_cutoff(T1 - 1, targets.get("A").copied()));
     }
 
     /// [`close_in_flight_mine`] 의 상한 판정과 **같은 식**이다.
