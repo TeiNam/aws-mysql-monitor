@@ -85,6 +85,61 @@ resource "aws_iam_role" "task" {
   })
 }
 
+# **인가·감사 레코드에 대한 쓰기를 명시적으로 거부한다** (08 §5.2, T-20·FR-CRD-10).
+#
+# # 왜 별도 정책인가
+#
+# `Deny` 는 어떤 `Allow` 보다 강하다. 아래 `task_storage` 가 config 테이블 전체에
+# 쓰기를 허용하는데, 그 안에 두 종류의 특별한 키가 있다:
+#
+# | 키 | 왜 앱이 쓰면 안 되나 |
+# |---|---|
+# | `USER#<sub>` | 앱이 침해되면 **자기 권한을 admin 으로 올릴 수 있다** (T-20 의 핵심) |
+# | `AUDIT#<yyyy-mm>` | 침해된 앱이 **자기 흔적을 지울 수 있다** (FR-CRD-10 이 무의미해진다) |
+#
+# 코드는 이미 읽기만 한다(`store::users` 는 쓰기 함수가 없고, `store::audit` 은
+# `PutItem` 만 한다). 그런데 **코드가 제한이 아니다** — 태스크 자격증명을 훔치면
+# DynamoDB API 를 직접 부를 수 있다. `store/users.rs` 의 주석이 "IAM 에서 Deny 된다"
+# 고 적어 놓고 정책이 없었다(교차 리뷰 5차가 잡았다).
+#
+# `AUDIT#` 은 **`PutItem` 을 허용한다** — 감사 레코드를 앱이 만든다. 대신 수정·삭제를
+# 막고, 어댑터의 조건식(`attribute_not_exists`)이 덮어쓰기를 막는다.
+resource "aws_iam_role_policy" "task_deny_authz_writes" {
+  name = "dbmon-deny-authz-writes"
+  role = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyUserRecordWrites"
+        Effect = "Deny"
+        Action = [
+          "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+          "dynamodb:BatchWriteItem",
+        ]
+        Resource = [local.foundation.config_table_arn]
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["USER#*"]
+          }
+        }
+      },
+      {
+        Sid    = "DenyAuditMutation"
+        Effect = "Deny"
+        # **`PutItem` 은 빠져 있다** — 앱이 감사 레코드를 만든다. 수정·삭제만 막는다.
+        Action   = ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        Resource = [local.foundation.config_table_arn]
+        Condition = {
+          "ForAllValues:StringLike" = {
+            "dynamodb:LeadingKeys" = ["AUDIT#*"]
+          }
+        }
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role_policy" "task_storage" {
   name = "dbmon-storage"
   role = aws_iam_role.task.id
