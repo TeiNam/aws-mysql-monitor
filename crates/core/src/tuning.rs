@@ -643,8 +643,6 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         "PREPARE",
         "EXECUTE",
         "DEALLOCATE",
-        "LOCK",
-        "UNLOCK",
         "COMMIT",
         "ROLLBACK",
         "START",
@@ -667,7 +665,22 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     // ③-b **어디에 있어도 안 되는 것.** 함수·절이라서 선두에 오지 않는다.
     //
     // 파일로 내보내거나 잠금을 잡는 것은 "튜닝된 조회" 가 아니다.
-    const FORBIDDEN_ANYWHERE: &[&str] = &["OUTFILE", "DUMPFILE", "GET_LOCK", "RELEASE_LOCK"];
+    // `LOCK`·`UNLOCK` 은 **선두에서만 보면 안 된다.**
+    //
+    // `SELECT … LOCK IN SHARE MODE` 는 선두가 `SELECT` 인 잠금 읽기다 — 트랜잭션 안에서
+    // 커밋까지 공유 잠금을 잡으므로 "같은 결과를 더 빠르게" 가 아니다. 문장 단위
+    // 키워드를 선두로 옮기면서 이게 열렸다(교차 리뷰 6회차가 내 수정의 구멍으로 잡았다).
+    //
+    // 둘 다 MySQL **예약어**라서 인용 없이 식별자로 쓸 수 없다 — 어디에 있어도 거부해도
+    // 정상 문장을 잡지 않는다(`start`·`session` 과 다른 점이다).
+    const FORBIDDEN_ANYWHERE: &[&str] = &[
+        "OUTFILE",
+        "DUMPFILE",
+        "GET_LOCK",
+        "RELEASE_LOCK",
+        "LOCK",
+        "UNLOCK",
+    ];
     if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
         return false;
     }
@@ -1620,6 +1633,9 @@ mod tests {
             "DO SLEEP(1)",
             "SET SESSION sort_buffer_size = 1",
             "LOCK TABLES orders READ",
+            // **선두는 SELECT 인 잠금 읽기.** 문장 단위 키워드를 선두로 옮기면서
+            // 열렸던 구멍이다(교차 리뷰 6회차).
+            "SELECT id FROM orders LOCK IN SHARE MODE",
             "PREPARE s FROM 'DELETE FROM orders'",
             // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
             // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).

@@ -373,12 +373,20 @@ async fn run_in_budget<T>(f: impl std::future::Future<Output = T>) -> std::resul
 /// 정지 집합**을 다시 쓰는데, 실패한 인스턴스를 그 사이 재개하면 대상에서 빠져 **영구히
 /// 안 닫힌다** — 이미 끝난 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는 고아
 /// 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차). 남은 **대상**을 그대로 들고 있어야 한다.
+/// `started_before_ms` 는 **끊을 레코드의 상한**이다.
+///
+/// 없으면(전체 정지) 내 것 전부다. 있으면 그 시각 이전에 시작된 것만 끊는다 — 부분 정지의
+/// 재시도가 다음 라운드로 밀린 사이 그 인스턴스를 **재개하면 새 수집 태스크가 새 레코드를
+/// 만드는데**, 대상이 인스턴스 id 뿐이면 그 새 레코드까지 `abandoned` 로 닫는다.
+/// 병합에서 `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수 없다
+/// (교차 리뷰 6회차).
 async fn close_in_flight_mine(
     store: &Arc<dbmon::store::AppSlowQueryStore>,
     worker_id: &str,
     epoch: Option<u64>,
     now_ms: i64,
     only: Option<&std::collections::BTreeSet<String>>,
+    started_before_ms: Option<i64>,
 ) -> std::collections::BTreeSet<String> {
     use dbmon_core::ports::SlowQueryStore as _;
     // **실패를 조용히 버리지 않는다.** 여기서 못 닫으면 그 레코드는 진행 중으로 남고,
@@ -396,10 +404,14 @@ async fn close_in_flight_mine(
             return only.cloned().unwrap_or_default();
         }
     };
-    if in_flight.len() >= ORPHAN_SWEEP_LIMIT {
+    // **상한을 채웠으면 관측이 불완전하다.** 그때 빈 `remaining` 을 돌려주면 호출부가
+    // "끝났다" 로 읽고 대상을 지운다 — 페이지 밖에 남은 레코드는 그 뒤로 아무도 닫지
+    // 않는다(고아 스윕이 같은 워커·epoch 를 `Mine` 으로 건너뛴다). 대상을 유지한다.
+    let truncated = in_flight.len() >= ORPHAN_SWEEP_LIMIT;
+    if truncated {
         tracing::warn!(
             limit = ORPHAN_SWEEP_LIMIT,
-            "진행 중 레코드가 상한을 채웠다 — 내 레코드가 이 페이지 밖에 남을 수 있다"
+            "진행 중 레코드가 상한을 채웠다 — 관측이 불완전하므로 대상을 유지한다"
         );
     }
     let mut closed = 0usize;
@@ -409,6 +421,10 @@ async fn close_in_flight_mine(
             continue;
         }
         if only.is_some_and(|ids| !ids.contains(q.instance_id.as_str())) {
+            continue;
+        }
+        // **재개 후 새로 만들어진 레코드는 건드리지 않는다.**
+        if started_before_ms.is_some_and(|cut| q.started_at_ms >= cut) {
             continue;
         }
         let marked = dbmon::orphan::abandon_with(q, now_ms, "collector_paused");
@@ -438,6 +454,10 @@ async fn close_in_flight_mine(
             closed,
             "정지로 진행 중 레코드를 추적 끊김으로 확정했다 (collector_paused)"
         );
+    }
+    if truncated {
+        // 관측이 불완전하므로 대상 전체를 남긴다.
+        return only.cloned().unwrap_or_default();
     }
     remaining
 }
@@ -1457,6 +1477,9 @@ fn spawn_leader_loop(
         // (교차 리뷰 5회차).
         let mut pending_pause_close: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // **정지가 반영된 시각.** 그 이전에 시작된 레코드만 끊는다 — 재시도가 밀린 사이
+        // 재개된 인스턴스의 새 레코드를 닫지 않기 위한 상한이다(교차 리뷰 6회차).
+        let mut pause_close_cutoff_ms: i64 = 0;
 
         loop {
             // 셧다운 신호가 오면 수집을 멈추고 리스를 반납하고 나간다.
@@ -1583,6 +1606,9 @@ fn spawn_leader_loop(
                             gate.worker_id(),
                             gate.epoch(),
                             now_ms,
+                            None,
+                            // 전체 정지는 내 것 전부다 — 새로 만들어질 레코드도 없다
+                            // (모든 태스크를 내렸다).
                             None,
                         )
                         .await;
@@ -1762,6 +1788,12 @@ fn spawn_leader_loop(
                                     .cloned()
                                     .chain(pending_pause_close.iter().cloned())
                                     .collect();
+                                // 정지 집합이 바뀐 시점을 상한으로 고정한다. 재시도는
+                                // 그 시점을 유지해야 한다 — 매번 `now` 로 갱신하면 새
+                                // 레코드가 상한 안에 들어온다.
+                                if pause_changed {
+                                    pause_close_cutoff_ms = now_ms;
+                                }
                                 if (pause_changed || !pending_pause_close.is_empty())
                                     && !close_targets.is_empty()
                                 {
@@ -1771,6 +1803,11 @@ fn spawn_leader_loop(
                                         gate.epoch(),
                                         now_ms,
                                         Some(&close_targets),
+                                        // **이 시각 이전에 시작된 것만 끊는다.** 재시도가
+                                        // 밀린 사이 재개된 인스턴스의 **새** 레코드까지
+                                        // 닫으면 되돌릴 수 없다(`Abandoned` 가 나중의
+                                        // `InFlight` 를 이긴다).
+                                        Some(pause_close_cutoff_ms),
                                     ))
                                     .await;
                                     pending_pause_close = match closed {
@@ -2407,6 +2444,32 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **정지 확정이 재개 후의 새 레코드를 닫지 않는다.**
+    ///
+    /// 부분 정지 확정이 실패하면 대상을 들고 다음 라운드에 다시 시도한다. 그 사이 그
+    /// 인스턴스를 재개하면 새 수집 태스크가 **새 레코드**를 만드는데, 대상이 인스턴스 id
+    /// 뿐이면 그 새 레코드까지 `abandoned` 로 닫는다 — 병합에서 `Abandoned` 는 나중의
+    /// `InFlight` 를 이기므로 되돌릴 수 없다(교차 리뷰 6회차).
+    ///
+    /// 시작 시각 상한이 그걸 막는다. 상한 판정만 순수하게 확인한다 — 저장소 왕복은
+    /// `it_store` 가 덮는다.
+    #[test]
+    fn the_pause_cutoff_protects_records_started_after_resume() {
+        const PAUSED_AT: i64 = 1_787_000_000_000;
+        // 상한 이전에 시작된 것 → 닫는다.
+        assert!(!skips_for_cutoff(PAUSED_AT - 1, Some(PAUSED_AT)));
+        // 상한과 같거나 이후 → 건드리지 않는다.
+        assert!(skips_for_cutoff(PAUSED_AT, Some(PAUSED_AT)));
+        assert!(skips_for_cutoff(PAUSED_AT + 1, Some(PAUSED_AT)));
+        // 상한이 없으면(전체 정지) 전부 닫는다.
+        assert!(!skips_for_cutoff(PAUSED_AT + 1, None));
+    }
+
+    /// [`close_in_flight_mine`] 의 상한 판정과 **같은 식**이다.
+    fn skips_for_cutoff(started_at_ms: i64, started_before_ms: Option<i64>) -> bool {
+        started_before_ms.is_some_and(|cut| started_at_ms >= cut)
+    }
 
     /// **예산을 넘긴 태스크가 실제로 멈춰야 한다.**
     ///
