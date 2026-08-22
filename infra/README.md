@@ -154,6 +154,8 @@ terraform plan -var environment=dev -var vpc_id=vpc-... \
 | 3 | 태스크 SG 를 열었는데도 안 붙는다 | **Client VPN SG 의 이그레스가 DB·DNS 로만** 열려 있다 | `60-seed` 가 `task_security_group_id` 를 받으면 `vpn_to_tasks` 이그레스를 만든다 |
 | 4 | 그래도 안 붙는다 | **Client VPN 인가 규칙은 목적지 CIDR 로 판정**한다. DB 서브넷만 인가돼 있었다 | `60-seed` 에 `-var 'task_subnet_cidrs=["10.x.x.0/20", …]'` |
 | 5 | Aurora 만 `1045 Access denied` (계정·플러그인·SG 정상) | `db_auth_resource_ids` 에 **인스턴스** id(`db-…`)를 넣었다. **Aurora 는 클러스터 id(`cluster-…`)** 로 판정한다 | `describe-db-clusters --query 'DBClusters[].DbClusterResourceId'` 를 함께 넣는다 |
+| 6a | Aurora 만 "등록된 마스터 시크릿이 없다" | `ClusterId::as_str()`(복합 id)를 `DescribeDBClusters` 에 넘겼고, 그 오류를 `.ok()?` 가 삼켰다 | `identifier()` 를 쓰고 오류를 그대로 올린다 |
+| 6b | ECS 가 세 번 재시작하고 롤백 (exit 133) | `reqwest` 의 `-no-provider` feature 는 rustls 프로바이더를 **명시적으로 설치**해야 한다 — 하나뿐이어도 그렇다 | `rustls::crypto::aws_lc_rs::default_provider().install_default()` |
 | 6 | CloudWatch 타일이 빔 | `GetMetricData` 에 `cloudwatch:namespace` 조건이 붙어 있었다 — 그 조건 키는 이 액션에 실려 오지 않아 `implicitDeny` 다 | 조건 없이 허용(노출 범위는 `iam.tf` 주석에) |
 
 3·4 는 보안 그룹만 봐서는 진단할 수 없다 — `describe-client-vpn-authorization-rules` 를

@@ -2542,3 +2542,68 @@ assert_eq!(complete.auth.effective_mode(true), M::Cognito);  // 통과한다
 
 창이 남는 것은 **토큰이 주장하는 그룹**뿐이다. 서버 레코드로 판정하는 것은 전부 즉시
 반영된다 — 그게 T-20 의 교집합을 쓰는 이유다.
+
+
+---
+
+## M3·Cognito 를 실제 AWS 에서 검증한 것 (2026-08-23)
+
+배포: ECS 태스크 1개(`dbmon-dev:5`, ARM64 Fargate Spot), `enable_bootstrap = true`.
+
+### 부트스트랩 — 두 자격증명 경로 모두 동작
+
+| 인스턴스 | 경로 | 결과 |
+|---|---|---|
+| `dbmon-seed-dev-aurora-2` | **(a) RDS 관리형** (`rds!cluster-…`) | `can_create_account: true` |
+| `dbmon-seed-dev-mysql` | **(b) 태그된 ARN** (`dbmon=true`) | `can_create_account: true` |
+
+Aurora 가 처음에 실패했다 — `credential_route` 가 `ClusterId::as_str()`(복합 id
+`계정/리전/이름`)를 `DescribeDBClusters` 에 넘겼고, 그 오류를 `.ok()?` 가 삼켜서
+**"등록된 마스터 시크릿이 없다"** 로 보였다. `identifier()` 를 쓰고 오류를 그대로
+올리도록 고쳤다. `ClusterId::identifier` 의 문서가 이미 같은 실수를 경고하고 있었다
+(CloudWatch 차원에서 겪은 것).
+
+### 계획이 골든 테스트가 예측한 문장을 정확히 냈다
+
+시드 계정은 모드 B 로 만들어져 있었고 설정은 모드 A 다:
+
+```
+GRANT PROCESS, SHOW DATABASES, REPLICATION CLIENT, SHOW VIEW ON *.* TO `dbmon`@`10.1.%`
+GRANT SELECT ON `shop`.* / `sys`.* / `performance_schema`.*
+```
+
+계획: **`GRANT SELECT ON *.* TO 'dbmon'@'10.1.%'` 하나.** 초과 권한 0건 —
+모드 A 의 전역 `SELECT` 가 기존 스키마 권한을 포함하므로 회수 대상이 아니다.
+`the_real_seed_state_plans_exactly_one_grant` 테스트가 예측한 그대로다.
+
+### 실행과 멱등성
+
+| 확인 | 결과 |
+|---|---|
+| `apply` | `executed: 1/1`, `credential_source: tagged_secret` |
+| DB 상태 | `GRANT SELECT, PROCESS, SHOW DATABASES, REPLICATION CLIENT, SHOW VIEW ON *.*` |
+| **재계획** | `noop: true`, 문장 0개 — **멱등성 실측 확인** |
+| 감사 레코드 | `AUDIT#2026-08` 에 plan 5건 + apply 1건 |
+| **T-19** | 감사 레코드에 마스터 비밀번호가 **없다** (실제 값으로 grep) |
+
+### Cognito
+
+| 확인 | 결과 |
+|---|---|
+| `cognito_ready` | `true` — 검증기가 배선됐다 (`COGNITO_READY` 상수를 없앤 결과) |
+| `effective_auth_mode` | `token` — 설정이 비어 있으므로 토큰 모드로 떨어진다 |
+| 화면 | "구현되지 않았다" 문구 대신 로그인 버튼 (설정이 불완전하면 빠진 값을 열거) |
+
+Terraform `30-identity` 는 `enable_cognito = false` 로 두었다. 사용자 풀은 한번 만들면
+지우기 어렵고(`sub` 가 사라지면 `USER#<sub>` 레코드가 전부 고아가 된다), 로그인시킬
+사람이 둘 이상이 됐을 때 켜는 것이 맞다.
+
+### 배포에서 잡힌 결함 하나
+
+`reqwest` 의 `-no-provider` feature 로 rustls 프로바이더 충돌을 없앴는데, 그러면
+reqwest 가 `Client::builder().build()` 에서 **"No provider set" 으로 패닉한다.**
+프로바이더가 하나뿐이어도 명시적 설치를 요구한다. ECS 가 세 번 재시작하고 롤백됐다.
+
+**왜 테스트가 못 잡았나** — 단위 테스트가 `JwksSource` 를 페이크로 대체하므로
+reqwest 클라이언트를 한 번도 만들지 않았다. 조립 자체를 확인하는 테스트를 넣고,
+설치 줄을 지우면 실제로 같은 패닉으로 실패하는 것을 확인했다.
