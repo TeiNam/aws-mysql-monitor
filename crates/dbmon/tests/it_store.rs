@@ -17,7 +17,7 @@ use dbmon::store::DynamoSlowQueryStore;
 use dbmon_core::env::Env;
 use dbmon_core::ids::{InstanceId, RecordId};
 use dbmon_core::instance::Engine;
-use dbmon_core::ports::SlowQueryStore;
+use dbmon_core::ports::{SlowQueryStore, StoredKey};
 use dbmon_core::slow_query::*;
 use dbmon_core::time::TimeRange;
 use dbmon_normalize::StatementType;
@@ -267,39 +267,30 @@ async fn in_flight_index_finds_only_running_records() {
     assert!(!ids.contains(&2002), "확정 레코드가 보인다: {ids:?}");
 }
 
-/// **하트비트는 있는 레코드의 생존 신호만 올린다.**
+/// **하트비트는 쓰기가 알려 준 자리의 생존 신호만 올린다.**
 ///
-/// 세 가지를 못박는다. 처음에는 `upsert_merged` 로 레코드 전체를 다시 썼는데 그게
-/// 셋 다 깨뜨렸다(교차 리뷰 23라운드):
+/// 네 가지를 못박는다. 처음에는 `upsert_merged` 로 레코드 전체를 다시 썼고(23라운드),
+/// 그다음엔 키를 계산했고(24라운드), 그다음엔 ±2초를 뒤졌다(25라운드). 세 번 모두
+/// **자리를 추측한 것**이 원인이었다.
 ///
-/// 1. **만들지 않는다** — 심층 조회 상한 밖의 후보는 레코드가 없는 것이 설계다.
-///    만들면 SQL 없는 레코드의 정책이 `off` 로 고정돼 나중 SQL 이 영구히 버려진다.
-/// 2. **되살리지 않는다** — 늦게 도착한 하트비트가 확정 레코드를 진행 중으로 되돌리면
-///    화면에 유령이 생긴다.
-/// 3. **지우지 않는다** — SQL·플랜은 그대로 남고 `last_seen_at_ms` 만 오른다.
+/// 1. **만들지 않는다** — 없는 자리에는 아무 일도 하지 않는다.
+/// 2. **되살리지 않는다** — 확정된 자리를 진행 중으로 되돌리지 않는다.
+/// 3. **되돌리지 않는다** — 뒤늦게 도착한 값이 앞선 값을 덮지 않는다.
+/// 4. **지우지 않는다** — SQL·플랜·정책은 그대로다.
 #[tokio::test]
-async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
+async fn a_heartbeat_only_refreshes_liveness_at_the_key_the_write_returned() {
     let Some(s) = store("heartbeat").await else {
         return;
     };
-    let inst = instance();
 
-    // ① 없는 레코드에는 아무 일도 하지 않는다.
+    // ① 이 어댑터가 만든 것이 아닌 자리에는 아무 일도 하지 않는다.
     let absent = s
-        .touch_in_flight(&inst, 2099, T0, T0 + 5_000)
+        .touch_in_flight(&StoredKey::new("SQ#nope\u{1}0000000000000#1"), T0 + 5_000)
         .await
         .expect("호출");
-    assert!(
-        !absent,
-        "없는 레코드에 하트비트가 성공했다 — 레코드를 만들었다"
-    );
-    let id = RecordId::new(&inst, 2099, T0);
-    assert!(
-        s.get(&id).await.expect("조회").is_none(),
-        "하트비트가 레코드를 만들었다 — 심층 조회 상한 밖 후보에 SQL 없는 레코드가 생긴다"
-    );
+    assert!(!absent, "없는 자리에 하트비트가 성공했다");
 
-    // ② 진행 중 레코드는 갱신하고, SQL·플랜은 남는다.
+    // ② 선행 저장이 자리를 알려 준다.
     let mut saved = sample(2010, T0);
     saved.state = SlowQueryState::InFlight;
     saved.ended_at_ms = None;
@@ -309,13 +300,12 @@ async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
         source: PlanSource::Rerun,
         ..Default::default()
     };
-    s.upsert_merged(&saved).await.expect("선행 저장");
+    let (_, key) = s.upsert_merged_keyed(&saved).await.expect("선행 저장");
 
-    let updated = s
-        .touch_in_flight(&inst, 2010, T0, T0 + 20_000)
-        .await
-        .expect("호출");
-    assert!(updated, "진행 중 레코드를 갱신하지 못했다");
+    assert!(
+        s.touch_in_flight(&key, T0 + 20_000).await.expect("호출"),
+        "쓰기가 알려 준 자리를 갱신하지 못했다"
+    );
 
     let got = s.get(&saved.record_id).await.expect("조회").expect("있음");
     assert_eq!(
@@ -337,20 +327,18 @@ async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
     assert_eq!(got.state, SlowQueryState::InFlight);
 
     // ③ 값을 되돌리지 않는다.
-    let backwards = s
-        .touch_in_flight(&inst, 2010, T0, T0 + 10_000)
-        .await
-        .expect("호출");
-    assert!(!backwards, "뒤늦게 도착한 갱신이 값을 되돌렸다");
+    assert!(
+        !s.touch_in_flight(&key, T0 + 10_000).await.expect("호출"),
+        "뒤늦게 도착한 갱신이 값을 되돌렸다"
+    );
 
-    // ④ 확정된 레코드는 되살리지 않는다.
+    // ④ 확정된 자리는 되살리지 않는다.
     let done = sample(2010, T0); // 같은 record_id, Finalized
     s.upsert_merged(&done).await.expect("확정");
-    let after_close = s
-        .touch_in_flight(&inst, 2010, T0, T0 + 30_000)
-        .await
-        .expect("호출");
-    assert!(!after_close, "확정 레코드에 하트비트가 성공했다");
+    assert!(
+        !s.touch_in_flight(&key, T0 + 30_000).await.expect("호출"),
+        "확정된 자리에 하트비트가 성공했다"
+    );
     let got = s.get(&saved.record_id).await.expect("조회").expect("있음");
     assert_eq!(got.state, SlowQueryState::Finalized);
     assert!(
@@ -363,114 +351,100 @@ async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
     );
 }
 
-/// **리더가 바뀌어 추정이 어긋나도 하트비트가 그 행을 찾는다.**
+/// **리더가 바뀌어 추정이 어긋나도, 병합이 도착한 자리를 그대로 받는다.**
 ///
-/// 물리 키는 `started_at_ms` 추정치로 만들어지고 그 추정은 관측자마다 최대 1초 다르다
-/// (`PROCESSLIST.TIME` 이 정수 초다). 이전 리더가 A 로 행을 만들고 드레인 없이 죽으면,
-/// 새 수집기는 B 로 추적을 시작하고 `upsert_merged` 는 ±2초 후보 조회로 **A 행에 병합**한다.
-/// 그때 하트비트가 B 키만 보면 그 행을 영원히 못 찾고 살아 있는 쿼리가 210초 뒤 고아로
-/// 확정된다(교차 리뷰 24라운드가 배포 차단으로 잡았다).
+/// 물리 키는 `started_at_ms` 추정치로 만들어지고 그 추정은 관측자마다 최대 1초 다르다.
+/// 이전 리더가 A 로 행을 만들고 드레인 없이 죽으면, 새 수집기는 B 로 추적을 시작하고
+/// `upsert_merged` 는 ±2초 후보 조회로 **A 행에 병합**한다. 그때 반환된 자리가 A 여야
+/// 한다 — B 를 돌려주면 그 뒤의 하트비트가 전부 헛돌고 살아 있는 쿼리가 210초 뒤 고아로
+/// 확정된다(24라운드). 자리를 다시 뒤져 고르는 방식은 같은 스레드의 옛 실행을 잘못
+/// 고를 수 있어 폐기했다(25라운드).
 #[tokio::test]
-async fn a_heartbeat_finds_the_row_after_the_physical_key_drifts() {
+async fn the_write_returns_the_row_it_actually_merged_into() {
     let Some(s) = store("heartbeat-drift").await else {
         return;
     };
-    let inst = instance();
 
-    // 이전 리더의 추정: T0 + 900 (행은 여기에 만들어진다).
+    // 이전 리더의 추정: T0 + 900.
     let mut old_leader = sample(2050, T0 + 900);
     old_leader.state = SlowQueryState::InFlight;
     old_leader.ended_at_ms = None;
     old_leader.last_seen_at_ms = Some(T0 + 1_000);
-    s.upsert_merged(&old_leader).await.expect("이전 리더 저장");
+    let (_, old_key) = s.upsert_merged_keyed(&old_leader).await.expect("이전 리더");
 
     // 새 수집기의 추정: T0 + 1_400 (같은 실행, 다른 추정).
-    let new_estimate = T0 + 1_400;
-    let updated = s
-        .touch_in_flight(&inst, 2050, new_estimate, T0 + 30_000)
-        .await
-        .expect("호출");
-    assert!(
-        updated,
-        "추정이 어긋난 뒤 하트비트가 행을 못 찾았다 — 살아 있는 쿼리가 고아로 확정된다"
+    let mut new_leader = sample(2050, T0 + 1_400);
+    new_leader.state = SlowQueryState::InFlight;
+    new_leader.ended_at_ms = None;
+    new_leader.last_seen_at_ms = Some(T0 + 12_000);
+    let (merged, new_key) = s.upsert_merged_keyed(&new_leader).await.expect("새 리더");
+
+    assert_eq!(
+        new_key, old_key,
+        "병합은 A 행에 했는데 자리는 B 를 돌려줬다 — 하트비트가 전부 헛돈다"
+    );
+    // 병합됐으므로 행은 하나다.
+    assert_eq!(
+        s.list_in_flight(50)
+            .await
+            .expect("조회")
+            .iter()
+            .filter(|q| q.thread_id == 2050)
+            .count(),
+        1,
+        "같은 실행에 행이 둘 생겼다"
     );
 
+    // 그 자리에 하트비트가 올라간다.
+    assert!(
+        s.touch_in_flight(&new_key, T0 + 40_000)
+            .await
+            .expect("호출"),
+        "반환된 자리에 하트비트가 실패했다"
+    );
+    let got = s.get(&merged.record_id).await.expect("조회").expect("있음");
+    assert_eq!(got.last_seen_at_ms, Some(T0 + 40_000));
+}
+
+/// **하트비트가 `rev` 를 올린다.**
+///
+/// 낙관적 잠금은 `rev` 만 본다. 하트비트가 그 값을 건드리지 않으면 **하트비트 전에 읽은
+/// 낡은 전체 쓰기가 그대로 성공해** 갱신한 생존 신호를 옛값으로 되돌린다 — 그러면 스윕이
+/// 살아 있는 레코드를 버린다(25라운드). `rev` 가 오르면 그 쓰기는 조건에서 걸려 다시
+/// 읽고 병합하며, 병합은 `max(last_seen)` 이므로 갱신값이 살아남는다.
+#[tokio::test]
+async fn a_heartbeat_makes_a_stale_full_write_retry() {
+    let Some(s) = store("heartbeat-rev").await else {
+        return;
+    };
+
+    let mut running = sample(2060, T0);
+    running.state = SlowQueryState::InFlight;
+    running.ended_at_ms = None;
+    running.last_seen_at_ms = Some(T0 + 1_000);
+    let (_, key) = s.upsert_merged_keyed(&running).await.expect("저장");
+
+    // 하트비트가 생존 신호를 올린다.
+    assert!(s.touch_in_flight(&key, T0 + 50_000).await.expect("호출"));
+
+    // **하트비트 전 값을 든 전체 쓰기**가 도착한다(느린 워커의 선행 저장).
+    let mut stale = running.clone();
+    stale.last_seen_at_ms = Some(T0 + 2_000);
+    s.upsert_merged(&stale).await.expect("낡은 쓰기");
+
     let got = s
-        .get(&old_leader.record_id)
+        .get(&running.record_id)
         .await
         .expect("조회")
         .expect("있음");
-    assert_eq!(got.last_seen_at_ms, Some(T0 + 30_000));
-    assert_eq!(got.state, SlowQueryState::InFlight);
-
-    // **그래도 만들지는 않는다.** 새 추정 키에 행이 생기면 쌍둥이가 된다.
-    let drifted_id = RecordId::new(&inst, 2050, new_estimate);
-    if drifted_id != old_leader.record_id {
-        assert!(
-            s.get(&drifted_id).await.expect("조회").is_none(),
-            "하트비트가 새 추정 키에 행을 만들었다 — 쌍둥이가 생긴다"
-        );
-    }
-
-    // 표류 경로에서도 확정된 행은 되살리지 않는다.
-    let done = sample(2050, T0 + 900);
-    s.upsert_merged(&done).await.expect("확정");
-    assert!(
-        !s.touch_in_flight(&inst, 2050, new_estimate, T0 + 60_000)
-            .await
-            .expect("호출"),
-        "확정된 행을 표류 경로로 되살렸다"
-    );
-}
-
-/// **`GSI1SK` 도 같이 올라간다.**
-///
-/// 진행 중 레코드의 `GSI1SK` 는 `last_seen_at_ms` 이고 스윕이 그 순서로 훑는다.
-/// 속성만 올리면 인덱스 순서와 속성이 어긋나 "오래된 것부터" 가 거짓이 된다.
-#[tokio::test]
-async fn a_heartbeat_moves_the_record_to_the_back_of_the_sweep_order() {
-    let Some(s) = store("heartbeat-order").await else {
-        return;
-    };
-    let inst = instance();
-
-    for (tid, seen) in [(2101u64, T0 + 1_000), (2102, T0 + 2_000)] {
-        let mut q = sample(tid, T0);
-        q.state = SlowQueryState::InFlight;
-        q.ended_at_ms = None;
-        q.last_seen_at_ms = Some(seen);
-        s.upsert_merged(&q).await.expect("저장");
-    }
-    let order: Vec<u64> = s
-        .list_in_flight(50)
-        .await
-        .expect("조회")
-        .iter()
-        .map(|q| q.thread_id)
-        .collect();
-    assert_eq!(order, vec![2101, 2102], "오래된 것부터가 아니다");
-
-    // 앞자리를 갱신하면 뒤로 간다.
-    assert!(
-        s.touch_in_flight(&inst, 2101, T0, T0 + 9_000)
-            .await
-            .expect("호출")
-    );
-    let order: Vec<u64> = s
-        .list_in_flight(50)
-        .await
-        .expect("조회")
-        .iter()
-        .map(|q| q.thread_id)
-        .collect();
     assert_eq!(
-        order,
-        vec![2102, 2101],
-        "GSI1SK 가 안 올라 인덱스 순서가 속성과 어긋났다"
+        got.last_seen_at_ms,
+        Some(T0 + 50_000),
+        "낡은 전체 쓰기가 생존 신호를 되돌렸다 — 스윕이 산 레코드를 버린다"
     );
 }
 
-/// 확정되면 GSI1 파티션이 **바뀌어야** 한다 — 진행 중 목록에서 빠진다.
+/// 확정되면 GSI1 파티션이 **바뀌어야** 한다/// 확정되면 GSI1 파티션이 **바뀌어야** 한다 — 진행 중 목록에서 빠진다.
 #[tokio::test]
 async fn finalizing_moves_the_record_out_of_the_in_flight_index() {
     let Some(s) = store("transition").await else {

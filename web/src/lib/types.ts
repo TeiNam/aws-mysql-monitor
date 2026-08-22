@@ -137,6 +137,13 @@ export interface ListResponse {
   has_more: boolean;
   /** 이 응답에 담긴 건수. **저장소 전체 건수가 아니다.** */
   total: number;
+  /**
+   * 서버가 이 응답을 만든 시각.
+   *
+   * 진행 중 경과 시간의 **기준점**이다. 브라우저 시계로 `started_at_ms` 를 빼면 시계가
+   * 앞선 기계에서 2초 쿼리가 5분으로 보인다(`lib/elapsed.ts`).
+   */
+  server_now_ms: number;
 }
 
 /** `crates/dbmon/src/api/view.rs` 의 `PlanView`. 플랜 JSON 은 마스킹돼 있다. */

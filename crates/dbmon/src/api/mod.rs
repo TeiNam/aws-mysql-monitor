@@ -445,6 +445,8 @@ async fn list_slow_queries(
         next_cursor: None,
         has_more,
         total,
+        // 화면이 진행 중 경과 시간을 브라우저 시계로 계산하므로 기준을 함께 준다.
+        server_now_ms: SystemClock.now_ms(),
     }))
 }
 
@@ -1061,6 +1063,7 @@ async fn list_plans(
         next_cursor: None,
         has_more: truncated || capped,
         total,
+        server_now_ms: SystemClock.now_ms(),
     }))
 }
 
