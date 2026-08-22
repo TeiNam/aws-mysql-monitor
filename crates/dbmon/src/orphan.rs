@@ -96,14 +96,28 @@ pub fn judge(
     if q.state != SlowQueryState::InFlight {
         return Verdict::NotInFlight;
     }
-    // 이름이 같고 **epoch 도 같고**, **지금 도는 태스크가 만진 것**일 때만 내 것이다.
+    // 이름이 같고 **epoch 도 같고**, **지금 도는 태스크의 것**일 때만 내 것이다.
     let is_mine = q.owner_worker.as_deref() == Some(me) && q.owner_epoch == my_epoch;
-    let touched_by_current_task = running.is_none_or(|r| {
-        r.get(q.instance_id.as_str())
-            // 갱신 시각이 없으면 선행 저장 직후다 — 시작 시각을 쓴다(아래 침묵 판정과 같다).
-            .is_some_and(|&started| q.last_seen_at_ms.unwrap_or(q.started_at_ms) >= started)
+    let owned_by_current_task = running.is_none_or(|r| {
+        r.get(q.instance_id.as_str()).is_some_and(|&started| {
+            // 갱신 시각이 없으면 선행 저장 직후다 — 시작 시각을 쓴다(침묵 판정과 같다).
+            let last_seen = q.last_seen_at_ms.unwrap_or(q.started_at_ms);
+            // ① 이 태스크가 만졌다. **엄격한 `>`** 다 — 우연히 같은 밀리초인 레코드를
+            //    "만졌다" 로 보면 영구히 가려진다(교차 리뷰 11회차). 살아 있는 레코드는
+            //    다음 tick(1초)에 갱신되어 넘어가므로 엄격해도 안전하다.
+            last_seen > started
+                // ② **갓 뜬 태스크에는 유예를 준다.** 태스크는 뜬 직후 인증·연결·첫
+                //    탐지를 비동기로 한다 — 그 사이에는 아직 아무 레코드도 만지지
+                //    못했다. 그때 ①만 보면 **살아 있는 쿼리의 레코드를 버린다.**
+                //    `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수 없다
+                //    (11회차가 배포 차단으로 잡았다 — 10회차 수정의 반대 방향이다).
+                //
+                //    유예는 침묵 임계와 같다: 그만큼 지났는데도 못 만졌으면 그 레코드는
+                //    이 태스크의 것이 아니다.
+                || now_ms.saturating_sub(started) <= threshold_ms
+        })
     });
-    if is_mine && touched_by_current_task {
+    if is_mine && owned_by_current_task {
         return Verdict::Mine;
     }
     // `last_seen_at_ms` 가 없으면 선행 저장 직후다 — `started_at_ms` 를 쓴다.
@@ -289,16 +303,67 @@ mod tests {
     /// id 만 보면 계속 `Mine` 이라 아무도 걷지 않는다(교차 리뷰 10회차).
     #[test]
     fn a_replacement_task_does_not_shield_the_previous_incarnation() {
-        let q = in_flight("me", Some(NOW - THRESHOLD - 1_000));
+        // 레코드는 오래 전에 갱신이 끊겼다.
+        let q = in_flight("me", Some(NOW - 3 * THRESHOLD));
         let id = q.instance_id.as_str().to_string();
-        // 새 태스크가 **그 레코드의 마지막 갱신 이후에** 떴다 → 그 태스크의 것이 아니다.
-        let replacement: RunningTasks = [(id, NOW - 500)].into_iter().collect();
+        // 새 태스크가 **그 레코드의 마지막 갱신 이후에** 떴고, **유예도 지났다** —
+        // 그만큼 돌았는데 못 만졌으면 그 태스크의 것이 아니다.
+        //
+        // 유예 안이면 `Mine` 이 맞다(갓 뜬 태스크는 아직 아무것도 못 만진다) — 그 경우는
+        // `a_freshly_spawned_task_gets_a_grace_period` 가 덮는다.
+        let replacement: RunningTasks = [(id, NOW - THRESHOLD - 1)].into_iter().collect();
         assert!(
             matches!(
                 judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&replacement)),
                 Verdict::Orphaned { .. }
             ),
             "교체 태스크가 옛 레코드를 영구히 가린다"
+        );
+    }
+
+    /// **갓 뜬 태스크의 인스턴스 레코드를 버리지 않는다.**
+    ///
+    /// 태스크는 뜬 직후 인증·연결·첫 탐지를 비동기로 한다 — 그 사이에는 아직 어떤
+    /// 레코드도 만지지 못했다. "만진 것만 내 것" 으로만 보면 그때 **살아 있는 쿼리의
+    /// 레코드를 버린다**, 그리고 `Abandoned` 는 나중의 `InFlight` 를 이기므로 되돌릴 수
+    /// 없다(교차 리뷰 11회차가 배포 차단으로 잡았다).
+    #[test]
+    fn a_freshly_spawned_task_gets_a_grace_period() {
+        let q = in_flight("me", Some(NOW - THRESHOLD - 10_000));
+        let id = q.instance_id.as_str().to_string();
+
+        // 방금 뜬 태스크 — 아직 아무것도 못 만졌다.
+        let fresh_task: RunningTasks = [(id.clone(), NOW - 1_000)].into_iter().collect();
+        assert_eq!(
+            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&fresh_task)),
+            Verdict::Mine,
+            "갓 뜬 태스크의 살아 있는 레코드를 버렸다"
+        );
+
+        // 유예가 지났는데도 못 만졌으면 이 태스크의 것이 아니다.
+        let old_task: RunningTasks = [(id, NOW - THRESHOLD - 1)].into_iter().collect();
+        assert!(matches!(
+            judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&old_task)),
+            Verdict::Orphaned { .. }
+        ));
+    }
+
+    /// **우연히 같은 밀리초인 레코드를 "만졌다" 로 보지 않는다.**
+    ///
+    /// `>=` 로 두면 그 레코드가 영구히 가려진다. 살아 있는 레코드는 다음 tick 에 갱신되어
+    /// 넘어가므로 엄격한 `>` 가 안전하다(교차 리뷰 11회차).
+    #[test]
+    fn an_equal_timestamp_is_not_treated_as_touched() {
+        let q = in_flight("me", Some(NOW - THRESHOLD - 10_000));
+        let id = q.instance_id.as_str().to_string();
+        // 태스크 시작 == 레코드 갱신 시각, 그리고 유예도 지났다.
+        let same: RunningTasks = [(id, NOW - THRESHOLD - 10_000)].into_iter().collect();
+        assert!(
+            matches!(
+                judge(&q, "me", Some(7), NOW, THRESHOLD, Some(&same)),
+                Verdict::Orphaned { .. }
+            ),
+            "같은 밀리초를 '만졌다' 로 보아 영구히 가렸다"
         );
     }
 
