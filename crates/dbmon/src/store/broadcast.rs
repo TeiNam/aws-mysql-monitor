@@ -88,6 +88,21 @@ impl<S: SlowQueryStore> SlowQueryStore for BroadcastingStore<S> {
     async fn list_in_flight(&self, limit: usize) -> Result<Vec<SlowQuery>> {
         self.inner.list_in_flight(limit).await
     }
+
+    /// **방송하지 않는다.** 하트비트는 새 사실이 아니다 — 이미 화면에 있는 레코드가
+    /// 아직 돌고 있다는 것뿐이고, 경과 시간은 클라이언트가 센다. 방송하면 브라우저가
+    /// 15초마다 목록 전체를 무효화한다(교차 리뷰 23라운드).
+    async fn touch_in_flight(
+        &self,
+        instance: &InstanceId,
+        thread_id: u64,
+        started_at_ms: EpochMs,
+        last_seen_at_ms: EpochMs,
+    ) -> Result<bool> {
+        self.inner
+            .touch_in_flight(instance, thread_id, started_at_ms, last_seen_at_ms)
+            .await
+    }
 }
 
 #[cfg(test)]

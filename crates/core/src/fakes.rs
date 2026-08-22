@@ -209,6 +209,29 @@ impl SlowQueryStore for FakeSlowQueryStore {
         out.truncate(limit);
         Ok(out)
     }
+
+    /// 어댑터와 **같은 세 조건**을 지킨다: 만들지 않고, 진행 중일 때만, 되돌리지 않는다.
+    /// 페이크가 느슨하면 통합 테스트만 통과하는 코드가 나온다(GSI 사영에서 한 번 데였다).
+    async fn touch_in_flight(
+        &self,
+        instance: &crate::ids::InstanceId,
+        thread_id: u64,
+        started_at_ms: EpochMs,
+        last_seen_at_ms: EpochMs,
+    ) -> Result<bool> {
+        let id = crate::ids::RecordId::new(instance, thread_id, started_at_ms);
+        let mut items = self.items.lock().unwrap();
+        let Some(e) = items.get_mut(id.as_str()) else {
+            return Ok(false);
+        };
+        if e.state != crate::slow_query::SlowQueryState::InFlight
+            || e.last_seen_at_ms.is_some_and(|cur| cur >= last_seen_at_ms)
+        {
+            return Ok(false);
+        }
+        e.last_seen_at_ms = Some(last_seen_at_ms);
+        Ok(true)
+    }
 }
 
 // ── DigestStore ─────────────────────────────────────────────────────────────

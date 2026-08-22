@@ -696,15 +696,16 @@ started_at_ms = observed_at_ms - (TIMER_WAIT / 1_000_000_000)
 선행 저장 시 함께 기록:
   owner_worker    : 워커 인스턴스 ID (사후 조사용 — 판정에는 쓰지 않는다)
   owner_epoch     : 샤드 리스 epoch (쓰기 펜싱용)
-  last_seen_at_ms : 관측이 계속되는 동안 15초 안에 반드시 한 번 갱신
+  last_seen_at_ms : 관측이 계속되는 동안 갱신 (목표 15초, 실질 상한은 tick 주기)
 
 수집 태스크가 tick 끝마다 (하트비트):
-  추적 중인데 마지막 저장이 15초보다 오래된 항목을 다시 쓴다
-    → last_seen_at_ms 만 올린다 (SQL·플랜은 병합이 보존한다)
+  이미 저장된 항목 중 마지막 저장이 15초보다 오래된 것을 조건부로 갱신한다
+    → last_seen_at_ms(+GSI1SK) 만 올린다. 만들지 않고, 되살리지 않고, 방송하지 않는다
+    → 값은 마지막 **관측** 시각이다 (now 가 아니다 — 안 본 것을 봤다고 하지 않는다)
 
 스케줄러 리더가 orphan_sweep_secs 마다:
   희소 GSI 로 state=in_flight 레코드를 오래된 순으로 조회
-  last_seen_at_ms < now - (3 × poll_interval + 30초 grace) 인 항목을
+  last_seen_at_ms < now - STALE_THRESHOLD_MS(210초) 인 항목을
     → state=abandoned 로 확정
     → duration_ms = 마지막 관측값, abandoned_reason = "owner_lost"
 ```
@@ -732,10 +733,11 @@ started_at_ms = observed_at_ms - (TIMER_WAIT / 1_000_000_000)
 | 갓 뜬 태스크에 유예를 준다 | 크래시 루프가 유예를 되돌려 무기한 가린다 |
 
 결론은 보정을 늘리는 게 아니라 **전제를 참으로 만드는 것**이었다. 관측 중이라는 사실은
-수집기만 알기 때문에 수집기가 하트비트로 그걸 저장하고, 판정은 침묵만 본다. 하트비트
-주기(15초)는 임계의 최소값(`GRACE_MS` = 30초)보다 **반드시 작아야 한다** — 스윕하는 리더와
-수집하는 워커의 `detect_interval_ms` 가 다를 수 있으므로 자기 임계에서 유도하면 안 된다.
-`orphan::HEARTBEAT_INTERVAL_MS` 의 단정이 그 불변식을 지킨다.
+수집기만 알기 때문에 수집기가 하트비트로 그걸 저장하고, 판정은 침묵만 본다. **임계는 설정에 의존하지 않는 상수(210초)다.** 하트비트는 tick 안에서만 쓸 수 있으므로
+갱신 주기의 실질 상한은 워커의 tick 이고(설정 상한 60초), 임계를 리더의 `detect_interval_ms`
+로 계산하면 **60초 tick 워커의 살아 있는 레코드를 200ms tick 리더가 버린다.** 그래서
+합법 설정의 최악값으로 계산한다: `3 × 60초 + 30초`. `orphan.rs` 의 컴파일 시점 단정과
+`config.rs` 가 같은 상수를 쓴다 — 상한을 올리면 임계도 함께 올라간다.
 
 기동 시 재수화(같은 `thread_id` 가 살아 있으면 추적 재개)는 **구현하지 않았다.** 하트비트가
 멈추면 침묵이 쌓여 `abandoned` 가 되고, 그건 "우리가 관측을 놓쳤다" 는 사실 그대로다 —

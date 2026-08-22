@@ -36,8 +36,8 @@ use dbmon_core::error::{DomainError, Result};
 use dbmon_core::ids::{InstanceId, RecordId};
 use dbmon_core::merge::merge;
 use dbmon_core::ports::SlowQueryStore;
-use dbmon_core::slow_query::SlowQuery;
-use dbmon_core::time::{DatePart, TimeRange, sort_key_ms};
+use dbmon_core::slow_query::{SlowQuery, SlowQueryState};
+use dbmon_core::time::{DatePart, EpochMs, TimeRange, sort_key_ms};
 
 /// 낙관적 잠금 재시도 상한.
 ///
@@ -943,6 +943,62 @@ impl SlowQueryStore for DynamoSlowQueryStore {
         // 인덱스 순서(오래된 것부터)를 유지한다 — 배치 응답은 순서를 보장하지 않는다.
         // 그 사이 지워진 레코드는 빠진다(정상).
         Ok(keys.iter().filter_map(|k| by_key.remove(k)).collect())
+    }
+
+    /// 생존 신호만 올리는 **조건부 `UpdateItem`**.
+    ///
+    /// `upsert_merged` 를 쓰지 않는 이유는 포트 문서에 있다. 여기서 중요한 것은
+    /// **이 연산이 만들 수 없고 되살릴 수 없다**는 것이다:
+    ///
+    /// - `attribute_exists(PK)` — 없는 레코드를 만들지 않는다
+    /// - `#st = :in_flight` — 확정·포기된 레코드를 되살리지 않는다
+    /// - `last_seen_at_ms < :ls` — 값을 되돌리지 않는다(뒤늦게 도착한 갱신)
+    ///
+    /// **`GSI1SK` 도 함께 올린다.** 진행 중 레코드의 `GSI1SK` 는 `last_seen_at_ms` 이고
+    /// 스윕이 그 순서로 훑는다([`keys::gsi1`]). 한쪽만 올리면 인덱스 순서와 속성이
+    /// 어긋나 "오래된 것부터" 가 거짓이 된다.
+    async fn touch_in_flight(
+        &self,
+        instance: &InstanceId,
+        thread_id: u64,
+        started_at_ms: EpochMs,
+        last_seen_at_ms: EpochMs,
+    ) -> Result<bool> {
+        use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
+
+        let pk = keys::slow_query_pk(instance, started_at_ms);
+        let sk = keys::slow_query_sk(started_at_ms, thread_id);
+        let res = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk))
+            .update_expression("SET last_seen_at_ms = :ls, GSI1SK = :g1sk")
+            .condition_expression(
+                "attribute_exists(PK) AND #st = :in_flight \
+                 AND (attribute_not_exists(last_seen_at_ms) OR last_seen_at_ms < :ls)",
+            )
+            .expression_attribute_names("#st", "state")
+            .expression_attribute_values(":ls", AttributeValue::N(last_seen_at_ms.to_string()))
+            .expression_attribute_values(":g1sk", AttributeValue::S(sort_key_ms(last_seen_at_ms)))
+            .expression_attribute_values(
+                ":in_flight",
+                AttributeValue::S(SlowQueryState::InFlight.as_str().to_string()),
+            )
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            // **조건 실패는 오류가 아니다.** 레코드가 없거나 이미 닫혔다는 사실이고,
+            // 호출부는 그걸 알아야 매 tick 재시도를 멈춘다.
+            Err(SdkError::ServiceError(e))
+                if matches!(e.err(), UpdateItemError::ConditionalCheckFailedException(_)) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(map_sdk_err(e)),
+        }
     }
 }
 

@@ -623,7 +623,10 @@ impl Config {
             }
         }
         let c = &self.collector;
-        if !(200..=60_000).contains(&c.detect_interval_ms) {
+        // ⚠ 상한을 올리려면 `orphan::MAX_DETECT_INTERVAL_MS` 도 함께 올려야 한다.
+        // 고아 임계가 그 값으로 계산되므로, 여기만 올리면 **느린 워커의 살아 있는
+        // 레코드가 버려진다**(교차 리뷰 23라운드). `orphan.rs` 의 테스트가 두 값을 대조한다.
+        if !(200..=(crate::orphan::MAX_DETECT_INTERVAL_MS as u64)).contains(&c.detect_interval_ms) {
             return Err(err("collector.detect_interval_ms", "200~60000 이어야 한다"));
         }
         if !(1..=3_600).contains(&c.slow_threshold_secs) {
