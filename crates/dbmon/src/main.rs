@@ -697,14 +697,22 @@ async fn backfill_round(
         //
         // 버린 엔트리는 **다시 읽는다**: 체크포인트를 남긴 마지막 엔트리 기준으로 잡고
         // 페이지 토큰을 버린다. 중복은 `record_id` 로 병합되므로 안전하다.
-        // 상한에 걸렸으면 **경계를 다시 읽는다.** 엔트리가 둘 이상이면 마지막 하나를
-        // 버리고(그게 잘렸을 수 있다), 하나뿐이면 버리지 않는다(버리면 진행이 0 이다).
+        // 상한에 걸렸으면 **마지막 엔트리를 항상 버린다.**
+        //
+        // 그게 잘렸을 수 있다 — 엔트리 하나가 이벤트 여러 개에 걸치고 상한이 그 중간에서
+        // 멈추면 파서는 청크 끝에서 현재 엔트리를 확정하고, 종결 세미콜론을 요구하지 않는다.
+        // **잘린 SQL 은 잘린 다이제스트로 저장되어 사전을 오염시킨다.**
+        //
+        // 전에는 엔트리가 하나뿐이면 남겼다("버리면 진행이 0 이다"). 그건 오염을 그
+        // 경우에만 허용하는 것이었고, 교차 리뷰 11회차가 그걸 지적했다. 진행은 아래에서
+        // 위치를 1ms 넘겨 보장한다 — **오염보다 결측이 낫다.**
         let capped = chunk.has_more;
-        if capped && parsed.entries.len() > 1 {
-            parsed.entries.pop();
+        if capped && let Some(dropped) = parsed.entries.pop() {
             tracing::info!(
                 instance = %instance.id.as_str(),
-                "상한에서 마지막 엔트리를 버렸다 — 다음 라운드가 그 자리부터 다시 읽는다"
+                remaining = parsed.entries.len(),
+                dropped_ended_at_ms = dropped.ended_at_ms,
+                "상한에서 마지막 엔트리를 버렸다 — 잘렸을 수 있다"
             );
         }
         // **소스가 시간 필터를 못 하는 경우를 여기서 막는다.**
@@ -766,20 +774,27 @@ async fn backfill_round(
                         // 위치가 `since_ms` 와 같아져 다음 라운드가 같은 자리에서
                         // 시작한다 — 진행 0 이다. 그때는 1ms 넘기고 크게 남긴다.
                         // 멈춰 있는 것이 한 밀리초를 건너뛰는 것보다 나쁘다.
-                        let pos = parsed.entries.iter().map(|e| e.ended_at_ms).max().map(|t| {
-                            if t > since_ms {
-                                t
-                            } else {
+                        // **항상 전진한다.**
+                        //
+                        // 남은 엔트리의 최대 시각을 쓰되, 그게 `since_ms` 보다 크지 않거나
+                        // 남은 엔트리가 아예 없으면(전부 걸러졌거나 하나뿐이어서 버렸다)
+                        // 1ms 넘긴다. 위치를 안 쓰면 체크포인트가 갱신되지 않아 같은
+                        // 청크를 영원히 다시 읽는다 — 폭주가 그 뒤의 모든 데이터를 굶긴다
+                        // (교차 리뷰 11회차).
+                        let last = parsed.entries.iter().map(|e| e.ended_at_ms).max();
+                        let pos = match last {
+                            Some(t) if t > since_ms => t,
+                            other => {
                                 tracing::warn!(
                                     instance = %instance.id.as_str(),
                                     since_ms,
-                                    last_entry_ms = t,
-                                    "상한 안의 엔트리가 모두 같은 밀리초다 — 1ms 넘긴다"
+                                    last_entry_ms = ?other,
+                                    "상한 라운드가 전진하지 못한다 — 1ms 넘긴다 (그 구간의 정확 지표가 없다)"
                                 );
                                 since_ms + 1
                             }
-                        });
-                        (pos, None)
+                        };
+                        (Some(pos), None)
                     } else {
                         (
                             chunk.next_since_ms.or_else(|| {
