@@ -36,6 +36,17 @@ pub struct Readiness {
     storage_ok: AtomicBool,
     /// **KMS 접근 거부 상태** (F25). 재시도가 무의미하므로 즉시 503 + 알림.
     kms_denied: AtomicBool,
+    /// **이 워커가 저장된 인증 모드를 수행할 수 있는가.**
+    ///
+    /// # 왜 준비 상태에 넣나 (교차 리뷰 5차)
+    ///
+    /// 롤링 배포 중에는 Cognito 검증기가 있는 워커와 없는 워커가 섞인다. 전역 설정이
+    /// `cognito` 로 바뀌면 **검증기 없는 워커는 모든 요청을 거부**하는데, 그 워커도
+    /// 계속 트래픽을 받는다 — 사용자는 간헐적 401 을 보고 화면이 토큰을 지운다.
+    ///
+    /// 준비 상태에 넣으면 ECS·ALB 가 그 워커를 빼고 새 워커로 교체한다.
+    /// 저장된 모드가 `cognito` 가 아니면 항상 참이다.
+    auth_mode_supported: AtomicBool,
     /// 수집 리더를 보유했다. `false` 면 standby.
     collect_leader: AtomicBool,
     /// 이 워커가 API 역할을 수행하는가. 보고용이다.
@@ -76,6 +87,8 @@ impl Readiness {
     pub fn new_for_role(serves_api: bool, runs_collector: bool) -> Arc<Self> {
         Arc::new(Self {
             config_loaded: AtomicBool::new(false),
+            // 기본은 참이다 — 저장된 모드가 `cognito` 일 때만 갱신된다.
+            auth_mode_supported: AtomicBool::new(true),
             storage_ok: AtomicBool::new(false),
             kms_denied: AtomicBool::new(false),
             collect_leader: AtomicBool::new(false),
@@ -91,6 +104,14 @@ impl Readiness {
 
     pub fn set_config_loaded(&self, v: bool) {
         self.config_loaded.store(v, Ordering::Relaxed);
+    }
+
+    /// 저장된 인증 모드를 이 워커가 수행할 수 있는가.
+    ///
+    /// 설정을 읽는 쪽(`settings_state` 폴러)이 부른다: 모드가 `cognito` 인데 이 워커에
+    /// 검증기가 없으면 `false` 다.
+    pub fn set_auth_mode_supported(&self, v: bool) {
+        self.auth_mode_supported.store(v, Ordering::Relaxed);
     }
     pub fn set_storage_ok(&self, v: bool) {
         self.storage_ok.store(v, Ordering::Relaxed);
@@ -151,11 +172,15 @@ impl Readiness {
         let storage_ok = self.storage_ok.load(Ordering::Relaxed);
         let kms_denied = self.kms_denied.load(Ordering::Relaxed);
         let collect_leader = self.collect_leader.load(Ordering::Relaxed);
+        let auth_mode_supported = self.auth_mode_supported.load(Ordering::Relaxed);
 
         let ready = !draining
             && config_loaded
             && storage_ok
             && !kms_denied
+            // 저장된 인증 모드를 수행할 수 없으면 트래픽을 받지 않는다 — 받으면
+            // 모든 요청이 401 이 되고 화면이 토큰을 지운다.
+            && auth_mode_supported
             // **API 와 수집을 겸하는 워커만** 리더 여부를 따진다 (FR-OPS-08 의
             // active/standby). collector 전용은 트래픽을 받지 않고, api 전용은
             // 리스를 잡지 않으므로 리더 여부를 물으면 영원히 준비되지 않는다.
@@ -201,6 +226,7 @@ impl Readiness {
                     config_loaded,
                     storage_ok,
                     kms_denied,
+                    auth_mode_supported,
                     self.requires_leadership,
                     collect_leader,
                 ))
@@ -208,11 +234,13 @@ impl Readiness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reason(
         draining: bool,
         config_loaded: bool,
         storage_ok: bool,
         kms_denied: bool,
+        auth_mode_supported: bool,
         serves_api: bool,
         collect_leader: bool,
     ) -> &'static str {
@@ -225,6 +253,9 @@ impl Readiness {
             "config_not_loaded"
         } else if !storage_ok {
             "storage_unavailable"
+        } else if !auth_mode_supported {
+            // 이 워커는 저장된 인증 모드를 수행할 수 없다 (예: Cognito 검증기 없음).
+            "auth_mode_unsupported"
         } else if serves_api && !collect_leader {
             "standby"
         } else {

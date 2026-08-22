@@ -2226,6 +2226,45 @@ async fn healthcheck(port: u16) -> anyhow::Result<()> {
     }
 }
 
+/// 저장된 인증 모드를 이 워커가 수행할 수 있는지 주기적으로 보고한다.
+///
+/// 설정 폴러가 캐시를 갱신하므로 여기서는 **읽기만** 한다. 주기가 짧은 이유: 모드를
+/// 바꾼 뒤 부적합 워커가 빠지는 데 걸리는 시간이 그만큼이다.
+fn spawn_auth_mode_watch(
+    settings: Arc<dbmon::settings_state::SettingsState>,
+    has_cognito_verifier: bool,
+    allow_auth_disable: bool,
+    readiness: Arc<Readiness>,
+    shutdown: Arc<Shutdown>,
+) {
+    const INTERVAL: Duration = Duration::from_secs(10);
+    tokio::spawn(async move {
+        use dbmon_core::settings::AuthModeSetting as M;
+        loop {
+            // **한 번도 읽지 못했으면 판정하지 않는다.** 기본값(Token)을 근거로
+            // "수행할 수 있다" 고 보고하면 그게 곧 fail-open 이다.
+            if settings.is_loaded() {
+                let s = settings.cached();
+                let supported = match s.auth.effective_mode(allow_auth_disable) {
+                    M::Cognito => has_cognito_verifier,
+                    M::Token | M::Off => true,
+                };
+                readiness.set_auth_mode_supported(supported);
+                if !supported {
+                    tracing::warn!(
+                        "저장된 인증 모드가 cognito 인데 이 워커에 검증기가 없다 — \
+                         준비 상태를 내린다"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(INTERVAL) => {}
+                _ = shutdown.wait() => return,
+            }
+        }
+    });
+}
+
 fn parse_role(s: &str) -> anyhow::Result<Role> {
     match s {
         "all" => Ok(Role::All),
@@ -2455,6 +2494,20 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // 조회 API 와 화면은 **저장소가 조립된 뒤에만** 붙는다 — 저장소 없이 라우트를
     // 열면 500 을 돌려주는 엔드포인트가 생기고, 그건 "데이터가 없다" 로 오해된다.
     if let Some(api_state) = api_state {
+        // **저장된 인증 모드를 이 워커가 수행할 수 있는지 보고한다** (교차 리뷰 5차).
+        //
+        // 롤링 배포 중에는 Cognito 검증기가 있는 워커와 없는 워커가 섞인다. 전역
+        // 설정이 `cognito` 로 바뀌면 검증기 없는 워커는 모든 요청을 거부하는데, 그
+        // 워커도 계속 트래픽을 받는다 — 사용자는 간헐적 401 을 보고 화면이 토큰을
+        // 지운다. `/readyz` 에 실으면 ECS·ALB 가 그 워커를 빼고 교체한다.
+        spawn_auth_mode_watch(
+            Arc::clone(&api_state.settings),
+            api_state.cognito.is_some(),
+            api_state.allow_auth_disable,
+            readiness.clone(),
+            shutdown.clone(),
+        );
+
         // **화면은 배포에서도 서빙한다.**
         //
         // 전에는 로컬 개발(`serves_local_ui`)에서만 붙였다. 근거는 "prd 에서는 인증을

@@ -2722,3 +2722,65 @@ blocker 5건. **세 건이 "이전 수정이 만든 새 문제" 다** — fail-c
 
 `introspect` 두 번 읽기, `SchemaNameMode` 전달, `dbmon-` 접두어 필수에서는 새 결함을
 찾지 못했다.
+
+
+---
+
+## 35라운드 — 5차 교차 리뷰 (2026-08-23)
+
+blocker 4건. **가장 중요한 것은 4번이다** — 내가 코드 주석에 "IAM 에서 Deny 된다" 고
+적어 놓고 그 정책을 만들지 않았다.
+
+### 4번 — 주석이 약속한 방어가 없었다
+
+`store/users.rs` 의 모듈 문서:
+
+> 문서(08 §5.2)가 규정했다: `USER` 레코드와 IdP 그룹 매핑 표에 대한 **앱 Role 의
+> 쓰기를 IAM 에서 Deny** 한다. 그래서 이 어댑터는 **읽기만 구현한다.**
+
+읽기만 구현한 것은 사실이다. 그런데 **IAM Deny 가 Terraform 에 없었다.** `task_storage`
+정책이 config 테이블 전체에 `PutItem`·`UpdateItem`·`DeleteItem` 을 허용했다.
+
+코드가 제한이 아니다 — 태스크 자격증명을 훔치면 DynamoDB API 를 직접 부른다. 그러면:
+
+| 키 | 할 수 있는 일 |
+|---|---|
+| `USER#<sub>` | **자기 권한을 admin 으로 올린다** (T-20 의 핵심을 우회) |
+| `AUDIT#<yyyy-mm>` | **자기 흔적을 지운다** (FR-CRD-10 이 무의미해진다) |
+
+`dynamodb:LeadingKeys` 조건으로 명시적 `Deny` 를 추가했다. `AUDIT#` 은 `PutItem` 을
+남긴다(앱이 감사 레코드를 만든다) — 수정·삭제만 막고, 어댑터의 조건식이 덮어쓰기를
+막는다.
+
+**교훈:** 주석이 "X 로 막는다" 고 말하면 X 가 존재해야 한다. 2차 리뷰의 "없는 테스트를
+근거로 적지 않는다" 와 같은 부류다.
+
+### blocker 표
+
+| # | 지적 | 고친 것 |
+|---|---|---|
+| 1 | 기동 직후 Cognito 설정이 Token 으로 fail-open | `cached()` 는 로드 전에 **기본값**(Token)을 준다. `is_loaded()` 를 확인하고, 아니면 거부한다 |
+| 2 | 혼합 배포에서 검증기 없는 워커가 401 을 낸다 | `/readyz` 에 `auth_mode_supported` 를 실었다 — ECS·ALB 가 부적합 워커를 빼고 교체한다 |
+| 3 | 콜드 JWKS 갱신 중 병렬 요청이 401 | **single-flight.** 락 없이 8개를 보내면 7개가 실패한다(테스트로 확인) |
+| 4 | IAM 이 USER·AUDIT 변조를 허용 | `LeadingKeys` 조건 `Deny` 추가 |
+
+### 3번을 고치면서 만든 결함 하나
+
+single-flight 를 넣을 때 빠른 경로에서 `lookup` 을 불렀다. `lookup` 은 판정하면서
+**갱신 예산을 기록**하므로, 그 다음 판정이 항상 레이트 리밋에 걸려 **갱신이 아예 일어나지
+않았다.** 읽기 전용 `fresh_cached` 를 분리해 고쳤다.
+
+### 이번 라운드의 테스트는 회귀를 넣어 확인했다
+
+| 테스트 | 회귀를 넣었을 때 |
+|---|---|
+| `cognito_mode_refuses_the_shared_token` | "검증기 없는 Cognito 모드에서 공유 토큰이 통과했다" |
+| `concurrent_cold_requests_share_one_fetch_and_all_succeed` | "병렬 요청 중 7개가 키를 못 얻었다" |
+
+4차 라운드의 교훈("테스트를 썼다 로 끝내지 않는다")을 이번에 두 번 적용했다.
+
+### 리뷰가 확인해 준 비결함
+
+- `introspect` 두 번 읽기는 계정 상태만 비교하므로 정상 부하에서 `Conflict` 를 내지 않는다
+- `literal_mode_*` 는 렌더링·왕복 성질을 확인한다
+- 음수 `revoked_after_ms` 테스트는 실제 파서를 부른다

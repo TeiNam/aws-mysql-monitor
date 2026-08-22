@@ -380,6 +380,19 @@ pub(crate) async fn context_from_token(
     let now_ms = SystemClock.now_ms();
     let fresh = state.settings.cached_fresh(now_ms);
 
+    // **설정을 한 번도 읽지 못했으면 거부한다** (교차 리뷰 5차).
+    //
+    // `cached()` 는 그때 **기본값**을 준다 — 그리고 기본 모드는 `Token` 이다. 저장된
+    // 모드가 Cognito 인 배포에서 새 워커가 뜨면, 첫 읽기가 끝나기 전에 온 요청이
+    // 남아 있는 공유 토큰을 admin 으로 승인한다.
+    //
+    // "모르면 닫는다" 가 이 함수의 규칙이고, 여기가 그 규칙이 가장 필요한 자리다.
+    // `/readyz` 가 같은 사실을 보고하므로 ECS·ALB 가 이 워커로 트래픽을 보내지
+    // 않는다 — 즉 실제로 닫히는 창은 짧다.
+    if fresh.is_none() && !state.settings.is_loaded() {
+        return Err(auth::AuthError::NotConfigured);
+    }
+
     // 캐시가 낡았으면 **마지막으로 권위 있게 읽은 모드**를 쓴다
     // ([`stale_fallback_mode`]). `off` 는 그 경로로 살아남지 못한다.
     let mode = match fresh.as_ref() {

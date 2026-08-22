@@ -418,6 +418,18 @@ pub enum KeyLookup {
 pub struct JwksCache {
     source: Box<dyn JwksSource>,
     state: RwLock<CacheState>,
+    /// **갱신 single-flight 락.**
+    ///
+    /// # 왜 필요한가 (교차 리뷰 5차가 잡은 결함)
+    ///
+    /// 콜드 워커에서 화면이 여는 병렬 요청이 동시에 캐시 미스를 낸다. 하나가 JWKS 를
+    /// 가져오는 동안 나머지는 레이트 리밋에 걸려 `RateLimited(None)` → **401** 이
+    /// 되고, 화면은 그걸 "토큰이 무효하다" 로 읽어 세션을 지운다.
+    ///
+    /// 즉 첫 로그인 직후 화면을 여는 것만으로 로그아웃될 수 있었다. 진행 중인
+    /// 갱신을 **기다리게** 하면 그 경로가 사라진다 — 레이트 리밋은 여전히 실제
+    /// 조회 횟수를 묶는다(락을 얻은 뒤 다시 판정하므로).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -436,12 +448,25 @@ impl JwksCache {
         Self {
             source,
             state: RwLock::new(CacheState::default()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     /// 캐시된 키. 갱신하지 않는다.
     pub fn cached(&self, kid: &str) -> Option<RsaKey> {
         self.state.read().ok()?.keys.get(kid).cloned()
+    }
+
+    /// **신선한** 캐시 히트만. 갱신 예산을 쓰지 않는다 (읽기 전용).
+    ///
+    /// [`Self::lookup`] 은 판정하면서 시도 시각을 기록하므로 여러 번 부르면 예산이
+    /// 소진된다 — 빠른 경로는 이 함수를 쓴다.
+    pub fn fresh_cached(&self, kid: &str, now_ms: EpochMs) -> Option<RsaKey> {
+        let s = self.state.read().ok()?;
+        if now_ms.saturating_sub(s.fetched_at_ms) > JWKS_TTL_MS {
+            return None;
+        }
+        s.keys.get(kid).cloned()
     }
 
     /// 키를 찾고 **갱신이 필요한지 함께 말한다.**
@@ -594,16 +619,38 @@ impl CognitoVerifier {
     }
 
     /// 키를 얻는다 — 캐시 판정에 따라 갱신을 **한 번만** 한다.
+    ///
+    /// # 동시 요청은 하나의 갱신을 **공유한다** (single-flight)
+    ///
+    /// 캐시가 신선하면 락을 잡지 않는다(정상 경로에 비용이 없다). 미스일 때만
+    /// 락을 잡고, 잡은 뒤 **다시 캐시를 본다** — 기다리는 동안 다른 요청이
+    /// 갱신을 끝냈을 수 있다.
     async fn key_for(&self, kid: &str, v: &Verification, now_ms: EpochMs) -> Option<RsaKey> {
+        // 빠른 경로: 신선한 캐시 히트. 락도, 외부 호출도 없다.
+        //
+        // **`lookup` 이 아니라 `fresh_cached` 다.** `lookup` 은 판정하면서 갱신 예산을
+        // 기록하므로, 빠른 경로에서 부르면 아래 판정이 항상 레이트 리밋에 걸린다 —
+        // 그러면 갱신이 아예 일어나지 않는다(이 함수를 쓰면서 실제로 만든 결함이다).
+        if let Some(k) = self.jwks.fresh_cached(kid, now_ms) {
+            return Some(k);
+        }
+
+        // **여기부터 하나씩 지난다.** 병렬 요청이 각자 401 을 받는 대신 기다린다.
+        let _guard = self.jwks.refresh_lock.lock().await;
+
+        // 락을 기다리는 동안 누가 갱신했는가 — 여전히 읽기만 한다.
+        if let Some(k) = self.jwks.fresh_cached(kid, now_ms) {
+            return Some(k);
+        }
+
+        // 이제 판정한다 (예산을 쓴다).
         let fallback = match self.jwks.lookup(kid, now_ms) {
-            // 신선하다. 외부 호출이 없다.
             KeyLookup::Fresh(k) => return Some(k),
             // **레이트 리밋에 걸렸다 — 갱신하지 않는다.** 무작위 `kid` 로 오는
             // 요청이 여기로 떨어지고, 그때 JWKS 를 가져오지 않는 것이 요점이다.
             //
-            // 다만 **캐시를 한 번 더 본다.** 키 회전 중이면 다른 요청이 방금 갱신을
-            // 끝냈을 수 있고, 그러면 이 요청도 새 키를 쓸 수 있다 — 리밋에 걸렸다는
-            // 이유로 유효한 토큰을 거부하지 않는다(교차 리뷰 2차가 지적했다).
+            // 캐시를 한 번 더 본다: 키 회전 중이면 방금 갱신이 끝났을 수 있고,
+            // 리밋에 걸렸다는 이유로 유효한 토큰을 거부하지 않는다.
             KeyLookup::RateLimited(cached) => return cached.or_else(|| self.jwks.cached(kid)),
             // 갱신하고, 실패하면 낡은 키로 계속한다 (Cognito 장애 내성).
             KeyLookup::Stale(k) => Some(k),
@@ -621,6 +668,12 @@ impl CognitoVerifier {
     /// 캐시된 키 수 (진단용).
     pub fn cached_keys(&self) -> usize {
         self.jwks.len()
+    }
+
+    /// 테스트가 락을 직접 잡아 보기 위한 접근자.
+    #[cfg(test)]
+    pub(crate) fn jwks_for_test(&self) -> &JwksCache {
+        &self.jwks
     }
 }
 
@@ -1443,5 +1496,121 @@ mod mode_dispatch_tests {
     fn off_requires_the_file_setting_too() {
         assert_eq!(settings(M::Off, false).auth.effective_mode(false), M::Token);
         assert_eq!(settings(M::Off, false).auth.effective_mode(true), M::Off);
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    //! **병렬 요청이 하나의 JWKS 조회를 공유한다** (교차 리뷰 5차가 잡은 결함).
+    //!
+    //! 콜드 워커에서 화면이 여는 병렬 요청이 동시에 캐시 미스를 내면, 하나가 조회하는
+    //! 동안 나머지가 레이트 리밋에 걸려 401 이 됐다 — 화면은 그걸 "토큰이 무효하다" 로
+    //! 읽고 세션을 지운다. 첫 로그인 직후 화면을 여는 것만으로 로그아웃됐다.
+
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 조회가 **느린** 소스. 그동안 다른 요청이 들어온다.
+    struct SlowSource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl JwksSource for SlowSource {
+        async fn fetch(&self, _url: &str) -> Result<JwksDocument, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(JwksDocument {
+                keys: vec![Jwk {
+                    kid: "rotated".into(),
+                    kty: "RSA".into(),
+                    n: URL_SAFE_NO_PAD.encode([0xAB; 256]),
+                    e: URL_SAFE_NO_PAD.encode([1u8, 0, 1]),
+                    alg: Some("RS256".into()),
+                }],
+            })
+        }
+    }
+
+    struct NoUsers;
+    #[async_trait::async_trait]
+    impl dbmon_core::ports::UserStore for NoUsers {
+        async fn get(
+            &self,
+            _subject: &str,
+        ) -> dbmon_core::error::Result<Option<dbmon_core::rbac::UserRecord>> {
+            Ok(None)
+        }
+    }
+
+    fn verification() -> Verification {
+        Verification {
+            issuer: "https://cognito-idp.ap-northeast-2.amazonaws.com/ap-northeast-2_AbCdEf".into(),
+            client_id: "cid".into(),
+        }
+    }
+
+    /// **동시에 들어온 요청이 전부 키를 얻는다.** 조회는 한 번만 나간다.
+    #[tokio::test]
+    async fn concurrent_cold_requests_share_one_fetch_and_all_succeed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = Arc::new(CognitoVerifier::new(
+            JwksCache::new(Box::new(SlowSource {
+                calls: Arc::clone(&calls),
+            })),
+            Arc::new(NoUsers),
+        ));
+        let v = verification();
+        let now = 1_787_443_200_000;
+
+        // 화면이 여는 병렬 요청 8개.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let verifier = Arc::clone(&verifier);
+            let v = v.clone();
+            tasks.push(tokio::spawn(async move {
+                verifier.key_for("rotated", &v, now).await
+            }));
+        }
+        let results: Vec<_> = futures::future::join_all(tasks).await;
+
+        let ok = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+        assert_eq!(
+            ok,
+            8,
+            "병렬 요청 중 {}개가 키를 못 얻었다 — 그 요청들은 401 이 되고 화면이 세션을 지운다",
+            8 - ok
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "조회가 여러 번 나갔다 — single-flight 가 아니다"
+        );
+    }
+
+    /// **신선한 캐시는 락을 잡지 않는다.** 정상 경로에 직렬화 비용이 없어야 한다.
+    #[tokio::test]
+    async fn a_fresh_cache_hit_does_not_take_the_lock() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = JwksCache::new(Box::new(SlowSource {
+            calls: Arc::clone(&calls),
+        }));
+        let now = 1_787_443_200_000;
+        cache.refresh("url", now).await.expect("갱신");
+
+        let verifier = CognitoVerifier::new(cache, Arc::new(NoUsers));
+        // 락을 **밖에서 잡아 둔다.** 빠른 경로가 락을 쓰면 여기서 멈춘다.
+        let held = verifier.jwks_for_test().refresh_lock.lock().await;
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            verifier.key_for("rotated", &verification(), now),
+        )
+        .await
+        .expect("빠른 경로가 락을 기다렸다");
+        assert!(got.is_some());
+        drop(held);
     }
 }
