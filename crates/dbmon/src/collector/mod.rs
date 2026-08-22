@@ -922,11 +922,18 @@ struct Candidate {
 struct Selection {
     /// 플랜을 조회할 대상. **멤버십 판정용**이다.
     plan: std::collections::BTreeSet<u64>,
-    /// 레코드를 쓸 대상. **플랜 대상이 소요 큰 순으로 앞에 온다.**
+    /// 레코드를 쓸 대상. **자리 없는 항목이 먼저, 그다음 플랜 대상.** 각 묶음은 소요 큰 순이다.
     ///
-    /// 순서가 규칙이다 — 집합으로만 들고 순회하면 `BTreeSet` 이 스레드 id 순으로 바꿔
-    /// 우선순위가 사라진다. 시간 예산이 중간에 끊기므로 **앞자리가 실제로 조회되는
-    /// 자리**다(교차 리뷰 29라운드).
+    /// # 왜 자리 없는 항목이 먼저인가
+    ///
+    /// 루프는 항목마다 `EXPLAIN`(최대 3초) → 쓰기를 **직렬로** 한다. 플랜 대상을 앞에 두면
+    /// 자리 없는 항목의 쓰기가 그 뒤에서 기다린다 — 29라운드에 자리(슬롯)는 보장했지만
+    /// **시간**은 보장하지 않아서, 301행 인수인계에서 마지막 행이 210초를 넘겼다
+    /// (30라운드가 재현했다). 순서를 뒤집으면 자리 얻기는 `EXPLAIN` 을 기다리지 않는다.
+    ///
+    /// 플랜 대상은 뒤에 있어도 **자리를 잃지 않는다**(상한이 예약돼 있다). 잃는 것은
+    /// 시간뿐이고, 플랜은 못 얻어도 다음 tick 에 다시 시도한다 — 살아 있는 행이 버려지는
+    /// 것과 비교할 대상이 아니다.
     write: Vec<u64>,
     /// 플랜 상한에 걸려 못 본 수.
     plan_skipped: usize,
@@ -975,10 +982,11 @@ fn select_targets(candidates: &[Candidate], plan_limit: usize) -> Selection {
 
     Selection {
         // **정렬된 순서 그대로** 이어 붙인다(집합이 아니라 벡터에서 가져온다).
-        write: plan
+        // 자리 없는 항목이 먼저다 — 위 `write` 문서 참고.
+        write: keyless
             .iter()
             .map(|c| c.id)
-            .chain(keyless.iter().map(|c| c.id))
+            .chain(plan.iter().map(|c| c.id))
             .collect(),
         plan: plan_ids,
         plan_skipped,
@@ -1032,7 +1040,13 @@ mod select_tests {
         }
         let picked = select_targets(&cands, 10);
         assert!(picked.plan.contains(&1), "플랜 대상이 빠졌다");
-        assert_eq!(picked.write[0], 1, "플랜 대상이 앞에 오지 않았다");
+        assert!(
+            picked.write.contains(&1),
+            "플랜 대상이 쓰기 목록에서 빠졌다"
+        );
+        // **자리는 보장하지만 순서는 뒤다** — 앞에 두면 자리 없는 항목의 쓰기가
+        // `EXPLAIN` 뒤에서 기다린다(30라운드).
+        assert_eq!(*picked.write.last().unwrap(), 1);
         assert_eq!(picked.write.len(), ACQUIRE_LIMIT);
         assert!(picked.write_skipped > 0, "자른 사실을 보고하지 않았다");
     }
@@ -1092,6 +1106,27 @@ mod select_tests {
             picked.write,
             vec![2, 3, 1],
             "소요 큰 순이 아니다 — 집합의 id 순으로 돌고 있다"
+        );
+    }
+
+    /// **자리 얻기가 `EXPLAIN` 을 기다리지 않는다.**
+    ///
+    /// 루프는 항목마다 `EXPLAIN`(최대 3초) → 쓰기를 직렬로 한다. 플랜 대상이 앞에 있으면
+    /// 자리 없는 항목의 쓰기가 그 뒤에서 기다리고, 301행 인수인계에서 마지막 행이 210초를
+    /// 넘긴다(교차 리뷰 30라운드).
+    #[test]
+    fn keyless_writes_come_before_any_plan_attempt() {
+        let cands = [
+            // 플랜 대상(자리는 있다). 소요가 훨씬 크지만 순서는 뒤여야 한다.
+            c(1, 99_000, true, true),
+            c(2, 1_000, false, false),
+            c(3, 2_000, false, false),
+        ];
+        let picked = select_targets(&cands, 10);
+        assert_eq!(
+            picked.write,
+            vec![3, 2, 1],
+            "플랜 대상이 앞에 있다 — 자리 얻기가 EXPLAIN 뒤에서 기다린다"
         );
     }
 
