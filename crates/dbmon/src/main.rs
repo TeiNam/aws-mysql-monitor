@@ -1407,6 +1407,12 @@ fn spawn_instance_collector(
                         // 0 이 아니면 "그 자리에 진행 중 레코드가 없었다" 는 뜻이다.
                         // 계속 0 이 아니면 키가 어긋난 것을 의심한다(F4 오판의 전조).
                         heartbeats_absent = stats.heartbeats_absent,
+                        // **플랜 카운터 셋을 함께 낸다.** 안 내면 "설정 상한이 좁다" 와
+                        // "대상 DB 가 느리다" 를 구분할 수 없다 — 처방이 다르다
+                        // (앞은 `deep_probe_limit`, 뒤는 락 경합·`query_timeout_ms`).
+                        deep_probed = stats.deep_probed,
+                        plan_over_limit = stats.deep_probe_skipped,
+                        plan_over_budget = stats.plan_budget_exceeded,
                         "수집 tick"
                     );
                 }

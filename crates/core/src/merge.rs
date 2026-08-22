@@ -273,6 +273,22 @@ fn merge_duration(
     let observed_floor = a.duration_ms.max(b.duration_ms);
 
     // ① 슬로우로그의 `duration_ms` 는 실제 측정값이므로 구간보다 신뢰한다.
+    //
+    // ⚠ **이 경로에서는 `duration` 과 `ended_at_ms` 의 짝이 어긋날 수 있다.**
+    //
+    // 소요는 슬로우로그(예: 2.1초)에서 오고 종료는 두 레코드 중 늦은 쪽에서 온다. 상대가
+    // 구 형식(사라진 것을 알아챈 tick 을 종료로 적던 시절)이면 그 값이 부풀려져 있어
+    // `ended − started ≠ duration` 이 된다(교차 리뷰 30라운드).
+    //
+    // **짝을 강제하면 다른 것이 깨진다.** "슬로우로그 자신의 종료만 쓴다" 로 좁히면
+    // 슬로우로그에 종료가 없을 때 상대의 관측된 종료를 **잃는다**(`duration_never_
+    // contradicts_the_observed_span` 이 그걸 금지한다). 없으면 상대 것으로 폴백하면
+    // 결합법칙이 깨진다 — 첫 병합이 종료를 흡수한 뒤 두 번째 종료를 막기 때문이다.
+    //
+    // 그래서 셋 중 둘(관측한 종료를 잃지 않는다 · 결합법칙)을 지키고 이 경로의 짝
+    // 불일치를 남긴다. 영향은 제한적이다: `ended_at_ms` 는 API 응답에 없고, 인덱스·TTL 은
+    // 시작 시각과 소요로 계산한다. 그리고 구 형식 레코드는 TTL(35일)로 사라진다.
+    // 테스트도 이 경로를 명시적으로 예외로 둔다.
     match (authoritative(a), authoritative(b)) {
         (true, false) => return (a.duration_ms, a.duration_source, ended_at_ms),
         (false, true) => return (b.duration_ms, b.duration_source, ended_at_ms),
