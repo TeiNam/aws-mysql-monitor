@@ -113,6 +113,15 @@ tf-check:
     #!/usr/bin/env bash
     set -uo pipefail
     fail=0
+    # **fmt 를 먼저 본다.** CI 가 'terraform fmt -check' 를 돌리는데 여기 없어서
+    # 정렬 위반이 로컬을 통과하고 러너에서 7초에 죽었다. validate 만 보면 그걸 놓친다.
+    if ! terraform fmt -check -recursive infra/ >/tmp/tf-fmt.txt 2>&1; then
+      printf '  ✗ fmt 위반:\n'; sed 's/^/      /' /tmp/tf-fmt.txt
+      printf '    → terraform fmt -recursive infra/\n'
+      fail=1
+    else
+      printf '  ✓ fmt\n'
+    fi
     for d in infra/layers/*/; do
       ( cd "$d" && terraform init -backend=false -input=false >/dev/null 2>&1
         if terraform validate 2>&1 | grep -q Success; then
