@@ -112,7 +112,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # 서비스 컨테이너는 커스텀 my.cnf 나 initdb 마운트를 받을 수 없다.
-      # `SET PERSIST` 로 같은 상태를 만들고 재시작해 정적 파라미터를 적용한다.
+      # `SET PERSIST_ONLY` 로 `mysqld-auto.cnf` 에 써 두고 재시작해서 적용한다.
+      #
+      # **`SET PERSIST` 가 아니다.** 이 셋은 전부 기동 시점에만 설정되는 읽기 전용
+      # 변수라서 `SET PERSIST` 는 즉시 적용도 시도하다가
+      # `Variable '…' is a read only variable` 로 죽는다. `PERSIST_ONLY` 는 파일에만
+      # 쓰므로 읽기 전용 변수에 쓸 수 있고, 그래서 재시작이 필요하다(바로 아래 줄).
       - name: MySQL 설정과 시드
         run: |
           set -euo pipefail
@@ -122,7 +127,7 @@ jobs:
           m 13307 -e "
             SET PERSIST_ONLY max_digest_length = 4096;
             SET PERSIST_ONLY performance_schema_max_digest_length = 4096;
-            SET PERSIST performance_schema_max_sql_text_length = 4096;"
+            SET PERSIST_ONLY performance_schema_max_sql_text_length = 4096;"
           docker restart "$(docker ps --filter publish=13307 -q)"
 
           for port in 13306 13307 13308; do

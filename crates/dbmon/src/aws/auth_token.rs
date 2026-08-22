@@ -25,7 +25,10 @@
 //! `Access denied` 가 되고, 원인이 IAM 정책처럼 보여 추적이 오래 걸린다.
 
 use std::sync::Arc;
+
 use std::time::{Duration, SystemTime};
+
+use dbmon_core::ids::InstanceId;
 
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
@@ -232,6 +235,27 @@ impl AuthTokenProvider for StaticPasswordProvider {
 
 #[cfg(test)]
 mod tests {
+    /// **크로스 계정 인스턴스에는 공급자를 주지 않는다.**
+    ///
+    /// 공급자는 기본 자격증명(우리 계정)으로 토큰을 서명한다. 대상 계정은 우리 주체를
+    /// 모르므로 접속이 거부되고, 그 실패는 "DB 계정이 없다"·"IAM 정책이 틀렸다" 처럼
+    /// 보인다 — 실제 원인은 크로스 계정 수집이 배선되지 않았다는 것이다.
+    #[test]
+    fn no_provider_for_a_cross_account_instance() {
+        use dbmon_core::ids::InstanceId;
+        let auth = TargetAuth::Shared(Arc::new(StaticPasswordProvider::new("pw")));
+        let own = "123456789012";
+
+        let mine = InstanceId::new(own, "ap-northeast-2", "orders-01").expect("id");
+        assert!(auth.for_instance(&mine, own).is_some());
+
+        let theirs = InstanceId::new("999988887777", "ap-northeast-2", "orders-01").expect("id");
+        assert!(
+            auth.for_instance(&theirs, own).is_none(),
+            "다른 계정 인스턴스에 우리 계정 토큰을 줬다"
+        );
+    }
+
     use super::*;
 
     /// 고정 자격증명. 서명이 결정론적이 되도록 값을 박는다.
@@ -673,5 +697,27 @@ impl TargetAuth {
             Self::Shared(p) => Some(Arc::clone(p)),
             Self::PerRegion(m) => m.get(region).cloned(),
         }
+    }
+
+    /// 이 인스턴스에 쓸 공급자. **계정이 다르면 `None`.**
+    ///
+    /// # 왜 계정을 보는가
+    ///
+    /// 공급자는 **기본 자격증명**(우리 계정)으로 토큰을 서명한다. 크로스 계정
+    /// 인스턴스에 그 토큰을 보내면 대상 계정이 우리 주체를 모르므로 접속이 거부되고,
+    /// 그 실패는 "DB 계정이 없다" 나 "IAM 정책이 틀렸다" 처럼 보인다 — 실제 원인은
+    /// **크로스 계정 수집이 배선되지 않았다** 는 것이다.
+    ///
+    /// 탐색과 메트릭은 역할을 맡지만(`sts:AssumeRole`) 여기는 아니다. 그 차이를
+    /// 조용히 넘기지 않고 여기서 끊는다.
+    pub fn for_instance(
+        &self,
+        instance: &InstanceId,
+        own_account: &str,
+    ) -> Option<Arc<dyn AuthTokenProvider>> {
+        if instance.account() != own_account {
+            return None;
+        }
+        self.for_region(instance.region())
     }
 }

@@ -135,14 +135,6 @@ impl AuthPolicy {
     pub fn has_any_credential(&self) -> bool {
         self.allows_local_bypass() || self.dev_token.is_some() || self.shared_token.is_some()
     }
-
-    /// 임베드 화면을 서빙해도 되는가.
-    ///
-    /// 우회가 되거나(루프백 `cargo run`) 로컬 토큰이 있을 때(dev 컨테이너).
-    /// prd 에서는 둘 다 거짓이므로 `/` 가 404 다.
-    pub fn serves_local_ui(&self) -> bool {
-        self.allows_local_bypass() || self.dev_token.is_some()
-    }
 }
 
 /// 로컬 개발 토큰을 발급한다. **세 조건이 모두 맞을 때만 `Some`.**
@@ -489,15 +481,6 @@ mod tests {
         assert_eq!(authenticate(&p, Some("neither")), Err(AuthError::Invalid));
     }
 
-    /// **공유 토큰은 화면을 서빙하게 만들지 않는다.**
-    ///
-    /// `/` 임베드 화면은 로컬 개발용 경로다. 공유 토큰이 그걸 켜면 prd 배포가
-    /// 내장 UI 를 서빙하기 시작하는데, 그건 별개의 결정이어야 한다.
-    #[test]
-    fn a_shared_token_does_not_serve_the_embedded_ui() {
-        assert!(!prd_with_shared(&"a".repeat(32)).serves_local_ui());
-    }
-
     /// 자격증명이 하나도 없는 배포를 **판정할 수 있어야** 한다 (기동 경고의 근거).
     #[test]
     fn a_deployment_without_credentials_is_detectable() {
@@ -584,30 +567,6 @@ mod tests {
                 "{wrong:?} 가 통과했다"
             );
         }
-    }
-
-    /// 화면은 우회가 되거나 토큰이 있을 때만 서빙된다.
-    #[test]
-    fn the_ui_is_served_only_locally() {
-        assert!(dev_loopback().serves_local_ui());
-        assert!(
-            AuthPolicy {
-                deployment_env: Env::Dev,
-                bind_is_loopback: false,
-                dev_token: Some(Arc::from("t")),
-                shared_token: None,
-            }
-            .serves_local_ui()
-        );
-        assert!(
-            !AuthPolicy {
-                deployment_env: Env::Prd,
-                bind_is_loopback: false,
-                dev_token: None,
-                shared_token: None,
-            }
-            .serves_local_ui()
-        );
     }
 
     /// **`Debug` 가 토큰을 찍지 않는다.** `Opts` 가 비밀번호를 평문 출력했던

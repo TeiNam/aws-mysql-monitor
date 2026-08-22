@@ -224,8 +224,11 @@ Point-in-time recovery on both is advised. `terraform -chdir=infra/layers/10-sto
 creates them with the right key schema (provider 6.x renamed `hash_key` inside GSIs — that is
 why the lock file is committed).
 
-Large plans (>300 KB) are offloaded to S3. The bucket is optional; without it those plans are
-dropped with a logged reason.
+**There is no S3 offload.** Plans are stored inline on the record. A plan whose masked JSON
+exceeds 150 KB is dropped with the reason `too_large:<n>KB` and the rest of the record is kept —
+losing the slow query itself because its plan was big would be the worse trade. (An earlier
+`storage.plan_bucket` setting was declared but never read, so it is gone; the offload is on the
+roadmap.)
 
 ## 3. IAM — task role
 
@@ -237,7 +240,8 @@ The task role is the only identity the app uses. Nine statements, each narrowed 
 ```json
 { "Sid": "DynamoDbData", "Effect": "Allow",
   "Action": ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:UpdateItem","dynamodb:DeleteItem",
-             "dynamodb:Query","dynamodb:BatchWriteItem","dynamodb:BatchGetItem"],
+             "dynamodb:Query","dynamodb:BatchWriteItem","dynamodb:BatchGetItem",
+             "dynamodb:DescribeTable"],
   "Resource": ["arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data",
                "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data/index/*",
                "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-config"] }
@@ -246,6 +250,9 @@ The task role is the only identity the app uses. Nine statements, each narrowed 
 ```json
 { "Sid": "DenyScan", "Effect": "Deny", "Action": ["dynamodb:Scan"], "Resource": "*" }
 ```
+
+`DescribeTable` is there because the readiness probe calls it — without it the storage probe
+fails with `AccessDenied` before the service can ever report ready.
 
 The explicit `Deny` on `Scan` is deliberate: a single accidental scan over a 500-instance table
 is both a cost event and a latency event. The code never scans; this makes that structural.
@@ -259,6 +266,9 @@ is both a cost event and a latency event. The code never scans; this makes that 
              "rds:DescribePendingMaintenanceActions","rds:ListTagsForResource"],
   "Resource": "*" }
 ```
+
+`ListMetrics` is **not** granted: the metric catalog lives in the code
+(`dbmon_core::cw_metrics`), so there is nothing to enumerate.
 
 `Resource: "*"` is required — `rds:Describe*` does not support resource-level permissions.
 Scope is enforced in configuration instead (`discovery.allowed_vpc_ids`,
@@ -282,7 +292,7 @@ cannot reach production instances.
 
 ```json
 { "Sid": "Metrics", "Effect": "Allow",
-  "Action": ["cloudwatch:GetMetricData","cloudwatch:ListMetrics"], "Resource": "*",
+  "Action": ["cloudwatch:GetMetricData"], "Resource": "*",
   "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
 ```
 
@@ -302,9 +312,22 @@ missing group is an environment fact, not an outage.
 ### 3.5 Multi-region
 
 No extra IAM. The same task role works in every region; the app creates a client per region.
-Set the regions in **Settings → Discovery scope** (or `aws.target_regions` in the file config).
 There is no "all regions" option on purpose: each region costs a `DescribeDBInstances` call per
 discovery round, and most accounts have RDS in one or two.
+
+**Two lists, and they are not interchangeable.**
+
+| List | Reloads without restart? | Governs |
+|---|---|---|
+| **Settings → Discovery scope** | yes, within 30 s | which regions get scanned |
+| `aws.target_regions` (file) | no | which regions get an IAM-auth and slow-log client |
+
+The IAM-auth token providers and CloudWatch Logs clients are built **once at startup** from
+`aws.target_regions`. A region added only through Settings will therefore be discovered — the
+instances appear in the list — but collection reports "no auth provider for this instance" and the
+slow-log read has no client. **Put every region you collect from in both places**, and restart
+after adding one to the file. CloudWatch metric clients are the exception: they are created lazily
+per `(account, region)`, so fleet metrics work for a Settings-only region.
 
 Everything the app reads per region needs to exist there: slow-log groups are regional, and
 CloudWatch metrics live in the instance's region (the app keys its CloudWatch clients by
@@ -343,8 +366,20 @@ Permissions:
 required for the *next* step, connecting to the database. So "appears in the list but
 `unreachable`" is a normal state, and the UI distinguishes it.
 
-For cross-account *collection* you also need `rds-db:connect` in the target account (attach it
-to the same `dbmon-discovery` role) and a network path plus security-group rule.
+**Cross-account *collection* is not supported yet.** Discovery and CloudWatch metrics assume the
+target-account role; the IAM database-auth token and the slow-log client do not — they run on the
+management account's own credentials. Both paths now refuse a cross-account instance instead of
+guessing:
+
+| Path | Cross-account | If it were not refused |
+|---|---|---|
+| Discovery (`rds:Describe*`) | **works** (assumes the role) | — |
+| CloudWatch metrics | **works** (assumes the role) | — |
+| IAM DB auth (`rds-db:connect`) | refused | a management-signed token reaches the target DB and fails as "no DB account" |
+| Slow log (`logs:FilterLogEvents`) | refused | the group name carries no account, so a same-named instance in the management account gets read and **its SQL stored against the target instance** |
+
+So a cross-account instance appears in the list, shows metrics, and stays `unreachable` for
+collection. Per-account token providers and log clients are on the roadmap.
 
 Enter the account list in **Settings → Discovery scope**; it must match
 `var.discovery_account_ids`, otherwise discovery fails with `AccessDenied` and those instances
@@ -487,9 +522,8 @@ half-working process that collects but cannot store is worse than one that refus
 | `collector.monitor_db_user` | `dbmon` | Also the self-exclusion key. |
 | `collector.literal_policy` | `masked` | `masked` / `full` / `full_restricted` / `off`. See below. |
 | `collector.backfill_secs` | `60` | Slow-log backfill period. |
-| `discovery.allowed_vpc_ids` | `[]` | Required in `dev`. |
+| `discovery.allowed_vpc_ids` | `[]` | **Required in every non-`prd` environment** (`dev`, `stg`, unknown) — startup validation rejects an empty list. |
 | `discovery.collect_production_targets` | `false` | Gate for `prd`-tagged instances. |
-| `storage.plan_bucket` | none | S3 bucket for plans > 300 KB. |
 
 **Literal policy** decides whether stored SQL keeps its values:
 
@@ -528,12 +562,13 @@ CREATE USER IF NOT EXISTS 'dbmon'@'10.1.%'
   IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'
   REQUIRE SSL;
 
--- Detection, replica status, schema listing.
-GRANT PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
+-- PROCESS: see other sessions in `information_schema.PROCESSLIST` — without it the
+--   account sees only its own threads and detection finds nothing.
+-- SHOW VIEW: `SHOW CREATE TABLE` on a view needs it, and plans do reference views.
+GRANT PROCESS, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
 
 -- Metrics and digests.
 GRANT SELECT ON `performance_schema`.* TO 'dbmon'@'10.1.%';
-GRANT SELECT ON `sys`.*                TO 'dbmon'@'10.1.%';
 
 -- Plans and tuning context need SELECT on the monitored schemas.
 -- Least privilege: enumerate them. Broad: GRANT SELECT ON *.* (gives cardinality for every table).
@@ -541,6 +576,13 @@ GRANT SELECT ON `shop`.* TO 'dbmon'@'10.1.%';
 
 SHOW GRANTS FOR 'dbmon'@'10.1.%';
 ```
+
+`REPLICATION CLIENT`, `SHOW DATABASES`, and `SELECT ON sys.*` used to be in this list.
+The collector never issues a query that needs them — it reads
+`performance_schema.{processlist,events_statements_current,events_statements_summary_by_digest,
+global_status,global_variables}`, `information_schema.{PROCESSLIST,STATISTICS,TABLES}`,
+and `SHOW CREATE TABLE`. A monitoring account that gets compromised should see as little
+as the job allows.
 
 Notes that cost time if you miss them:
 

@@ -221,8 +221,10 @@ docker run --rm dbmon:dev --version
 스키마로 만든다(프로바이더 6.x 가 GSI 안의 `hash_key` 를 개명했다 — 락 파일을 커밋해 둔
 이유다).
 
-300KB 를 넘는 실행계획은 S3 로 뺀다. 버킷은 선택이고, 없으면 그 계획은 사유가 기록된 채
-버려진다.
+**S3 오프로드는 없다.** 계획은 레코드에 인라인으로 저장된다. 마스킹된 JSON 이 150KB 를
+넘으면 `too_large:<n>KB` 사유와 함께 계획만 버리고 레코드는 남긴다 — 계획이 크다는 이유로
+슬로우 쿼리 자체를 잃는 쪽이 훨씬 나쁘다. (`storage.plan_bucket` 설정이 있었지만 읽는
+코드가 없어 지웠다. 오프로드는 로드맵에 있다.)
 
 ## 3. IAM — 태스크 롤
 
@@ -234,7 +236,8 @@ docker run --rm dbmon:dev --version
 ```json
 { "Sid": "DynamoDbData", "Effect": "Allow",
   "Action": ["dynamodb:GetItem","dynamodb:PutItem","dynamodb:UpdateItem","dynamodb:DeleteItem",
-             "dynamodb:Query","dynamodb:BatchWriteItem","dynamodb:BatchGetItem"],
+             "dynamodb:Query","dynamodb:BatchWriteItem","dynamodb:BatchGetItem",
+             "dynamodb:DescribeTable"],
   "Resource": ["arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data",
                "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-data/index/*",
                "arn:aws:dynamodb:ap-northeast-2:123456789012:table/dbmon-config"] }
@@ -243,6 +246,9 @@ docker run --rm dbmon:dev --version
 ```json
 { "Sid": "DenyScan", "Effect": "Deny", "Action": ["dynamodb:Scan"], "Resource": "*" }
 ```
+
+`DescribeTable` 이 있는 이유는 준비 프로브가 그걸 부르기 때문이다 — 없으면 저장소
+프로브가 `AccessDenied` 로 실패하고 서비스가 준비 상태에 도달하지 못한다.
 
 `Scan` 명시 거부는 의도적이다. 500대짜리 테이블을 한 번 잘못 스캔하면 비용 사건이면서
 지연 사건이다. 코드는 스캔하지 않는데, 이 문장이 그걸 **구조로** 만든다.
@@ -256,6 +262,9 @@ docker run --rm dbmon:dev --version
              "rds:DescribePendingMaintenanceActions","rds:ListTagsForResource"],
   "Resource": "*" }
 ```
+
+`ListMetrics` 는 **주지 않는다.** 지표 카탈로그는 코드에 있으므로
+(`dbmon_core::cw_metrics`) 열거할 이유가 없다.
 
 `Resource: "*"` 는 불가피하다 — `rds:Describe*` 는 리소스 수준 권한을 지원하지 않는다.
 범위는 대신 설정에서 강제한다(`discovery.allowed_vpc_ids`, `denied_name_substrings`,
@@ -279,7 +288,7 @@ docker run --rm dbmon:dev --version
 
 ```json
 { "Sid": "Metrics", "Effect": "Allow",
-  "Action": ["cloudwatch:GetMetricData","cloudwatch:ListMetrics"], "Resource": "*",
+  "Action": ["cloudwatch:GetMetricData"], "Resource": "*",
   "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
 ```
 
@@ -299,9 +308,22 @@ docker run --rm dbmon:dev --version
 ### 3.5 멀티 리전
 
 **추가 IAM 은 없다.** 같은 태스크 롤이 모든 리전에서 동작하고, 앱이 리전별 클라이언트를
-만든다. 리전은 **설정 → 탐색 범위**(또는 파일 설정 `aws.target_regions`)에서 정한다.
-"전체 리전" 옵션은 의도적으로 없다 — 리전마다 탐색 라운드당 `DescribeDBInstances` 가
-한 번 나가고, 대부분의 계정은 RDS 가 한두 리전에만 있다.
+만든다. "전체 리전" 옵션은 의도적으로 없다 — 리전마다 탐색 라운드당
+`DescribeDBInstances` 가 한 번 나가고, 대부분의 계정은 RDS 가 한두 리전에만 있다.
+
+**목록이 두 개이고, 서로 대체되지 않는다.**
+
+| 목록 | 재시작 없이 반영? | 정하는 것 |
+|---|---|---|
+| **설정 → 탐색 범위** | 된다 (30초) | 어느 리전을 조회할지 |
+| `aws.target_regions` (파일) | 안 된다 | 어느 리전에 IAM 인증·슬로우로그 클라이언트를 만들지 |
+
+IAM 인증 토큰 공급자와 CloudWatch Logs 클라이언트는 `aws.target_regions` 로 **기동
+시점에 한 번** 만들어진다. 그래서 설정에만 추가한 리전은 탐색은 되고(목록에 뜬다)
+수집은 "이 인스턴스에 쓸 인증 공급자가 없다" 로 멈추며 슬로우로그는 클라이언트가 없다.
+**수집할 리전은 두 곳에 모두 넣고**, 파일에 추가했으면 재시작한다. CloudWatch 지표
+클라이언트만 예외다 — `(계정, 리전)` 별로 지연 생성되므로 설정에만 있는 리전도 플릿
+메트릭은 나온다.
 
 리전별로 읽는 것은 그 리전에 있어야 한다. 슬로우로그 그룹은 리전 자원이고, CloudWatch
 지표는 인스턴스가 있는 리전에 있다(그래서 앱이 CloudWatch 클라이언트를 `(계정, 리전)`
@@ -340,8 +362,19 @@ mgmt 계정 태스크 롤:
 단계, 즉 DB 에 붙을 때 필요하다. 그래서 "목록에는 뜨는데 `unreachable`" 은 정상적으로
 존재하는 상태이고, 화면이 그걸 구분해 보여준다.
 
-크로스 계정 **수집**까지 하려면 대상 계정에 `rds-db:connect` 도 붙이고(같은
-`dbmon-discovery` 역할에 넣는다) 네트워크 경로와 보안그룹 규칙이 있어야 한다.
+**크로스 계정 수집은 아직 지원하지 않는다.** 탐색과 CloudWatch 메트릭은 대상 계정
+역할을 맡지만, IAM DB 인증 토큰과 슬로우로그 클라이언트는 그렇지 않다 — mgmt 계정의
+기본 자격증명으로 돈다. 두 경로는 이제 추측하지 않고 **거부한다**:
+
+| 경로 | 크로스 계정 | 거부하지 않으면 |
+|---|---|---|
+| 탐색 (`rds:Describe*`) | **된다** (역할을 맡는다) | — |
+| CloudWatch 메트릭 | **된다** (역할을 맡는다) | — |
+| IAM DB 인증 (`rds-db:connect`) | 거부 | mgmt 로 서명한 토큰이 대상 DB 에 가서 "DB 계정이 없다" 로 실패한다 |
+| 슬로우로그 (`logs:FilterLogEvents`) | 거부 | 그룹 이름에 계정이 없으므로 mgmt 계정의 같은 이름 인스턴스를 읽고 **그 SQL 을 대상 인스턴스의 것으로 저장한다** |
+
+그래서 크로스 계정 인스턴스는 목록에 뜨고 메트릭도 나오지만 수집은 `unreachable` 로
+남는다. 계정별 토큰 공급자·로그 클라이언트는 로드맵에 있다.
 
 계정 목록은 **설정 → 탐색 범위**에 넣는데, `var.discovery_account_ids` 와 같아야 한다.
 다르면 탐색이 `AccessDenied` 로 실패하고 그 인스턴스는 목록에 뜨지 않는다.
@@ -483,9 +516,8 @@ Aurora 는 발견한 인스턴스의 **라이터 엔드포인트**(클러스터 
 | `collector.monitor_db_user` | `dbmon` | 자기 제외 키이기도 하다. |
 | `collector.literal_policy` | `masked` | `masked`/`full`/`full_restricted`/`off`. 아래 참고. |
 | `collector.backfill_secs` | `60` | 슬로우로그 백필 주기. |
-| `discovery.allowed_vpc_ids` | `[]` | `dev` 에서는 필수. |
+| `discovery.allowed_vpc_ids` | `[]` | **`prd` 가 아닌 모든 환경에서 필수**(`dev`·`stg`·미지정) — 비어 있으면 기동 검증이 거부한다. |
 | `discovery.collect_production_targets` | `false` | `prd` 태그 인스턴스 게이트. |
-| `storage.plan_bucket` | 없음 | 300KB 초과 계획용 S3 버킷. |
 
 **리터럴 정책**은 저장된 SQL 이 값을 유지하는지를 정한다.
 
@@ -524,12 +556,13 @@ CREATE USER IF NOT EXISTS 'dbmon'@'10.1.%'
   IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'
   REQUIRE SSL;
 
--- 탐지, 리플리카 상태, 스키마 목록.
-GRANT PROCESS, REPLICATION CLIENT, SHOW DATABASES, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
+-- PROCESS: `information_schema.PROCESSLIST` 에서 남의 세션을 본다 — 없으면 자기
+--   스레드만 보이고 탐지가 아무것도 못 찾는다.
+-- SHOW VIEW: 뷰에 `SHOW CREATE TABLE` 을 하려면 필요하다(계획이 뷰를 참조한다).
+GRANT PROCESS, SHOW VIEW ON *.* TO 'dbmon'@'10.1.%';
 
 -- 메트릭·다이제스트.
 GRANT SELECT ON `performance_schema`.* TO 'dbmon'@'10.1.%';
-GRANT SELECT ON `sys`.*                TO 'dbmon'@'10.1.%';
 
 -- 실행계획과 튜닝 컨텍스트는 대상 스키마의 SELECT 가 필요하다.
 -- 최소 권한: 열거한다. 넓게: GRANT SELECT ON *.* (모든 테이블의 카디널리티를 얻는다).
@@ -537,6 +570,13 @@ GRANT SELECT ON `shop`.* TO 'dbmon'@'10.1.%';
 
 SHOW GRANTS FOR 'dbmon'@'10.1.%';
 ```
+
+`REPLICATION CLIENT`·`SHOW DATABASES`·`SELECT ON sys.*` 는 전에 이 목록에 있었다.
+수집기가 그것을 필요로 하는 쿼리를 하나도 던지지 않는다 — 읽는 것은
+`performance_schema.{processlist,events_statements_current,events_statements_summary_by_digest,
+global_status,global_variables}`, `information_schema.{PROCESSLIST,STATISTICS,TABLES}`,
+그리고 `SHOW CREATE TABLE` 이다. 모니터링 계정이 침해됐을 때 보이는 범위는 일에
+필요한 만큼이어야 한다.
 
 놓치면 시간을 잡아먹는 것들:
 

@@ -186,8 +186,6 @@ pub struct AwsConfig {
 pub struct StorageConfig {
     pub data_table: String,
     pub config_table: String,
-    #[serde(default)]
-    pub plan_bucket: Option<String>,
     /// DynamoDB 엔드포인트 재지정. **로컬 개발 전용.**
     ///
     /// `http://127.0.0.1:18000` 을 주면 DynamoDB Local 에 붙는다. SSO 가 만료돼도
@@ -933,7 +931,6 @@ fn default_document() -> toml::Value {
         to_value(StorageConfig {
             data_table: String::new(),
             config_table: String::new(),
-            plan_bucket: None,
             endpoint_url: None,
         }),
     );
