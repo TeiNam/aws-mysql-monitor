@@ -25,6 +25,7 @@ import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { EnvChip } from "../components/Shell";
+import { displayDurationMs, isRunning } from "../lib/elapsed";
 import { SqlModal } from "../components/SqlModal";
 import { StateBadge } from "../components/StateBadge";
 import {
@@ -142,12 +143,26 @@ export function MySQLMonitorPage() {
   }
 
   const items = list.data?.items ?? [];
-  const nowMs = Date.now();
   // **결과가 줄면 페이지를 당긴다.** 3페이지를 보다 자동 새로고침으로 건수가 줄면
   // 빈 표가 나오고, 그건 "기록이 없다" 로 읽힌다.
   const lastPage = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
   const safePage = Math.min(page, lastPage);
   const visible = items.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  // **진행 중 행의 경과 시간은 여기서 흐른다.**
+  //
+  // 저장된 `duration_ms` 는 마지막으로 저장된 시점의 값이다. 수집기는 실행계획을 확보하면
+  // 그 레코드를 다시 쓰지 않으므로(하트비트는 관측 시각만 올린다) 10분째 도는 쿼리가
+  // `2.0s` 로 남는다 — 09 §3.4 가 약속한 동작이 구현되지 않은 상태였다(24라운드).
+  //
+  // 진행 중 행이 보일 때만 타이머를 돈다. 항상 돌리면 정적인 표에서 매초 리렌더한다.
+  const hasRunning = visible.some((q) => isRunning(q.state));
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRunning) return;
+    const id = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, [hasRunning]);
 
   return (
     <div className="space-y-6">
@@ -316,10 +331,17 @@ export function MySQLMonitorPage() {
                             {q.thread_id}
                           </span>
                         </td>
-                        <td className={`${TD_NUM} ${COL_TIGHT}`} title={`측정 소스: ${q.duration_source}`}>
+                        <td
+                          className={`${TD_NUM} ${COL_TIGHT}`}
+                          title={
+                            isRunning(q.state)
+                              ? `아직 실행 중 — 경과는 시작 시각 기준이다 (측정 소스: ${q.duration_source})`
+                              : `측정 소스: ${q.duration_source}`
+                          }
+                        >
                           <span className="flex items-center justify-end">
                             <Clock className={CELL_ICON} />
-                            {(q.duration_ms / 1000).toFixed(1)}s
+                            {(displayDurationMs(q, nowMs) / 1000).toFixed(1)}s
                           </span>
                         </td>
                         <td className={`${TD_NUM} ${COL_TIGHT}`} title="조사 행 / 반환 행">

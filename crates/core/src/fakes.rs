@@ -210,8 +210,9 @@ impl SlowQueryStore for FakeSlowQueryStore {
         Ok(out)
     }
 
-    /// 어댑터와 **같은 세 조건**을 지킨다: 만들지 않고, 진행 중일 때만, 되돌리지 않는다.
-    /// 페이크가 느슨하면 통합 테스트만 통과하는 코드가 나온다(GSI 사영에서 한 번 데였다).
+    /// 어댑터와 **같은 계약**을 지킨다: 만들지 않고, 진행 중일 때만, 되돌리지 않고,
+    /// **키가 표류했으면 찾아서** 갱신한다. 페이크가 느슨하면 통합 테스트만 통과하는
+    /// 코드가 나온다(GSI 사영에서 한 번 데였다).
     async fn touch_in_flight(
         &self,
         instance: &crate::ids::InstanceId,
@@ -219,14 +220,33 @@ impl SlowQueryStore for FakeSlowQueryStore {
         started_at_ms: EpochMs,
         last_seen_at_ms: EpochMs,
     ) -> Result<bool> {
+        use crate::slow_query::SlowQueryState;
+
         let id = crate::ids::RecordId::new(instance, thread_id, started_at_ms);
+        let window = crate::clock_offset::BASE_MERGE_WINDOW_MS;
         let mut items = self.items.lock().unwrap();
-        let Some(e) = items.get_mut(id.as_str()) else {
+
+        // 빠른 경로(계산한 키) → 느린 경로(같은 스레드의 진행 중 행, ±2초).
+        let key = items
+            .get(id.as_str())
+            .filter(|e| e.state == SlowQueryState::InFlight)
+            .map(|_| id.as_str().to_string())
+            .or_else(|| {
+                items
+                    .values()
+                    .find(|e| {
+                        e.state == SlowQueryState::InFlight
+                            && e.instance_id == *instance
+                            && e.thread_id == thread_id
+                            && (e.started_at_ms - started_at_ms).abs() <= window
+                    })
+                    .map(|e| e.record_id.as_str().to_string())
+            });
+        let Some(key) = key else {
             return Ok(false);
         };
-        if e.state != crate::slow_query::SlowQueryState::InFlight
-            || e.last_seen_at_ms.is_some_and(|cur| cur >= last_seen_at_ms)
-        {
+        let e = items.get_mut(&key).expect("직전에 찾았다");
+        if e.last_seen_at_ms.is_some_and(|cur| cur >= last_seen_at_ms) {
             return Ok(false);
         }
         e.last_seen_at_ms = Some(last_seen_at_ms);

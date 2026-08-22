@@ -417,27 +417,40 @@ impl InFlightTracker {
     /// 관측하지 않는다" 를 뜻하게 되고, 스윕은 시각 비교만으로 옳아진다 — 소유를
     /// 추론할 필요가 없다(그 추론이 20~22라운드에서 양방향으로 틀렸다).
     ///
-    /// # 한 번도 저장되지 않은 항목은 **대상이 아니다**
+    /// # 미저장 항목도 대상이다 — 다만 **뒤로 밀린다**
     ///
-    /// 하트비트는 있는 레코드를 갱신할 뿐 만들지 않는다. 심층 조회 상한(`deep_probe_limit`)
-    /// 밖의 후보는 레코드가 **없는 것이 설계**다(지표만 남긴다). 그걸 하트비트가 만들면
-    /// SQL 없는 레코드가 생기고, 그 레코드는 정책이 `off` 로 강등되며, 병합은 **먼저
-    /// 기록된 정책을 고정**하므로 나중에 도착한 SQL 이 영구히 버려진다
-    /// (교차 리뷰 23라운드가 배포 차단으로 잡았다).
+    /// 23라운드에는 미저장 항목을 제외했다. 그때는 하트비트가 `upsert_merged` 였고 없는
+    /// 레코드를 **만들었기** 때문이다(그러면 SQL 없는 레코드의 정책이 `off` 로 고정돼
+    /// 나중 SQL 이 버려진다). 지금은 조건부 갱신이라 만들 수 없으므로 제외할 이유가 없고,
+    /// 제외하면 **인수인계 구멍**이 생긴다: 새 리더의 추적기는 비어 있으므로 이전 리더가
+    /// 남긴 진행 중 레코드가 전부 "미저장" 인데, 그 레코드는 저장소에 **있다.**
+    /// 심층 조회 상한 밖이거나 선행 저장이 계속 실패하면 아무도 갱신하지 않아 살아 있는
+    /// 쿼리가 버려진다(24라운드가 배포 차단으로 잡았다).
+    ///
+    /// **저장된 항목을 먼저 준다.** 그쪽은 레코드가 있는 것이 확실하므로 상한(`호출부`)에
+    /// 걸릴 때 먼저 보호받아야 한다. 미저장 항목은 조건이 깨져도 손해가 호출 한 번이다.
     ///
     /// 상한은 두지 않는다. **호출부가 자르고 자른 사실을 기록한다** — 조용히 자르면
     /// 잘린 항목이 고아로 확정되는데 그 이유가 어디에도 남지 않는다.
     pub fn needs_heartbeat(&self, now_ms: EpochMs, interval_ms: i64) -> Vec<u64> {
-        let mut stale: Vec<(EpochMs, u64)> = self
-            .entries
-            .values()
-            .filter_map(|t| {
-                let saved = t.saved_at_ms?;
-                (now_ms.saturating_sub(saved) >= interval_ms).then_some((saved, t.thread_id))
-            })
-            .collect();
+        // 정렬 키: (저장된 적 없는가, 마지막 저장·관측 시각). 저장된 것이 앞이다.
+        let mut stale: Vec<(bool, EpochMs, u64)> =
+            self.entries
+                .values()
+                .filter_map(|t| match t.saved_at_ms {
+                    Some(saved) => (now_ms.saturating_sub(saved) >= interval_ms).then_some((
+                        false,
+                        saved,
+                        t.thread_id,
+                    )),
+                    // 미저장 항목의 페이스는 **최초 관측 시각**으로 잰다. 그게 없으면 매 tick
+                    // 시도해 상한을 미저장 항목으로 채운다.
+                    None => (now_ms.saturating_sub(t.first_observed_at_ms) >= interval_ms)
+                        .then_some((true, t.first_observed_at_ms, t.thread_id)),
+                })
+                .collect();
         stale.sort_unstable();
-        stale.into_iter().map(|(_, id)| id).collect()
+        stale.into_iter().map(|(_, _, id)| id).collect()
     }
 
     pub fn record_deep_probe(
@@ -980,13 +993,14 @@ mod tests {
         assert_eq!(t.needs_heartbeat(46_000, INTERVAL), vec![1]);
     }
 
-    /// **한 번도 저장되지 않은 항목은 하트비트 대상이 아니다.**
+    /// **미저장 항목도 대상이지만 저장된 항목보다 뒤에 온다.**
     ///
-    /// 하트비트는 있는 레코드를 갱신할 뿐 만들지 않는다. 심층 조회 상한 밖의 후보는
-    /// 레코드가 **없는 것이 설계**이고, 만들면 SQL 없는 레코드의 리터럴 정책이 `off` 로
-    /// 고정돼 나중에 도착한 SQL 이 영구히 버려진다(교차 리뷰 23라운드, 배포 차단).
+    /// 인수인계 뒤 새 리더의 추적기는 비어 있으므로 이전 리더가 남긴 **저장소에 있는**
+    /// 레코드가 전부 미저장으로 보인다. 제외하면 그 레코드를 아무도 갱신하지 않아 살아
+    /// 있는 쿼리가 버려진다(24라운드). 순서를 두는 이유는 상한에 걸릴 때 **레코드가 있는
+    /// 것이 확실한 쪽**을 먼저 보호하기 위해서다.
     #[test]
-    fn unsaved_entries_are_not_heartbeat_candidates() {
+    fn unsaved_entries_come_after_saved_ones() {
         const INTERVAL: EpochMs = 15_000;
         let mut t = InFlightTracker::default();
         t.tick(
@@ -1001,10 +1015,13 @@ mod tests {
         );
         t.record_saved(1, 20_000);
         t.record_saved(3, 1_000);
-        // 2 는 한 번도 저장되지 않았다 → 빠진다. 나머지는 오래된 순(3 → 1).
-        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![3, 1]);
-        // 상한은 호출부가 자른다 — 여기서 조용히 자르지 않는다.
-        assert_eq!(t.needs_heartbeat(40_000, INTERVAL).len(), 2);
+        // 저장된 것이 오래된 순(3 → 1), 그다음 미저장(2).
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![3, 1, 2]);
+        // 미저장도 **주기를 지킨다** — 최초 관측 직후에는 시도하지 않는다.
+        assert_eq!(
+            t.needs_heartbeat(1_000 + INTERVAL - 1, INTERVAL),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]

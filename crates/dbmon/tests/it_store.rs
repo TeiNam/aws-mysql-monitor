@@ -363,6 +363,66 @@ async fn a_heartbeat_only_refreshes_liveness_of_an_existing_in_flight_record() {
     );
 }
 
+/// **리더가 바뀌어 추정이 어긋나도 하트비트가 그 행을 찾는다.**
+///
+/// 물리 키는 `started_at_ms` 추정치로 만들어지고 그 추정은 관측자마다 최대 1초 다르다
+/// (`PROCESSLIST.TIME` 이 정수 초다). 이전 리더가 A 로 행을 만들고 드레인 없이 죽으면,
+/// 새 수집기는 B 로 추적을 시작하고 `upsert_merged` 는 ±2초 후보 조회로 **A 행에 병합**한다.
+/// 그때 하트비트가 B 키만 보면 그 행을 영원히 못 찾고 살아 있는 쿼리가 210초 뒤 고아로
+/// 확정된다(교차 리뷰 24라운드가 배포 차단으로 잡았다).
+#[tokio::test]
+async fn a_heartbeat_finds_the_row_after_the_physical_key_drifts() {
+    let Some(s) = store("heartbeat-drift").await else {
+        return;
+    };
+    let inst = instance();
+
+    // 이전 리더의 추정: T0 + 900 (행은 여기에 만들어진다).
+    let mut old_leader = sample(2050, T0 + 900);
+    old_leader.state = SlowQueryState::InFlight;
+    old_leader.ended_at_ms = None;
+    old_leader.last_seen_at_ms = Some(T0 + 1_000);
+    s.upsert_merged(&old_leader).await.expect("이전 리더 저장");
+
+    // 새 수집기의 추정: T0 + 1_400 (같은 실행, 다른 추정).
+    let new_estimate = T0 + 1_400;
+    let updated = s
+        .touch_in_flight(&inst, 2050, new_estimate, T0 + 30_000)
+        .await
+        .expect("호출");
+    assert!(
+        updated,
+        "추정이 어긋난 뒤 하트비트가 행을 못 찾았다 — 살아 있는 쿼리가 고아로 확정된다"
+    );
+
+    let got = s
+        .get(&old_leader.record_id)
+        .await
+        .expect("조회")
+        .expect("있음");
+    assert_eq!(got.last_seen_at_ms, Some(T0 + 30_000));
+    assert_eq!(got.state, SlowQueryState::InFlight);
+
+    // **그래도 만들지는 않는다.** 새 추정 키에 행이 생기면 쌍둥이가 된다.
+    let drifted_id = RecordId::new(&inst, 2050, new_estimate);
+    if drifted_id != old_leader.record_id {
+        assert!(
+            s.get(&drifted_id).await.expect("조회").is_none(),
+            "하트비트가 새 추정 키에 행을 만들었다 — 쌍둥이가 생긴다"
+        );
+    }
+
+    // 표류 경로에서도 확정된 행은 되살리지 않는다.
+    let done = sample(2050, T0 + 900);
+    s.upsert_merged(&done).await.expect("확정");
+    assert!(
+        !s.touch_in_flight(&inst, 2050, new_estimate, T0 + 60_000)
+            .await
+            .expect("호출"),
+        "확정된 행을 표류 경로로 되살렸다"
+    );
+}
+
 /// **`GSI1SK` 도 같이 올라간다.**
 ///
 /// 진행 중 레코드의 `GSI1SK` 는 `last_seen_at_ms` 이고 스윕이 그 순서로 훑는다.
