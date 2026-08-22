@@ -53,11 +53,32 @@
 //! `ECS_CONTAINER_METADATA_URI_V4` 를 주입하므로 **그 부재**로 판정한다 —
 //! 위험한 방향(프로덕션에서 켜짐)을 막으려면 부재를 조건으로 두는 것이 맞다.
 //!
+//! # 배포에는 공유 토큰이 있다 (`http.auth_token`)
+//!
+//! 위의 두 수단은 **dev 전용**이다. 그것만 있으면 ECS 배포에서 들어올 방법이 없어
+//! 모든 요청이 401 이 된다 — 설정 화면이 `token` 모드를 제공하는데 그 모드로 들어올
+//! 수단이 코드에 없는 상태였고, 그게 실제 구멍이었다(교차 리뷰 이전에 발견).
+//!
+//! 그래서 배포 설정에서 토큰 하나를 받는다. 발급하지 않고 **운영자가 넣는다** —
+//! 우리가 발급하면 어딘가에 찍어야 하고, prd 에서 그 어딘가는 CloudWatch Logs 다.
+//!
+//! | 수단 | 조건 | `subject` |
+//! |---|---|---|
+//! | 로컬 우회 | dev + 루프백 + 토큰 없음 | `local-dev` |
+//! | 발급 토큰 | dev + 비루프백 + 비ECS | `local-dev` |
+//! | **공유 토큰** | `http.auth_token` 설정 | `shared-token` |
+//! | 인증 없음 | 파일·화면 두 곳 허용 | `anonymous` |
+//!
+//! 셋 다 역할이 `admin` 이다. 주체가 하나뿐인 자격증명으로 역할을 나눌 근거가 없다 —
+//! 사람마다 나누는 것이 Cognito 를 넣는 이유다.
+//!
 //! # Cognito 검증은 아직 없다 — 그리고 조용히 통과시키지 않는다
 //!
-//! JWT 검증(JWKS 조회·kid 캐시·클레임 교집합)은 M5 의 남은 작업이다. 그 전까지
-//! 비-dev 배포는 API 요청을 **거부한다.** 스텁으로 통과시키면 인증이 있는 것처럼
-//! 보이면서 없는 상태가 되고, 그게 가장 나쁘다.
+//! JWT 검증(JWKS 조회·kid 캐시·클레임 교집합)은 M5 의 남은 작업이다. 설정에서
+//! `cognito` 를 고르면 [`COGNITO_READY`] 가 거짓이라 **공유 토큰 방식으로
+//! 떨어진다** — 즉 토큰을 넣어 둔 배포는 계속 동작하고, 넣지 않은 배포는 401 이다.
+//! 스텁으로 통과시키지 않는 이유는 그게 인증이 있는 것처럼 보이면서 없는 상태이기
+//! 때문이다.
 
 use std::sync::Arc;
 
@@ -76,6 +97,12 @@ pub struct AuthPolicy {
     pub bind_is_loopback: bool,
     /// 로컬 개발용으로 발급된 토큰. [`mint_dev_token`] 만 채운다.
     pub dev_token: Option<Arc<str>>,
+    /// 배포 설정의 공유 토큰 (`http.auth_token`).
+    ///
+    /// `dev_token` 과 **별도**다. 그건 우리가 발급하고 로그에 찍는 개발용이고,
+    /// 이건 운영자가 넣은 자격증명이라 어느 환경에서든 유효하다. 하나로 합치면
+    /// "prd 에 로컬 토큰이 생기지 않는다" 는 불변식을 표현할 수 없다.
+    pub shared_token: Option<Arc<str>>,
 }
 
 /// **토큰을 절대 찍지 않는다.** `Opts` 가 파생 `Debug` 로 비밀번호를 평문
@@ -86,6 +113,10 @@ impl std::fmt::Debug for AuthPolicy {
             .field("deployment_env", &self.deployment_env)
             .field("bind_is_loopback", &self.bind_is_loopback)
             .field("dev_token", &self.dev_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "shared_token",
+                &self.shared_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -94,6 +125,15 @@ impl AuthPolicy {
     /// 로컬 개발 우회가 허용되는가. **두 조건이 모두 참일 때만.**
     pub fn allows_local_bypass(&self) -> bool {
         self.deployment_env == Env::Dev && self.bind_is_loopback
+    }
+
+    /// **이 배포로 들어올 수 있는 방법이 하나라도 있는가.**
+    ///
+    /// 거짓이면 `auth.mode = off` 를 켜지 않는 한 모든 요청이 401 이다. 기동 시 그
+    /// 사실을 경고로 알리기 위해 존재한다 — 배포해 놓고 화면이 안 열리는 이유를
+    /// 로그에서 찾을 수 있어야 한다.
+    pub fn has_any_credential(&self) -> bool {
+        self.allows_local_bypass() || self.dev_token.is_some() || self.shared_token.is_some()
     }
 
     /// 임베드 화면을 서빙해도 되는가.
@@ -216,6 +256,27 @@ pub fn no_auth_context() -> AuthContext {
     }
 }
 
+/// **공유 토큰**으로 들어온 요청의 문맥 (`http.auth_token`).
+///
+/// # 왜 admin 인가
+///
+/// 토큰 하나에는 주체가 없다. 주체를 모르면 역할을 나눌 근거가 없고, viewer 로
+/// 떨어뜨리면 통제하는 것처럼 보이면서 정작 토큰을 가진 누구나 들어와 있는 상태가
+/// 된다 — [`no_auth_context`] 와 같은 판단이다.
+///
+/// `subject` 를 `shared-token` 으로 두는 이유: 감사 로그에서 "루프백 개발"
+/// (`local-dev`)·"인증 없음"(`anonymous`)·"공유 토큰" 은 전혀 다른 사실이다.
+/// 사람별로 나누려면 Cognito 가 필요하다([`COGNITO_READY`]).
+fn shared_token_context() -> AuthContext {
+    AuthContext {
+        subject: "shared-token".into(),
+        role: Role::Admin,
+        env_scope: Env::ALL.to_vec(),
+        can_see_literals: true,
+        claims_version: 0,
+    }
+}
+
 /// 요청의 인증 문맥을 만든다.
 ///
 /// `bearer` 는 `Authorization: Bearer …` 의 토큰 부분이다.
@@ -229,14 +290,33 @@ pub fn authenticate(policy: &AuthPolicy, bearer: Option<&str>) -> Result<AuthCon
         return Err(AuthError::Missing);
     };
 
-    // 로컬 개발 토큰. `mint_dev_token` 이 dev 에서만 채우므로 prd 에서는
-    // `dev_token` 이 `None` 이고 이 분기가 죽어 있다.
-    if let Some(expected) = policy.dev_token.as_deref() {
-        return if secrets_match(token.as_bytes(), expected.as_bytes()) {
-            Ok(local_dev_context())
-        } else {
-            Err(AuthError::Invalid)
-        };
+    // **두 수단을 모두 시도한다.** 하나가 어긋나도 다른 하나로 들어올 수 있어야
+    // 한다 — dev 컨테이너에 공유 토큰까지 넣어 두는 배포가 있고, 먼저 검사한 쪽에서
+    // 조기 반환하면 나머지가 죽은 코드가 된다.
+    //
+    // 비교는 상수 시간이고, **어느 쪽이 맞았는지에 따라 문맥이 다르다** —
+    // 감사 로그의 `subject` 가 갈린다.
+    let mut matched: Option<AuthContext> = None;
+    let mut any_configured = false;
+    for (expected, ctx) in [
+        (policy.dev_token.as_deref(), local_dev_context as fn() -> _),
+        (
+            policy.shared_token.as_deref(),
+            shared_token_context as fn() -> _,
+        ),
+    ] {
+        let Some(expected) = expected else { continue };
+        any_configured = true;
+        // 조기 탈출하지 않는다 — 어느 수단이 설정돼 있는지가 타이밍으로 새지 않게.
+        if secrets_match(token.as_bytes(), expected.as_bytes()) && matched.is_none() {
+            matched = Some(ctx());
+        }
+    }
+    if let Some(ctx) = matched {
+        return Ok(ctx);
+    }
+    if any_configured {
+        return Err(AuthError::Invalid);
     }
 
     // M5 의 남은 작업: JWKS 조회 → 서명 검증 → `TokenClaims` →
@@ -256,6 +336,7 @@ mod tests {
             deployment_env: Env::Dev,
             bind_is_loopback: true,
             dev_token: None,
+            shared_token: None,
         }
     }
 
@@ -278,6 +359,7 @@ mod tests {
             deployment_env: Env::Dev,
             bind_is_loopback: false,
             dev_token: None,
+            shared_token: None,
         };
         assert_eq!(authenticate(&exposed, None), Err(AuthError::Missing));
 
@@ -287,6 +369,7 @@ mod tests {
                 deployment_env: env,
                 bind_is_loopback: true,
                 dev_token: None,
+                shared_token: None,
             };
             assert_eq!(
                 authenticate(&p, None),
@@ -317,11 +400,123 @@ mod tests {
             deployment_env: Env::Prd,
             bind_is_loopback: false,
             dev_token: None,
+            shared_token: None,
         };
         assert!(authenticate(&p, None).is_err());
         assert!(authenticate(&p, Some("jwt")).is_err());
         // 상태 코드는 구성 상태를 노출하지 않는다.
         assert_eq!(AuthError::NotConfigured.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── 배포 공유 토큰 (`http.auth_token`) ────────────────────────────────────
+
+    fn prd_with_shared(token: &str) -> AuthPolicy {
+        AuthPolicy {
+            deployment_env: Env::Prd,
+            bind_is_loopback: false,
+            dev_token: None,
+            shared_token: Some(Arc::from(token)),
+        }
+    }
+
+    /// **이게 없으면 ECS 배포에서 화면을 쓸 수 없다.**
+    ///
+    /// 이 테스트가 존재하는 이유: 공유 토큰을 배선하기 전에는 `authenticate` 가
+    /// `dev_token` 만 봤고, 그건 dev+비루프백+비ECS 에서만 채워진다 — 즉 prd/ECS
+    /// 에서는 어떤 토큰을 줘도 `NotConfigured` 였다. 설정 화면은 `token` 모드를
+    /// 제공하는데 그 모드로 들어올 수단이 코드에 없었다.
+    #[test]
+    fn the_shared_token_authenticates_in_production() {
+        let token = "a".repeat(32);
+        let p = prd_with_shared(&token);
+        let ctx = authenticate(&p, Some(&token)).expect("공유 토큰 인증");
+        assert_eq!(ctx.role, Role::Admin);
+        // **감사 로그에서 구분돼야 한다** — 루프백 개발도, 인증 없음도 아니다.
+        assert_eq!(ctx.subject, "shared-token");
+        assert!(ctx.can_see_literals);
+    }
+
+    /// 틀린 토큰·빈 토큰·없는 토큰은 전부 막힌다.
+    #[test]
+    fn a_wrong_shared_token_does_not_pass() {
+        let token = "a".repeat(32);
+        let p = prd_with_shared(&token);
+        assert_eq!(authenticate(&p, None), Err(AuthError::Missing));
+        for wrong in ["", "b", &"a".repeat(31), &"a".repeat(33), &"A".repeat(32)] {
+            assert_eq!(
+                authenticate(&p, Some(wrong)),
+                Err(AuthError::Invalid),
+                "{wrong:?} 가 통과했다"
+            );
+        }
+    }
+
+    /// **공유 토큰이 설정되면 `NotConfigured` 가 아니라 `Invalid` 다.**
+    ///
+    /// 구분이 중요한 이유는 진단이다 — `NotConfigured` 는 "이 배포에 인증 수단이
+    /// 없다"(설정 파일을 고쳐라)이고 `Invalid` 는 "토큰이 틀렸다"(값을 확인하라)다.
+    /// 둘 다 401 을 주지만 로그와 테스트에서는 갈라야 한다.
+    #[test]
+    fn a_configured_deployment_reports_invalid_not_unconfigured() {
+        assert_eq!(
+            authenticate(&prd_with_shared(&"a".repeat(32)), Some("nope")),
+            Err(AuthError::Invalid)
+        );
+    }
+
+    /// **두 수단이 함께 있으면 각자 자기 문맥으로 들어온다.**
+    ///
+    /// dev 컨테이너에 공유 토큰까지 넣어 둔 배포가 있다. 먼저 검사한 쪽에서
+    /// 조기 반환하면 나머지가 죽은 코드가 되고, 그 사실이 조용히 묻힌다.
+    #[test]
+    fn both_credentials_work_side_by_side() {
+        let dev = mint_dev_token(Env::Dev, false, false, ENTROPY).expect("발급");
+        let shared: Arc<str> = Arc::from("s".repeat(32).as_str());
+        let p = AuthPolicy {
+            deployment_env: Env::Dev,
+            bind_is_loopback: false,
+            dev_token: Some(Arc::clone(&dev)),
+            shared_token: Some(Arc::clone(&shared)),
+        };
+        assert_eq!(
+            authenticate(&p, Some(&dev)).expect("dev").subject,
+            "local-dev"
+        );
+        assert_eq!(
+            authenticate(&p, Some(&shared)).expect("shared").subject,
+            "shared-token"
+        );
+        assert_eq!(authenticate(&p, Some("neither")), Err(AuthError::Invalid));
+    }
+
+    /// **공유 토큰은 화면을 서빙하게 만들지 않는다.**
+    ///
+    /// `/` 임베드 화면은 로컬 개발용 경로다. 공유 토큰이 그걸 켜면 prd 배포가
+    /// 내장 UI 를 서빙하기 시작하는데, 그건 별개의 결정이어야 한다.
+    #[test]
+    fn a_shared_token_does_not_serve_the_embedded_ui() {
+        assert!(!prd_with_shared(&"a".repeat(32)).serves_local_ui());
+    }
+
+    /// 자격증명이 하나도 없는 배포를 **판정할 수 있어야** 한다 (기동 경고의 근거).
+    #[test]
+    fn a_deployment_without_credentials_is_detectable() {
+        let none = AuthPolicy {
+            deployment_env: Env::Prd,
+            bind_is_loopback: false,
+            dev_token: None,
+            shared_token: None,
+        };
+        assert!(!none.has_any_credential());
+        assert!(prd_with_shared(&"a".repeat(32)).has_any_credential());
+        assert!(dev_loopback().has_any_credential());
+    }
+
+    /// `Debug` 가 공유 토큰도 가린다.
+    #[test]
+    fn debug_does_not_print_the_shared_token() {
+        let s = format!("{:?}", prd_with_shared("sh4r3d-token-value-padded-to-32ch"));
+        assert!(!s.contains("sh4r3d"), "공유 토큰이 Debug 에 찍혔다: {s}");
     }
 
     // ── 컨테이너용 로컬 토큰 ──────────────────────────────────────────────────
@@ -374,6 +569,7 @@ mod tests {
             deployment_env: Env::Dev,
             bind_is_loopback: false,
             dev_token: Some(Arc::clone(&token)),
+            shared_token: None,
         };
 
         let ctx = authenticate(&p, Some(&token)).expect("토큰 인증");
@@ -399,6 +595,7 @@ mod tests {
                 deployment_env: Env::Dev,
                 bind_is_loopback: false,
                 dev_token: Some(Arc::from("t")),
+                shared_token: None,
             }
             .serves_local_ui()
         );
@@ -407,6 +604,7 @@ mod tests {
                 deployment_env: Env::Prd,
                 bind_is_loopback: false,
                 dev_token: None,
+                shared_token: None,
             }
             .serves_local_ui()
         );
@@ -420,6 +618,7 @@ mod tests {
             deployment_env: Env::Dev,
             bind_is_loopback: false,
             dev_token: Some(Arc::from("s3cr3t-token-value")),
+            shared_token: None,
         };
         let s = format!("{p:?}");
         assert!(!s.contains("s3cr3t"), "토큰이 Debug 에 찍혔다: {s}");

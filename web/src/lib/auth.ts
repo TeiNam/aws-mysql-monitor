@@ -7,6 +7,8 @@
  * |---|---|---|
  * | `local-dev` | 없음 | 호스트에서 루프백 바인드로 `cargo run` |
  * | `local-token` | 기동 로그의 URL | 컨테이너 (루프백 바인드가 불가능) |
+ * | `shared-token` | 배포 설정의 `http.auth_token` | ECS 등 실제 배포 |
+ * | `unconfigured` | **없다** | 토큰도 없고 인증도 안 껐다 — 전부 401 |
  * | `cognito` | OIDC 액세스 토큰 | 배포. **아직 미구현 — 백엔드가 fail closed** |
  *
  * # 토큰을 URL 에서 즉시 지운다

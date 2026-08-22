@@ -242,13 +242,14 @@ fn spawn_settings_poller(
     settings: Arc<dbmon::settings_state::SettingsState>,
     shutdown: Arc<dbmon::shutdown::Shutdown>,
 ) {
-    let interval = Duration::from_millis(
-        (dbmon::settings_state::CACHE_TTL_MS / 3).max(1_000) as u64,
-    );
+    let interval =
+        Duration::from_millis((dbmon::settings_state::CACHE_TTL_MS / 3).max(1_000) as u64);
     // **조회에 상한을 둔다.** AWS SDK 에는 요청 전체 상한이 기본으로 없다 — 응답하지
     // 않는 조회가 걸리면 폴러가 그 자리에 멈추고, 30초 뒤 인증이 조용히 잠긴다
     // (3차 교차 리뷰가 medium 으로 잡았다). 주기보다 짧게 잡아 매 주기 기회를 준다.
-    let budget = interval.saturating_sub(Duration::from_millis(500)).max(Duration::from_secs(2));
+    let budget = interval
+        .saturating_sub(Duration::from_millis(500))
+        .max(Duration::from_secs(2));
     tokio::spawn(async move {
         loop {
             // **주기를 고정한다.** 조회에 쓴 시간을 다음 대기에서 빼지 않으면,
@@ -1006,7 +1007,9 @@ fn spawn_instance_collector(
             let label = label.clone();
             async move {
                 match registry.set_state(&id, to).await {
-                    Ok(()) => tracing::info!(instance = %label, state = to.as_str(), "첫 판정 기록"),
+                    Ok(()) => {
+                        tracing::info!(instance = %label, state = to.as_str(), "첫 판정 기록")
+                    }
                     Err(e) => tracing::warn!(
                         instance = %label,
                         state = to.as_str(),
@@ -1018,7 +1021,6 @@ fn spawn_instance_collector(
         };
         // **지금 등록부에 적혀 있다고 아는 상태.** 전이될 때만 쓴다.
         let mut recorded = instance.state;
-
 
         // **엔드포인트를 먼저 확인한다.** 없으면 토큰을 요청하지 않는다 —
         // 빈 호스트로 서명하면 STS 왕복만 낭비하고, 이어지는 오류가
@@ -1808,6 +1810,36 @@ fn dev_access_token(config: &dbmon::config::Config, bind_is_loopback: bool) -> O
     Some(token)
 }
 
+/// 인증 정책을 만들고, **들어올 방법이 없으면 크게 경고한다.**
+///
+/// 경고가 필요한 이유: 자격증명이 하나도 없는 배포는 `auth.mode = off` 를 켜지 않는
+/// 한 모든 요청이 401 이다. 그건 화면이 흰 채로 뜨는 것으로만 나타나고, 원인은
+/// "설정 파일에 한 줄이 없다" 인데 응답은 `401` 뿐이라 아무것도 알려 주지 않는다.
+///
+/// 기동을 **막지는 않는다** — `role=collector` 워커는 API 를 쓰지 않고, 운영 설정으로
+/// 인증을 끈 배포도 정상이다. 판정 근거(DynamoDB 설정)는 여기서 아직 읽지 않았다.
+fn auth_policy(
+    config: &dbmon::config::Config,
+    bind_is_loopback: bool,
+) -> dbmon::api::auth::AuthPolicy {
+    let policy = dbmon::api::auth::AuthPolicy {
+        deployment_env: config.deployment_env,
+        bind_is_loopback,
+        dev_token: dev_access_token(config, bind_is_loopback),
+        shared_token: config.http.auth_token.as_deref().map(Arc::from),
+    };
+    if !policy.has_any_credential() {
+        tracing::warn!(
+            allow_auth_disable = config.http.allow_auth_disable,
+            concat!(
+                "인증 수단이 하나도 없다 — `http.auth_token` 을 넣거나 ",
+                "운영 설정에서 인증을 끄지 않으면 모든 API 요청이 401 이 된다"
+            )
+        );
+    }
+    policy
+}
+
 /// SPA 빌드 산출물 디렉터리. 없으면 `None`.
 ///
 /// **런타임 이미지에 노드를 넣지 않는다.** `web/` 은 빌더 스테이지에서 빌드하고
@@ -2016,11 +2048,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             api_state = Some(dbmon::api::ApiState {
                 store: Arc::clone(&stores.slow_query),
                 registry: Arc::clone(&stores.registry),
-                policy: dbmon::api::auth::AuthPolicy {
-                    deployment_env: config.deployment_env,
-                    bind_is_loopback,
-                    dev_token: dev_access_token(&config, bind_is_loopback),
-                },
+                policy: auth_policy(&config, bind_is_loopback),
                 // 프로세스마다 다른 키. 재시작하면 기존 커서가 무효해지고, 그게
                 // 조용한 오동작이 아니라 명시적 `invalid_cursor` 로 나타난다.
                 cursor_key: Arc::new(random_cursor_key()),
@@ -2064,10 +2092,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             //
             // TTL 의 1/3 주기로 돌려 항상 신선하게 유지한다. 조회가 실패하면 캐시가
             // 낡고, 그때는 인증이 켜진 쪽으로 떨어진다 — 그게 옳은 방향이다.
-            spawn_settings_poller(
-                Arc::clone(&stores.settings),
-                Arc::clone(&shutdown),
-            );
+            spawn_settings_poller(Arc::clone(&stores.settings), Arc::clone(&shutdown));
 
             // 인증 공급자를 먼저 만든다 — 리전별 SDK 설정 로드는 await 가 필요하다.
             let auth = dbmon::aws::auth_token::build_target_auth(&config).await;

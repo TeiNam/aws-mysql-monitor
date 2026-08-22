@@ -23,7 +23,15 @@ export type Env = "prd" | "stg" | "dev" | "unknown";
  * `off` 는 운영 설정이 인증을 껐다는 뜻이다(배포 설정도 허용해야 그 값이 나온다).
  * 그때 화면은 토큰 안내를 띄우면 안 된다 — 있지도 않은 토큰을 찾게 만든다.
  */
-export type AuthMode = "off" | "local-dev" | "local-token" | "cognito";
+export type AuthMode =
+  | "off"
+  | "local-dev"
+  | "local-token"
+  /** 배포 설정의 `http.auth_token`. 안내가 **로그가 아니라 설정**을 가리켜야 한다. */
+  | "shared-token"
+  /** 들어올 방법이 없다. 찾을 토큰이 존재하지 않으므로 "찾아라" 라고 말하면 안 된다. */
+  | "unconfigured"
+  | "cognito";
 
 export interface AuthConfig {
   mode: AuthMode;

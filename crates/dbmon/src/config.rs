@@ -76,7 +76,9 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// **`Debug` 를 손으로 쓴다** — `auth_token` 이 파생 출력에 실리면 기동 로그에 비밀이
+/// 찍힌다. `AuthPolicy` 에서 같은 이유로 같은 일을 한다.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     pub bind: String,
@@ -105,6 +107,47 @@ pub struct HttpConfig {
     /// 그 판단은 코드가 대신할 수 없으므로 운영자가 파일에 적는다.
     #[serde(default)]
     pub allow_auth_disable: bool,
+    /// **공유 접속 토큰** (`Authorization: Bearer <이 값>`).
+    ///
+    /// # 왜 파일(환경변수)에 두는가
+    ///
+    /// 운영 설정(`CFG/GLOBAL`)에 두지 않는다. 그 문서는 viewer 도 읽고 DynamoDB
+    /// 백업·CloudTrail 로도 흐른다 — 자기 자신을 여는 열쇠를 그런 곳에 두면 통제할
+    /// 수 없다. 배포 설정은 ECS 태스크 정의의 `secrets:` 로 주입할 수 있고, 그러면
+    /// 정의에는 Secrets Manager ARN 만 남는다.
+    ///
+    /// # 역할이 하나다
+    ///
+    /// 토큰 하나에 주체가 없으므로 역할을 나눌 근거가 없다. 이 토큰으로 들어온
+    /// 요청은 **admin** 이다 — 설정을 바꾸고 인증을 끌 수도 있다. 사람마다 역할을
+    /// 나누려면 Cognito 가 필요하다([`crate::api::auth::COGNITO_READY`]).
+    ///
+    /// 비어 있으면 이 수단은 없다. 그러면 남는 것은 로컬 우회(dev+루프백)와
+    /// 운영 설정의 `auth.mode = off` 뿐이고, 둘 다 아니면 **모든 요청이 401** 이다 —
+    /// 기동 로그가 그 사실을 경고로 알린다.
+    #[serde(default, skip_serializing)]
+    pub auth_token: Option<String>,
+}
+
+/// 공유 토큰의 최소 길이. [`crate::api::auth::mint_dev_token`] 이 만드는 128비트
+/// 16진수와 같은 값이다 — **약한 토큰은 인증이 없는 것보다 나쁘다**(있다고 착각하게
+/// 만든다). 그래서 짧으면 기동을 거부한다.
+pub const MIN_AUTH_TOKEN_CHARS: usize = 32;
+
+impl std::fmt::Debug for HttpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpConfig")
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("shutdown_grace_secs", &self.shutdown_grace_secs)
+            .field("deregistration_wait_secs", &self.deregistration_wait_secs)
+            .field("allow_auth_disable", &self.allow_auth_disable)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for HttpConfig {
@@ -117,6 +160,7 @@ impl Default for HttpConfig {
             deregistration_wait_secs: 20,
             // 기본은 **인증을 끌 수 없다.** 열려면 배포 설정에 한 줄 적는다.
             allow_auth_disable: false,
+            auth_token: None,
         }
     }
 }
@@ -562,6 +606,24 @@ impl Config {
         if self.storage.data_table.is_empty() || self.storage.config_table.is_empty() {
             return Err(err("storage", "data_table 과 config_table 은 필수다"));
         }
+        // **약한 토큰으로 기동하지 않는다.** 짧은 공유 토큰은 인증이 있는 것처럼
+        // 보이면서 없는 상태다. 값 자체는 오류 메시지에 넣지 않는다(로그로 흐른다).
+        if let Some(t) = self.http.auth_token.as_deref() {
+            let n = t.chars().count();
+            if n < MIN_AUTH_TOKEN_CHARS {
+                return Err(err(
+                    "http.auth_token",
+                    format!("{MIN_AUTH_TOKEN_CHARS}자 이상이어야 한다 (지금 {n}자)"),
+                ));
+            }
+            // 공백이 섞이면 헤더에서 잘려 "맞는 토큰인데 401" 이 된다 — 그 진단은 어렵다.
+            if t.chars().any(char::is_whitespace) {
+                return Err(err(
+                    "http.auth_token",
+                    "공백을 담을 수 없다 — Authorization 헤더에서 잘린다",
+                ));
+            }
+        }
         let c = &self.collector;
         if !(200..=60_000).contains(&c.detect_interval_ms) {
             return Err(err("collector.detect_interval_ms", "200~60000 이어야 한다"));
@@ -1004,6 +1066,80 @@ config_table = "dbmon-config"
         assert_eq!(c.collector.detect_interval_ms, 1_000);
         assert_eq!(c.collector.digest_top_n, 200);
         assert_eq!(c.target_regions(), vec!["ap-northeast-2"]);
+    }
+
+    // ── 공유 접속 토큰 (`http.auth_token`) ────────────────────────────────────
+
+    /// 기본은 **없다.** 있으면 기본값으로 인증이 생기는 셈이 된다.
+    #[test]
+    fn there_is_no_shared_token_by_default() {
+        assert!(
+            load_str(minimal_toml(), &[])
+                .unwrap()
+                .http
+                .auth_token
+                .is_none()
+        );
+    }
+
+    /// 환경변수로 넣을 수 있어야 한다 — ECS `secrets:` 가 그 경로다.
+    #[test]
+    fn the_shared_token_comes_from_the_environment() {
+        let c = load_str(
+            minimal_toml(),
+            &[("DBMON__HTTP__AUTH_TOKEN", &"f".repeat(40))],
+        )
+        .unwrap();
+        assert_eq!(c.http.auth_token.as_deref(), Some("f".repeat(40).as_str()));
+    }
+
+    /// **약한 토큰으로 기동하지 않는다.** 짧은 토큰은 인증이 있다는 착각을 만든다.
+    #[test]
+    fn a_short_shared_token_is_rejected() {
+        let e = load_str(minimal_toml(), &[("DBMON__HTTP__AUTH_TOKEN", "short")])
+            .expect_err("짧은 토큰이 통과했다");
+        assert_eq!(e.field, "http.auth_token");
+        // 사유는 길이를 말하되 **값을 담지 않는다** — 오류는 로그로 흐른다.
+        assert!(!e.reason.contains("short"), "{}", e.reason);
+    }
+
+    /// 공백이 섞이면 헤더에서 잘려 "맞는 토큰인데 401" 이 된다.
+    #[test]
+    fn a_shared_token_with_whitespace_is_rejected() {
+        let with_space = format!("{} {}", "a".repeat(20), "b".repeat(20));
+        let e = load_str(minimal_toml(), &[("DBMON__HTTP__AUTH_TOKEN", &with_space)])
+            .expect_err("공백 토큰이 통과했다");
+        assert_eq!(e.field, "http.auth_token");
+    }
+
+    /// **`Debug` 가 토큰을 찍지 않는다.** 기동 로그에 설정을 찍는 경로가 있다.
+    #[test]
+    fn debug_redacts_the_shared_token() {
+        let c = load_str(
+            minimal_toml(),
+            &[(
+                "DBMON__HTTP__AUTH_TOKEN",
+                "s3cr3t-value-padded-out-to-32ch!",
+            )],
+        )
+        .unwrap();
+        let s = format!("{:?}", c.http);
+        assert!(!s.contains("s3cr3t"), "토큰이 Debug 에 찍혔다: {s}");
+        assert!(s.contains("redacted"));
+    }
+
+    /// **`Serialize` 에도 실리지 않는다.** 설정을 JSON 으로 덤프하는 경로가 생기면
+    /// 그때 새는 것보다 지금 막는 편이 싸다.
+    #[test]
+    fn serialization_omits_the_shared_token() {
+        let c = load_str(
+            minimal_toml(),
+            &[("DBMON__HTTP__AUTH_TOKEN", &"z".repeat(32))],
+        )
+        .unwrap();
+        let json = serde_json::to_string(&c.http).expect("직렬화");
+        assert!(!json.contains("zzzz"), "{json}");
+        assert!(!json.contains("auth_token"), "{json}");
     }
 
     /// 필수값이 없으면 **어느 값이 왜 필요한지** 말해야 한다.
@@ -1560,7 +1696,11 @@ config_table = "c"
         c.discovery.denied_name_substrings.clear();
         c.discovery.reject_production_tags = false;
         c.apply_derived_defaults();
-        assert!(c.discovery.denied_name_substrings.contains(&"prd".to_string()));
+        assert!(
+            c.discovery
+                .denied_name_substrings
+                .contains(&"prd".to_string())
+        );
         assert!(c.discovery.reject_production_tags);
 
         // 명시하면 둘 다 켜지지 않는다 — 대신 VPC 필터가 범위를 정한다.
