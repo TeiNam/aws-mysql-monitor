@@ -679,8 +679,24 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         // 결과를 더 빠르게" 와 무관하므로 재작성에 나올 이유가 없다.
         "LOAD_FILE",
         "BENCHMARK",
+        // 세션 잠금을 전부 놓는다 — 다른 문장의 잠금까지 영향을 준다.
+        "RELEASE_ALL_LOCKS",
+        // **실행을 지연시킨다.** 원본에 `SLEEP` 이 있어도 그걸 유지한 재작성은 "같은
+        // 결과를 더 빠르게" 가 아니다. 실제 운영 쿼리에는 나오지 않는다(교차 리뷰 8회차).
+        "SLEEP",
     ];
     if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
+        return false;
+    }
+
+    // ③-b-1 **세션 상태를 바꾸는 것.**
+    //
+    // `SELECT @x := 1` 은 사용자 변수를 만들고, `@@…` 는 세션 변수를 읽거나 쓴다. 복사해
+    // 실행하면 그 세션의 뒤 문장에 영향을 준다 — 조회 재작성이 할 일이 아니다
+    // (교차 리뷰 8회차).
+    //
+    // `:=` 는 토큰 분리에서 사라지므로(구분자다) **인용을 덮은 사본에서 직접** 찾는다.
+    if up.contains(":=") || tokens.iter().any(|t| t.starts_with('@')) {
         return false;
     }
 
@@ -688,11 +704,16 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     // 커밋까지 공유 잠금을 잡으므로 "같은 결과를 더 빠르게" 가 아니다. 문장 단위 키워드를
     // 선두로 옮기면서 이게 열렸다(교차 리뷰 6회차).
     //
-    // **인접 토큰으로 본다.** `LOCK` 을 어디서나 거부하면 `SELECT t.lock FROM t` 가
-    // 걸린다 — 예약어도 `.` 뒤에서는 인용 없이 쓸 수 있다(7회차가 오탐으로 지적).
-    // `UNLOCK` 은 `SELECT` 절에 나올 형태가 없어 선두 검사로 충분하다.
+    // **인접 토큰 셋으로 본다.** `LOCK` 을 어디서나 거부하면 `SELECT t.lock FROM t` 가
+    // 걸리고(예약어도 `.` 뒤에서는 인용 없이 쓴다), `LOCK IN` 두 개로 보면
+    // `SELECT o.lock IN (1) FROM orders o` 가 걸린다 — 거기서 `IN` 은 술어다
+    // (7·8회차가 차례로 오탐으로 지적). `UNLOCK` 은 `SELECT` 절에 나올 형태가 없어
+    // 선두 검사로 충분하다.
     for (i, t) in tokens.iter().enumerate() {
-        if *t == "LOCK" && tokens.get(i + 1).is_some_and(|n| *n == "IN") {
+        if *t == "LOCK"
+            && tokens.get(i + 1).is_some_and(|n| *n == "IN")
+            && tokens.get(i + 2).is_some_and(|n| *n == "SHARE")
+        {
             return false;
         }
     }
@@ -1652,6 +1673,11 @@ mod tests {
             // 목록의 `LOAD` 에 걸리지 않는다.
             "SELECT LOAD_FILE('/etc/passwd') FROM orders",
             "SELECT BENCHMARK(1000000, MD5('x')) FROM orders",
+            // 세션 잠금·지연·세션 상태 (교차 리뷰 8회차).
+            "SELECT RELEASE_ALL_LOCKS()",
+            "SELECT SLEEP(600)",
+            "SELECT @x := 1 FROM orders",
+            "SELECT @@sort_buffer_size FROM orders",
             "PREPARE s FROM 'DELETE FROM orders'",
             // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
             // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).
@@ -1699,6 +1725,8 @@ mod tests {
             // **예약어도 `.` 뒤에서는 인용 없이 쓴다.** `LOCK` 을 어디서나 거부하면 이걸
             // 잡는다(교차 리뷰 7회차가 오탐으로 지적).
             "SELECT o.lock FROM orders o WHERE o.id = ?",
+            // `IN` 은 여기서 술어다 — `LOCK IN SHARE MODE` 가 아니다(8회차 nit).
+            "SELECT o.lock IN (1, 2) FROM orders o",
         ] {
             let raw = RawAdvice {
                 summary: "풀스캔이다".into(),
