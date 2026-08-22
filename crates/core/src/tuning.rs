@@ -643,6 +643,7 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         "PREPARE",
         "EXECUTE",
         "DEALLOCATE",
+        "UNLOCK",
         "COMMIT",
         "ROLLBACK",
         "START",
@@ -665,21 +666,12 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     // ③-b **어디에 있어도 안 되는 것.** 함수·절이라서 선두에 오지 않는다.
     //
     // 파일로 내보내거나 잠금을 잡는 것은 "튜닝된 조회" 가 아니다.
-    // `LOCK`·`UNLOCK` 은 **선두에서만 보면 안 된다.**
-    //
-    // `SELECT … LOCK IN SHARE MODE` 는 선두가 `SELECT` 인 잠금 읽기다 — 트랜잭션 안에서
-    // 커밋까지 공유 잠금을 잡으므로 "같은 결과를 더 빠르게" 가 아니다. 문장 단위
-    // 키워드를 선두로 옮기면서 이게 열렸다(교차 리뷰 6회차가 내 수정의 구멍으로 잡았다).
-    //
-    // 둘 다 MySQL **예약어**라서 인용 없이 식별자로 쓸 수 없다 — 어디에 있어도 거부해도
-    // 정상 문장을 잡지 않는다(`start`·`session` 과 다른 점이다).
+    // **함수·절 이름은 선두에서만 보면 안 된다.**
     const FORBIDDEN_ANYWHERE: &[&str] = &[
         "OUTFILE",
         "DUMPFILE",
         "GET_LOCK",
         "RELEASE_LOCK",
-        "LOCK",
-        "UNLOCK",
         // **함수 이름은 선두 키워드 검사에 걸리지 않는다.** `_` 가 식별자 문자이므로
         // `LOAD_FILE` 은 `LOAD` 로 쪼개지지 않는다 — 목록에 `LOAD` 가 있어도 통과한다.
         //
@@ -690,6 +682,19 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
     ];
     if FORBIDDEN_ANYWHERE.iter().any(|k| has(k)) {
         return false;
+    }
+
+    // ③-b-2 **`LOCK IN SHARE MODE`.** 선두가 `SELECT` 인 잠금 읽기다 — 트랜잭션 안에서
+    // 커밋까지 공유 잠금을 잡으므로 "같은 결과를 더 빠르게" 가 아니다. 문장 단위 키워드를
+    // 선두로 옮기면서 이게 열렸다(교차 리뷰 6회차).
+    //
+    // **인접 토큰으로 본다.** `LOCK` 을 어디서나 거부하면 `SELECT t.lock FROM t` 가
+    // 걸린다 — 예약어도 `.` 뒤에서는 인용 없이 쓸 수 있다(7회차가 오탐으로 지적).
+    // `UNLOCK` 은 `SELECT` 절에 나올 형태가 없어 선두 검사로 충분하다.
+    for (i, t) in tokens.iter().enumerate() {
+        if *t == "LOCK" && tokens.get(i + 1).is_some_and(|n| *n == "IN") {
+            return false;
+        }
     }
 
     // ③-c **읽기인데 부수효과가 있는 절.** 원본이 select 일 때만 본다.
@@ -1691,6 +1696,9 @@ mod tests {
             "SELECT start FROM orders WHERE id = ?",
             "SELECT o.session, o.global FROM orders o",
             "SELECT COUNT(*) FROM orders WHERE `check` = ?",
+            // **예약어도 `.` 뒤에서는 인용 없이 쓴다.** `LOCK` 을 어디서나 거부하면 이걸
+            // 잡는다(교차 리뷰 7회차가 오탐으로 지적).
+            "SELECT o.lock FROM orders o WHERE o.id = ?",
         ] {
             let raw = RawAdvice {
                 summary: "풀스캔이다".into(),
