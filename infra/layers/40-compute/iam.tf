@@ -361,3 +361,69 @@ resource "aws_iam_role_policy" "task_channel_secrets" {
     }]
   })
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 부트스트랩 마스터 자격증명 (M3, docs/07-credentials-bootstrap.md §1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# **이 정책이 이 태스크에게 가장 큰 능력을 준다.** 대상 DB 의 마스터 비밀번호를 읽고,
+# 그것으로 `CREATE USER`/`GRANT` 를 실행할 수 있다.
+#
+# # 두 경로만 열고, 각각 다르게 좁힌다
+#
+# | 경로 | 리소스 | 왜 이렇게 좁히나 |
+# |---|---|---|
+# | (a) RDS 관리형 | `secret:rds!*` | RDS 가 만드는 이름 규칙이다. 사람이 만든 비밀은 이 접두어를 쓸 수 없다 |
+# | (b) 지정 ARN | 태그 조건 `dbmon=true` | 임의 ARN 을 받으면 이 앱이 계정의 모든 비밀을 읽는 도구가 된다 |
+#
+# 앱도 같은 태그를 확인한다(`bootstrap::secret::is_tagged_for_dbmon`) — 정책이
+# 느슨해져도 코드가 한 겹 막고, 코드가 뚫려도 정책이 막는다.
+#
+# # `*` 로 열지 않는다
+#
+# `secretsmanager:GetSecretValue` 를 `*` 로 주면 이 태스크가 침해됐을 때 계정의
+# 모든 비밀(다른 서비스의 API 키, 다른 DB 의 마스터 암호)이 함께 나간다.
+resource "aws_iam_role_policy" "task_bootstrap" {
+  count = var.enable_bootstrap ? 1 : 0
+  name  = "dbmon-bootstrap"
+  role  = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadRdsManagedMasterSecret"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = ["arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:rds!*"]
+      },
+      {
+        Sid      = "ReadTaggedMasterSecret"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = ["arn:aws:secretsmanager:${var.region}:${local.account_id}:secret:*"]
+        Condition = {
+          StringEquals = { "secretsmanager:ResourceTag/dbmon" = "true" }
+        }
+      },
+      # 관리형 시크릿이 고객 관리 KMS 키로 암호화돼 있으면 복호화 권한이 필요하다.
+      # `ViaService` 로 좁혀서 이 키를 다른 용도로 쓸 수 없게 한다.
+      {
+        Sid      = "DecryptSecretsManagerKeys"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = ["*"]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "secretsmanager.${var.region}.amazonaws.com"
+          }
+        }
+      },
+    ]
+  })
+}
+
+# ⚠ **`ModifyDBInstance` 를 주지 않는다** (NFR-S-09, 07 §2.1).
+#
+# IAM DB 인증이 꺼진 인스턴스는 계획이 **CLI 명령을 보여주고** 사람이 실행한다.
+# 앱이 프로덕션 RDS 를 변경할 권한을 기본으로 갖지 않는 것이 그 결정이다.
+# 정책을 추가하려면 `bootstrap.allow_rds_modify` 설정과 함께 여기에 문장을 더한다.

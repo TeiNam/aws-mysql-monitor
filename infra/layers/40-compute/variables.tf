@@ -427,3 +427,19 @@ variable "auth_token_secret_arn" {
   }
 }
 
+
+variable "enable_bootstrap" {
+  description = <<-EOT
+    모니터링 계정 부트스트랩(M3)을 켤까.
+
+    **기본 `false`.** 켜면 태스크 롤이 **대상 DB 의 마스터 비밀번호를 읽을 수 있다** —
+    이 배포에서 가장 큰 권한이다. 켜지 않으면 화면이 수동 스크립트를 보여주고
+    사람이 실행한다(문서 07 §5 가 "가장 안전한 기본값" 이라고 지목한 경로다).
+
+    켜기 전에 확인할 것:
+    - 마스터 시크릿이 RDS 관리형(`rds!*`)이거나 `dbmon=true` 태그가 붙어 있다
+    - `bootstrap.monitor_host` 설정에 앱 서브넷 CIDR 이 들어 있다 (`%` 가 아니다)
+  EOT
+  type        = bool
+  default     = false
+}
