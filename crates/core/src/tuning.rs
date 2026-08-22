@@ -689,6 +689,10 @@ pub fn is_safe_rewrite(sql: &str, statement_type: &str) -> bool {
         // **실행을 지연시킨다.** 원본에 `SLEEP` 이 있어도 그걸 유지한 재작성은 "같은
         // 결과를 더 빠르게" 가 아니다(교차 리뷰 8회차).
         "SLEEP",
+        // **인자를 주면 세션 상태를 바꾼다.** `LAST_INSERT_ID(123)` 은 이후의
+        // `LAST_INSERT_ID()` 가 돌려주는 값을 바꾼다 — 읽기처럼 보이는 쓰기다
+        // (교차 리뷰 10회차). 인자 없는 형태도 재작성에 나올 이유가 없다.
+        "LAST_INSERT_ID",
     ];
     if FORBIDDEN_FUNCTIONS.iter().any(|f| calls_function(&up, f)) {
         return false;
@@ -1723,6 +1727,8 @@ mod tests {
             "SELECT RELEASE_ALL_LOCKS()",
             "SELECT SLEEP(600)",
             "SELECT @x := 1 FROM orders",
+            // 읽기처럼 보이지만 세션 상태를 바꾼다 (교차 리뷰 10회차).
+            "SELECT LAST_INSERT_ID(123) FROM orders",
             "PREPARE s FROM 'DELETE FROM orders'",
             // **`sql_mode` 에 따라 두 문장이 되는 형태.** `NO_BACKSLASH_ESCAPES` 에서는
             // 문자열이 `x\\` 에서 끝나고 DELETE 가 별개 문장이다(교차 리뷰 5회차).
