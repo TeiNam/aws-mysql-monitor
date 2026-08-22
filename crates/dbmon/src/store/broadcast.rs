@@ -25,7 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dbmon_core::Result;
 use dbmon_core::ids::{InstanceId, RecordId};
-use dbmon_core::ports::SlowQueryStore;
+use dbmon_core::ports::{SlowQueryStore, StoredKey};
 use dbmon_core::slow_query::SlowQuery;
 use dbmon_core::time::{EpochMs, TimeRange};
 
@@ -52,11 +52,11 @@ impl<S> BroadcastingStore<S> {
 
 #[async_trait]
 impl<S: SlowQueryStore> SlowQueryStore for BroadcastingStore<S> {
-    async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
-        let merged = self.inner.upsert_merged(q).await?;
+    async fn upsert_merged_keyed(&self, q: &SlowQuery) -> Result<(SlowQuery, StoredKey)> {
+        let (merged, key) = self.inner.upsert_merged_keyed(q).await?;
         // 병합 결과를 방송한다 — 입력이 아니라.
         self.hub.publish_slow_query(&merged);
-        Ok(merged)
+        Ok((merged, key))
     }
 
     async fn get(&self, id: &RecordId) -> Result<Option<SlowQuery>> {
@@ -92,16 +92,8 @@ impl<S: SlowQueryStore> SlowQueryStore for BroadcastingStore<S> {
     /// **방송하지 않는다.** 하트비트는 새 사실이 아니다 — 이미 화면에 있는 레코드가
     /// 아직 돌고 있다는 것뿐이고, 경과 시간은 클라이언트가 센다. 방송하면 브라우저가
     /// 15초마다 목록 전체를 무효화한다(교차 리뷰 23라운드).
-    async fn touch_in_flight(
-        &self,
-        instance: &InstanceId,
-        thread_id: u64,
-        started_at_ms: EpochMs,
-        last_seen_at_ms: EpochMs,
-    ) -> Result<bool> {
-        self.inner
-            .touch_in_flight(instance, thread_id, started_at_ms, last_seen_at_ms)
-            .await
+    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool> {
+        self.inner.touch_in_flight(key, last_seen_at_ms).await
     }
 }
 

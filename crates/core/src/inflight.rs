@@ -88,13 +88,24 @@ pub struct Tracked {
     pub max_time_secs: i64,
     /// 마지막으로 관측된 시각(우리 시계). 고아 판정 기준 (F4).
     pub last_seen_at_ms: EpochMs,
-    /// 이 항목을 **저장소에 마지막으로 쓴 시각**. 한 번도 못 썼으면 `None`.
+    /// 이 항목의 레코드가 **저장소에서 실제로 놓인 자리**. 한 번도 못 썼으면 `None`.
     ///
     /// 고아 판정은 저장된 `last_seen_at_ms` 의 침묵으로 한다. 그런데 저장은 심층 조회
     /// 대상일 때만 일어나고, 플랜을 확보하면 그 대상에서 빠진다 — **살아 있는 쿼리의
     /// 저장된 갱신 시각이 굳는다.** 그러면 임계를 넘겨 고아로 확정된다(교차 리뷰 22라운드).
-    /// 이 값으로 "굳기 전에 다시 쓸 항목" 을 고른다 ([`Tracker::needs_heartbeat`]).
-    pub saved_at_ms: Option<EpochMs>,
+    /// 그래서 주기적으로 그 자리에 생존 신호만 올린다([`InFlightTracker::needs_heartbeat`]).
+    ///
+    /// **자리를 계산으로 복원할 수 없다.** 물리 키는 시작 시각 추정에서 나오고 그 추정은
+    /// 관측자마다 다르며, 병합이 시작 시각을 앞당기면 필드와 키가 어긋난다. 그래서 쓰기가
+    /// 알려 준 값을 그대로 들고 있는다 — 24·25라운드의 블로커 셋이 전부 이 값을 추측한
+    /// 결과였다.
+    pub storage_key: Option<crate::ports::StoredKey>,
+    /// 생존 신호를 **마지막으로 시도한** 시각(성공·실패 무관).
+    ///
+    /// 성공만 기록하면 실패한 항목이 매 tick 다시 후보가 되어 상한을 채운다. 반대로
+    /// 실패를 성공처럼 기록하면 그 항목이 **줄의 앞자리를 영구히 차지**해 진짜 갱신이
+    /// 필요한 항목이 굶는다(25라운드). 그래서 성공과 시도를 나눠 둔다.
+    pub touch_attempt_ms: Option<EpochMs>,
     /// 플랜 수집 시도 횟수. 상한을 넘으면 포기한다.
     pub plan_attempts: u8,
     /// 플랜을 확보했다.
@@ -395,12 +406,20 @@ impl InFlightTracker {
     }
 
     /// 심층 조회 결과를 반영한다.
-    /// 이 항목을 저장소에 **성공적으로 썼다**고 표시한다.
+    /// 이 항목을 저장소에 **성공적으로 썼다**고 표시한다. 자리도 함께 기록한다.
     ///
     /// 실패했을 때는 부르지 않는다 — 다음 tick 이 다시 고르게 둔다.
-    pub fn record_saved(&mut self, thread_id: u64, now_ms: EpochMs) {
+    pub fn record_saved(&mut self, thread_id: u64, now_ms: EpochMs, key: crate::ports::StoredKey) {
         if let Some(t) = self.entries.get_mut(&thread_id) {
-            t.saved_at_ms = Some(now_ms);
+            t.storage_key = Some(key);
+            t.touch_attempt_ms = Some(now_ms);
+        }
+    }
+
+    /// 생존 신호를 **시도했다**고만 표시한다(결과 무관). 페이스 전용이다.
+    pub fn record_touch_attempt(&mut self, thread_id: u64, now_ms: EpochMs) {
+        if let Some(t) = self.entries.get_mut(&thread_id) {
+            t.touch_attempt_ms = Some(now_ms);
         }
     }
 
@@ -417,40 +436,34 @@ impl InFlightTracker {
     /// 관측하지 않는다" 를 뜻하게 되고, 스윕은 시각 비교만으로 옳아진다 — 소유를
     /// 추론할 필요가 없다(그 추론이 20~22라운드에서 양방향으로 틀렸다).
     ///
-    /// # 미저장 항목도 대상이다 — 다만 **뒤로 밀린다**
+    /// # 자리를 아는 항목만 대상이다
     ///
-    /// 23라운드에는 미저장 항목을 제외했다. 그때는 하트비트가 `upsert_merged` 였고 없는
-    /// 레코드를 **만들었기** 때문이다(그러면 SQL 없는 레코드의 정책이 `off` 로 고정돼
-    /// 나중 SQL 이 버려진다). 지금은 조건부 갱신이라 만들 수 없으므로 제외할 이유가 없고,
-    /// 제외하면 **인수인계 구멍**이 생긴다: 새 리더의 추적기는 비어 있으므로 이전 리더가
-    /// 남긴 진행 중 레코드가 전부 "미저장" 인데, 그 레코드는 저장소에 **있다.**
-    /// 심층 조회 상한 밖이거나 선행 저장이 계속 실패하면 아무도 갱신하지 않아 살아 있는
-    /// 쿼리가 버려진다(24라운드가 배포 차단으로 잡았다).
+    /// 하트비트는 **쓰기가 알려 준 자리**에만 신호를 올린다(추측하면 다른 실행의 행을
+    /// 갱신한다 — 교차 리뷰 25라운드). 그래서 아직 한 번도 저장되지 않은 항목은 올릴
+    /// 자리가 없다.
     ///
-    /// **저장된 항목을 먼저 준다.** 그쪽은 레코드가 있는 것이 확실하므로 상한(`호출부`)에
-    /// 걸릴 때 먼저 보호받아야 한다. 미저장 항목은 조건이 깨져도 손해가 호출 한 번이다.
+    /// 그게 인수인계에서 구멍이 되지 않는 이유: **새 추적 항목은 첫 tick 에 반드시 심층
+    /// 조회 대상**이고(`needs_deep_probe`), 그 선행 저장이 이전 리더가 만든 행에 병합되며
+    /// 그때 자리를 알려 준다. 심층 조회 상한에 걸린 항목은 다음 tick 에 다시 후보가 된다.
+    ///
+    /// **줄은 마지막 시도 순이다** — 계급을 두지 않는다. 실패한 시도를 성공처럼 기록해
+    /// 앞자리에 두면 진짜 갱신이 필요한 항목이 굶는다(25라운드가 201개로 재현했다).
     ///
     /// 상한은 두지 않는다. **호출부가 자르고 자른 사실을 기록한다** — 조용히 자르면
     /// 잘린 항목이 고아로 확정되는데 그 이유가 어디에도 남지 않는다.
     pub fn needs_heartbeat(&self, now_ms: EpochMs, interval_ms: i64) -> Vec<u64> {
-        // 정렬 키: (저장된 적 없는가, 마지막 저장·관측 시각). 저장된 것이 앞이다.
-        let mut stale: Vec<(bool, EpochMs, u64)> =
-            self.entries
-                .values()
-                .filter_map(|t| match t.saved_at_ms {
-                    Some(saved) => (now_ms.saturating_sub(saved) >= interval_ms).then_some((
-                        false,
-                        saved,
-                        t.thread_id,
-                    )),
-                    // 미저장 항목의 페이스는 **최초 관측 시각**으로 잰다. 그게 없으면 매 tick
-                    // 시도해 상한을 미저장 항목으로 채운다.
-                    None => (now_ms.saturating_sub(t.first_observed_at_ms) >= interval_ms)
-                        .then_some((true, t.first_observed_at_ms, t.thread_id)),
-                })
-                .collect();
+        let mut stale: Vec<(EpochMs, u64)> = self
+            .entries
+            .values()
+            .filter(|t| t.storage_key.is_some())
+            .filter_map(|t| {
+                // 시도한 적이 없으면 최초 관측을 기준으로 잰다.
+                let last = t.touch_attempt_ms.unwrap_or(t.first_observed_at_ms);
+                (now_ms.saturating_sub(last) >= interval_ms).then_some((last, t.thread_id))
+            })
+            .collect();
         stale.sort_unstable();
-        stale.into_iter().map(|(_, _, id)| id).collect()
+        stale.into_iter().map(|(_, id)| id).collect()
     }
 
     pub fn record_deep_probe(
@@ -512,7 +525,8 @@ fn new_tracked(obs: &Observation, now_ms: EpochMs, offset: &ClockOffset) -> Trac
         started_at_ms_precise: None,
         max_time_secs: obs.time_secs,
         last_seen_at_ms: now_ms,
-        saved_at_ms: None,
+        storage_key: None,
+        touch_attempt_ms: None,
         plan_attempts: 0,
         has_plan: false,
     }
@@ -959,6 +973,10 @@ mod tests {
         assert!(drained.iter().all(|(_, r)| !r.observed_end()));
     }
 
+    fn key(n: u64) -> crate::ports::StoredKey {
+        crate::ports::StoredKey::new(format!("row-{n}"))
+    }
+
     /// **플랜을 확보한 뒤에도 하트비트 대상이다.**
     ///
     /// 심층 조회 대상은 "플랜이 없는 것" 이므로 플랜을 확보하면 저장이 멈춘다. 그때
@@ -971,9 +989,9 @@ mod tests {
         let r = t.tick(&[obs(1, 2, Some("a"))], 1_000, &no_offset(), false);
         assert_eq!(r.needs_deep_probe, vec![1], "새 항목은 심층 조회 대상이다");
 
-        // 심층 조회로 플랜을 확보하고 저장했다.
+        // 심층 조회로 플랜을 확보하고 저장했다 — 그때 저장소가 자리를 알려 준다.
         t.record_plan_attempt(1, true);
-        t.record_saved(1, 1_000);
+        t.record_saved(1, 1_000, key(1));
 
         // 이제 심층 조회 대상이 아니다 — 저장을 유발하는 경로가 없다.
         let r = t.tick(&[obs(1, 30, Some("a"))], 31_000, &no_offset(), false);
@@ -987,41 +1005,61 @@ mod tests {
         // **주기가 지났으므로 다시 써야 한다.**
         assert_eq!(t.needs_heartbeat(31_000, INTERVAL), vec![1]);
 
-        // 쓰고 나면 주기 안에는 다시 고르지 않는다 — 쓰기 비용에 상한이 생긴다.
-        t.record_saved(1, 31_000);
+        // 시도하면 주기 안에는 다시 고르지 않는다 — 쓰기 비용에 상한이 생긴다.
+        t.record_touch_attempt(1, 31_000);
         assert!(t.needs_heartbeat(40_000, INTERVAL).is_empty());
         assert_eq!(t.needs_heartbeat(46_000, INTERVAL), vec![1]);
     }
 
-    /// **미저장 항목도 대상이지만 저장된 항목보다 뒤에 온다.**
+    /// **자리를 모르는 항목은 대상이 아니다.**
     ///
-    /// 인수인계 뒤 새 리더의 추적기는 비어 있으므로 이전 리더가 남긴 **저장소에 있는**
-    /// 레코드가 전부 미저장으로 보인다. 제외하면 그 레코드를 아무도 갱신하지 않아 살아
-    /// 있는 쿼리가 버려진다(24라운드). 순서를 두는 이유는 상한에 걸릴 때 **레코드가 있는
-    /// 것이 확실한 쪽**을 먼저 보호하기 위해서다.
+    /// 하트비트는 쓰기가 알려 준 자리에만 신호를 올린다. 자리를 추측하면 같은 스레드의
+    /// 옛 실행을 살려 두고 산 실행을 버릴 수 있다(25라운드). 자리를 모르는 항목은
+    /// 첫 tick 의 심층 조회로 곧 자리를 얻는다.
     #[test]
-    fn unsaved_entries_come_after_saved_ones() {
+    fn entries_without_a_known_row_are_not_candidates() {
         const INTERVAL: EpochMs = 15_000;
         let mut t = InFlightTracker::default();
         t.tick(
-            &[
-                obs(1, 2, Some("a")),
-                obs(2, 3, Some("b")),
-                obs(3, 4, Some("c")),
-            ],
+            &[obs(1, 2, Some("a")), obs(2, 3, Some("b"))],
             1_000,
             &no_offset(),
             false,
         );
-        t.record_saved(1, 20_000);
-        t.record_saved(3, 1_000);
-        // 저장된 것이 오래된 순(3 → 1), 그다음 미저장(2).
-        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![3, 1, 2]);
-        // 미저장도 **주기를 지킨다** — 최초 관측 직후에는 시도하지 않는다.
-        assert_eq!(
-            t.needs_heartbeat(1_000 + INTERVAL - 1, INTERVAL),
-            Vec::<u64>::new()
-        );
+        // 둘 다 아직 저장되지 않았다 → 올릴 자리가 없다.
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), Vec::<u64>::new());
+        // 선행 저장이 자리를 알려 주면 대상이 된다.
+        t.record_saved(1, 2_000, key(1));
+        assert_eq!(t.needs_heartbeat(40_000, INTERVAL), vec![1]);
+    }
+
+    /// **실패한 시도가 줄의 앞자리를 차지하지 않는다.**
+    ///
+    /// 25라운드가 201개로 재현했다: 조건이 깨진 항목을 "저장했다" 로 기록하면 그 항목들이
+    /// 매 tick 앞자리를 채워, 상한(호출부 200) 밖으로 밀린 **진짜 갱신이 필요한 항목**이
+    /// 영구히 굶는다. 줄을 마지막 시도 순으로만 세우면 그 상태가 만들어지지 않는다.
+    #[test]
+    fn a_failed_attempt_does_not_starve_the_queue() {
+        const INTERVAL: EpochMs = 15_000;
+        const CAP: usize = 200;
+        let mut t = InFlightTracker::default();
+        let obs_all: Vec<Observation> = (1..=201).map(|i| obs(i, 2, Some("a"))).collect();
+        t.tick(&obs_all, 1_000, &no_offset(), false);
+        // 전부 자리를 안다(선행 저장이 됐다).
+        for i in 1..=201u64 {
+            t.record_saved(i, 1_000, key(i));
+        }
+
+        // 1차: 상한만큼 시도한다. 조건이 깨져도 **시도**로 기록된다.
+        let first = t.needs_heartbeat(20_000, INTERVAL);
+        assert_eq!(first.len(), 201);
+        for id in first.iter().take(CAP) {
+            t.record_touch_attempt(*id, 20_000);
+        }
+
+        // 2차: 밀렸던 201번이 **맨 앞**이다 — 그게 공평한 줄이다.
+        let second = t.needs_heartbeat(36_000, INTERVAL);
+        assert_eq!(second[0], 201, "밀린 항목이 다시 뒤로 갔다 — 영구히 굶는다");
     }
 
     #[test]

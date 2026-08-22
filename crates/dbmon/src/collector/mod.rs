@@ -411,25 +411,22 @@ where
             // **관측 시각을 쓴다 — `now_ms` 가 아니다.** 관측이 끊긴 항목(잘린 tick 에서
             // 못 본 스레드)에 `now` 를 쓰면 "보고 있다" 는 거짓이 저장되고, 그 레코드는
             // 아무도 확정하지 않는데 영원히 살아 있는 것으로 보인다.
-            let Some((started_at_ms, last_seen_at_ms)) = self
+            //
+            // 자리는 **쓰기가 알려 준 것**이다(`needs_heartbeat` 가 자리를 아는 항목만 준다).
+            let Some((key, last_seen_at_ms)) = self
                 .tracker
                 .get(id)
-                .map(|t| (t.started_at_ms, t.last_seen_at_ms))
+                .and_then(|t| t.storage_key.clone().map(|k| (k, t.last_seen_at_ms)))
             else {
                 continue;
             };
-            match self
-                .store
-                .touch_in_flight(&self.instance.id, id, started_at_ms, last_seen_at_ms)
-                .await
-            {
+            // **결과와 무관하게 시도를 기록한다.** 성공으로 기록하면 실패한 항목이 줄의
+            // 앞자리를 차지해 갱신이 필요한 항목이 굶는다(25라운드).
+            self.tracker.record_touch_attempt(id, now_ms);
+            match self.store.touch_in_flight(&key, last_seen_at_ms).await {
                 Ok(updated) => {
                     stats.heartbeats += usize::from(updated);
                     stats.heartbeats_absent += usize::from(!updated);
-                    // **조건이 깨졌어도 저장 시각을 갱신한다.** 레코드가 이미 확정됐거나
-                    // (슬로우로그가 먼저 닫았다) 없는 경우인데, 그때 매 tick 다시 시도하면
-                    // 스레드가 사라질 때까지 호출을 낭비한다.
-                    self.tracker.record_saved(id, now_ms);
                 }
                 Err(e) => {
                     stats.store_errors += 1;
@@ -600,10 +597,12 @@ where
             };
             stats.masking_degraded += usize::from(out.masking_degraded);
             stats.plan_redactions += out.plan_redactions;
-            match self.store.upsert_merged(&out.query).await {
-                Ok(_) => {
+            // **키를 받는 형태로 저장한다.** 하트비트는 계산한 키가 아니라 이 자리에만
+            // 신호를 올린다 — 추정으로 만든 키는 관측자가 바뀌면 어긋난다.
+            match self.store.upsert_merged_keyed(&out.query).await {
+                Ok((_, key)) => {
                     stats.prefetch_saved += 1;
-                    self.tracker.record_saved(*id, now_ms);
+                    self.tracker.record_saved(*id, now_ms, key);
                 }
                 Err(e) => {
                     stats.store_errors += 1;

@@ -18,7 +18,8 @@ use crate::ports::target_db::{
     ProcessRow, StmtCurrentRow, TargetDb,
 };
 use crate::ports::{
-    DigestStore, DigestTextEntry, InstanceRegistry, LEASE_TTL_MS, Lease, LeaseStore, SlowQueryStore,
+    DigestStore, DigestTextEntry, InstanceRegistry, LEASE_TTL_MS, Lease, LeaseStore,
+    SlowQueryStore, StoredKey,
 };
 use crate::rollup::DigestRollupRow;
 use crate::slow_query::SlowQuery;
@@ -96,7 +97,7 @@ impl FakeSlowQueryStore {
 
 #[async_trait]
 impl SlowQueryStore for FakeSlowQueryStore {
-    async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
+    async fn upsert_merged_keyed(&self, q: &SlowQuery) -> Result<(SlowQuery, StoredKey)> {
         if let Some(e) = self.take_failure() {
             return Err(e);
         }
@@ -118,8 +119,8 @@ impl SlowQueryStore for FakeSlowQueryStore {
                 );
             if same {
                 let merged = merge(existing, q);
-                items.insert(key, merged.clone());
-                return Ok(merged);
+                items.insert(key.clone(), merged.clone());
+                return Ok((merged, StoredKey::new(key)));
             }
         }
         // 2) ±2초 보조 조회 — 시작 시각 추정이 1초 어긋난 같은 실행을 찾는다.
@@ -144,11 +145,13 @@ impl SlowQueryStore for FakeSlowQueryStore {
         if let Some(ck) = candidate_key {
             let existing = items.get(&ck).unwrap().clone();
             let merged = merge(&existing, q);
-            items.insert(ck, merged.clone());
-            return Ok(merged);
+            items.insert(ck.clone(), merged.clone());
+            // **후보 자리를 알려 준다** — 어댑터와 같은 계약이다. 여기서 계산한 키를
+            // 돌려주면 호출부가 다른 자리를 겨냥한다.
+            return Ok((merged, StoredKey::new(ck)));
         }
-        items.insert(key, q.clone());
-        Ok(q.clone())
+        items.insert(key.clone(), q.clone());
+        Ok((q.clone(), StoredKey::new(key)))
     }
 
     async fn get(&self, id: &RecordId) -> Result<Option<SlowQuery>> {
@@ -210,43 +213,17 @@ impl SlowQueryStore for FakeSlowQueryStore {
         Ok(out)
     }
 
-    /// 어댑터와 **같은 계약**을 지킨다: 만들지 않고, 진행 중일 때만, 되돌리지 않고,
-    /// **키가 표류했으면 찾아서** 갱신한다. 페이크가 느슨하면 통합 테스트만 통과하는
+    /// 어댑터와 **같은 계약**을 지킨다: 쓰기가 알려 준 자리만 보고, 없으면 만들지 않고,
+    /// 진행 중일 때만, 값을 되돌리지 않는다. 페이크가 느슨하면 통합 테스트만 통과하는
     /// 코드가 나온다(GSI 사영에서 한 번 데였다).
-    async fn touch_in_flight(
-        &self,
-        instance: &crate::ids::InstanceId,
-        thread_id: u64,
-        started_at_ms: EpochMs,
-        last_seen_at_ms: EpochMs,
-    ) -> Result<bool> {
-        use crate::slow_query::SlowQueryState;
-
-        let id = crate::ids::RecordId::new(instance, thread_id, started_at_ms);
-        let window = crate::clock_offset::BASE_MERGE_WINDOW_MS;
+    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool> {
         let mut items = self.items.lock().unwrap();
-
-        // 빠른 경로(계산한 키) → 느린 경로(같은 스레드의 진행 중 행, ±2초).
-        let key = items
-            .get(id.as_str())
-            .filter(|e| e.state == SlowQueryState::InFlight)
-            .map(|_| id.as_str().to_string())
-            .or_else(|| {
-                items
-                    .values()
-                    .find(|e| {
-                        e.state == SlowQueryState::InFlight
-                            && e.instance_id == *instance
-                            && e.thread_id == thread_id
-                            && (e.started_at_ms - started_at_ms).abs() <= window
-                    })
-                    .map(|e| e.record_id.as_str().to_string())
-            });
-        let Some(key) = key else {
+        let Some(e) = items.get_mut(key.as_str()) else {
             return Ok(false);
         };
-        let e = items.get_mut(&key).expect("직전에 찾았다");
-        if e.last_seen_at_ms.is_some_and(|cur| cur >= last_seen_at_ms) {
+        if e.state != crate::slow_query::SlowQueryState::InFlight
+            || e.last_seen_at_ms.is_some_and(|cur| cur >= last_seen_at_ms)
+        {
             return Ok(false);
         }
         e.last_seen_at_ms = Some(last_seen_at_ms);

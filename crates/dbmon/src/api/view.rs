@@ -12,6 +12,7 @@
 
 use dbmon_core::rbac::AuthContext;
 use dbmon_core::slow_query::{LiteralPolicy, SlowQuery};
+use dbmon_core::time::EpochMs;
 use serde::Serialize;
 
 /// 목록·상세에 쓰는 슬로우 쿼리 뷰.
@@ -152,6 +153,15 @@ pub struct ListResponse {
     /// 전체 건수를 세려면 구간 전체를 훑어야 하고, 그건 목록 화면이 낼 비용이
     /// 아니다. `has_more` 가 상한에 걸렸는지 말해 준다.
     pub total: usize,
+    /// 서버가 이 응답을 만든 시각(epoch ms).
+    ///
+    /// # 왜 필요한가
+    ///
+    /// 화면은 진행 중 쿼리의 경과 시간을 **클라이언트에서** 흘린다(09 §3.4). 그 계산이
+    /// 브라우저 시계에서 `started_at_ms` 를 빼면, 브라우저가 5분 앞선 기계에서는 2초
+    /// 쿼리가 **5분째 실행 중**으로 보인다(교차 리뷰 25라운드). 서버 시각을 함께 주면
+    /// 클라이언트가 그 차이를 한 번 재고 자기 시계의 **경과분만** 더할 수 있다.
+    pub server_now_ms: EpochMs,
 }
 
 /// 실행계획 응답.

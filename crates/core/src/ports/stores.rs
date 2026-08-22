@@ -13,6 +13,38 @@ use crate::slow_query::SlowQuery;
 use crate::time::{EpochMs, TimeRange};
 use async_trait::async_trait;
 
+/// 저장소가 그 레코드를 **실제로 둔 자리**. 도메인은 내용을 해석하지 않는다.
+///
+/// # 왜 필요한가
+///
+/// 물리 키는 `started_at_ms` **추정치**에서 나오고 그 추정은 관측자마다 다르다
+/// (`PROCESSLIST.TIME` 이 정수 초다). 게다가 병합이 시작 시각을 앞당기면 **필드와 키가
+/// 어긋난다** — 항목은 처음 자리에 남는다. 그래서 나중에 같은 레코드를 겨냥하려면
+/// 키를 **다시 계산할 수 없고**, 쓰기가 알려 준 자리를 들고 있어야 한다.
+///
+/// 교차 리뷰 24·25라운드가 이 자리에서 블로커를 세 개 냈다. 처음에는 하트비트가 키를
+/// 다시 계산했고(리더가 바뀌면 못 찾는다), 그다음엔 ±2초를 뒤져 **가장 가까운 행**을
+/// 골랐다(같은 스레드의 옛 실행을 살려 두고 산 실행을 버릴 수 있다). 추측을 없애는
+/// 방법은 추측하지 않는 것이다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoredKey(String);
+
+impl StoredKey {
+    /// 어댑터만 만든다. 형식은 어댑터의 사정이다.
+    pub fn new(opaque: impl Into<String>) -> Self {
+        Self(opaque.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StoredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// 슬로우 쿼리 저장.
 #[async_trait]
 pub trait SlowQueryStore: Send + Sync {
@@ -22,7 +54,16 @@ pub trait SlowQueryStore: Send + Sync {
     /// 수집 경로가 **이 하나의 메서드만** 쓴다.
     ///
     /// 반환값은 저장된(병합된) 레코드다 — 호출자가 `record_id` 가 유지됐는지 알 수 있다.
-    async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery>;
+    async fn upsert_merged(&self, q: &SlowQuery) -> Result<SlowQuery> {
+        Ok(self.upsert_merged_keyed(q).await?.0)
+    }
+
+    /// `upsert_merged` + **레코드가 실제로 놓인 자리**([`StoredKey`]).
+    ///
+    /// 진행 중 레코드의 생존 신호를 나중에 올려야 하는 호출부(수집기)가 쓴다. 키를 다시
+    /// 계산하거나 뒤져서 찾으면 **다른 실행의 행을 갱신할 수 있다** — 그래서 쓴 쪽이
+    /// 알려 준다.
+    async fn upsert_merged_keyed(&self, q: &SlowQuery) -> Result<(SlowQuery, StoredKey)>;
 
     async fn get(&self, id: &RecordId) -> Result<Option<SlowQuery>>;
 
@@ -72,15 +113,10 @@ pub trait SlowQueryStore: Send + Sync {
     /// 반환값은 **실제로 갱신했는가**다. `false` 면 그 레코드는 이 워커가 갱신할 대상이
     /// 아니다(없거나 이미 닫혔다) — 호출부가 재시도하면 매 tick 낭비가 되므로 구분한다.
     ///
-    /// 인자는 **키와 갱신할 값뿐**이다. `SlowQuery` 를 받으면 그걸 만들기 위해 정책
-    /// 판정을 거쳐야 하고, 위 표의 두 번째 줄이 그렇게 들어왔다.
-    async fn touch_in_flight(
-        &self,
-        instance: &InstanceId,
-        thread_id: u64,
-        started_at_ms: EpochMs,
-        last_seen_at_ms: EpochMs,
-    ) -> Result<bool>;
+    /// 인자는 **쓰기가 알려 준 자리와 갱신할 값뿐**이다. `SlowQuery` 를 받으면 그걸
+    /// 만들기 위해 정책 판정을 거쳐야 하고, 위 표의 두 번째 줄이 그렇게 들어왔다.
+    /// 키를 여기서 계산하거나 뒤져서 찾지 않는 이유는 [`StoredKey`] 에 있다.
+    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool>;
 }
 
 /// 다이제스트 롤업 저장.

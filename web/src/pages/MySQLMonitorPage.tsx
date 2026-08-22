@@ -25,7 +25,7 @@ import { EnvFilter, InstanceFilter, InstanceSearch } from "../components/Filters
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { Pagination } from "../components/Pagination";
 import { EnvChip } from "../components/Shell";
-import { displayDurationMs, isRunning } from "../lib/elapsed";
+import { displayDurationMs, isRunning, serverNow } from "../lib/elapsed";
 import { SqlModal } from "../components/SqlModal";
 import { StateBadge } from "../components/StateBadge";
 import {
@@ -157,12 +157,23 @@ export function MySQLMonitorPage() {
   //
   // 진행 중 행이 보일 때만 타이머를 돈다. 항상 돌리면 정적인 표에서 매초 리렌더한다.
   const hasRunning = visible.some((q) => isRunning(q.state));
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [browserNowMs, setBrowserNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!hasRunning) return;
-    const id = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    const id = window.setInterval(() => setBrowserNowMs(Date.now()), 1_000);
     return () => window.clearInterval(id);
   }, [hasRunning]);
+
+  // **기준점은 서버 시각이다.** 브라우저 시계는 응답 이후 흐른 시간만 기여한다 —
+  // 절대값을 쓰면 시계가 5분 앞선 기계에서 2초 쿼리가 5분으로 보인다(25라운드).
+  // `dataUpdatedAt` 은 이 응답을 받은 브라우저 시각이다.
+  const nowMs =
+    list.data && list.dataUpdatedAt
+      ? serverNow(
+          { serverNowMs: list.data.server_now_ms, receivedAtMs: list.dataUpdatedAt },
+          browserNowMs,
+        )
+      : browserNowMs;
 
   return (
     <div className="space-y-6">

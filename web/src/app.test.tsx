@@ -38,6 +38,9 @@ function json(body: unknown): Response {
   });
 }
 
+/** 서버가 응답을 만든 시각. 진행 중 경과 시간의 기준점이다(`lib/elapsed.ts`). */
+const NOW_MS = Date.now();
+
 const RECORD = {
   record_id: `${INSTANCE}:12:1700000000`,
   instance_id: INSTANCE,
@@ -114,9 +117,9 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   }
   if (url.startsWith("/api/slow-queries") || url.startsWith("/api/plans")) {
     if (emptyButTruncated) {
-      return Promise.resolve(json({ items: [], next_cursor: null, has_more: true, total: 0 }));
+      return Promise.resolve(json({ items: [], next_cursor: null, has_more: true, total: 0, server_now_ms: NOW_MS }));
     }
-    return Promise.resolve(json({ items: [RECORD], next_cursor: null, has_more: false, total: 1 }));
+    return Promise.resolve(json({ items: [RECORD], next_cursor: null, has_more: false, total: 1, server_now_ms: NOW_MS }));
   }
   if (url.includes("/plan")) {
     return Promise.resolve(
