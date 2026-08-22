@@ -201,6 +201,11 @@ impl SlowLogFetcher for CloudWatchFetcher {
         // 슬로우 쿼리가 **영구히 유실된다**(교차 리뷰 3회차).
         let mut text = String::new();
         let mut last_ts: Option<EpochMs> = None;
+        // **이벤트를 하나라도 처리했는가.** `last_ts` 와 다른 사실이다 — CloudWatch 이벤트에
+        // `timestamp` 가 없을 수 있다(타입이 옵션이다). 둘을 뭉치면 "본문은 처리했는데
+        // 위치는 그대로" 가 되어 다음 라운드가 같은 페이지를 영원히 다시 읽는다
+        // (교차 리뷰 6회차).
+        let mut consumed = 0usize;
         // **저장된 토큰에서 이어받는다.** 없으면 처음부터.
         let mut token: Option<String> = resume_token.map(str::to_string);
         let mut hit_cap = false;
@@ -283,6 +288,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // RDS 는 슬로우 로그 엔트리 하나를 여러 이벤트로 쪼갤 수도, 한 이벤트에
             // 담을 수도 있다. 파서가 `# Time:` 을 경계로 자르므로 어느 쪽이든 동작한다.
             for e in out.events() {
+                consumed += 1;
                 if let Some(msg) = e.message() {
                     text.push_str(msg.trim_end_matches('\n'));
                     text.push('\n');
@@ -334,10 +340,17 @@ impl SlowLogFetcher for CloudWatchFetcher {
             // 토큰이 있으면 위치를 올리지 않는다: 다음 라운드가 같은 `start_time` 과
             // 토큰으로 정확히 이어받는다. 다 읽었으면 마지막 이벤트 다음으로 올리고,
             // 이벤트가 없었으면 그 자리에 둔다(그리고 토큰이 지워진다).
-            next_since_ms: Some(match (token.is_some(), last_ts) {
-                (true, _) => since_ms,
-                (false, Some(t)) => t + 1,
-                (false, None) => since_ms,
+            next_since_ms: Some(match (token.is_some(), last_ts, consumed) {
+                // 토큰이 살아 있다 — 위치를 올리지 않는다. 전진은 토큰이 한다.
+                (true, _, _) => since_ms,
+                // 다 읽었고 시각을 안다 — 그 다음으로 올린다.
+                (false, Some(t), _) => t + 1,
+                // 다 읽었고 **이벤트가 없었다** — 그 자리에 둔다(토큰이 지워진다).
+                (false, None, 0) => since_ms,
+                // 다 읽었고 이벤트는 있었는데 **시각이 없다.** 그 자리에 두면 다음
+                // 라운드가 같은 페이지를 영원히 다시 읽는다. 1ms 전진시킨다 — 그 경계의
+                // 이벤트를 잃을 수 있지만 멈추는 것보다 낫다.
+                (false, None, _) => since_ms + 1,
             }),
             has_more: hit_cap,
             // 상한에 걸려 남은 토큰. 다 읽었으면 `None` 이고 위치가 전진한다.
@@ -511,6 +524,39 @@ mod tests {
             (),
         );
         assert!(!is_bad_token(&not_found));
+    }
+
+    /// **이벤트를 처리했는데 시각이 없으면 전진시킨다.**
+    ///
+    /// CloudWatch 이벤트의 `timestamp` 는 옵션이다. 본문은 처리했는데 `last_ts` 가 없으면
+    /// 위치를 그대로 두게 되어 다음 라운드가 **같은 페이지를 영원히 다시 읽는다**
+    /// (교차 리뷰 6회차). 경계 이벤트 하나를 잃는 것이 멈추는 것보다 낫다.
+    ///
+    /// 판정을 표로 고정한다 — 네 경우가 서로 다른 사실이고 두 개를 뭉치면 그중 하나가
+    /// 조용히 잘못된다.
+    #[test]
+    fn the_cursor_advances_when_events_were_consumed_without_timestamps() {
+        // (토큰 있음, 시각, 처리 수) → 다음 시작 시각
+        //   토큰 살아 있음   → 그대로 (전진은 토큰이 한다)
+        //   시각 있음        → +1
+        //   이벤트 0개       → 그대로 (토큰이 지워진다)
+        //   이벤트 있고 시각 없음 → +1 (멈추지 않는다)
+        let decide = |token: bool, last: Option<i64>, consumed: usize, since: i64| match (
+            token, last, consumed,
+        ) {
+            (true, _, _) => since,
+            (false, Some(t), _) => t + 1,
+            (false, None, 0) => since,
+            (false, None, _) => since + 1,
+        };
+        assert_eq!(decide(true, Some(500), 3, 100), 100);
+        assert_eq!(decide(false, Some(500), 3, 100), 501);
+        assert_eq!(decide(false, None, 0, 100), 100);
+        assert_eq!(
+            decide(false, None, 3, 100),
+            101,
+            "본문을 처리했는데 위치가 그대로면 같은 페이지를 영원히 다시 읽는다"
+        );
     }
 
     /// **빈 페이지로 끝나도 커서를 갱신한다.**
