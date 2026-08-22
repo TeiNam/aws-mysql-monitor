@@ -122,9 +122,23 @@ impl BootstrapService {
     ///
     /// **자격증명을 실제로 읽지 않는다.** 경로가 있는지만 본다. 읽으면 화면을 여는
     /// 것만으로 `GetSecretValue` 가 호출되고, 그건 CloudTrail 에 남는 동작이다.
-    pub async fn credential_route(&self, instance: &Instance) -> Result<&'static str, SecretError> {
-        let managed = self.managed_secret(instance).await;
-        if managed.is_some() {
+    ///
+    /// # RDS 조회 실패를 "시크릿이 없다" 로 접지 않는다
+    ///
+    /// 처음에는 `instance_facts(...).ok()?` 로 오류를 삼켰다. 그러면 `ClusterId` 를
+    /// 잘못 넘겨 `DescribeDBClusters` 가 실패한 것이 **"등록된 마스터 시크릿이 없다"**
+    /// 로 보인다 — 실제로 그 상태를 만들었고, 사람이 있지도 않은 설정을 뒤지게 했다.
+    /// 원인이 다르면 메시지가 달라야 한다.
+    pub async fn credential_route(
+        &self,
+        instance: &Instance,
+    ) -> Result<&'static str, BootstrapError> {
+        if self
+            .instance_facts(instance)
+            .await?
+            .managed_secret
+            .is_some()
+        {
             return Ok("rds_managed_secret");
         }
         let settings = self.settings.load(SystemClock.now_ms()).await;
@@ -135,9 +149,9 @@ impl BootstrapService {
         {
             return Ok("tagged_secret");
         }
-        Err(SecretError::NoSource {
+        Err(BootstrapError::Credentials(SecretError::NoSource {
             instance_id: instance.id.as_str().to_string(),
-        })
+        }))
     }
 
     /// 계획을 만든다.
@@ -215,20 +229,30 @@ impl BootstrapService {
         // 클러스터에 붙어 있다. 인스턴스만 보면 둘 다 못 찾는다(실제로 겪었다:
         // `rds-db:connect` 도 클러스터 리소스 id 를 요구한다).
         if let Some(cluster) = instance.cluster_id.as_ref() {
+            // **`as_str()` 이 아니라 `identifier()` 다.**
+            //
+            // `ClusterId` 는 `계정/리전/이름` 복합 id 이고 RDS 는 마지막 조각만 받는다.
+            // 처음에 `as_str()` 을 넘겨 `DescribeDBClusters` 가 실패했고, 그 오류를
+            // 삼키는 헬퍼가 있어서 "등록된 마스터 시크릿이 없다" 로 보였다 — 두
+            // 결함이 겹쳐 진단이 한 바퀴 늦었다.
+            //
+            // `ClusterId::identifier` 의 문서가 이미 이 실수를 경고하고 있었다
+            // (CloudWatch 차원에서 같은 것을 겪었다).
+            let identifier = cluster.identifier();
             let out = clients
                 .rds
                 .describe_db_clusters()
-                .db_cluster_identifier(cluster.as_str())
+                .db_cluster_identifier(identifier)
                 .send()
                 .await
                 .map_err(|e| {
                     BootstrapError::Domain(dbmon_core::error::DomainError::Unavailable {
                         dependency: "rds",
-                        reason: format!("DescribeDBClusters({}) 실패: {e}", cluster.as_str()),
+                        reason: format!("DescribeDBClusters({identifier}) 실패: {e}"),
                     })
                 })?;
             let c = out.db_clusters().first().ok_or_else(|| {
-                BootstrapError::Invalid(format!("클러스터를 찾을 수 없다: {}", cluster.as_str()))
+                BootstrapError::Invalid(format!("클러스터를 찾을 수 없다: {identifier}"))
             })?;
             return Ok(InstanceFacts {
                 iam_auth_enabled: c.iam_database_authentication_enabled().unwrap_or(false),
@@ -264,10 +288,11 @@ impl BootstrapService {
         })
     }
 
-    /// 관리형 시크릿만 확인한다 (자격증명을 읽지 않는다).
-    async fn managed_secret(&self, instance: &Instance) -> Option<(String, String)> {
-        self.instance_facts(instance).await.ok()?.managed_secret
-    }
+    // **오류를 삼키는 `managed_secret` 헬퍼를 없앴다.**
+    //
+    // `instance_facts(...).ok()?` 로 접으면 RDS 조회 실패가 "시크릿이 없다" 로 보인다.
+    // 그런 함수를 남겨 두면 언젠가 다시 쓰이므로 지운다 — `credential_route` 와
+    // `credentials` 가 `instance_facts` 를 직접 부르고 오류를 그대로 올린다.
 
     /// 마스터 자격증명 — **경로 a 우선, 없으면 b.**
     async fn credentials(

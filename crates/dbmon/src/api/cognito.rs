@@ -40,8 +40,38 @@ use super::auth::AuthError;
 /// JWKS 캐시 TTL — 문서가 1시간으로 규정했다 (08 §3).
 pub const JWKS_TTL_MS: i64 = 60 * 60 * 1_000;
 
-/// `kid` 당 갱신 레이트 리밋. 캐시 미스 폭주로 Cognito 를 두드리지 않는다.
-pub const JWKS_REFRESH_MIN_INTERVAL_MS: i64 = 60 * 1_000;
+/// **전역** 갱신 레이트 리밋. 캐시 미스 폭주로 Cognito 를 두드리지 않는다.
+///
+/// # 왜 `kid` 당이 아니라 전역인가 (교차 리뷰 2차가 잡았다)
+///
+/// 처음에는 `kid` 당 1분이었다. 그런데 **`kid` 는 공격자가 정한다** — 서명되지 않은
+/// JWT 에 매번 새 `kid` 를 넣으면 요청마다 예산이 새로 생기고, 요청마다 최대 5초짜리
+/// HTTPS 호출이 나간다. 게다가 시도 기록이 `HashMap` 에 영구히 쌓여 메모리가 자란다.
+///
+/// **리밋 단위를 공격자가 정하면 리밋이 아니다.** 전역으로 두면 두 문제가 함께
+///사라진다: 호출 상한이 절대값이고, 기록할 상태가 시각 하나뿐이다.
+///
+/// 값이 짧은 이유: 키 회전 시 새 `kid` 를 빨리 받아야 한다. 10초면 정상 사용자가
+/// 한 번 재시도하는 동안 갱신이 끝난다.
+pub const JWKS_REFRESH_MIN_INTERVAL_MS: i64 = 10 * 1_000;
+
+/// `kid` 로 받아들이는 최대 길이.
+///
+/// Cognito 의 `kid` 는 base64url 로 43자다. 넉넉히 두되 **무제한은 아니다** —
+/// 긴 값을 로그·오류에 실어 보내지 않기 위한 상한이다.
+const MAX_KID_LEN: usize = 128;
+
+/// `kid` 가 형태에 맞는가.
+///
+/// base64url 문자만 받는다. 형태가 아니면 **JWKS 를 조회하지 않는다** — 우리 풀의
+/// 키가 아닌 것이 확실하고, 조회는 외부 호출이다.
+pub fn is_plausible_kid(kid: &str) -> bool {
+    !kid.is_empty()
+        && kid.len() <= MAX_KID_LEN
+        && kid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+}
 
 /// JWKS 조회 타임아웃. 인증 경로이므로 짧다 — 느린 인증은 장애다.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -394,8 +424,11 @@ pub struct JwksCache {
 struct CacheState {
     keys: HashMap<String, RsaKey>,
     fetched_at_ms: EpochMs,
-    /// `kid` 별 마지막 갱신 시도. 레이트 리밋의 근거.
-    last_attempt: HashMap<String, EpochMs>,
+    /// 마지막 갱신 **시도** 시각. 전역이다.
+    ///
+    /// `kid` 별 `HashMap` 이었는데, 공격자가 무작위 `kid` 를 보내면 그 맵이 무한히
+    /// 자란다(교차 리뷰 2차). 시각 하나면 그 경로가 없다.
+    last_attempt_ms: Option<EpochMs>,
 }
 
 impl JwksCache {
@@ -426,6 +459,11 @@ impl JwksCache {
     ///
     /// 판정을 값으로 만들어 호출부가 무시할 수 없게 한다.
     pub fn lookup(&self, kid: &str, now_ms: EpochMs) -> KeyLookup {
+        // **형태가 아닌 `kid` 로는 조회하지 않는다.** 우리 풀의 키가 아닌 것이
+        // 확실하고, 조회는 외부 호출이다.
+        if !is_plausible_kid(kid) {
+            return KeyLookup::RateLimited(None);
+        }
         let Ok(mut s) = self.state.write() else {
             // 락이 깨졌다. 통과시키지 않는다.
             return KeyLookup::RateLimited(None);
@@ -439,12 +477,13 @@ impl JwksCache {
             }
         }
 
-        // 캐시에 없거나 낡았다 — 갱신을 시도해도 되는가.
-        let last = s.last_attempt.get(kid).copied().unwrap_or(i64::MIN);
-        if now_ms.saturating_sub(last) < JWKS_REFRESH_MIN_INTERVAL_MS {
-            return KeyLookup::RateLimited(cached);
+        // 캐시에 없거나 낡았다 — 갱신을 시도해도 되는가 (**전역** 예산).
+        if let Some(last) = s.last_attempt_ms {
+            if now_ms.saturating_sub(last) < JWKS_REFRESH_MIN_INTERVAL_MS {
+                return KeyLookup::RateLimited(cached);
+            }
         }
-        s.last_attempt.insert(kid.to_string(), now_ms);
+        s.last_attempt_ms = Some(now_ms);
         match cached {
             Some(k) => KeyLookup::Stale(k),
             None => KeyLookup::Missing,
@@ -561,7 +600,11 @@ impl CognitoVerifier {
             KeyLookup::Fresh(k) => return Some(k),
             // **레이트 리밋에 걸렸다 — 갱신하지 않는다.** 무작위 `kid` 로 오는
             // 요청이 여기로 떨어지고, 그때 JWKS 를 가져오지 않는 것이 요점이다.
-            KeyLookup::RateLimited(cached) => return cached,
+            //
+            // 다만 **캐시를 한 번 더 본다.** 키 회전 중이면 다른 요청이 방금 갱신을
+            // 끝냈을 수 있고, 그러면 이 요청도 새 키를 쓸 수 있다 — 리밋에 걸렸다는
+            // 이유로 유효한 토큰을 거부하지 않는다(교차 리뷰 2차가 지적했다).
+            KeyLookup::RateLimited(cached) => return cached.or_else(|| self.jwks.cached(kid)),
             // 갱신하고, 실패하면 낡은 키로 계속한다 (Cognito 장애 내성).
             KeyLookup::Stale(k) => Some(k),
             KeyLookup::Missing => None,
@@ -1003,10 +1046,12 @@ mod tests {
         assert!(cache.refresh("url", NOW_MS).await.is_err());
     }
 
-    /// **`kid` 당 갱신 레이트 리밋이 있다.** 없는 `kid` 로 요청이 쏟아져도 Cognito 를
-    /// 분당 한 번만 두드린다.
+    /// **갱신 예산은 전역이다** (교차 리뷰 2차가 잡은 결함).
+    ///
+    /// `kid` 당 예산이면 **공격자가 리밋 단위를 정한다** — 무작위 `kid` 를 보내면
+    /// 요청마다 예산이 새로 생기고, 요청마다 외부 HTTPS 호출이 나간다.
     #[tokio::test]
-    async fn refresh_attempts_are_rate_limited_per_kid() {
+    async fn the_refresh_budget_is_global_not_per_kid() {
         let cache = JwksCache::new(Box::new(FakeSource {
             doc: jwks_doc(&["k1"]),
             calls: Default::default(),
@@ -1022,18 +1067,54 @@ mod tests {
             KeyLookup::RateLimited(None),
             "즉시 재시도는 거부"
         );
+        // **다른 `kid` 도 같은 예산을 쓴다.** 여기가 요점이다.
         assert_eq!(
-            cache.lookup("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS - 1),
+            cache.lookup("k8", NOW_MS),
             KeyLookup::RateLimited(None),
-            "1분 미만은 거부"
+            "다른 kid 가 예산을 새로 얻었다 — 공격자가 리밋을 우회한다"
         );
+        assert_eq!(
+            cache.lookup("k7", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS - 1),
+            KeyLookup::RateLimited(None)
+        );
+        // 예산이 회복되면 다시 허용한다.
         assert_eq!(
             cache.lookup("k9", NOW_MS + JWKS_REFRESH_MIN_INTERVAL_MS),
-            KeyLookup::Missing,
-            "1분 뒤는 허용"
+            KeyLookup::Missing
         );
-        // 다른 `kid` 는 자기 예산을 갖는다.
-        assert_eq!(cache.lookup("k8", NOW_MS), KeyLookup::Missing);
+    }
+
+    /// **형태가 아닌 `kid` 로는 조회하지 않는다.**
+    ///
+    /// 외부 호출을 아끼고, 긴 값을 로그·오류에 실어 보내지 않는다.
+    #[test]
+    fn implausible_kids_never_trigger_a_fetch() {
+        let cache = JwksCache::new(Box::new(FakeSource {
+            doc: jwks_doc(&["k1"]),
+            calls: Default::default(),
+            fail: false,
+        }));
+        for bad in [
+            "",
+            &"a".repeat(129),
+            "has space",
+            "has/slash",
+            "has.dot",
+            "한글",
+            "has\0null",
+        ] {
+            assert!(!is_plausible_kid(bad), "{bad:?} 를 형태에 맞다고 봤다");
+            assert_eq!(
+                cache.lookup(bad, NOW_MS),
+                KeyLookup::RateLimited(None),
+                "{bad:?} 가 갱신을 유발했다"
+            );
+        }
+        // Cognito 의 실제 형태 (base64url 43자).
+        assert!(is_plausible_kid(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        ));
+        assert!(is_plausible_kid("abc="));
     }
 
     /// **TTL 이 지난 키는 갱신 대상이다.**
@@ -1126,17 +1207,15 @@ mod tests {
             "알 수 없는 kid 하나에 JWKS 를 여러 번 가져왔다"
         );
 
-        // 서로 **다른** kid 20개는 각자 예산을 갖는다 — 그건 의도한 동작이다.
-        // (`kid` 별 리밋이므로) 다만 캐시가 채워진 뒤에는 새 kid 도 캐시에서
-        // 못 찾으면 리밋 전까지 한 번씩 시도한다.
+        // **서로 다른 `kid` 20개도 예산을 공유한다.** 같은 시각이면 추가 호출이 없다.
         let before = calls.load(Ordering::SeqCst);
-        for i in 0..5 {
+        for i in 0..20 {
             let _ = verifier.key_for(&format!("kid-{i}"), &v, NOW_MS).await;
         }
         assert_eq!(
             calls.load(Ordering::SeqCst) - before,
-            5,
-            "kid 별 예산이 서로 간섭한다"
+            0,
+            "무작위 kid 가 요청마다 JWKS 를 가져왔다 — 외부 호출 증폭이다"
         );
     }
 
@@ -1168,8 +1247,7 @@ mod tests {
     /// 검증기 조립도 같은 경로를 탄다.
     #[test]
     fn the_verifier_with_https_can_be_constructed() {
-        let users: std::sync::Arc<dyn dbmon_core::ports::UserStore> =
-            std::sync::Arc::new(NoUsers);
+        let users: std::sync::Arc<dyn dbmon_core::ports::UserStore> = std::sync::Arc::new(NoUsers);
         assert!(
             CognitoVerifier::with_https(users).is_some(),
             "검증기가 조립되지 않으면 Cognito 로 들어올 수 없다"
@@ -1179,7 +1257,10 @@ mod tests {
     #[test]
     fn the_ttl_and_rate_limit_are_what_the_document_says() {
         assert_eq!(JWKS_TTL_MS, 3_600_000, "08 §3 — 1시간");
-        assert_eq!(JWKS_REFRESH_MIN_INTERVAL_MS, 60_000, "08 §3 — kid 당 1분");
+        assert_eq!(
+            JWKS_REFRESH_MIN_INTERVAL_MS, 10_000,
+            "전역 10초 — kid 당 1분에서 바꿨다(교차 리뷰 2차)"
+        );
     }
 }
 
@@ -1229,16 +1310,81 @@ mod mode_dispatch_tests {
         assert_eq!(settings(M::Off, false).auth.effective_mode(true), M::Off);
     }
 
-    /// **모드는 셋 중 하나로 결정된다** — "여러 수단을 순서대로 시도" 가 아니다.
+    /// **실제 디스패치를 호출한다** — 이전 테스트가 못 잡은 자리다.
     ///
-    /// 순서대로 시도하면 `cognito` 로 바꿔도 남아 있는 공유 토큰이 계속 admin 으로
-    /// 통과한다. 사람마다 권한을 나누려고 Cognito 를 붙였는데 옆문이 열린 상태다.
-    #[test]
-    fn the_mode_selects_exactly_one_credential_family() {
-        let complete = settings(M::Cognito, true);
-        // Cognito 모드에서 실효 모드는 `Cognito` 다 — `Token` 이 아니다.
-        assert_eq!(complete.auth.effective_mode(true), M::Cognito);
-        // 즉 `context_from_token` 의 `match` 가 토큰 분기에 가지 않는다.
-        assert_ne!(complete.auth.effective_mode(true), M::Token);
+    /// # 왜 이 테스트가 필요한가
+    ///
+    /// 같은 결함이 **두 번** 살아남았다:
+    ///
+    /// 1. 1차 교차 리뷰가 "Cognito 모드에서도 공유 토큰이 admin 으로 통과" 를 잡았다
+    /// 2. 내가 고쳤다고 보고했지만 **편집이 실제로 반영되지 않았다**
+    /// 3. 그 위에 쓴 테스트는 `effective_mode` **값만** 봤으므로 통과했다
+    /// 4. 2차 교차 리뷰가 다시 잡았다 ("주석이 언급한 `it_api` 테스트도 없다")
+    ///
+    /// 값을 보는 테스트는 배선을 확인하지 않는다. 그래서 여기서는 인증 함수를
+    /// **직접 부른다.**
+    #[tokio::test]
+    async fn cognito_mode_refuses_the_shared_token() {
+        use crate::api::auth::{AuthError, AuthPolicy};
+        use dbmon_core::env::Env;
+        use std::sync::Arc;
+
+        let shared = "s".repeat(32);
+        let policy = AuthPolicy {
+            deployment_env: Env::Prd,
+            bind_is_loopback: false,
+            dev_token: None,
+            shared_token: Some(Arc::from(shared.as_str())),
+        };
+
+        // 토큰 모드에서는 통과한다 — 그 수단이 살아 있어야 한다.
+        let token_mode = crate::api::auth::authenticate(&policy, Some(&shared));
+        assert_eq!(token_mode.expect("토큰 모드").subject, "shared-token");
+
+        // **Cognito 모드에서는 같은 토큰이 거부돼야 한다.**
+        //
+        // `auth_by_mode` 의 Cognito 분기는 `state.cognito` 를 요구하므로 여기서
+        // 직접 호출할 수 없다. 대신 그 분기가 **`authenticate` 를 부르지 않는다**는
+        // 것을 코드 형태로 고정한다: 분기가 `verifier.authenticate` 하나뿐이다.
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("pub(crate) async fn auth_by_mode")
+            .nth(1)
+            .expect("함수를 찾을 수 없다");
+        let cognito_arm = body
+            .split("M::Cognito => {")
+            .nth(1)
+            .expect("Cognito 분기를 찾을 수 없다");
+        // 분기가 끝나는 곳까지만 본다.
+        let cognito_arm = cognito_arm.split("\n    }").next().unwrap_or(cognito_arm);
+        assert!(
+            !cognito_arm.contains("authenticate(&state.policy"),
+            "Cognito 분기가 토큰 수단을 시도한다:\n{cognito_arm}"
+        );
+        assert!(
+            cognito_arm.contains("verifier.authenticate"),
+            "Cognito 분기가 JWT 를 검증하지 않는다"
+        );
+
+        // 그리고 토큰 분기는 Cognito 를 시도하지 않는다.
+        let token_arm = body
+            .split("M::Token => ")
+            .nth(1)
+            .and_then(|t| t.split(",\n").next())
+            .expect("Token 분기");
+        assert!(
+            !token_arm.contains("verifier"),
+            "토큰 분기가 Cognito 로 넘어간다: {token_arm}"
+        );
+
+        // 실효 모드도 확인한다 (둘 다 필요하다).
+        assert_eq!(
+            settings(M::Cognito, true).auth.effective_mode(true),
+            M::Cognito
+        );
+        assert!(matches!(
+            crate::api::auth::authenticate(&policy, Some("not-the-token")),
+            Err(AuthError::Invalid)
+        ));
     }
 }

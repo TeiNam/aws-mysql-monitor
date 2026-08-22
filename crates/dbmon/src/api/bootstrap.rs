@@ -41,10 +41,18 @@ pub struct PlanRequest {
     /// 모드 `least` 의 스키마 화이트리스트.
     #[serde(default)]
     pub schemas: Vec<String>,
-    /// 인증 방식. 없으면 IAM DB 인증.
-    #[serde(default)]
-    pub auth_method: Option<AuthMethod>,
 }
+
+// **`auth_method` 를 받지 않는다** (교차 리뷰 2차가 잡았다).
+//
+// 받았을 때 `password` 를 고르면 `sql::create_user` 가 즉시 오류를 내고 화면은
+// `invalid_bootstrap` 을 본다 — **선택할 수 있는데 실행되지 않는 옵션**이었다.
+// 그건 없는 옵션보다 나쁘다.
+//
+// 비밀번호 폴백(M3-10)은 CSPRNG 생성 + Secrets Manager 저장 + 로테이션 Lambda 가
+// 함께 있어야 완성된다. 도메인 계층에는 그 조각들이 있고(`create_user_with_password`,
+// `PASSWORD_ALPHABET`, `PasswordAccountAlreadyExists`) 테스트도 있지만, 조립되지
+// 않았으므로 API 는 제공하지 않는다. 조립되면 이 필드를 되살린다.
 
 /// 실행 요청 본문.
 #[derive(Debug, Deserialize)]
@@ -84,7 +92,8 @@ pub fn desired_from(
     Desired {
         user: monitor_user.to_string(),
         host: monitor_host.to_string(),
-        auth: req.auth_method.unwrap_or_default(),
+        // IAM DB 인증만 제공한다 — 위 주석 참조.
+        auth: AuthMethod::IamDbAuth,
         mode: req.privilege_mode.unwrap_or(default_mode),
         schemas: req.schemas.clone(),
     }
@@ -268,10 +277,10 @@ mod tests {
         let req = PlanRequest {
             privilege_mode: None,
             schemas: vec![],
-            auth_method: None,
         };
         let d = desired_from(&req, "dbmon", "10.1.%", PrivilegeMode::Broad);
         assert_eq!(d.mode, PrivilegeMode::Broad);
+        // **IAM 방식만 나온다.** 요청이 바꿀 수 없다.
         assert_eq!(d.auth, AuthMethod::IamDbAuth);
         assert_eq!(d.user, "dbmon");
         assert!(d.validate().is_ok());
@@ -282,7 +291,6 @@ mod tests {
         let req = PlanRequest {
             privilege_mode: Some(PrivilegeMode::Least),
             schemas: vec!["shop".into()],
-            auth_method: None,
         };
         let d = desired_from(&req, "dbmon", "10.1.%", PrivilegeMode::Broad);
         assert_eq!(d.mode, PrivilegeMode::Least);
@@ -296,7 +304,6 @@ mod tests {
         let req = PlanRequest {
             privilege_mode: Some(PrivilegeMode::Least),
             schemas: vec!["shop`; DROP DATABASE x; --".into()],
-            auth_method: None,
         };
         let d = desired_from(&req, "dbmon", "10.1.%", PrivilegeMode::Broad);
         assert!(d.validate().is_err());
