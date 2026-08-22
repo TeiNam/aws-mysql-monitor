@@ -1813,13 +1813,27 @@ fn spawn_leader_loop(
                                 // 고아 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 7회차가
                                 // 배포 차단으로 잡았다). 반대로 항상 덮으면 재개된
                                 // 인스턴스의 새 레코드를 닫는다(6회차).
+                                // **상한은 태스크를 내린 뒤의 시각이다.**
+                                //
+                                // 루프 앞에서 읽은 `now_ms` 를 쓰면 그 사이(탐색·태스크
+                                // 종료 중) 시작된 레코드가 상한 밖으로 나가고, 엣지
+                                // 트리거였을 때는 아무도 그것을 닫지 않았다
+                                // (교차 리뷰 8회차).
+                                let close_now_ms = SystemClock.now_ms();
                                 let mut close_targets = pending_pause_close.clone();
                                 for id in &paused {
-                                    close_targets.insert(id.clone(), now_ms);
+                                    close_targets.insert(id.clone(), close_now_ms);
                                 }
-                                if (pause_changed || !pending_pause_close.is_empty())
-                                    && !close_targets.is_empty()
-                                {
+                                // **레벨 트리거다.** 정지 집합이 바뀐 tick 에만 돌리면
+                                // 그 tick 에서 등록부 조회가 실패하거나 상한 밖 레코드가
+                                // 생겼을 때 **다시 시도할 계기가 없다** — 그 레코드는
+                                // 영구히 진행 중으로 남고 고아 스윕도 같은 워커·epoch 를
+                                // `Mine` 으로 건너뛴다(8회차가 배포 차단으로 잡았다).
+                                //
+                                // 멈춘 인스턴스가 있는 동안 탐색 라운드마다 한 번
+                                // `list_in_flight` 를 부른다. 전체 정지 경로가 매 tick
+                                // 같은 일을 하고 있으므로 새로운 비용이 아니다.
+                                if !close_targets.is_empty() {
                                     let closed = run_in_budget(close_in_flight_mine(
                                         &stores.slow_query,
                                         gate.worker_id(),

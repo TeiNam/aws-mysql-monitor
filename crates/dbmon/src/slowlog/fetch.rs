@@ -319,6 +319,21 @@ impl SlowLogFetcher for CloudWatchFetcher {
             }
         }
 
+        // 상한에 걸렸으면 마지막 완성 엔트리까지만 남긴다(위 함수의 주석 참고).
+        let text = if hit_cap {
+            let cut = cut_at_last_entry_boundary(&text);
+            if cut.len() != text.len() {
+                tracing::warn!(
+                    instance = %instance.as_str(),
+                    dropped_bytes = text.len() - cut.len(),
+                    "상한에서 잘린 엔트리를 버렸다 — 절단된 SQL 을 저장하지 않는다"
+                );
+            }
+            cut.to_string()
+        } else {
+            text
+        };
+
         Ok(LogChunk {
             text,
             // **상한에 걸렸으면 경계를 다시 읽는다.**
@@ -384,6 +399,27 @@ fn is_bad_token<R>(
             .message()
             .is_some_and(|m| m.to_ascii_lowercase().contains("token")),
         _ => false,
+    }
+}
+
+/// 상한에 걸려 멈췄을 때, **마지막 완성 엔트리까지만** 남긴다.
+///
+/// # 왜 필요한가
+///
+/// 슬로우로그 엔트리 하나가 CloudWatch 이벤트 여러 개에 걸칠 수 있다. 페이지·크기 상한이
+/// 그 중간에서 멈추면 파서는 청크 끝에서 현재 엔트리를 **그대로 확정한다** — 잘린 SQL 이
+/// 잘린 다이제스트로 저장되고, 그건 다이제스트 사전을 오염시킨다. 이어지는 조각은 다음
+/// 라운드에 `# Time:` 없이 도착해 버려지므로 **잘린 것만 남는다**(교차 리뷰 8회차).
+///
+/// 그래서 마지막 `# Time:` 앞에서 자른다. 그 엔트리 하나는 잃지만 **잘린 채 저장되지는
+/// 않는다** — 오염보다 결측이 낫다. 상한은 로그가 폭주할 때만 닿는다.
+///
+/// 자를 곳이 없으면(청크 전체가 한 엔트리의 일부) 전부 버린다. 그 경우 남길 수 있는
+/// 완성 엔트리가 없다.
+fn cut_at_last_entry_boundary(text: &str) -> &str {
+    match text.rfind("# Time:") {
+        Some(0) | None => "",
+        Some(i) => &text[..i],
     }
 }
 
@@ -524,6 +560,29 @@ mod tests {
             (),
         );
         assert!(!is_bad_token(&not_found));
+    }
+
+    /// **상한에서 잘린 엔트리를 절단된 채로 저장하지 않는다.**
+    ///
+    /// 엔트리 하나가 CloudWatch 이벤트 여러 개에 걸칠 수 있고, 상한이 그 중간에서 멈추면
+    /// 파서는 청크 끝에서 현재 엔트리를 그대로 확정한다 — **잘린 SQL 이 잘린 다이제스트로
+    /// 저장되고** 이어지는 조각은 `# Time:` 이 없어 버려진다(교차 리뷰 8회차).
+    #[test]
+    fn a_capped_chunk_keeps_only_complete_entries() {
+        let full = "# Time: A\nSELECT 1;\n# Time: B\nSELECT 2;\n";
+        // 마지막 엔트리가 잘린 형태.
+        let partial = "# Time: A\nSELECT 1;\n# Time: B\nSELECT very_long_and_cut";
+        assert_eq!(
+            cut_at_last_entry_boundary(partial),
+            "# Time: A\nSELECT 1;\n",
+            "완성 엔트리까지 남기지 않았다"
+        );
+        // 완성 엔트리가 둘이면 마지막 하나를 버린다(그게 잘렸을 수 있다).
+        assert_eq!(cut_at_last_entry_boundary(full), "# Time: A\nSELECT 1;\n");
+        // 청크 전체가 한 엔트리의 일부면 남길 것이 없다.
+        assert_eq!(cut_at_last_entry_boundary("# Time: A\nSELECT cut"), "");
+        assert_eq!(cut_at_last_entry_boundary("SELECT no_header"), "");
+        assert_eq!(cut_at_last_entry_boundary(""), "");
     }
 
     /// **이벤트를 처리했는데 시각이 없으면 전진시킨다.**
