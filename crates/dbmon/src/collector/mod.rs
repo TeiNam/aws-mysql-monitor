@@ -284,10 +284,21 @@ where
         }
 
         // ── 심층 조회 ──────────────────────────────────────────────────────
-        // 느린 순으로 상한까지만. 나머지는 지표만 남는다.
+        //
+        // **자리를 모르는 항목이 먼저다.** 그 항목은 아직 저장소에 행이 없거나 어디 있는지
+        // 모르고, 그래서 하트비트를 할 수 없다 — 210초 안에 자리를 얻지 못하면 이전
+        // 리더가 남긴 **살아 있는 행**이 버려진다. 긴 쿼리를 먼저 보는 규칙만 두면 상한이
+        // 작을 때 뒤쪽 항목이 영구히 밀린다(교차 리뷰 26라운드가 3개로 재현했다).
+        //
+        // 그다음이 느린 순이다 — 플랜은 비싸므로 가치가 큰 것부터 본다.
         let mut targets = tick.needs_deep_probe.clone();
         targets.sort_by_key(|id| {
-            std::cmp::Reverse(self.tracker.get(*id).map(|t| t.max_time_secs).unwrap_or(0))
+            let t = self.tracker.get(*id);
+            (
+                // false(자리 없음) < true(자리 있음) → 자리 없는 것이 앞이다.
+                t.is_some_and(|t| t.storage_key.is_some()),
+                std::cmp::Reverse(t.map(|t| t.max_time_secs).unwrap_or(0)),
+            )
         });
         if targets.len() > self.params.deep_probe_limit {
             stats.deep_probe_skipped = targets.len() - self.params.deep_probe_limit;
@@ -413,17 +424,21 @@ where
             // 아무도 확정하지 않는데 영원히 살아 있는 것으로 보인다.
             //
             // 자리는 **쓰기가 알려 준 것**이다(`needs_heartbeat` 가 자리를 아는 항목만 준다).
-            let Some((key, last_seen_at_ms)) = self
-                .tracker
-                .get(id)
-                .and_then(|t| t.storage_key.clone().map(|k| (k, t.last_seen_at_ms)))
-            else {
+            let Some((key, last_seen_at_ms, duration_ms)) = self.tracker.get(id).and_then(|t| {
+                t.storage_key
+                    .clone()
+                    .map(|k| (k, t.last_seen_at_ms, t.duration_ms()))
+            }) else {
                 continue;
             };
             // **결과와 무관하게 시도를 기록한다.** 성공으로 기록하면 실패한 항목이 줄의
             // 앞자리를 차지해 갱신이 필요한 항목이 굶는다(25라운드).
             self.tracker.record_touch_attempt(id, now_ms);
-            match self.store.touch_in_flight(&key, last_seen_at_ms).await {
+            match self
+                .store
+                .touch_in_flight(&key, last_seen_at_ms, duration_ms)
+                .await
+            {
                 Ok(updated) => {
                     stats.heartbeats += usize::from(updated);
                     stats.heartbeats_absent += usize::from(!updated);
@@ -566,8 +581,18 @@ where
                 &self.offset,
             );
 
-            let plan = self.collect_plan(*id, f, s, stats).await;
-            self.tracker.record_plan_attempt(*id, plan.json.is_some());
+            // **플랜 시도가 끝난 항목에는 다시 시도하지 않는다.**
+            //
+            // 자리를 얻기 위해 대상에 남은 항목이 있으므로(위 `wants_plan` 참고),
+            // 여기서 걸러야 이미 포기한 플랜을 매 tick 다시 시도하지 않는다 — 그건
+            // 대상 DB 에 실제 부하다.
+            let plan = if self.tracker.wants_plan(*id) {
+                let plan = self.collect_plan(*id, f, s, stats).await;
+                self.tracker.record_plan_attempt(*id, plan.json.is_some());
+                plan
+            } else {
+                PlanResult::not_attempted()
+            };
 
             // **선행 저장** — 정규화·마스킹을 거친 형태로 (F2).
             //
@@ -777,6 +802,15 @@ impl PlanResult {
         Self {
             json: Some(json),
             source,
+            error: None,
+        }
+    }
+    /// **플랜을 시도하지 않았다.** 이미 얻었거나 시도 상한에 걸린 항목이 자리를 얻기
+    /// 위해 대상에 남아 있는 경우다 — 실패가 아니므로 사유를 남기지 않는다.
+    fn not_attempted() -> Self {
+        Self {
+            json: None,
+            source: PlanSource::None,
             error: None,
         }
     }

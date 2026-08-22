@@ -116,6 +116,13 @@ export interface SlowQueryView {
   started_at_ms: number;
   duration_ms: number;
   duration_source: string;
+  /**
+   * 이 소요를 관측한 시각(수집기 시계). 진행 중 경과는 `duration_ms + (지금 − 이 값)`.
+   *
+   * `started_at_ms` 는 **대상 DB 시계**이므로 경과 계산에 쓰지 않는다 —
+   * 두 기계의 시계를 빼면 DB 가 5분 어긋난 환경에서 2초 쿼리가 5분으로 보인다.
+   */
+  last_seen_at_ms: number | null;
   capture_source: string;
   app_digest: string;
   statement_type: string;

@@ -116,7 +116,20 @@ pub trait SlowQueryStore: Send + Sync {
     /// 인자는 **쓰기가 알려 준 자리와 갱신할 값뿐**이다. `SlowQuery` 를 받으면 그걸
     /// 만들기 위해 정책 판정을 거쳐야 하고, 위 표의 두 번째 줄이 그렇게 들어왔다.
     /// 키를 여기서 계산하거나 뒤져서 찾지 않는 이유는 [`StoredKey`] 에 있다.
-    async fn touch_in_flight(&self, key: &StoredKey, last_seen_at_ms: EpochMs) -> Result<bool>;
+    /// `duration_ms` 를 **함께** 올린다.
+    ///
+    /// 화면은 진행 중 경과를 `duration_ms + (지금 − last_seen_at_ms)` 로 센다. 두 값을
+    /// 따로 쓰면 짝이 어긋나 **10분째 도는 쿼리가 2초로** 보인다(하트비트만 올리면
+    /// 갱신 시각은 신선한데 소요는 첫 저장에서 굳어 있다). 둘은 같은 관측이므로 같이 쓴다.
+    ///
+    /// 관측된 소요는 단조 증가한다(`max_time_secs` 의 `max`). 그리고 조건이 통과하려면
+    /// 갱신 시각이 올라가야 하므로, 소요가 뒤로 가는 조합은 쓰이지 않는다.
+    async fn touch_in_flight(
+        &self,
+        key: &StoredKey,
+        last_seen_at_ms: EpochMs,
+        duration_ms: i64,
+    ) -> Result<bool>;
 }
 
 /// 다이제스트 롤업 저장.
