@@ -1798,12 +1798,24 @@ fn spawn_leader_loop(
                                 // 실행은 다시 관측되지 않고, 같은 워커·epoch 레코드는
                                 // 고아 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 5회차).
                                 //
-                                // 상한은 **대상마다**다. 남아 있던 것은 자기 시각을
-                                // 유지하고(그 뒤에 만들어진 레코드를 지킨다), 새로 멈춘
-                                // 것은 지금을 쓴다.
+                                // 상한은 **대상마다**이고, 규칙은 "지금 멈춰 있는가" 로
+                                // 갈린다.
+                                //
+                                // - **지금 멈춰 있으면** 상한을 지금으로 올린다. 태스크가
+                                //   내려가 있으므로 새 레코드가 만들어지지 않는다 —
+                                //   올려도 위험이 없고, 재정지(A → 재개 → 다시 A 정지)
+                                //   때 그 사이 만들어진 레코드를 닫을 수 있다.
+                                // - **재개됐는데 아직 남아 있으면** 옛 상한을 유지한다.
+                                //   지금 돌고 있는 태스크의 새 레코드를 지켜야 한다.
+                                //
+                                // `or_insert` 로 두면 후자만 맞고 전자가 틀린다 — 재정지
+                                // 시 `[옛 상한, 재정지)` 구간 레코드를 아무도 닫지 않고
+                                // 고아 스윕도 `Mine` 으로 건너뛴다(교차 리뷰 7회차가
+                                // 배포 차단으로 잡았다). 반대로 항상 덮으면 재개된
+                                // 인스턴스의 새 레코드를 닫는다(6회차).
                                 let mut close_targets = pending_pause_close.clone();
                                 for id in &paused {
-                                    close_targets.entry(id.clone()).or_insert(now_ms);
+                                    close_targets.insert(id.clone(), now_ms);
                                 }
                                 if (pause_changed || !pending_pause_close.is_empty())
                                     && !close_targets.is_empty()
@@ -2495,6 +2507,24 @@ mod tests {
 
         assert_eq!(targets.get("A"), Some(&T1), "A 의 상한이 넓어졌다");
         assert_eq!(targets.get("B"), Some(&T4));
+
+        // **그런데 A 를 다시 멈추면 상한이 올라가야 한다.**
+        //
+        // 안 올리면 `[T1, 재정지)` 구간에 만들어진 레코드를 아무도 닫지 않는다 — 고아
+        // 스윕도 같은 워커·epoch 를 `Mine` 으로 건너뛴다(교차 리뷰 7회차).
+        let repaused = ["A".to_string(), "B".to_string()];
+        let t5 = T4 + 600_000;
+        let mut targets2 = pending.clone();
+        for id in &repaused {
+            targets2.insert(id.clone(), t5);
+        }
+        assert_eq!(
+            targets2.get("A"),
+            Some(&t5),
+            "재정지에서 상한이 올라가지 않았다"
+        );
+        // 그 사이(T1 이후, t5 이전)에 만들어진 레코드를 닫는다.
+        assert!(!skips_for_cutoff(T1 + 60_000, targets2.get("A").copied()));
 
         // A 를 재개한 뒤(T2) 만들어진 레코드(T3)는 A 의 상한 밖이다.
         let t3 = T1 + 60_000;
