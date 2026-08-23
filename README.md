@@ -129,9 +129,13 @@ within 30 seconds across every worker.
 | Alert delivery | Channel + template are stored; rule evaluation / sending is a later milestone |
 | Cold-tier archive (Athena/Iceberg) | Withdrawn — DynamoDB retention is 35 days and Markdown export covers the rest |
 
-This is a personal project developed against a real AWS account. The design docs in `docs/`
-are the source of truth and record *why* each decision was made, including the ones that were
-reversed.
+This is a personal project developed against a real AWS account. The design documents
+(requirements, ADRs, data model, review log) live outside the repository and are not published —
+everything needed to install and operate it is in the [install guide](docs/install.md).
+
+`Cargo.toml` is the source of truth for the version and `dbmon --version` reports it. Major means
+an operator has to do something (a config key, an IAM policy, a storage format), minor means new
+behaviour on the same config, patch means a fix.
 
 ---
 

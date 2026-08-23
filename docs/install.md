@@ -817,7 +817,8 @@ aws ecs create-cluster --cluster-name "dbmon-$ENV"
 **Image** — the task is Graviton, so `--platform linux/arm64` is required.
 
 ```bash
-TAG="v0.1.0-$(git rev-parse --short HEAD)"     # never `latest`
+# `Cargo.toml` is the source of truth for the version — typing it by hand drifts from `--version`.
+TAG="v$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' Cargo.toml)-$(git rev-parse --short HEAD)"     # never `latest`
 REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/dbmon-$ENV"
 
 aws ecr get-login-password --region "$AWS_REGION" \

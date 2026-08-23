@@ -487,3 +487,58 @@ fn the_install_guide_matches_the_iam_policies() {
         );
     }
 }
+
+/// **버전의 정본이 하나여야 한다.**
+///
+/// `Cargo.toml` 의 `workspace.package.version` 이 정본이고 `clap` 이 `--version` 을 그
+/// 값으로 만든다. 문서·예시가 다른 값을 적으면 운영자가 그걸 태그로 쓰고, 그러면 코드가
+/// `1.0.0` 이라고 말하면서 이미지는 다른 번호로 발행된다 — 롤백 대상을 특정할 수 없다.
+///
+/// `release.yml` 의 `version-gate` 가 릴리스 태그를 막지만, 그건 태그를 붙인 **뒤**다.
+/// 여기서는 저장소 안의 값들이 서로 맞는지 본다.
+#[test]
+fn the_version_has_a_single_source_of_truth() {
+    let cargo = read("Cargo.toml");
+    // `[workspace.package]` 블록의 첫 `version` — 의존성의 `version = "4"` 에 걸리면 안 된다.
+    let block = cargo
+        .split_once("[workspace.package]")
+        .expect("[workspace.package] 가 없다")
+        .1;
+    let block = block.split("\n[").next().expect("블록");
+    let version = block
+        .lines()
+        .find_map(|l| l.strip_prefix("version"))
+        .and_then(|l| l.split('"').nth(1))
+        .expect("workspace.package.version 을 못 읽었다");
+
+    // 코드가 보고하는 값과 같아야 한다. `CARGO_PKG_VERSION` 은 이 테스트 크레이트의 것이고,
+    // 워크스페이스가 버전을 상속하므로 같은 값이다 — 다르면 상속이 끊긴 것이다.
+    assert_eq!(
+        version,
+        env!("CARGO_PKG_VERSION"),
+        "워크스페이스 버전 상속이 끊겼다 — `version.workspace = true` 를 확인한다"
+    );
+
+    // 1.0.0 이후로는 0.x 로 되돌아가지 않는다. major 가 0 이면 위 정책표가 뜻을 잃는다.
+    let major: u32 = version.split('.').next().unwrap().parse().expect("major");
+    assert!(
+        major >= 1,
+        "버전이 0.x 로 돌아갔다 ({version}) — 정책은 1.0.0 부터다"
+    );
+
+    // 릴리스 게이트가 `release.yml` 에 살아 있어야 한다. 없으면 태그와 코드가 갈릴 수 있다.
+    let release = read(".github/workflows/release.yml");
+    assert!(
+        release.contains("version-gate"),
+        "release.yml 의 버전 게이트가 사라졌다 — 태그와 코드가 갈려도 발행된다"
+    );
+
+    // 문서의 이미지 태그 예시가 버전을 손으로 박지 않아야 한다.
+    for doc in ["docs/install.md", "docs/install.ko.md"] {
+        let t = read(doc);
+        assert!(
+            t.contains("workspace\\.package") || t.contains("workspace.package"),
+            "{doc} 의 태그 예시가 `Cargo.toml` 에서 버전을 뽑지 않는다 — 손으로 적으면 갈린다"
+        );
+    }
+}

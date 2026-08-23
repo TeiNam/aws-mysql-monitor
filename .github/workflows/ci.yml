@@ -178,12 +178,51 @@ jobs:
   #
   # x86 러너에서 `--platform linux/arm64` 를 쓰면 QEMU 에뮬레이션으로 수십 분이 된다
   # (aws-lc-rs 가 cmake/clang 로 풀빌드된다). ARM 러너를 쓰면 네이티브다.
+  # **이 잡은 발행하지 않는다** (`push: false`). 머지 전에 Dockerfile·빌드가 깨졌는지 보는
+  # 안전장치다. 발행은 `release.yml` 이 `main` 푸시에서만 한다.
+  #
+  # # 이미지에 영향 없는 변경에는 돌지 않는다
+  #
+  # 8분짜리 잡이다(arm64 러너 + `aws-lc-rs`). 문서만 바꾼 PR 이 그 값을 낼 이유가 없고,
+  # 실제로 문서 PR 네 개가 연속으로 그 값을 냈다 — 그중 하나는 무관한 레지스트리 레이트
+  # 리밋(`public.ecr.aws` 429)으로 실패해 재실행까지 했다.
+  #
+  # **판단이 안 되면 돈다.** 첫 푸시·강제 푸시·얕은 히스토리에서 비교 기준을 못 잡으면
+  # 빌드하는 쪽이 안전하다 — 건너뛴 채로 깨진 Dockerfile 이 main 에 들어가는 것보다 낫다.
   image:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
+        with:
+          # 비교 기준 커밋이 필요하다. 얕은 클론이면 `git diff` 가 실패한다.
+          fetch-depth: 0
+      - name: 이미지에 영향이 있나
+        id: scope
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -uo pipefail
+          # 기준이 없거나(첫 푸시) 존재하지 않는 커밋이면 무조건 빌드한다.
+          if [ -z "${BASE:-}" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "기준 커밋을 못 잡았다 — 빌드한다"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE" HEAD)
+          echo "변경 파일:"; echo "$changed" | sed 's/^/  /'
+          # 이미지 내용을 정하는 것만 본다. `docs/`·`README*`·`infra/`·`.claude/` 는 아니다.
+          # **워크플로 자체도 넣는다** — 이 판정을 바꿀 때 그 판정이 실제로 도는지 봐야 한다.
+          if echo "$changed" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|crates/|web/|rust-toolchain|\.github/workflows/)'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "이미지에 영향 없음 — 건너뛴다"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/setup-buildx-action@v3
+        if: steps.scope.outputs.build == 'true'
       - name: 빌드
+        if: steps.scope.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -195,6 +234,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: 스모크 — 헬스체크와 SIGTERM 반응
+        if: steps.scope.outputs.build == 'true'
         run: |
           set -euo pipefail
           docker run --rm dbmon:ci --version

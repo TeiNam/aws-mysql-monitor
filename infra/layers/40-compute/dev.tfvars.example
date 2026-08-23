@@ -9,7 +9,8 @@ state_bucket = "dbmon-tfstate-CHANGEME"     # 00-bootstrap 이 만든 버킷
 vpc_id       = "vpc-CHANGEME"               # dev-vpc-01. prd VPC 를 넣지 않는다
 subnet_ids   = ["subnet-CHANGEME", "subnet-CHANGEME"]
 
-image_tag = "vX.Y.Z-CHANGEME"               # `latest` 금지 — 커밋 SHA 를 붙인다
+# `v<Cargo.toml 의 버전>-<커밋 SHA>`. `latest` 금지 — 롤백 대상을 특정할 수 없다.
+image_tag = "v1.0.0-CHANGEME"
 
 allowed_vpc_ids = ["vpc-CHANGEME"]          # T-37. 비우면 앱이 기동을 거부한다
 
