@@ -585,18 +585,40 @@ async fn list_slow_queries(
         ("env", p.env.as_deref().unwrap_or("")),
         ("limit", &limit.to_string()),
     ]);
-    if let Some(raw) = p.cursor.as_deref() {
-        cursor::Cursor::decode(raw, &state.cursor_key, &ctx.subject, &filters, now_ms)
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_cursor"))?;
-        // 위치를 실제 페이지네이션에 쓰는 것은 M6 의 남은 작업이다 —
-        // `list_by_instance` 가 `LastEvaluatedKey` 를 아직 노출하지 않는다.
-    }
+    let seek = match p.cursor.as_deref() {
+        Some(raw) => {
+            let c = cursor::Cursor::decode(raw, &state.cursor_key, &ctx.subject, &filters, now_ms)
+                .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_cursor"))?;
+            Some(
+                cursor::Position::parse(&c.position)
+                    .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid_cursor"))?,
+            )
+        }
+        None => None,
+    };
+
+    // **재개하면 읽을 구간의 위쪽을 커서 시점으로 좁힌다.**
+    //
+    // 저장소는 정렬 키로도 상한을 받지만(`before`), 날짜 파티션 목록은 구간에서 나온다.
+    // 좁히지 않으면 커서보다 새로운 날의 파티션을 매 페이지 다시 질의하고 — 결과는 전부
+    // 빈 응답이다 — 파티션 예산(`MAX_PARTITION_QUERIES`)을 그만큼 헛되게 쓴다.
+    //
+    // 필터 해시는 **요청 파라미터**로 위에서 계산했으므로 이 좁힘이 해시를 바꾸지 않는다.
+    let read_range = match &seek {
+        Some(s) => checked_range(range.from_ms(), s.started_at_ms)?,
+        None => range,
+    };
 
     // **인스턴스마다 같은 몫을 읽고 전역 정렬한다.**
     //
     // 예전에는 인스턴스를 순회하며 상한에 닿으면 중단했다. 그러면 등록부 순서가
     // 앞선 인스턴스가 상한을 다 먹고, **뒤 인스턴스의 더 새로운 행이 통째로 빠진다** —
     // 정렬은 그 뒤에 하므로 화면은 그 사실을 알 수 없다.
+    //
+    // 재개할 때 한 자리를 더 요청한다. 저장소가 재개 지점을 포함해 돌려주므로 커서
+    // 자신이 한 자리를 먹고, 그러면 `has_more` 판정용 여분이 사라져 마지막 페이지에서
+    // "더 있다" 를 잘못 말한다(눌러 보면 0건인 버튼).
+    let extra = 1 + usize::from(seek.is_some());
     let got = collect_views(
         &state,
         &ctx,
@@ -605,23 +627,51 @@ async fn list_slow_queries(
             instance: p.instance.as_deref(),
             instance_like: p.instance_like.as_deref(),
         },
-        range,
+        read_range,
         // 하나 더 읽어 "더 있다" 를 정확히 판정한다. `>` 만 쓰면 정확히 상한일 때
         // `has_more=false` 가 되어 마지막 페이지가 끝인 것처럼 보인다.
-        limit + 1,
-        limit + 1,
+        limit + extra,
+        limit + extra,
+        seek.as_ref(),
     )
     .await?;
     let mut items = got.views;
 
-    let has_more = got.truncated || items.len() > limit;
+    let mut has_more = got.truncated || items.len() > limit;
     items.truncate(limit);
     let total = items.len();
+
+    // **빈 페이지에서 멈춘다.** 같은 밀리초·같은 스레드에 인스턴스마다 행이 있어 전부
+    // 걸러지면 이 페이지는 0건인데 `truncated` 는 참일 수 있다. 그때 커서를 다시 주면
+    // 같은 커서가 돌아와 화면이 무한히 "더 보기" 를 누른다.
+    //
+    // ponytail: 그 경우 여기서 끝낸다. 천장은 **극단적 동시 시작에서 한 페이지 일찍
+    // 끝날 수 있다**는 것이고, 무한 루프보다 그쪽이 낫다. 정확히 하려면 재개 지점을
+    // 인스턴스별로 들고 있어야 하고 그러면 커서가 인스턴스 수에 비례해 커진다.
+    if seek.is_some() && items.is_empty() {
+        has_more = false;
+    }
+
+    // 마지막 행이 다음 페이지의 시작점이다. **`has_more` 일 때만 발급한다** —
+    // 빈 커서나 끝난 커서를 주면 화면이 한 번 더 헛되게 묻는다.
+    let next_cursor = has_more.then(|| items.last()).flatten().map(|v| {
+        cursor::Cursor {
+            sub: ctx.subject.clone(),
+            filters_hash: filters.clone(),
+            position: cursor::Position {
+                started_at_ms: v.started_at_ms,
+                thread_id: v.thread_id,
+                instance_id: v.instance_id.clone(),
+            }
+            .encode(),
+            expires_at_ms: now_ms + cursor::CURSOR_TTL_MS,
+        }
+        .encode(&state.cursor_key)
+    });
+
     Ok(Json(ListResponse {
         items,
-        // 페이지네이션 위치가 아직 없으므로 커서를 발급하지 않는다.
-        // **빈 커서를 주고 무한 루프를 만들지 않는다.**
-        next_cursor: None,
+        next_cursor,
         has_more,
         total,
         // 화면이 진행 중 경과 시간을 브라우저 시계로 계산하므로 기준을 함께 준다.
@@ -912,8 +962,11 @@ async fn collect_views(
     range: TimeRange,
     per_instance: usize,
     ceiling: usize,
+    // 페이지 재개 지점. 집계 경로는 페이지를 넘기지 않으므로 `None` 이다.
+    seek: Option<&cursor::Position>,
 ) -> Result<Collected, ApiError> {
     let allowed = filter.allowed;
+    let before = seek.map(|s| s.order_key());
     let instances = self_instances(state, filter.instance, filter.instance_like).await?;
     if instances.is_empty() {
         return Ok(Collected {
@@ -930,7 +983,7 @@ async fn collect_views(
 
     // ② 1차: 천장을 균등 분배.
     let mut share = even_share(ceiling, ids.len(), per_instance);
-    let mut rows = read_share(state, &ids, range, share).await?;
+    let mut rows = read_share(state, &ids, range, share, before.as_deref()).await?;
     let mut asked = vec![share; ids.len()];
 
     // ③ 꽉 채운 인스턴스에만 남은 예산을 재분배한다. **한 번으로는 부족하다** —
@@ -951,7 +1004,7 @@ async fn collect_views(
         for &slot in &hungry {
             rows[slot] = Vec::new();
         }
-        let refetched = read_share(state, &hungry_ids, range, bigger).await?;
+        let refetched = read_share(state, &hungry_ids, range, bigger, before.as_deref()).await?;
         for (&slot, found) in hungry.iter().zip(refetched) {
             rows[slot] = found;
             asked[slot] = bigger;
@@ -973,6 +1026,12 @@ async fn collect_views(
                 // prd 행이 섞이고(환경이 바뀐 인스턴스의 과거 행), 인스턴스의 현재
                 // 환경만 보면 그 반대로 볼 수 있는 행이 빠진다.
                 .filter(|q| allowed.contains(&q.env))
+                // 저장소는 재개 지점을 **포함**해 돌려준다(같은 순서 키가 인스턴스마다
+                // 하나씩 있을 수 있어서다). 커서 자신과 그보다 앞인 행을 여기서 뗀다 —
+                // 안 떼면 매 페이지 첫 행이 앞 페이지 마지막 행과 겹친다.
+                .filter(|q| {
+                    seek.is_none_or(|s| s.is_before(&q.list_order_key(), q.instance_id.as_str()))
+                })
                 .map(|q| SlowQueryView::from_record(q, ctx)),
         );
     }
@@ -991,7 +1050,11 @@ async fn collect_views(
     }
 
     // 전역 최신순. 인스턴스별 결과를 이어 붙였으므로 여기서 한 번 맞춘다.
-    views.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
+    //
+    // **총순서로 정렬한다** — `started_at_ms` 만으로는 같은 밀리초의 순서가 정해지지
+    // 않고, 그러면 페이지 경계가 요청마다 흔들려 행이 중복되거나 사라진다.
+    // 정렬 키는 저장소 정렬 키와 같은 사전순이다([`list_order_key`]).
+    views.sort_by_cached_key(sort_position);
     if views.len() > ceiling {
         views.truncate(ceiling);
         truncated = true;
@@ -1056,6 +1119,20 @@ fn redistributed(
     (bigger > share).then_some(bigger)
 }
 
+/// 목록의 **총순서**: 순서 키 내림, 같으면 인스턴스 id 오름.
+///
+/// 커서가 이 순서의 한 점을 가리킨다([`cursor::Position`]). 정렬과 커서 판정이 갈리면
+/// 페이지 경계에서 행이 중복되거나 사라지므로, 두 곳이 이 함수를 함께 쓴다.
+fn sort_position(v: &SlowQueryView) -> (std::cmp::Reverse<String>, String) {
+    (
+        std::cmp::Reverse(dbmon_core::slow_query::list_order_key(
+            v.started_at_ms,
+            v.thread_id,
+        )),
+        v.instance_id.clone(),
+    )
+}
+
 /// 인스턴스별 조회를 **동시에** 던진다. 순차로 돌면 왕복 지연이 그대로 곱해진다 —
 /// 500대 × 5ms 면 응답 하나가 2.5초다. 상한을 두는 이유는 저장소 조절(throttle)이다.
 async fn read_share(
@@ -1063,6 +1140,7 @@ async fn read_share(
     ids: &[dbmon_core::ids::InstanceId],
     range: TimeRange,
     limit: usize,
+    before: Option<&str>,
 ) -> Result<Vec<Vec<dbmon_core::slow_query::SlowQuery>>, ApiError> {
     use futures::stream::{StreamExt, TryStreamExt};
 
@@ -1074,9 +1152,10 @@ async fn read_share(
         .map(|id| {
             let store = Arc::clone(&state.store);
             let id = id.clone();
+            let before = before.map(str::to_string);
             async move {
                 store
-                    .list_by_instance(&id, range, limit)
+                    .list_by_instance(&id, range, limit, before.as_deref())
                     .await
                     .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "store_unavailable"))
             }
@@ -1152,6 +1231,8 @@ async fn collect_for_aggregate(
         range,
         AGGREGATE_PAGE,
         ceiling,
+        // 집계는 구간 전체를 한 번에 접는다 — 페이지를 넘기지 않는다.
+        None,
     )
     .await
 }
@@ -1232,7 +1313,9 @@ async fn list_plans(
 
     // **플랜이 있는 것만.** 없는 레코드를 섞으면 "플랜을 눌렀는데 아무것도 없다" 가 된다.
     views.retain(|v| v.has_plan);
-    views.sort_by_key(|v| std::cmp::Reverse(v.started_at_ms));
+    // 목록과 **같은 총순서**를 쓴다 — 같은 밀리초의 순서가 요청마다 흔들리면 표가
+    // 새로고침마다 미묘하게 다른 순서로 보인다.
+    views.sort_by_cached_key(sort_position);
     // 잘렸으면 **그 사실도 `has_more` 다.** 화면이 "플랜이 이게 전부" 로 읽으면 안 된다.
     let capped = views.len() > MAX_LIMIT;
     views.truncate(MAX_LIMIT);
@@ -2055,6 +2138,166 @@ mod tests {
         // 상한을 넘겨도 잘린다 — 클라이언트가 1만 건을 요구할 수 없다.
         assert_eq!(usize::MAX.clamp(1, MAX_LIMIT), MAX_LIMIT);
         assert_eq!(0usize.clamp(1, MAX_LIMIT), 1);
+    }
+
+    /// **페이지네이션이 모든 행을 정확히 한 번 낸다.**
+    ///
+    /// `MAX_LIMIT` 은 페이지 크기이고 천장이 아니다 — 커서로 그 뒤까지 간다. 이 테스트가
+    /// 없으면 경계에서 행이 중복되거나 사라지는 것을 아무도 모른다(둘 다 조용하다).
+    ///
+    /// 함정 세 개를 데이터에 심어 뒀다:
+    ///
+    /// | 함정 | 심은 행 |
+    /// |---|---|
+    /// | 사전순 ≠ 숫자순 | 같은 ms 의 `thread_id` 6·50, 그리고 99·100 |
+    /// | 인스턴스 간 동률 | 같은 `(ms, thread_id)` 를 A·B 양쪽에 |
+    /// | 구간을 커서 시점으로 좁혀도 그 ms 의 동률이 살아야 한다 | 위 동률이 마지막 ms 에 |
+    ///
+    /// 저장소는 **프로덕션 구현 중 하나**(페이크)를 그대로 쓴다. 순회 규칙을 테스트가
+    /// 다시 쓰면 어댑터만 틀렸을 때 통과한다.
+    #[tokio::test]
+    async fn paging_covers_every_row_exactly_once() {
+        use dbmon_core::fakes::FakeSlowQueryStore;
+        use dbmon_core::ids::{InstanceId, RecordId};
+        use dbmon_core::ports::SlowQueryStore;
+        use dbmon_core::slow_query::{
+            CaptureSource, DurationSource, LiteralPolicy, SlowQuery, SlowQueryState,
+        };
+
+        const T: i64 = 1_787_000_000_000;
+
+        fn inst(name: &str) -> InstanceId {
+            InstanceId::new("123456789012", "ap-northeast-2", name).expect("id")
+        }
+
+        fn rec(instance: &InstanceId, thread_id: u64, started_at_ms: i64) -> SlowQuery {
+            SlowQuery {
+                record_id: RecordId::new(instance, thread_id, started_at_ms),
+                instance_id: instance.clone(),
+                cluster_id: None,
+                env: Env::Dev,
+                engine: dbmon_core::instance::Engine::Mysql,
+                engine_version: "8.4.6".into(),
+                state: SlowQueryState::Finalized,
+                thread_id,
+                schema_name: None,
+                db_user: None,
+                db_host: None,
+                started_at_ms,
+                started_at_ms_precise: None,
+                ended_at_ms: Some(started_at_ms + 3_000),
+                captured_at_ms: started_at_ms + 3_100,
+                duration_ms: 3_000,
+                duration_source: DurationSource::Span,
+                sql_text: Some("SELECT 1".into()),
+                sql_text_truncated: false,
+                sql_text_lossy: false,
+                literal_policy: LiteralPolicy::Masked,
+                literal_policy_at_ms: started_at_ms,
+                app_digest: "d".into(),
+                digest_algo_version: 1,
+                mysql_digest: None,
+                statement_type: dbmon_normalize::StatementType::Select,
+                is_nested: false,
+                stats: Default::default(),
+                plan: Default::default(),
+                capture_source: CaptureSource::Processlist,
+                owner_worker: None,
+                owner_epoch: None,
+                last_seen_at_ms: None,
+                abandoned_reason: None,
+                long_running: false,
+            }
+        }
+
+        let (a, b) = (inst("inst-a"), inst("inst-b"));
+        let store = FakeSlowQueryStore::new();
+        // (인스턴스, thread_id, ms) — 넣는 순서는 결과에 영향을 주지 않아야 한다.
+        let rows = [
+            (&a, 6u64, T),
+            (&a, 50, T),
+            (&a, 42, T),
+            (&b, 42, T),
+            (&b, 7, T - 1),
+            (&a, 100, T - 2),
+            (&b, 99, T - 2),
+        ];
+        for (instance, thread_id, ms) in rows {
+            store
+                .upsert_merged(&rec(instance, thread_id, ms))
+                .await
+                .expect("저장");
+        }
+
+        // 기대 순서 — 순서 키 사전순 내림, 동률이면 인스턴스 id 오름.
+        // 사전순이라 `#6` > `#50` > `#42` 이고 `#99` > `#100` 이다.
+        let expected: Vec<String> = [
+            (&a, 6u64, T),
+            (&a, 50, T),
+            (&a, 42, T),
+            (&b, 42, T),
+            (&b, 7, T - 1),
+            (&b, 99, T - 2),
+            (&a, 100, T - 2),
+        ]
+        .iter()
+        .map(|(i, t, ms)| RecordId::new(i, *t, *ms).as_str().to_string())
+        .collect();
+
+        let auth = ctx(dbmon_core::rbac::Role::Admin, &Env::ALL);
+        let full = TimeRange::new(T - 10_000, T + 10_000).expect("구간");
+        const LIMIT: usize = 2;
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut seek: Option<cursor::Position> = None;
+        // 페이지 수 상한. 진전이 없으면 무한 루프이므로 **테스트가 멈춰야 한다.**
+        for _ in 0..rows.len() + 2 {
+            // 핸들러와 같다: 재개하면 구간의 위쪽을 커서 시점으로 좁히고 한 자리 더 읽는다.
+            let read_range = match &seek {
+                Some(s) => TimeRange::new(full.from_ms(), s.started_at_ms).expect("구간"),
+                None => full,
+            };
+            let extra = 1 + usize::from(seek.is_some());
+            let before = seek.as_ref().map(|s| s.order_key());
+
+            let mut page: Vec<SlowQueryView> = Vec::new();
+            for instance in [&a, &b] {
+                let found = store
+                    .list_by_instance(instance, read_range, LIMIT + extra, before.as_deref())
+                    .await
+                    .expect("조회");
+                page.extend(
+                    found
+                        .iter()
+                        .filter(|q| {
+                            seek.as_ref().is_none_or(|s| {
+                                s.is_before(&q.list_order_key(), q.instance_id.as_str())
+                            })
+                        })
+                        .map(|q| SlowQueryView::from_record(q, &auth)),
+                );
+            }
+            page.sort_by_cached_key(sort_position);
+            let has_more = page.len() > LIMIT;
+            page.truncate(LIMIT);
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|v| v.record_id.clone()));
+            let Some(last) = page.last().filter(|_| has_more) else {
+                break;
+            };
+            seek = Some(cursor::Position {
+                started_at_ms: last.started_at_ms,
+                thread_id: last.thread_id,
+                instance_id: last.instance_id.clone(),
+            });
+        }
+
+        assert_eq!(
+            seen, expected,
+            "페이지를 이어 붙인 결과가 전역 순서와 달라졌다 — 경계에서 행이 빠졌거나 겹쳤다"
+        );
     }
 
     /// **`viewer` 는 수집을 멈출 수 없다.** 관측을 멈추는 것은 그 구간의 슬로우

@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   Calendar,
@@ -48,7 +48,7 @@ import {
 } from "../components/ui";
 import { useInstances } from "../hooks/useInstances";
 import { useLive, useLiveMissed, useLiveSlowqSeen, useLiveTopics } from "../hooks/useLive";
-import { fetchSlowQueries, queryKeys } from "../lib/api";
+import { ApiError, fetchSlowQueries, queryKeys } from "../lib/api";
 import { EMPTY, fmtInt, fmtListTime, shortInstance, type Timezone } from "../lib/format";
 import type { InstanceView, SlowQueryView } from "../lib/types";
 
@@ -63,7 +63,13 @@ const REFRESH_INTERVALS = [
 ] as const;
 
 const PAGE_SIZE = 20;
-/** 서버에서 한 번에 받아 클라이언트가 나눠 보여줄 최대 건수 (백엔드 `MAX_LIMIT`). */
+/**
+ * 한 번에 받아 클라이언트가 나눠 보여줄 건수 (백엔드 `MAX_LIMIT`).
+ *
+ * **천장이 아니라 창 크기다.** 예전에는 이 500건이 끝이라 25페이지에서 표가 멈췄고,
+ * 화면은 그걸 "이게 전부" 로 보여줬다. 서버가 `next_cursor` 를 주므로 끝에 다가가면
+ * 다음 창을 이어 붙인다.
+ */
 const WINDOW = 500;
 
 export function MySQLMonitorPage() {
@@ -91,9 +97,16 @@ export function MySQLMonitorPage() {
     [instance, env, instanceLike],
   );
 
-  const list = useQuery({
+  const list = useInfiniteQuery({
     queryKey: queryKeys.slowQueries(listParams),
-    queryFn: ({ signal }) => fetchSlowQueries(listParams, signal),
+    queryFn: ({ signal, pageParam }) =>
+      fetchSlowQueries(
+        pageParam === undefined ? listParams : { ...listParams, cursor: pageParam },
+        signal,
+      ),
+    initialPageParam: undefined as string | undefined,
+    // 서버는 더 있을 때만 커서를 준다 — `has_more` 를 따로 볼 필요가 없다.
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
   });
   // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
   // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
@@ -143,12 +156,36 @@ export function MySQLMonitorPage() {
     setParams(next, { replace: true });
   }
 
-  const items = list.data?.items ?? [];
+  const items = list.data?.pages.flatMap((p) => p.items) ?? [];
+  // 마지막으로 받은 창이 "더 있는가" 를 말한다. 앞 창들의 값은 이미 지난 사실이다.
+  const lastWindow = list.data?.pages.at(-1);
+  const hasMore = lastWindow?.has_more ?? false;
   // **결과가 줄면 페이지를 당긴다.** 3페이지를 보다 자동 새로고침으로 건수가 줄면
   // 빈 표가 나오고, 그건 "기록이 없다" 로 읽힌다.
   const lastPage = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
   const safePage = Math.min(page, lastPage);
   const visible = items.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  // **끝에 닿기 전에 다음 창을 읽는다.**
+  //
+  // 마지막 페이지에서야 읽으면 `>` 버튼이 한 박자 죽어 있고, 그 순간 화면은 "끝" 처럼
+  // 보인다. 한 페이지 앞에서 이어 붙이면 그 틈이 없다.
+  useEffect(() => {
+    if (safePage < lastPage - 1) return;
+    if (!list.hasNextPage || list.isFetchingNextPage) return;
+    void list.fetchNextPage();
+  }, [safePage, lastPage, list.hasNextPage, list.isFetchingNextPage, list.fetchNextPage]);
+
+  // **만료된 커서에서 회복한다.**
+  //
+  // 커서 서명은 1시간이면 만료된다(`CURSOR_TTL_MS`). 깊게 넘겨 둔 화면이 그 뒤에
+  // 새로고침되면 그 창만 400 이고 재시도로는 풀리지 않는다(`main.tsx`). 그때는 쌓아 둔
+  // 창을 버리고 처음부터 다시 읽는다 — 에러 화면보다 그쪽이 맞다.
+  const cursorExpired = list.error instanceof ApiError && list.error.code === "invalid_cursor";
+  useEffect(() => {
+    if (!cursorExpired) return;
+    void queryClient.resetQueries({ queryKey: queryKeys.slowQueriesAll });
+  }, [cursorExpired, queryClient]);
 
   // **진행 중 행의 경과 시간은 여기서 흐른다.**
   //
@@ -158,7 +195,7 @@ export function MySQLMonitorPage() {
   //
   // 진행 중 행이 보일 때만 타이머를 돈다. 항상 돌리면 정적인 표에서 매초 리렌더한다.
   const hasRunning = visible.some((q) => isRunning(q.state));
-  const nowMs = useRunningNow(hasRunning, list.data?.server_now_ms, list.dataUpdatedAt);
+  const nowMs = useRunningNow(hasRunning, lastWindow?.server_now_ms, list.dataUpdatedAt);
 
   return (
     <div className="space-y-6">
@@ -286,7 +323,7 @@ export function MySQLMonitorPage() {
                     // 문제가 없다고 결론 내린다. 상한 표시는 `Pagination` 이 담당하는데
                     // 그건 0건에서 렌더되지 않으므로 여기서 말한다.
                     <EmptyRow colSpan={9}>
-                      {list.data.has_more
+                      {hasMore
                         ? "조회 상한에 걸려 이 조건에 맞는 기록을 찾지 못했다 — 기록이 없다는 뜻은 아니다. 인스턴스나 구간을 좁혀서 다시 본다."
                         : "조회 구간(최근 24시간)에 기록이 없다. 임계값을 넘는 쿼리가 실행되면 여기 쌓인다."}
                     </EmptyRow>
@@ -366,7 +403,7 @@ export function MySQLMonitorPage() {
               page={safePage}
               pageSize={PAGE_SIZE}
               total={items.length}
-              truncated={list.data.has_more}
+              truncated={hasMore}
               onChange={(n) => update("page", String(n))}
             />
             <Note>

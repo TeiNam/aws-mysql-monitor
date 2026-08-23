@@ -506,7 +506,7 @@ async fn lists_by_instance_within_a_range() {
 
     let range = TimeRange::new(T0 - 1_000, T0 + 200_000).expect("구간");
     let got = s
-        .list_by_instance(&instance(), range, 10)
+        .list_by_instance(&instance(), range, 10, None)
         .await
         .expect("조회");
     let ids: Vec<u64> = got.iter().map(|q| q.thread_id).collect();
@@ -517,7 +517,7 @@ async fn lists_by_instance_within_a_range() {
     // 좁은 구간은 일부만.
     let narrow = TimeRange::new(T0 - 1_000, T0 + 1_000).expect("구간");
     let got = s
-        .list_by_instance(&instance(), narrow, 10)
+        .list_by_instance(&instance(), narrow, 10, None)
         .await
         .expect("조회");
     let ids: Vec<u64> = got.iter().map(|q| q.thread_id).collect();
@@ -1269,7 +1269,7 @@ async fn one_execution_never_splits_across_second_buckets() {
 
     // **레코드가 하나여야 한다.**
     let range = TimeRange::new(T0 - 10_000, T0 + 60_000).expect("구간");
-    let all = s.list_by_instance(&i, range, 50).await.expect("조회");
+    let all = s.list_by_instance(&i, range, 50, None).await.expect("조회");
     let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 7001).collect();
     assert_eq!(
         mine.len(),
@@ -1320,7 +1320,7 @@ async fn bucket_split_merge_is_order_independent() {
 
     let range = TimeRange::new(T0 - 10_000, T0 + 60_000).expect("구간");
     let mine: Vec<_> = s
-        .list_by_instance(&i, range, 50)
+        .list_by_instance(&i, range, 50, None)
         .await
         .expect("조회")
         .into_iter()
@@ -1355,7 +1355,7 @@ async fn a_capped_listing_keeps_the_newest_records() {
     let range = TimeRange::new(older_ms - 10_000, T0 + 10_000).expect("구간");
 
     // 상한이 1이면 **새 것**이 와야 한다.
-    let capped = s.list_by_instance(&i, range, 1).await.expect("조회");
+    let capped = s.list_by_instance(&i, range, 1, None).await.expect("조회");
     assert_eq!(capped.len(), 1);
     assert_eq!(
         capped[0].thread_id, 9002,
@@ -1363,13 +1363,50 @@ async fn a_capped_listing_keeps_the_newest_records() {
     );
 
     // 상한을 풀면 둘 다, 그리고 최신순이어야 한다.
-    let all = s.list_by_instance(&i, range, 10).await.expect("조회");
+    let all = s.list_by_instance(&i, range, 10, None).await.expect("조회");
     let mine: Vec<u64> = all
         .iter()
         .filter(|q| q.thread_id == 9001 || q.thread_id == 9002)
         .map(|q| q.thread_id)
         .collect();
     assert_eq!(mine, vec![9002, 9001], "최신순이 아니다");
+}
+
+/// **재개 지점이 정렬 키 사전순 상한으로 동작한다** — 페이지네이션의 전제다.
+///
+/// `thread_id` 는 0 패딩이 아니므로 같은 밀리초에서 사전순과 숫자순이 갈린다:
+/// `"…#6" > "…#50"` 이다. 조회의 전역 정렬도 이 사전순을 쓰므로(`list_order_key`)
+/// 어댑터가 다른 규칙으로 자르면 페이지 경계에서 행이 조용히 사라진다.
+///
+/// 경계값을 **포함**하는 것도 여기서 고정한다. 같은 순서 키가 인스턴스마다 하나씩 있을
+/// 수 있어서 어느 쪽이 앞인지는 호출부가 인스턴스 id 로 가른다 — 어댑터가 경계값을
+/// 빼면 호출부에는 가를 기회가 없다.
+#[tokio::test]
+async fn a_resume_point_bounds_by_sort_key_not_by_number() {
+    let Some(s) = store("resume-bound").await else {
+        return;
+    };
+    let i = instance();
+
+    for thread_id in [6u64, 50, 42] {
+        s.upsert_merged(&sample(thread_id, T0)).await.expect("저장");
+    }
+    s.upsert_merged(&sample(7, T0 - 1)).await.expect("저장");
+
+    let range = TimeRange::new(T0 - 10_000, T0 + 10_000).expect("구간");
+    let before = list_order_key(T0, 50);
+    let got = s
+        .list_by_instance(&i, range, 10, Some(&before))
+        .await
+        .expect("조회");
+    let threads: Vec<u64> = got.iter().map(|q| q.thread_id).collect();
+
+    assert_eq!(
+        threads,
+        vec![50, 42, 7],
+        "사전순 상한이 아니다 — `#6` 은 `#50` 보다 뒤이므로 이 페이지에 오면 안 되고, \
+         경계값 `#50` 은 와야 한다"
+    );
 }
 
 /// **쌍둥이가 있으면 고아 스윕의 확정이 무효화됐다** (실측으로 발견).
@@ -1489,7 +1526,7 @@ async fn a_record_stays_writable_after_a_merge_moves_its_start_time() {
     // ④ **항목이 하나여야 한다.** 키를 다시 만들면 쌍둥이가 생긴다.
     let range = TimeRange::new(T0 - 10_000, T0 + 10_000).expect("구간");
     let all = s
-        .list_by_instance(&instance(), range, 50)
+        .list_by_instance(&instance(), range, 50, None)
         .await
         .expect("조회");
     let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 7777).collect();
@@ -1577,7 +1614,7 @@ async fn the_store_does_not_merge_a_rerun_into_the_previous_execution() {
 
     let range = TimeRange::new(T0 - 10_000, T0 + 20_000).expect("구간");
     let all = s
-        .list_by_instance(&instance(), range, 50)
+        .list_by_instance(&instance(), range, 50, None)
         .await
         .expect("조회");
     let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 5150).collect();
@@ -1599,7 +1636,7 @@ async fn the_store_does_not_merge_a_rerun_into_the_previous_execution() {
     log.stats.rows_examined = Some(999_999);
     s.upsert_merged(&log).await.expect("슬로우로그 병합");
     let all = s
-        .list_by_instance(&instance(), range, 50)
+        .list_by_instance(&instance(), range, 50, None)
         .await
         .expect("조회");
     let twins: Vec<_> = all.iter().filter(|q| q.thread_id == 5151).collect();
@@ -1643,7 +1680,7 @@ async fn two_statements_in_the_same_second_bucket_stay_separate() {
 
     let range = TimeRange::new(T0 - 10_000, T0 + 20_000).expect("구간");
     let all = s
-        .list_by_instance(&instance(), range, 50)
+        .list_by_instance(&instance(), range, 50, None)
         .await
         .expect("조회");
     let mine: Vec<_> = all.iter().filter(|q| q.thread_id == 6161).collect();

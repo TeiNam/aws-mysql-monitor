@@ -81,8 +81,11 @@ impl<S: SlowQueryStore> SlowQueryStore for BroadcastingStore<S> {
         instance: &InstanceId,
         range: TimeRange,
         limit: usize,
+        before: Option<&str>,
     ) -> Result<Vec<SlowQuery>> {
-        self.inner.list_by_instance(instance, range, limit).await
+        self.inner
+            .list_by_instance(instance, range, limit, before)
+            .await
     }
 
     async fn list_in_flight(&self, limit: usize) -> Result<Vec<SlowQuery>> {

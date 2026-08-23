@@ -308,6 +308,37 @@ impl SlowQuery {
     pub fn display_started_at_ms(&self) -> EpochMs {
         self.started_at_ms_precise.unwrap_or(self.started_at_ms)
     }
+
+    /// 목록 정렬·페이지 재개의 총순서 키 ([`list_order_key`]).
+    pub fn list_order_key(&self) -> String {
+        list_order_key(self.started_at_ms, self.thread_id)
+    }
+}
+
+/// 목록의 **총순서 키**. `(started_at_ms, thread_id)` 를 사전순 문자열 하나로 접는다.
+///
+/// # 왜 숫자가 아니라 문자열인가
+///
+/// 저장소의 정렬 키가 `<started_at_ms:013>#<thread_id>` 이고 `S` 타입이라 **사전순**
+/// 이다. `thread_id` 는 0 패딩이 아니므로 사전순과 숫자순이 갈린다:
+///
+/// ```text
+/// 사전순:  "…#6" > "…#50"
+/// 숫자순:   6    <  50
+/// ```
+///
+/// 목록 조회는 이 키로 전역 정렬하고, 페이지 재개는 **같은 키로 저장소의 범위를 좁힌다**
+/// (`SK <= 커서`). 두 순서가 갈리면 경계에서 행이 조용히 사라진다 — 커서가
+/// `thread_id=50` 일 때 같은 밀리초의 `thread_id=6` 은 숫자로는 다음 페이지인데
+/// 사전순으로는 커서보다 커서 범위에서 빠진다.
+///
+/// 그래서 **화면의 정렬이 저장소의 사전순을 따른다.** 같은 밀리초 안의 `thread_id`
+/// 순서는 사용자에게 의미가 없고, 행이 사라지는 것은 의미가 있다.
+///
+/// 어댑터의 키 조립은 [`crate::time::sort_key_ms`] 와 이 함수만 쓴다 — 문자열을 두 곳에서
+/// 만들면 한쪽만 바뀔 때 조회가 조용히 0건이 된다.
+pub fn list_order_key(started_at_ms: EpochMs, thread_id: u64) -> String {
+    format!("{}#{thread_id}", crate::time::sort_key_ms(started_at_ms))
 }
 
 /// 다이제스트를 계산할 수 없을 때 쓰는 **자리표** 접두어.

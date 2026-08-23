@@ -750,12 +750,24 @@ impl SlowQueryStore for DynamoSlowQueryStore {
     /// 돌려줄 수 있다(1MB 페이지 상한). SQL 본문이 큰 레코드는 몇십 건에서 1MB 를
     /// 넘으므로, 페이지를 안 따라가면 "5000건 요청 → 80건 도착 → 이게 전부다" 로
     /// 오판한다. 호출부의 절단 판정(`found.len() == page`)도 그 위에서만 맞다.
+    ///
+    /// **③ `before` 로 페이지를 재개한다.** 정렬 키 사전순 상한이므로 그 이하만 읽는다.
+    /// 시각(`to_ms`)으로 좁히지 않는 이유는 같은 밀리초에 여러 행이 있을 수 있어서다 —
+    /// 시각만 쓰면 그 밀리초를 매 페이지 다시 읽거나 통째로 건너뛴다.
     async fn list_by_instance(
         &self,
         instance: &InstanceId,
         range: TimeRange,
         limit: usize,
+        before: Option<&str>,
     ) -> Result<Vec<SlowQuery>> {
+        // 구간에서 유도한 상한과 재개 지점 중 **작은 쪽**. `before` 가 구간보다 미래를
+        // 가리키면(필터가 바뀐 커서 등) 구간이 이긴다 — 커서가 범위를 넓히지 못한다.
+        let range_hi = format!("{}#\u{10FFFF}", sort_key_ms(range.to_ms()));
+        let hi = match before {
+            Some(b) if b < range_hi.as_str() => b.to_string(),
+            _ => range_hi,
+        };
         let mut out = Vec::new();
         for date in range.date_parts().into_iter().rev() {
             if out.len() >= limit {
@@ -775,10 +787,7 @@ impl SlowQueryStore for DynamoSlowQueryStore {
                         ":lo",
                         AttributeValue::S(sort_key_ms(range.from_ms())),
                     )
-                    .expression_attribute_values(
-                        ":hi",
-                        AttributeValue::S(format!("{}#\u{10FFFF}", sort_key_ms(range.to_ms()))),
-                    )
+                    .expression_attribute_values(":hi", AttributeValue::S(hi.clone()))
                     // 최신순.
                     .scan_index_forward(false)
                     .limit(remaining as i32)

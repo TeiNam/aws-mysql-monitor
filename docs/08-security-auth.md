@@ -784,7 +784,7 @@ CMK는 자동 회전 활성. 키 정책에서 앱 Role과 관리자만 허용.
 | `env` | enum: `prd`/`stg`/`dev`/`unknown` |
 | `from`/`to` | RFC3339. `from < to`. 범위 최대 400일 |
 | 정렬 키 | 화이트리스트 enum |
-| 페이지 크기 | 1~200, 기본 50 |
+| 페이지 크기 | 1~500(`MAX_LIMIT`), 기본 50. 넘겨도 `clamp` 된다 |
 | 스키마명 | `^[A-Za-z0-9_$]{1,64}$` |
 | **`monitor_user`** | `^[a-z][a-z0-9_]{0,31}$` + MySQL 예약어 거부 + 길이 32자 (T-18) |
 | **`monitor_host`** | CIDR 또는 `%`. 기본값은 앱 서브넷 CIDR (T-04 완화) |

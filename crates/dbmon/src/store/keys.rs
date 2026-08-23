@@ -19,8 +19,12 @@ pub fn slow_query_pk(instance: &InstanceId, started_at_ms: i64) -> String {
 ///
 /// **13자리 0 패딩이 필수다.** `S` 정렬 키는 사전순이라 `"1000" < "999"` 다
 /// ([04 §2.2a](../../../../docs/04-data-model.md)).
+///
+/// 조회의 전역 정렬·페이지 재개가 **이 문자열의 사전순에 의존한다.** 그래서 조립을
+/// [`dbmon_core::slow_query::list_order_key`] 하나로 모았다 — 두 곳에서 만들면 정렬과
+/// 범위 조회가 갈리고, 그러면 페이지 경계에서 행이 조용히 사라진다.
 pub fn slow_query_sk(started_at_ms: i64, thread_id: u64) -> String {
-    format!("{}#{thread_id}", sort_key_ms(started_at_ms))
+    dbmon_core::slow_query::list_order_key(started_at_ms, thread_id)
 }
 
 /// GSI1 — **상태에 따라 파티션이 바뀐다.**

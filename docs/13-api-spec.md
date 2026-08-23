@@ -27,13 +27,29 @@ GET /api/slow-queries?limit=50&cursor=eyJ…
 payload = {
   sub:      요청자 Cognito sub          ← 커서 공유·탈취 차단
   filters:  정규화된 필터 집합의 해시     ← 필터 바꿔치기 차단
-  phase:    "hot" | "cold"              ← 핫/콜드 통합 페이지네이션
-  ddb:      LastEvaluatedKey            (phase=hot)
-  athena:   { execution_id, next_token } (phase=cold)
   exp:      만료 시각 (기본 1시간)
+  position: <started_at_ms>|<thread_id>|<instance_id>   ← 정렬 총순서의 한 점
 }
-cursor = base64url(payload) + "." + base64url(HMAC-SHA256(server_key, payload))
+cursor = base64url(payload) + "." + HMAC-SHA256(server_key, base64url(payload))
 ```
+
+**`position` 은 `LastEvaluatedKey` 가 아니다.** 목록 조회는 인스턴스 N대에 팬아웃해 전역
+정렬하므로 저장소 재개 키 하나로는 위치를 표현할 수 없다. N개를 담으면 커서가 인스턴스
+수에 비례해 커지고, 인스턴스가 추가·삭제되는 순간 그 커서는 뜻을 잃는다.
+
+그래서 **정렬 순서의 좌표**를 담는다. 총순서는 `(순서 키 내림, 인스턴스 id 오름)` 이고
+순서 키는 저장소 정렬 키와 같은 `<started_at_ms:013>#<thread_id>` 사전순이다
+(`dbmon_core::slow_query::list_order_key`).
+
+| 성질 | 왜 필요한가 |
+|---|---|
+| 정렬과 저장소 범위가 **같은 사전순**을 쓴다 | `thread_id` 는 0 패딩이 아니라 `"…#6" > "…#50"` 이다. 한쪽만 숫자순으로 보면 커서가 `thread_id=50` 일 때 같은 밀리초의 `6` 이 **어느 페이지에도 없다** |
+| 인스턴스 id 가 마지막 갈래다 | 같은 `(ms, thread_id)` 가 인스턴스마다 하나씩 있을 수 있다. 갈래가 없으면 그 행이 1페이지(정렬이 뒤로 놓아서)에도 2페이지(경계값이라 걸러져서)에도 없다 |
+| 저장소는 경계값을 **포함**해 돌려준다 | 위 갈래를 호출부가 판정할 수 있어야 한다. 어댑터가 경계값을 빼면 그 기회가 없다 |
+| 재개하면 읽을 구간의 위쪽을 커서 시점으로 좁힌다 | 안 좁히면 커서보다 새로운 날짜 파티션을 매 페이지 다시 질의하고 결과는 전부 빈 응답이다 (파티션 예산 낭비) |
+
+페이지를 넘기는 사이에 들어온 새 행은 **1페이지에만** 나타난다 — 조사 도구에서 그게 맞는
+방향이다(오프셋 방식은 그 행이 경계를 밀어 같은 행을 두 번 보여준다).
 
 **검증 규칙**
 - 서명 불일치 / 만료 / `sub` 불일치 → `400 invalid_cursor`
@@ -43,7 +59,9 @@ cursor = base64url(payload) + "." + base64url(HMAC-SHA256(server_key, payload))
 - 초기 설계는 `LastEvaluatedKey`를 base64로만 인코딩했다. **불투명이 아니라 가역적**이라
   내부 키 구조(PK/SK 패턴, `record_id` 구성)가 노출되고 위조가 가능했다.
 
-**핫/콜드 통합 페이지네이션** — 경계를 교차하는 조회는 `phase`로 단계를 관리한다.
+**핫/콜드 통합 페이지네이션 (미구현)** — 경계를 교차하는 조회는 `phase`로 단계를 관리한다.
+지금은 핫 티어(DynamoDB)만 페이지를 넘긴다. `phase` 는 커서에 없다 — 쓰지 않는 필드를 담으면
+"콜드도 된다" 로 읽힌다.
 ```
 phase=hot  : DynamoDB 구간을 소진할 때까지 (ddb.LastEvaluatedKey 로 진행)
              소진되면 next_cursor 의 phase 를 cold 로 전환하고 Athena 실행을 시작
@@ -54,7 +72,7 @@ phase=cold : Athena 결과를 next_token 으로 진행
 경계를 나눌 때 **DynamoDB 구간은 `[hot_boundary, to]`, Athena 구간은 `[from, hot_boundary)`**
 로 배타적으로 잘라 중복을 원천 제거한다.
 
-- `limit`: 1~200, 기본 50
+- `limit`: 1~500(`MAX_LIMIT`), 기본 50. **페이지 크기이고 천장이 아니다** — 그 뒤는 커서로 간다.
 - 오프셋 페이지네이션은 제공하지 않는다.
 - 총 건수는 반환하지 않는다. 필요하면 `/api/slow-queries/count`가 근사치를 반환한다.
 
