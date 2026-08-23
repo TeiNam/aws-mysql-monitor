@@ -359,3 +359,96 @@ fn bedrock_iam_covers_the_models_the_ui_offers() {
         );
     }
 }
+
+/// **설치 문서(README)의 IAM 정책이 `iam.tf` 와 갈리지 않아야 한다.**
+///
+/// `README.md`·`README.ko.md` 는 Terraform 없이 설치하는 사람이 **손으로 옮겨 쓰는** 문서다.
+/// 거기 적힌 정책이 실제와 갈리면 문서를 따른 설치가 조용히 다르게 동작한다 — 권한이 좁으면
+/// 기능이 죽고, 넓으면 그 사실을 아무도 모른다.
+///
+/// 실제로 갈려 있었다. README 가 이 정책을 싣고 있었다:
+///
+/// ```json
+/// { "Action": ["cloudwatch:GetMetricData"],
+///   "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
+/// ```
+///
+/// 그 조건 키는 `GetMetricData` 요청에 실려 오지 않으므로 문이 절대 매치되지 않는다. 코드는
+/// 그걸 고쳤는데(`b50deb7`) README 는 따라오지 않았고, **문서를 따른 설치는 CloudWatch 열이
+/// 영구히 빈다.** 그 부류를 여기서 막는다.
+///
+/// 정책 JSON 전체를 비교하지는 않는다(형식이 달라 의미 없는 실패가 난다). **의도를 담은
+/// 이름과 함정 경고**가 양쪽에 있는지 본다 — 그게 갈릴 때가 위험한 순간이다.
+#[test]
+fn the_readme_install_guide_matches_the_iam_policies() {
+    let iam = std::fs::read_to_string("../../infra/layers/40-compute/iam.tf").expect("iam.tf");
+    let main_tf =
+        std::fs::read_to_string("../../infra/layers/40-compute/main.tf").expect("main.tf");
+    let readmes = [
+        (
+            "README.md",
+            std::fs::read_to_string("../../README.md").expect("README.md"),
+        ),
+        (
+            "README.ko.md",
+            std::fs::read_to_string("../../README.ko.md").expect("README.ko.md"),
+        ),
+    ];
+
+    for (name, doc) in &readmes {
+        // 문서가 옮겨 적은 `Sid` 는 실제 정책에도 있어야 한다.
+        for sid in [
+            "DynamoDbData",
+            "DenyScan",
+            "DiscoveryReadOnly",
+            "PutOwnMetrics",
+            "MetricsRead",
+            "SlowLogRead",
+        ] {
+            assert!(iam.contains(sid), "{name} 의 `{sid}` 가 iam.tf 에 없다");
+            assert!(doc.contains(sid), "iam.tf 의 `{sid}` 를 {name} 이 빠뜨렸다");
+        }
+
+        // **기능을 끄는 정책이 다시 들어오지 않게 한다.**
+        //
+        // 본문 어디에 그 문자열이 있는지가 아니라 **정책 블록 안에** 있는지를 본다 —
+        // 함정을 설명하는 경고 문구에도 같은 문자열이 나오고, 그건 있어야 하는 것이다.
+        for block in doc.split("```").skip(1).step_by(2) {
+            if block.contains("cloudwatch:GetMetricData") {
+                assert!(
+                    !block.contains("cloudwatch:namespace"),
+                    "{name} 의 정책 예시가 GetMetricData 에 네임스페이스 조건을 걸었다 — \
+                     그 조건 키는 이 액션의 요청에 실려 오지 않아 문이 절대 매치되지 않는다"
+                );
+            }
+        }
+
+        // Aurora 를 살리는 두 가지.
+        assert!(
+            doc.contains("/aws/rds/cluster/*/slowquery"),
+            "{name} 에 Aurora 클러스터 로그 그룹이 없다 — Aurora 백필이 조용히 안 돈다"
+        );
+        assert!(
+            doc.contains("dbuser:cluster-"),
+            "{name} 에 Aurora 클러스터 리소스 id 가 없다 — 멤버 id 를 쓰면 1045 다"
+        );
+
+        // 배포에서 조용히 물리는 설정.
+        for key in [
+            "DBMON__DISCOVERY__ALLOWED_VPC_IDS",
+            "DBMON__COLLECTOR__LITERAL_POLICY",
+        ] {
+            assert!(main_tf.contains(key), "`{key}` 가 app_env 에 없다");
+            assert!(
+                doc.contains(key),
+                "{name} 의 태스크 정의 예시에 `{key}` 가 없다"
+            );
+        }
+
+        // 헬스체크를 바꿔 쓰면 standby 가 영원히 죽는다 — 두 경로를 문서가 구분해야 한다.
+        assert!(
+            doc.contains("/readyz") && doc.contains("/healthz"),
+            "{name} 이 컨테이너·타깃그룹 헬스체크를 구분하지 않는다"
+        );
+    }
+}

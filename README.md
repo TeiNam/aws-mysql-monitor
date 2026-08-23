@@ -146,6 +146,35 @@ Everything below assumes `ap-northeast-2` and account `123456789012`; substitute
 Terraform for all of it lives in [`infra/layers/`](infra/) — the manual steps are spelled out
 so you can audit what the Terraform does.
 
+## 0. Two install paths
+
+Sections 1–8 describe the **manual** path: every resource created by hand with the console or CLI.
+That is the reference — it shows exactly what the app needs and why each permission is narrowed.
+
+There is also a **Terraform** path. It creates the same resources, split into independent layers
+with their own state, and is what the maintainer actually runs.
+
+| | Manual (§1–8) | Terraform (`infra/`) |
+|---|---|---|
+| When | evaluating, one environment, or no Terraform in your org | repeatable, multiple environments |
+| Effort | ~20 resources by hand | `terraform apply` per layer |
+| Drift | you own it | state owns it |
+| Layers | — | `00-bootstrap` → `10-foundation` → `(20/30/50/60)` → `40-compute` |
+
+Per-layer commands and required variables live in [`infra/README.md`](infra/README.md).
+Two things about that path are worth stating here because they bite:
+
+- **Layer order is not advisory.** `40-compute` reads `10-foundation`'s state object directly, so
+  running it first fails at `plan`, not at `apply`.
+- **Keep the apply inputs in a file.** Terraform state does not store root-module input variables.
+  Lose them and you must reconstruct from live resources — and an apply that forgets
+  `db_auth_resource_ids` falls back to `dbuser:*/dbmon`, silently granting database auth to every
+  instance in the account. Copy `infra/layers/40-compute/dev.tfvars.example`, fill it in, and
+  always pass `-var-file`.
+
+Either way, §3 (IAM) and §4 (networking) are the sections to read carefully — the target
+database's security group is **not** managed by this project in either path.
+
 ## 1. Image
 
 `.github/workflows/release.yml` publishes on every push to `main`:
@@ -261,8 +290,9 @@ is both a cost event and a latency event. The code never scans; this makes that 
 
 ```json
 { "Sid": "DiscoveryReadOnly", "Effect": "Allow",
-  "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters","rds:DescribeDBEngineVersions",
+  "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters",
              "rds:DescribeDBParameters","rds:DescribeDBParameterGroups",
+             "rds:DescribeDBClusterParameters","rds:DescribeEvents",
              "rds:DescribePendingMaintenanceActions","rds:ListTagsForResource"],
   "Resource": "*" }
 ```
@@ -278,32 +308,67 @@ Scope is enforced in configuration instead (`discovery.allowed_vpc_ids`,
 
 ```json
 { "Effect": "Allow", "Action": ["rds-db:connect"],
-  "Resource": "arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:*/dbmon" }
+  "Resource": ["arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:db-ABC123…/dbmon",
+               "arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:cluster-XYZ789…/dbmon"] }
 ```
 
-`dbuser:*/dbmon` means "the `dbmon` account on any instance". In non-production accounts,
-enumerate `db-XXXX` resource IDs instead (`var.db_auth_resource_ids`) so a dev deployment
-cannot reach production instances.
+**Enumerate the resource IDs.** `dbuser:*/dbmon` means "the `dbmon` account on *any* instance in
+this account" — production included. The Terraform variable `db_auth_resource_ids` falls back to
+that wildcard when left empty, so an apply that forgets it silently widens reach.
 
-> The resource ID is the **`DbiResourceId`** (`db-ABC123…`), not the instance name.
-> `aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'`
+> The resource ID is **not** the instance name.
+>
+> ```bash
+> # RDS instances → DbiResourceId (db-…)
+> aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]' --output text
+> # Aurora → DbClusterResourceId (cluster-…)
+> aws rds describe-db-clusters  --query 'DBClusters[].[DBClusterIdentifier,DbClusterResourceId]' --output text
+> ```
+>
+> **Aurora members authenticate against the *cluster* resource ID.** Using a member's
+> `DbiResourceId` makes the generated token invalid and the connection fails with `1045
+> Access denied` — the same error you get from a wrong password, which is why this costs hours.
 
 ### 3.4 Metrics and slow logs
 
 ```json
-{ "Sid": "Metrics", "Effect": "Allow",
-  "Action": ["cloudwatch:GetMetricData"], "Resource": "*",
-  "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
+{ "Sid": "PutOwnMetrics", "Effect": "Allow",
+  "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
+  "Condition": { "StringEquals": { "cloudwatch:namespace": "dbmon" } } }
 ```
 
 ```json
-{ "Sid": "SlowLogRead", "Effect": "Allow", "Action": ["logs:FilterLogEvents"],
-  "Resource": ["arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery:*",
-               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery"] }
+{ "Sid": "MetricsRead", "Effect": "Allow",
+  "Action": ["cloudwatch:GetMetricData"], "Resource": "*" }
 ```
 
-Slow logs contain **query literals**. `/aws/rds/instance/*/slowquery` is far narrower than
-`/aws/rds/*`, which would include the audit log — that logs every statement.
+> ⚠ **Do not put a namespace condition on `GetMetricData`.** The `cloudwatch:namespace`
+> condition key is supplied for `PutMetricData` but **not** for `GetMetricData`, so a statement
+> conditioned on it never matches and the result is `implicitDeny`. An earlier version of this
+> README shipped `StringEquals { "cloudwatch:namespace": "AWS/RDS" }` here — following it left the
+> CloudWatch columns permanently empty while the UI reported a missing permission. Verify with
+> `aws iam simulate-principal-policy` (local development runs as admin and hides this).
+>
+> Be honest about the blast radius: this role can read **every** CloudWatch metric in the account.
+> IAM cannot narrow it; a permissions boundary or SCP can. What the code actually queries is the
+> catalog in `dbmon_core::cw_metrics`, and that is `AWS/RDS` only.
+
+```json
+{ "Sid": "SlowLogRead", "Effect": "Allow", "Action": ["logs:FilterLogEvents"],
+  "Resource": ["arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery:*",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/cluster/*/slowquery",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/cluster/*/slowquery:*"] }
+```
+
+> ⚠ **The `cluster` form is what makes Aurora work.** Aurora writes its slow log to a
+> *cluster-level* group (`/aws/rds/cluster/<cluster>/slowquery`) with one **stream per member**,
+> while RDS uses `/aws/rds/instance/<instance>/slowquery`. Omit the cluster form and Aurora
+> backfill never runs — and the failure is quiet: the instance still collects, but
+> `rows_examined` stays empty because the exact metrics only exist in the slow log.
+
+Slow logs contain **query literals**. `/aws/rds/{instance,cluster}/*/slowquery` is far narrower
+than `/aws/rds/*`, which would include the audit log — that logs every statement.
 
 If a group does not exist yet (slow log never written, or log export disabled) the app reports
 `슬로우로그 원천이 없다 … (장애가 아니다)` once per round at info level and keeps going — a
@@ -441,8 +506,28 @@ Keep it separate from the task role — the app must never be able to pull or pu
 |---|---|
 | Task → RDS | DB security group: allow **TCP 3306 from the task security group** (not a CIDR). Security-group references survive IP changes. |
 | Task → AWS APIs | NAT gateway, or interface VPC endpoints for `dynamodb` (gateway), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, `s3`. Endpoints avoid NAT data charges and keep traffic off the internet. |
-| ALB → Task | Target group on 8080, health check path `/healthz`. |
-| Task inbound | Only from the ALB security group. Nothing else. |
+| ALB → Task | Target group on 8080, health check path **`/readyz`**. |
+| Task inbound | The ALB security group, **or** an admin/VPN security group when running without an ALB. Nothing else. |
+
+**Running without an ALB is supported and is the cheaper default.** An ALB bills per hour; for a
+VPN-reachable internal tool you can open the container port to the VPN security group instead:
+
+```bash
+aws ec2 authorize-security-group-ingress --group-id <task-sg> \
+  --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,\
+UserIdGroupPairs=[{GroupId=<vpn-sg>,Description='from VPN to container port'}]"
+
+# the task's private IP
+TASK=$(aws ecs list-tasks --cluster dbmon --service-name dbmon --query 'taskArns[0]' --output text)
+aws ecs describe-tasks --cluster dbmon --tasks "$TASK" \
+  --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text
+```
+
+> ⚠ **The two health checks are not interchangeable.** The *container* health check must use
+> `/healthz` and the *target group* must use `/readyz`. A standby worker answers `/readyz` with 503
+> while being perfectly alive (F1) — point the container check at `/readyz` and ECS kills and
+> restarts standby workers forever. Point the target group at `/healthz` and traffic goes to a
+> worker that is not ready.
 
 **ALB idle timeout must be ≥ 300 seconds.** The WebSocket carries live metrics, and the AI
 tuning request can run ~30–100 seconds. At the default 60 s the UI reconnects constantly and
@@ -473,6 +558,7 @@ endpoints, not the cluster endpoint) so `performance_schema` reads are attribute
       { "name": "DBMON__STORAGE__DATA_TABLE",      "value": "dbmon-data" },
       { "name": "DBMON__STORAGE__CONFIG_TABLE",    "value": "dbmon-config" },
       { "name": "DBMON__COLLECTOR__MONITOR_DB_USER", "value": "dbmon" },
+      { "name": "DBMON__COLLECTOR__LITERAL_POLICY",  "value": "masked" },
       { "name": "DBMON__DISCOVERY__ALLOWED_VPC_IDS", "value": "vpc-0123456789abcdef0" }
     ],
     "secrets": [
@@ -537,6 +623,17 @@ half-working process that collects but cannot store is worse than one that refus
 Masking is **one-way**: switching to `masked` later does not remove literals already stored,
 and switching away does not recover masked ones. It applies to newly stored records only.
 Execution-plan JSON is masked regardless of this setting.
+
+> ⚠ **The runtime image has no config file.** It ships the binary and `web/dist` only, so anything
+> not in `environment` falls back to the code default. `local/dbmon-aws.toml` applies to local runs
+> only — a value you set there and not here is silently ignored in the deployment.
+>
+> `DBMON__COLLECTOR__LITERAL_POLICY` is the one that bites: the default `masked` replaces SQL
+> literals with `?` **irreversibly**. Set `full_restricted` if you need the original text
+> (operator role + audit log on view).
+>
+> Do not pass keys the app does not know — configuration is `deny_unknown_fields`, so an extra key
+> **fails startup** rather than being ignored.
 
 ## 6. Database account (per instance)
 
@@ -732,6 +829,37 @@ outage it is reacting to. So the condition is exposed as a value and alarming is
 **Nothing publishes CloudWatch metrics yet.** `PutMetricData` appears in the IAM policy but no
 code calls it, so there is no CloudWatch alarm on `collect_stale` — poll `/readyz` from whatever
 you already use for synthetic checks. Publishing FR-OPS-09 metrics is on the roadmap.
+
+## 9. When it does not work
+
+Every row below was hit for real during deployment.
+
+| Symptom | Cause | Where to look |
+|---|---|---|
+| Task exits immediately | x86 image (the task is Graviton/arm64) | task stopped reason |
+| Exits on startup with a config error | an env key the app does not know (`deny_unknown_fields`) | first log line |
+| Startup refused in a non-prd environment | `DBMON__DISCOVERY__ALLOWED_VPC_IDS` is empty (T-37) | log |
+| Every request is 401 | the shared token was never injected | `GET /api/auth/config` → `mode` |
+| SQL is always `?` | `LITERAL_POLICY` not set, so the code default `masked` applies | a record's `literal_policy` |
+| CloudWatch columns are all `—` | a namespace condition on `GetMetricData` (§3.4) | `aws iam simulate-principal-policy` |
+| Only Aurora has empty `rows_examined` | the slow-log IAM resource list has no `cluster` form (§3.4) | backfill log line, `no_source_instances` |
+| Tuning returns `AccessDenied` | `bedrock:InvokeModel` missing, or that model is not enumerated | the error text shown on screen |
+| IAM database auth fails with `1045` | an Aurora member's `DbiResourceId` was used instead of the cluster's (§3.3) | the `dbuser:` values in the policy |
+| Target database connection times out | the target DB security group has no inbound from the task security group | §4 |
+| Standby workers restart forever | the *container* health check points at `/readyz` | §4 |
+| Cursor pagination stops after one page | an old build; the cursor's filter hash included the resolved time window | `next_cursor` in the response |
+
+Two diagnostics are worth knowing:
+
+```bash
+curl -s "$URL/readyz" | jq       # config_loaded / storage_ok / kms_denied / auth_mode_supported
+aws iam simulate-principal-policy --policy-source-arn <task-role-arn> \
+  --action-names cloudwatch:GetMetricData rds:DescribeDBInstances logs:FilterLogEvents \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text
+```
+
+**The simulator is sometimes the only way to see a permission problem**, because local development
+runs with administrator credentials and hides condition-key mistakes.
 
 ## Local development
 
