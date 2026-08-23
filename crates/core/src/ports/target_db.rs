@@ -88,11 +88,43 @@ pub struct StmtCurrentRow {
     pub no_good_index_used: Option<bool>,
     /// `STATEMENT` 면 프로시저 내부 문장이다 — 양쪽 SQL 을 모두 저장하고 `is_nested=true`.
     pub nesting_event_type: Option<String>,
+    /// `END_EVENT_ID` — **없으면 아직 실행 중**이다.
+    ///
+    /// 이 값이 이벤트 카운터의 유효성을 가른다([`Self::counters_are_final`]).
+    pub end_event_id: Option<u64>,
 }
 
 impl StmtCurrentRow {
     pub fn is_nested_statement(&self) -> bool {
         self.nesting_event_type.as_deref() == Some("STATEMENT")
+    }
+
+    /// 이벤트 카운터를 **사실로 쓸 수 있는가.**
+    ///
+    /// # 실행 중에는 전부 0 이다 (실측)
+    ///
+    /// Aurora MySQL 8.0, 12만 행을 훑는 조인. 같은 문장을 실행 중과 완료 후에 읽었다:
+    ///
+    /// ```text
+    ///                    실행 중(current)   완료 후(history)
+    /// ROWS_EXAMINED               0            120,005
+    /// ROWS_SENT                   0                  5
+    /// NO_INDEX_USED               1                  1     ← 옵티마이즈 시점, 유효하다
+    /// END_EVENT_ID             NULL                  4
+    /// ```
+    ///
+    /// `0` 을 그대로 저장하면 **"모른다" 가 "0행을 훑었다" 는 사실이 된다.** 실제로 그렇게
+    /// 저장돼 있었고(전체 4,814건 중 2,016건 = 42%), 튜닝 모델이 "검사 행 0 은 실행계획과
+    /// 모순" 이라며 신뢰도를 내렸다.
+    ///
+    /// `CREATED_TMP_TABLES`·`SELECT_FULL_JOIN`·`SORT_MERGE_PASSES` 는 실측 쿼리에서 완료
+    /// 후에도 0 이라 **시점을 증명하지 못했다.** 같은 이벤트 카운터 계열이므로 안전한 쪽
+    /// (모름)으로 둔다 — "임시 테이블을 쓰지 않았다" 를 근거 없이 단정하는 것이 더 나쁘다.
+    ///
+    /// `NO_INDEX_USED`·`NO_GOOD_INDEX_USED`·`TIMER_WAIT`·`LOCK_TIME` 은 실행 중에도
+    /// 유효하므로 이 판정과 무관하게 쓴다.
+    pub fn counters_are_final(&self) -> bool {
+        self.end_event_id.is_some()
     }
 }
 
@@ -280,6 +312,30 @@ pub trait TargetDb: Send + Sync {
 
     /// 임계값 초과 스레드의 정확 지표 + 다이제스트.
     async fn stmt_current(&self, ids: &[u64]) -> Result<Vec<StmtCurrentRow>>;
+
+    /// **끝난** 문장의 지표 (`events_statements_history`). 확정 시점에 부른다.
+    ///
+    /// # 왜 이게 있어야 하는가
+    ///
+    /// 실행 중 카운터는 전부 0 이므로([`StmtCurrentRow::counters_are_final`]) 실시간
+    /// 캡처만으로는 `rows_examined` 를 영구히 알 수 없다. 슬로우로그가 병합되면 채워지지만
+    /// 도착하지 않으면 그대로다 — 실측 4,814건 중 2,016건(42%)이 그 상태였다.
+    ///
+    /// 확정 시점 주석은 "스레드가 이미 사라졌으므로 새로 조회할 수 없다" 고 적혀 있었다.
+    /// **그건 커넥션이 닫혔을 때만 참이다.** 풀링 커넥션은 살아 있고, 그 스레드의
+    /// `events_statements_history` 가 방금 끝난 문장을 **실제 값으로** 들고 있다:
+    ///
+    /// ```text
+    /// 실행 중(current):  ROWS_EXAMINED=0        END_EVENT_ID=NULL
+    /// 완료 후(history):  ROWS_EXAMINED=120,005  END_EVENT_ID=4
+    /// ```
+    ///
+    /// `events_statements_history` consumer 는 MySQL 8 기본 활성이고 스레드당 5개를 남긴다
+    /// (`performance_schema_events_statements_history_size`). 실측으로 확인했다.
+    ///
+    /// 끝난 행만(`END_EVENT_ID IS NOT NULL`) 최신순으로 돌려준다. 어느 행이 우리 것인지는
+    /// 호출부가 다이제스트로 가른다 — 모르면 추측하지 않는다.
+    async fn stmt_history(&self, ids: &[u64]) -> Result<Vec<StmtCurrentRow>>;
 
     /// 실행 중 실행계획. **별도 연결에서** 실행해야 폴링이 밀리지 않는다.
     ///

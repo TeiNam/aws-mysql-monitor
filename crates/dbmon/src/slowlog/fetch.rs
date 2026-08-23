@@ -18,6 +18,7 @@
 
 use dbmon_core::error::Result;
 use dbmon_core::ids::InstanceId;
+use dbmon_core::instance::Instance;
 use dbmon_core::time::EpochMs;
 
 /// 가져온 로그 조각과 다음 시작점.
@@ -44,25 +45,62 @@ pub trait SlowLogFetcher: Send + Sync {
     /// `since_ms` 이후의 로그를 가져온다.
     /// `resume_token` 이 있으면 **그 자리에서** 이어 읽는다. 그때 `since_ms` 는 토큰이
     /// 발급될 때와 같아야 한다 — CloudWatch 가 그걸 요구한다.
+    /// **`Instance` 를 받는다.** 로그 그룹이 엔진에 따라 다르므로 `cluster_id` 가 필요하다
+    /// ([`slowquery_log_source`]) — `InstanceId` 만으로는 Aurora 를 알 수 없다.
     async fn fetch(
         &self,
-        instance: &InstanceId,
+        instance: &Instance,
         since_ms: EpochMs,
         resume_token: Option<&str>,
     ) -> Result<LogChunk>;
 }
 
-/// CloudWatch Logs 로그 그룹 이름 ([05 §8.3](../../../../docs/05-collector.md)).
+/// 슬로우로그가 실제로 쌓이는 자리 ([05 §8.3](../../../../docs/05-collector.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSource {
+    pub group: String,
+    /// **Aurora 만 채운다.** 클러스터 그룹 하나에 멤버마다 스트림이 따로 있다.
+    ///
+    /// 필터가 없으면 라이터가 리더의 슬로우 쿼리를 **자기 것으로** 저장한다 — 리터럴을
+    /// 포함한 오귀속이고, [`check_scope`] 가 막으려는 것과 같은 부류다.
+    pub stream: Option<String>,
+}
+
+/// CloudWatch Logs 로그 그룹·스트림 ([05 §8.3](../../../../docs/05-collector.md)).
 ///
-/// RDS 가 만드는 이름 규칙이다. **인스턴스 식별자만 들어간다** — 계정·리전은 API
-/// 호출의 자격증명·엔드포인트가 정한다.
-/// **`InstanceId` 의 접근자를 쓴다.** 문자열을 다시 파싱하면 검증 규칙이 두 곳이 된다 —
-/// `validate_identifier` 가 이미 `/`·`:`·`#` 를 거부하므로 경로 조작은 불가능하다.
-pub fn slowquery_log_group(instance: &InstanceId) -> Result<String> {
-    Ok(format!(
-        "/aws/rds/instance/{}/slowquery",
-        instance.identifier()
-    ))
+/// # Aurora 와 RDS 가 다르다 — 이걸 몰라서 Aurora 는 백필이 한 번도 돌지 않았다
+///
+/// | 엔진 | 로그 그룹 | 스트림 |
+/// |---|---|---|
+/// | RDS MySQL | `/aws/rds/instance/<인스턴스>/slowquery` | 인스턴스 하나 |
+/// | **Aurora** | `/aws/rds/cluster/<클러스터>/slowquery` | **멤버마다 하나** |
+///
+/// 예전에는 항상 인스턴스 형태로 만들었다. Aurora 멤버는 **존재하지 않는 그룹**을 조회하고
+/// `ResourceNotFound` 로 끝나므로, 체크포인트도 생기지 않고 병합도 없다. 실측(dev):
+///
+/// ```text
+/// dbmon-seed-dev-mysql     merged 2,725  slowlog 54   ← RDS, 정상
+/// dbmon-seed-dev-aurora-2  merged     0  slowlog  0   ← Aurora, 1,961건 전부 processlist
+/// ```
+///
+/// 그 1,961건은 `rows_examined` 를 영구히 모른다(실행 중 값은 0 이라 버린다). 실패가
+/// `Unsupported` 로 분류돼 `info` 로만 남으므로 **조용했다.**
+///
+/// **계정·리전은 이름에 넣지 않는다** — API 호출의 자격증명·엔드포인트가 정한다
+/// ([`check_scope`] 가 그 짝을 검사한다). `Id` 타입의 접근자를 쓴다: 문자열을 다시
+/// 파싱하면 검증 규칙이 두 곳이 되고, `validate_identifier` 가 이미 `/`·`:`·`#` 를 거부한다.
+pub fn slowquery_log_source(instance: &Instance) -> Result<LogSource> {
+    Ok(match &instance.cluster_id {
+        Some(cluster) => LogSource {
+            group: format!("/aws/rds/cluster/{}/slowquery", cluster.identifier()),
+            // 스트림 이름은 **멤버 인스턴스 식별자**다 (실측으로 확인).
+            stream: Some(instance.id.identifier().to_string()),
+        },
+        None => LogSource {
+            group: format!("/aws/rds/instance/{}/slowquery", instance.id.identifier()),
+            stream: None,
+        },
+    })
 }
 
 /// 이 클라이언트로 이 인스턴스의 로그를 읽어도 되는가.
@@ -165,11 +203,11 @@ impl RegionalFetchers {
 impl SlowLogFetcher for RegionalFetchers {
     async fn fetch(
         &self,
-        instance: &InstanceId,
+        instance: &Instance,
         since_ms: EpochMs,
         resume_token: Option<&str>,
     ) -> Result<LogChunk> {
-        let region = instance.region();
+        let region = instance.id.region();
         // **다른 리전 클라이언트로 대신하지 않는다.** 같은 식별자가 그 리전에도
         // 있으면 남의 DB 로그를 파싱해 엉뚱한 인스턴스로 저장한다.
         let f = self.by_region.get(region).ok_or_else(|| {
@@ -186,12 +224,16 @@ impl SlowLogFetcher for RegionalFetchers {
 impl SlowLogFetcher for CloudWatchFetcher {
     async fn fetch(
         &self,
-        instance: &InstanceId,
+        instance: &Instance,
         since_ms: EpochMs,
         resume_token: Option<&str>,
     ) -> Result<LogChunk> {
-        check_scope(instance, &self.region, &self.account)?;
-        let group = slowquery_log_group(instance)?;
+        check_scope(&instance.id, &self.region, &self.account)?;
+        let source = slowquery_log_source(instance)?;
+        let group = source.group;
+        // Aurora 는 클러스터 그룹 하나에 멤버 스트림이 여럿이다. 필터를 걸지 않으면
+        // 이 멤버가 **다른 멤버의 슬로우 쿼리**를 자기 것으로 저장한다.
+        let streams: Option<Vec<String>> = source.stream.map(|s| vec![s]);
 
         // **페이지를 따라간다.**
         //
@@ -215,6 +257,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
                 .client
                 .filter_log_events()
                 .log_group_name(&group)
+                .set_log_stream_names(streams.clone())
                 .start_time(since_ms)
                 .limit(self.max_events)
                 .set_next_token(token.clone())
@@ -233,7 +276,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
             let sent = match (sent, token.is_some()) {
                 (Err(e), true) if is_bad_token(&e) => {
                     tracing::warn!(
-                        instance = %instance.as_str(),
+                        instance = %instance.id.as_str(),
                         since_ms,
                         "저장된 페이지 토큰이 거부됐다 — 버리고 위치부터 다시 읽는다"
                     );
@@ -245,6 +288,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
                     self.client
                         .filter_log_events()
                         .log_group_name(&group)
+                        .set_log_stream_names(streams.clone())
                         .start_time(since_ms)
                         .limit(self.max_events)
                         .send()
@@ -307,7 +351,7 @@ impl SlowLogFetcher for CloudWatchFetcher {
             if text.len() >= MAX_CHUNK_BYTES {
                 tracing::info!(
                     bytes = text.len(),
-                    instance = %instance.as_str(),
+                    instance = %instance.id.as_str(),
                     "슬로우로그 청크가 크기 상한에 닿았다 — 나머지는 다음 라운드가 읽는다"
                 );
                 hit_cap = true;
@@ -417,7 +461,7 @@ impl FileFetcher {
 impl SlowLogFetcher for FileFetcher {
     async fn fetch(
         &self,
-        _instance: &InstanceId,
+        _instance: &Instance,
         _since_ms: EpochMs,
         _resume_token: Option<&str>,
     ) -> Result<LogChunk> {
@@ -474,12 +518,62 @@ mod tests {
         InstanceId::new("123456789012", "ap-northeast-2", "orders-01").expect("id")
     }
 
-    /// RDS 의 로그 그룹 이름 규칙 ([05 §8.3]).
+    /// 도메인 인스턴스. `cluster` 를 주면 Aurora 멤버다.
+    fn domain(name: &str, cluster: Option<&str>) -> Instance {
+        use dbmon_core::env::{Env, EnvResolution};
+        use dbmon_core::ids::ClusterId;
+        use dbmon_core::instance::{Engine, EngineVersion, InstanceState};
+        Instance {
+            id: InstanceId::new("123456789012", "ap-northeast-2", name).expect("id"),
+            cluster_id: cluster
+                .map(|c| ClusterId::new("123456789012", "ap-northeast-2", c).expect("cluster")),
+            engine: Engine::Mysql,
+            engine_version: EngineVersion::parse("8.0.39").expect("ver"),
+            env: EnvResolution::resolve(Env::Dev, None),
+            state: InstanceState::Collecting,
+            endpoint: None,
+            port: 3306,
+            dbi_resource_id: "db-X".into(),
+            vpc_id: None,
+            availability_zone: None,
+            instance_class: None,
+            allocated_storage_gb: None,
+            is_cluster_writer: true,
+            iam_auth_enabled: false,
+            tags: Default::default(),
+            cert_valid_till_ms: None,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            deleted_at_ms: None,
+            missing_count: 0,
+            renamed_from: None,
+            renamed_to: None,
+        }
+    }
+
+    /// RDS 의 로그 그룹 이름 규칙 ([05 §8.3]). 스트림 필터는 없다.
     #[test]
     fn log_group_follows_the_rds_naming_rule() {
+        let s = slowquery_log_source(&domain("orders-01", None)).expect("이름");
+        assert_eq!(s.group, "/aws/rds/instance/orders-01/slowquery");
+        assert_eq!(s.stream, None, "RDS 는 그룹에 인스턴스 하나뿐이다");
+    }
+
+    /// **Aurora 는 클러스터 그룹이다.** 이걸 몰라서 백필이 한 번도 돌지 않았다.
+    ///
+    /// 실측(dev): `dbmon-seed-dev-aurora-2` 는 merged 0 · slowlog 0 · processlist 1,961.
+    /// 같은 시각 `dbmon-seed-dev-mysql` 은 merged 2,725. 인스턴스 이름으로 만든 그룹이
+    /// 존재하지 않아 `ResourceNotFound` 였고, 그 실패는 `Unsupported` 로 분류돼
+    /// `info` 로만 남았다 — 조용히 42%의 레코드가 정확 지표를 잃었다.
+    #[test]
+    fn aurora_reads_the_cluster_group_and_filters_its_own_stream() {
+        let s =
+            slowquery_log_source(&domain("orders-aurora-2", Some("orders-aurora"))).expect("이름");
+        assert_eq!(s.group, "/aws/rds/cluster/orders-aurora/slowquery");
         assert_eq!(
-            slowquery_log_group(&instance()).expect("이름"),
-            "/aws/rds/instance/orders-01/slowquery"
+            s.stream.as_deref(),
+            Some("orders-aurora-2"),
+            "스트림을 좁히지 않으면 이 멤버가 다른 멤버의 슬로우 쿼리를 자기 것으로 저장한다"
         );
     }
 
@@ -661,7 +755,9 @@ mod tests {
     /// **계정·리전을 이름에 넣지 않는다.** 넣으면 존재하지 않는 그룹을 조회한다.
     #[test]
     fn log_group_contains_only_the_identifier() {
-        let name = slowquery_log_group(&instance()).expect("이름");
+        let name = slowquery_log_source(&domain("orders-01", None))
+            .expect("이름")
+            .group;
         assert!(!name.contains("123456789012"), "{name}");
         assert!(!name.contains("ap-northeast-2"), "{name}");
     }
@@ -674,7 +770,7 @@ mod tests {
         tokio::fs::write(&path, body).await.expect("쓰기");
 
         let chunk = FileFetcher::new(&path)
-            .fetch(&instance(), 0, None)
+            .fetch(&domain("orders-01", None), 0, None)
             .await
             .expect("읽기");
         assert_eq!(chunk.text, body);
@@ -688,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_file_is_an_error_not_an_empty_chunk() {
         let e = FileFetcher::new("/nonexistent/dbmon/slow.log")
-            .fetch(&instance(), 0, None)
+            .fetch(&domain("orders-01", None), 0, None)
             .await
             .expect_err("없는 파일을 읽었다");
         assert!(format!("{e}").contains("slowlog_file"), "{e}");

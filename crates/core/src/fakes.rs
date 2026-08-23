@@ -769,6 +769,9 @@ pub struct FakeTargetDb {
     pub full: Mutex<Vec<FullSqlRow>>,
     /// `stmt_current` 가 돌려줄 행.
     pub stmts: Mutex<Vec<StmtCurrentRow>>,
+    /// `stmt_history` 가 돌려줄 행. **비어 있으면 히스토리가 없는 것**이다 —
+    /// 커넥션이 닫혀 스레드가 사라진 경우를 재현한다.
+    pub history: Mutex<Vec<StmtCurrentRow>>,
     /// `probe` 를 앞으로 n 번 실패시킨다. **연결 실패를 재현한다.**
     fail_probe: AtomicUsize,
     /// `full_sql` 을 앞으로 n 번 실패시킨다.
@@ -838,6 +841,44 @@ impl FakeTargetDb {
                 state: Some("executing".into()),
             })
             .collect();
+    }
+
+    /// 심층 조회(`stmt_current`)가 돌려줄 행. **실행 중**을 재현한다 —
+    /// `end_event_id: None` 이고 카운터는 0 이다(MySQL 의 실제 동작).
+    pub fn with_running_stmt(self, processlist_id: u64, digest: &str) -> Self {
+        self.stmts.lock().unwrap().push(StmtCurrentRow {
+            processlist_id,
+            thread_id: processlist_id,
+            digest: Some(digest.to_string()),
+            digest_text: Some("SELECT * FROM `t` WHERE `id` = ?".into()),
+            sql_text: Some("SELECT * FROM t WHERE id = 1".into()),
+            rows_examined: Some(0),
+            rows_sent: Some(0),
+            end_event_id: None,
+            ..Default::default()
+        });
+        self
+    }
+
+    /// 확정 시점 조회(`stmt_history`)가 돌려줄 행. **완료된 문장**이다.
+    pub fn with_finished_history(
+        &self,
+        processlist_id: u64,
+        digest: &str,
+        rows_examined: u64,
+        rows_sent: u64,
+    ) {
+        self.history.lock().unwrap().push(StmtCurrentRow {
+            processlist_id,
+            thread_id: processlist_id,
+            digest: Some(digest.to_string()),
+            digest_text: Some("SELECT * FROM `t` WHERE `id` = ?".into()),
+            sql_text: Some("SELECT * FROM t WHERE id = 1".into()),
+            rows_examined: Some(rows_examined),
+            rows_sent: Some(rows_sent),
+            end_event_id: Some(4),
+            ..Default::default()
+        });
     }
 
     /// `probe.truncated` 를 설정한다.
@@ -911,6 +952,12 @@ impl TargetDb for FakeTargetDb {
             });
         }
         Ok(self.stmts.lock().unwrap().clone())
+    }
+
+    async fn stmt_history(&self, _ids: &[u64]) -> Result<Vec<StmtCurrentRow>> {
+        // **`stmt_current` 와 실패 스위치를 공유하지 않는다.** 확정 경로가 선행 저장의
+        // 실패에 끌려가면 안 된다 — 확정은 반드시 돌아야 하는 경로다.
+        Ok(self.history.lock().unwrap().clone())
     }
 
     async fn explain_for_connection(&self, _connection_id: u64) -> Result<ExplainOutcome> {

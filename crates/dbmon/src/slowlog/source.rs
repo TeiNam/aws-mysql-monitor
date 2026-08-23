@@ -34,8 +34,14 @@ use super::SlowLogEntry;
 /// DynamoDB 항목 한도(400KB)보다 훨씬 작게 둔다 — 한 항목에 플랜·지표도 들어간다.
 const MAX_STORED_SQL_BYTES: usize = 64 * 1024;
 
+/// `no_source` 인스턴스 이름을 몇 개까지 로그에 남기나.
+///
+/// 전부 남기면 500대 배포에서 한 줄이 수십 KB 가 된다. 몇 개만 있으면 운영자가 패턴을
+/// 알아채기에 충분하고, 수(`no_source`)가 전체 규모를 말한다.
+pub const NO_SOURCE_SAMPLE: usize = 5;
+
 /// 백필 결과. 조용히 넘기지 않기 위해 센다.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BackfillStats {
     pub merged: usize,
     /// 도메인 레코드를 만들 수 없어 버린 수 (식별자 위반 등).
@@ -56,6 +62,17 @@ pub struct BackfillStats {
     /// 매 주기 경고가 쌓여 **진짜 장애가 그 소음에 묻힌다.** 재시도로 해결되지 않는
     /// 상태이므로 따로 센다.
     pub no_source: usize,
+    /// 원천이 없던 인스턴스 **이름** (최대 [`NO_SOURCE_SAMPLE`]개).
+    ///
+    /// # 왜 수만으로는 부족했나
+    ///
+    /// Aurora 는 클러스터 그룹에 로그를 쓰는데 코드가 인스턴스 이름으로 그룹을 만들어
+    /// **전원이 `no_source`** 였다. 그런데 라운드 요약 로그의 조건이
+    /// `merged > 0 || errors > 0 || …` 이라 그 라운드는 **아무 줄도 남기지 않았다** —
+    /// 백필이 도는지조차 알 수 없었고, 그 상태로 1,961건이 정확 지표를 잃었다.
+    ///
+    /// 이름을 함께 남기면 운영자가 "어느 인스턴스가 조용한가" 를 바로 본다.
+    pub no_source_instances: Vec<String>,
     /// **한 라운드에 다 읽지 못한 인스턴스 수** (`has_more`).
     ///
     /// `FilterLogEvents` 는 페이지당 10,000건 상한이 있다. 세지 않으면 바쁜

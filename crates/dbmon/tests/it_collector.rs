@@ -478,6 +478,77 @@ async fn deep_probe_limit_caps_work() {
     }
 }
 
+/// **확정 시점에 실제 검사 행수를 채운다** (`events_statements_history`).
+///
+/// # 이 테스트가 지키는 것
+///
+/// 실행 중 `ROWS_EXAMINED` 는 0 이므로 실시간 캡처만으로는 영구히 알 수 없다. 슬로우로그가
+/// 병합되면 채워지지만 그게 오지 않으면 그대로다 — 실측(dev) 4,814건 중 2,016건(42%)이
+/// 그 상태였고, 그 중 Aurora 1,961건은 로그 그룹 이름이 틀려 **영구히** 오지 않았다.
+///
+/// 확정 시점 주석은 "스레드가 이미 사라졌으므로 새로 조회할 수 없다" 고 했다. 그건 커넥션이
+/// 닫혔을 때만 참이다. **풀링 커넥션은 살아 있고** 그 스레드의 히스토리가 방금 끝난 문장을
+/// 실제 값으로 들고 있다 — `run_then_idle` 이 그 상황을 만든다.
+#[tokio::test]
+async fn finalization_reads_the_real_metrics_from_history() {
+    if !containers_up().await {
+        return;
+    }
+    let _guard = exclusive_target(MYSQL84).await;
+    let Some((mut c, store)) = collector(LiteralPolicy::Full, CollectParams::default()) else {
+        return;
+    };
+    let _ = c.detect_tick().await;
+
+    // 임계값을 넘길 만큼 느리고, **행을 실제로 훑고**, 유한해야 한다.
+    // `SLEEP` 만으로는 `ROWS_EXAMINED` 가 늘지 않고, 밴드 조인은 시드 크기에 따라 몇 분이
+    // 될 수 있다 — `LIMIT` 으로 소요를 고정한다(로컬 실측 5.7초).
+    let sql = "SELECT COUNT(*) FROM (SELECT id FROM orders LIMIT 8000) x WHERE SLEEP(0.0004) = 0";
+    // 문장이 끝난 뒤 커넥션을 유휴로 살려 둔다 → 히스토리가 남는다.
+    let Some(running) = run_then_idle(MYSQL84, LOADGEN, sql, Duration::from_secs(20)).await else {
+        return;
+    };
+
+    // ① 실행 중에 자리를 얻는다. 이때 카운터는 모른다.
+    tick_until(&mut c, 12, |s| s.deep_probed > 0).await;
+    let mid = store.all();
+    let inflight = mid
+        .iter()
+        .find(|q| q.sql_text.as_deref().is_some_and(|t| t.contains("0.0004")));
+    if let Some(q) = inflight {
+        assert_eq!(
+            q.stats.rows_examined, None,
+            "실행 중 값 0 을 사실로 저장했다: {:?}",
+            q.stats
+        );
+    }
+
+    // ② 문장이 끝나면 확정된다 — 그때 히스토리에서 실제 값을 읽어야 한다.
+    let done = tick_until(&mut c, 40, |s| s.finalized > 0).await;
+    assert!(done.finalized > 0, "확정되지 않았다: {done:?}");
+    assert!(
+        done.finalized_with_history > 0,
+        "확정 시점 히스토리를 읽지 못했다 — 조용히 예전 동작으로 돌아간 것과 구분되지 않는다: {done:?}"
+    );
+
+    let saved = store.all();
+    let rec = saved
+        .iter()
+        .find(|q| q.sql_text.as_deref().is_some_and(|t| t.contains("0.0004")))
+        .unwrap_or_else(|| panic!("대상 쿼리가 저장되지 않았다: {saved:#?}"));
+    assert_eq!(rec.state, SlowQueryState::Finalized);
+    let examined = rec
+        .stats
+        .rows_examined
+        .unwrap_or_else(|| panic!("확정 뒤에도 검사 행수를 모른다: {:?}", rec.stats));
+    assert!(
+        examined > 0,
+        "검사 행수가 0 이다 — 히스토리가 아니라 실행 중 값을 읽었다"
+    );
+
+    kill_and_wait(running).await;
+}
+
 /// 정확 지표가 `events_statements_current` 에서 온다.
 #[tokio::test]
 async fn exact_metrics_come_from_statements_current() {
@@ -506,11 +577,17 @@ async fn exact_metrics_come_from_statements_current() {
         })
         .unwrap_or_else(|| panic!("대상 쿼리가 저장되지 않았다: {saved:#?}"));
 
-    // **`ROWS_EXAMINED` 는 실행 중 스냅샷이다.** 캡처 시점에 아직 0일 수 있으므로
-    // 값의 크기를 단정하지 않는다. 중요한 것은 필드가 채워지는 경로가 살아 있는가다.
-    assert!(
-        rec.stats.rows_examined.is_some(),
-        "events_statements_current 지표를 받지 못했다 — consumer 설정을 확인한다"
+    // **실행 중 카운터는 사실이 아니다.** MySQL 은 그때 `ROWS_EXAMINED = 0` 을 주고
+    // (실측: 12만 행을 훑는 조인이 완료 후 120,005), 그 0 을 저장하면 "0행을 훑었다" 는
+    // 거짓 사실이 된다. 실제로 그렇게 저장돼 있었고 튜닝 모델이 실행계획과의 모순을
+    // 근거로 신뢰도를 내렸다.
+    //
+    // 지표 경로가 살아 있는지는 아래 `started_at_ms_precise`(TIMER_WAIT)로 확인한다 —
+    // 그건 실행 중에도 유효한 값이다.
+    assert_eq!(
+        rec.stats.rows_examined, None,
+        "실행 중 값 0 을 사실로 저장했다: {:?}",
+        rec.stats
     );
     // **`TIMER_WAIT` 를 받았다는 증거는 정밀 시작 시각이다.**
     //

@@ -329,3 +329,109 @@ async fn eviction_is_visible_in_tick_stats() {
         "축출이 TickStats.evicted 로 올라오지 않았다"
     );
 }
+
+/// **확정 시점에 끝난 문장의 지표를 실제로 채운다.**
+///
+/// # 왜 이게 필요한가
+///
+/// MySQL 은 실행 중인 문장의 `ROWS_EXAMINED` 를 **0 으로** 준다(실측: 12만 행을 훑는
+/// 조인이 완료 후 120,005). 실시간 캡처만으로는 그 값을 영구히 알 수 없고, 슬로우로그가
+/// 병합되지 않으면 그대로 남는다 — 실측 4,814건 중 2,016건(42%)이 그 상태였다.
+///
+/// 확정 시점 주석은 "스레드가 이미 사라졌으므로 새로 조회할 수 없다" 고 했지만, 그건
+/// 커넥션이 닫혔을 때만 참이다. 풀링 커넥션의 `events_statements_history` 는 방금 끝난
+/// 문장을 실제 값으로 들고 있다.
+#[tokio::test]
+async fn finalization_fills_metrics_from_statement_history() {
+    let db = FakeTargetDb::new()
+        .with_threads(&[(1, 3)])
+        // 심층 조회는 **실행 중** 값을 준다 — 카운터가 0 이다.
+        .with_running_stmt(1, "d-abc");
+    // 확정 시점에는 끝난 문장이 히스토리에 있다.
+    db.with_finished_history(1, "d-abc", 120_005, 5);
+
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store.clone(),
+        clock.clone(),
+        params(),
+    );
+
+    c.detect_tick().await.expect("tick1");
+    // 선행 저장 시점에는 아직 모른다 — 0 을 사실로 저장하지 않는다.
+    let mid = store.all();
+    let running = mid
+        .iter()
+        .find(|q| q.thread_id == 1)
+        .expect("선행 저장 레코드");
+    assert_eq!(
+        running.stats.rows_examined, None,
+        "실행 중 값 0 을 '0행을 훑었다' 로 저장했다"
+    );
+
+    // 스레드가 끝났다 → 확정.
+    c.db_mut().with_threads_mut(&[]);
+    clock.advance(1_000);
+    let t2 = c.detect_tick().await.expect("tick2");
+
+    assert_eq!(t2.finalized, 1);
+    assert_eq!(
+        t2.finalized_with_history, 1,
+        "히스토리를 못 읽었다 — 조용히 예전 동작으로 돌아간 것과 구분되지 않는다"
+    );
+
+    let saved = store.all();
+    let done = saved
+        .iter()
+        .find(|q| q.thread_id == 1)
+        .expect("확정 레코드");
+    assert_eq!(done.state, SlowQueryState::Finalized);
+    assert_eq!(
+        done.stats.rows_examined,
+        Some(120_005),
+        "확정 시점에 실제 검사 행수를 채우지 못했다"
+    );
+    assert_eq!(done.stats.rows_sent, Some(5));
+}
+
+/// **다이제스트를 모르면 히스토리를 붙이지 않는다.**
+///
+/// 같은 커넥션의 히스토리에는 최근 문장 5개가 남는다. 가릴 근거 없이 아무 행을 붙이면
+/// **엉뚱한 문장의 지표**가 이 레코드의 사실이 된다 — 지표가 없는 것보다 나쁘다.
+/// "가장 가까운 행을 고른다" 는 교차 리뷰 24·25라운드에 블로커였다.
+#[tokio::test]
+async fn history_is_not_applied_without_a_digest_to_match_on() {
+    // 심층 조회 결과가 없다 → 다이제스트를 모른다.
+    let db = FakeTargetDb::new().with_threads(&[(1, 3)]);
+    db.with_finished_history(1, "d-somebody-else", 999_999, 7);
+
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store.clone(),
+        clock.clone(),
+        params(),
+    );
+
+    c.detect_tick().await.expect("tick1");
+    c.db_mut().with_threads_mut(&[]);
+    clock.advance(1_000);
+    let t2 = c.detect_tick().await.expect("tick2");
+
+    assert_eq!(t2.finalized, 1, "확정 자체는 되어야 한다");
+    assert_eq!(
+        t2.finalized_with_history, 0,
+        "다이제스트 없이 히스토리를 붙였다 — 남의 지표를 이 레코드의 사실로 만들었다"
+    );
+    let saved = store.all();
+    let done = saved
+        .iter()
+        .find(|q| q.thread_id == 1)
+        .expect("확정 레코드");
+    assert_eq!(done.stats.rows_examined, None);
+}
