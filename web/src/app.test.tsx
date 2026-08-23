@@ -465,6 +465,38 @@ describe("MySQL Monitor", () => {
 });
 
 /**
+ * 푸터. **공개 저장소로 전환할 것을 전제로 둔다** — 스크린샷만 돌아다닐 때 이름·출처·
+ * 라이선스를 읽을 수 있는 유일한 자리다.
+ */
+describe("푸터", () => {
+  it("제품명·저장소 링크·라이선스를 보여준다", async () => {
+    await renderApp("/mysql");
+    const footer = document.querySelector("footer");
+    if (footer === null) throw new Error("푸터가 없다");
+
+    expect(footer.textContent).toContain(
+      "AWS Aurora & RDS MySQL Slow Query Monitor",
+    );
+    expect(footer.textContent).toContain("TeiNam");
+
+    // 저장소 링크는 **개인 프로필이 아니라 이 저장소**를 가리켜야 한다.
+    const repo = footer.querySelector<HTMLAnchorElement>(
+      'a[href="https://github.com/TeiNam/aws-mysql-monitor"]',
+    );
+    if (repo === null) {
+      throw new Error(`저장소 링크가 없다: ${footer.innerHTML}`);
+    }
+    // 새 탭으로 열면서 opener 를 넘기지 않는다(탭 탈취 방지).
+    expect(repo.rel).toContain("noopener");
+
+    // **없는 허가를 준 것처럼 적지 않는다.** `LICENSE` 가 없는 동안은 README 의 문구와
+    // 같아야 한다 — 화면에 `MIT` 가 뜨면 공개 저장소에서 되돌리기 어렵다.
+    expect(footer.textContent).toContain("All rights reserved");
+    expect(footer.textContent).not.toMatch(/\bMIT\b|Apache/);
+  });
+});
+
+/**
  * 플릿 메트릭 화면. **한 줄에 두 출처가 섞인다** — CloudWatch(15분)와 자체 수집(5초).
  * 타입만 맞으면 컴파일은 통과하므로, 표가 두 응답의 필드를 실제로 읽는지 DOM 에서 본다.
  */
