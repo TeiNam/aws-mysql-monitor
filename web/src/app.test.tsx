@@ -28,6 +28,8 @@ let unauthorized = false;
 let authMode = "local-token";
 /** 서버가 조회 상한에 걸려 **0건**을 준 상황. */
 let emptyButTruncated = false;
+/** 서버가 커서로 두 창을 나눠 주는 상황. 첫 창이 상한이고 두 번째가 끝이다. */
+let pagedWindows = false;
 /** 설정을 읽지 못한 상황(손상된 문서·저장소 장애). */
 let settingsLoadError: string | null = null;
 
@@ -64,6 +66,13 @@ const RECORD = {
   has_plan: true,
   abandoned_reason: null,
 };
+
+/** 창 이어 붙이기 테스트용 행. `thread_id` 로 어느 창에서 왔는지 구분한다. */
+const pagedRecord = (threadId: number) => ({
+  ...RECORD,
+  record_id: `${INSTANCE}:${threadId}:1700000000`,
+  thread_id: threadId,
+});
 
 function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
@@ -118,6 +127,20 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   if (url.startsWith("/api/slow-queries") || url.startsWith("/api/plans")) {
     if (emptyButTruncated) {
       return Promise.resolve(json({ items: [], next_cursor: null, has_more: true, total: 0, server_now_ms: NOW_MS }));
+    }
+    if (pagedWindows) {
+      // 커서가 붙어 왔으면 **두 번째 창**이다. 여기서 끝난다.
+      const resumed = url.includes("cursor=");
+      const rows = resumed ? [pagedRecord(987654)] : [pagedRecord(111111), pagedRecord(222222)];
+      return Promise.resolve(
+        json({
+          items: rows,
+          next_cursor: resumed ? null : "signed-cursor-1",
+          has_more: !resumed,
+          total: rows.length,
+          server_now_ms: NOW_MS,
+        }),
+      );
     }
     return Promise.resolve(json({ items: [RECORD], next_cursor: null, has_more: false, total: 1, server_now_ms: NOW_MS }));
   }
@@ -328,6 +351,7 @@ beforeEach(() => {
   unauthorized = false;
   authMode = "local-token";
   emptyButTruncated = false;
+  pagedWindows = false;
   settingsLoadError = null;
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
@@ -412,6 +436,26 @@ describe("MySQL Monitor", () => {
     await renderApp("/mysql");
     expect(await screen.findByText(/조회 상한에 걸려/)).toBeDefined();
     expect(screen.queryByText(/조회 구간\(최근 24시간\)에 기록이 없다/)).toBeNull();
+  });
+
+  /**
+   * **한 창이 끝이 아니다.**
+   *
+   * 예전에는 `limit=500` 이 천장이라 표가 그 지점에서 멈췄고, 화면은 그걸 "이게 전부" 로
+   * 보여줬다. 서버가 `next_cursor` 를 주므로 끝에 다가가면 다음 창을 이어 붙여야 한다 —
+   * 커서를 안 보내면 이 테스트가 1창(2건)에서 멈춘다.
+   */
+  it("서버가 커서를 주면 다음 창을 이어 붙인다", async () => {
+    pagedWindows = true;
+    await renderApp("/mysql");
+    // 첫 창의 행.
+    expect(await screen.findByText("111111")).toBeDefined();
+    // 두 번째 창의 행이 **같은 표에** 이어 붙는다. 커서를 안 보내면 여기서 멈춘다.
+    expect(await screen.findByText("987654")).toBeDefined();
+    // 다 읽었으면 상한 경고를 지운다 — 계속 띄우면 "더 있다" 가 늑대소년이 된다.
+    await waitFor(() => {
+      expect(screen.queryByText(/조회 상한에 걸렸다/)).toBeNull();
+    });
   });
 });
 

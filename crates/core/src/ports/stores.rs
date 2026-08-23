@@ -78,11 +78,17 @@ pub trait SlowQueryStore: Send + Sync {
         window_ms: i64,
     ) -> Result<Option<SlowQuery>>;
 
+    /// 구간 안의 레코드를 **최신순으로**.
+    ///
+    /// `before` 는 페이지 재개 지점이다 — 그 **순서 키 이하**만 읽는다
+    /// ([`crate::slow_query::list_order_key`]). 경계값을 포함하는 이유는 같은 순서 키가
+    /// 인스턴스마다 하나씩 있을 수 있어서다. 그 갈래는 호출부가 인스턴스 id 로 가른다.
     async fn list_by_instance(
         &self,
         instance: &InstanceId,
         range: TimeRange,
         limit: usize,
+        before: Option<&str>,
     ) -> Result<Vec<SlowQuery>>;
 
     /// 희소 GSI 로 진행 중 레코드를 조회한다 (고아 정리, F4).

@@ -185,6 +185,7 @@ impl SlowQueryStore for FakeSlowQueryStore {
         instance: &InstanceId,
         range: TimeRange,
         limit: usize,
+        before: Option<&str>,
     ) -> Result<Vec<SlowQuery>> {
         let mut out: Vec<SlowQuery> = self
             .items
@@ -192,9 +193,14 @@ impl SlowQueryStore for FakeSlowQueryStore {
             .unwrap()
             .values()
             .filter(|e| e.instance_id == *instance && range.contains(e.started_at_ms))
+            // **실제 저장소와 같은 규칙으로 자른다.** 어댑터는 정렬 키 사전순으로
+            // 범위를 좁히므로 페이크가 `started_at_ms` 숫자로 자르면 페이지 경계가
+            // 갈리고, 단위 테스트가 통과하면서 프로덕션만 틀린다.
+            .filter(|e| before.is_none_or(|b| e.list_order_key().as_str() <= b))
             .cloned()
             .collect();
-        out.sort_by_key(|e| std::cmp::Reverse(e.started_at_ms));
+        // 어댑터의 `scan_index_forward(false)` 와 같은 순서다 — 정렬 키 사전순 내림.
+        out.sort_by_cached_key(|e| std::cmp::Reverse(e.list_order_key()));
         out.truncate(limit);
         Ok(out)
     }

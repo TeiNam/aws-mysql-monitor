@@ -33,11 +33,78 @@ pub struct Cursor {
     pub sub: String,
     /// 정규화된 필터 집합의 해시.
     pub filters_hash: String,
-    /// DynamoDB `LastEvaluatedKey` 를 문자열로 직렬화한 것.
+    /// 재개 지점([`Position::encode`]). **문자열로 들고 있는다** — 서명·왕복이 내용을
+    /// 해석하지 않아야 형식을 바꿀 때 여기가 안 깨진다.
     ///
     /// 핫 티어만 구현했다 — 콜드(Athena) 단계는 아직 없다([05 §8.3] 백필과 별개).
     pub position: String,
     pub expires_at_ms: EpochMs,
+}
+
+/// 커서가 가리키는 **총순서의 한 점**.
+///
+/// # `LastEvaluatedKey` 가 아니다
+///
+/// 목록 조회는 인스턴스 N대에 팬아웃해 전역 정렬한다. 저장소 재개 키 하나로는 그 위치를
+/// 표현할 수 없고, N개를 담으면 커서가 인스턴스 수에 비례해 커지며 인스턴스가 추가·삭제
+/// 되는 순간 뜻을 잃는다.
+///
+/// 대신 **정렬 순서의 좌표**를 담는다 — 인스턴스 수와 무관하고, 페이지를 넘기는 사이에
+/// 들어온 새 행은 1페이지에만 나타난다(조사 도구에서 그게 맞는 방향이다).
+///
+/// 총순서는 `(순서 키 내림, 인스턴스 id 오름)` 이다. 순서 키만으로는 총순서가 아니다 —
+/// 같은 `(started_at_ms, thread_id)` 가 인스턴스마다 하나씩 있을 수 있고, 그러면 경계에서
+/// 어느 쪽이 앞인지 정해지지 않아 행이 중복되거나 사라진다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Position {
+    pub started_at_ms: EpochMs,
+    pub thread_id: u64,
+    pub instance_id: String,
+}
+
+impl Position {
+    /// 저장소 범위 조회에 쓰는 정렬 키 상한.
+    pub fn order_key(&self) -> String {
+        dbmon_core::slow_query::list_order_key(self.started_at_ms, self.thread_id)
+    }
+
+    /// `<started_at_ms>|<thread_id>|<instance_id>`.
+    ///
+    /// 인스턴스 id 를 **맨 뒤에** 둔다. 앞의 둘은 숫자라 `|` 를 가질 수 없고, 뒤는 무엇이
+    /// 들어와도 `splitn` 이 살아남는다([`Cursor::encode`] 와 같은 이유).
+    pub fn encode(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.started_at_ms, self.thread_id, self.instance_id
+        )
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.splitn(3, '|');
+        let (ms, thread_id, instance_id) = (parts.next()?, parts.next()?, parts.next()?);
+        if instance_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            started_at_ms: ms.parse().ok()?,
+            thread_id: thread_id.parse().ok()?,
+            instance_id: instance_id.to_string(),
+        })
+    }
+
+    /// 이 행이 커서 **뒤**인가 — 즉 다음 페이지에 실려야 하는가.
+    ///
+    /// 저장소는 경계값을 **포함**해 돌려주므로(같은 순서 키가 인스턴스마다 있을 수 있다)
+    /// 커서 자신과 그보다 앞인 행을 여기서 걸러낸다.
+    pub fn is_before(&self, order_key: &str, instance_id: &str) -> bool {
+        use std::cmp::Ordering;
+        match order_key.cmp(self.order_key().as_str()) {
+            // 순서 키가 작다 = 더 오래됐다 = 뒤 페이지.
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => instance_id > self.instance_id.as_str(),
+        }
+    }
 }
 
 /// 커서 검증 실패. **왜 실패했는지 클라이언트에 알리지 않는다** — 위조 시도에
@@ -305,6 +372,78 @@ mod tests {
             let back = Cursor::decode(&c.encode(KEY), KEY, &c.sub, &c.filters_hash, NOW);
             assert_eq!(back.as_ref().map(|b| b.position.as_str()), Ok(position));
         }
+    }
+
+    fn pos(ms: EpochMs, thread_id: u64, instance: &str) -> Position {
+        Position {
+            started_at_ms: ms,
+            thread_id,
+            instance_id: instance.into(),
+        }
+    }
+
+    #[test]
+    fn position_round_trips() {
+        for p in [
+            pos(NOW, 42, "123456789012/ap-northeast-2/db-a"),
+            pos(0, 0, "x"),
+            pos(i64::MAX, u64::MAX, "a/b/c"),
+        ] {
+            assert_eq!(Position::parse(&p.encode()).as_ref(), Some(&p));
+        }
+    }
+
+    #[test]
+    fn malformed_position_is_rejected_without_panicking() {
+        for raw in [
+            "",
+            "|",
+            "1|2",
+            "a|2|inst",
+            "1|b|inst",
+            "1|2|",
+            &"9".repeat(40),
+        ] {
+            assert!(Position::parse(raw).is_none(), "{raw:?} 를 통과시켰다");
+        }
+    }
+
+    /// **커서 자신은 다음 페이지에 실리지 않는다.** 저장소가 경계값을 포함해 주므로
+    /// 이 판정이 유일한 방어다 — 빠지면 매 페이지 첫 행이 앞 페이지 마지막 행과 겹친다.
+    #[test]
+    fn the_cursor_row_itself_is_not_on_the_next_page() {
+        let c = pos(NOW, 42, "acct/region/inst-b");
+        let key = c.order_key();
+        assert!(!c.is_before(&key, "acct/region/inst-b"));
+    }
+
+    /// 같은 순서 키를 가진 **다른 인스턴스**의 행은 id 순으로 갈린다.
+    ///
+    /// 이 갈래가 없으면 그 행은 1페이지에서도(정렬이 커서 뒤로 놓아서) 2페이지에서도
+    /// (경계값이라 걸러져서) 빠진다.
+    #[test]
+    fn a_tie_on_another_instance_is_split_by_instance_id() {
+        let c = pos(NOW, 42, "acct/region/inst-b");
+        let key = c.order_key();
+        assert!(c.is_before(&key, "acct/region/inst-c"));
+        assert!(!c.is_before(&key, "acct/region/inst-a"));
+    }
+
+    /// **사전순이 숫자순과 갈리는 자리를 고정한다.**
+    ///
+    /// `thread_id` 는 0 패딩이 아니므로 같은 밀리초에서 `"#6" > "#50"` 이다. 정렬과 저장소
+    /// 범위가 이 순서를 함께 쓰는 것이 페이지네이션의 전제다 — 한쪽만 숫자순으로 바꾸면
+    /// 커서가 `thread_id=50` 일 때 `thread_id=6` 이 어느 페이지에도 없다.
+    #[test]
+    fn ordering_follows_the_sort_key_not_the_number() {
+        let c = pos(NOW, 50, "acct/region/inst");
+        let six = dbmon_core::slow_query::list_order_key(NOW, 6);
+        // 숫자로는 6 < 50 이지만 사전순으로는 `#6` > `#50` — 앞 페이지에 속한다.
+        assert!(six > c.order_key());
+        assert!(!c.is_before(&six, "acct/region/inst"));
+        // 더 오래된 밀리초는 언제나 뒤 페이지다.
+        let older = dbmon_core::slow_query::list_order_key(NOW - 1, 999_999);
+        assert!(c.is_before(&older, "acct/region/inst"));
     }
 
     /// 필터 해시는 **순서에 무관**해야 한다 — 아니면 정당한 재개가 거부된다.
