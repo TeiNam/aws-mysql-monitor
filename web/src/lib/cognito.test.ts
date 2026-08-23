@@ -23,7 +23,7 @@ const config: CognitoConfig = {
   user_pool_id: "ap-northeast-2_AbCdEf",
   client_id: "1h57kf5cpq17m0eml12EXAMPLE",
   region: "ap-northeast-2",
-  domain: "dbmon-dev-319165777726",
+  domain: "dbmon-dev-123456789012",
 };
 
 beforeEach(() => {
@@ -33,7 +33,7 @@ beforeEach(() => {
 describe("hostedUiBase", () => {
   it("접두어만 오면 리전으로 조립한다", () => {
     expect(hostedUiBase(config)).toBe(
-      "https://dbmon-dev-319165777726.auth.ap-northeast-2.amazoncognito.com",
+      "https://dbmon-dev-123456789012.auth.ap-northeast-2.amazoncognito.com",
     );
   });
 
