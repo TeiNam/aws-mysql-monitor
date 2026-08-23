@@ -291,3 +291,52 @@ fn slowlog_iam_scope_matches_what_the_code_reads() {
         "로그 그룹 이름 규칙이 바뀌었다 — IAM 패턴도 함께 고쳐야 한다"
     );
 }
+
+/// **화면이 제시하는 모델을 IAM 이 전부 허용해야 한다.**
+///
+/// 설정 화면의 모델 바로가기 칩은 한 번 누르면 그 값이 저장되고, 그 다음 Tuning 버튼이
+/// `bedrock:InvokeModel` 을 부른다. IAM 목록에 없는 모델을 제시하면 **눌리는데 403 인
+/// 선택지**가 되고, 사용자는 자기가 무엇을 잘못했는지 알 수 없다.
+///
+/// 실제로 그렇게 됐다: 화면은 `claude-opus-5` 를 제시했고 IAM 기본값은 `claude-sonnet-5`
+/// 하나였다. 배포는 `enable_ai_tuning=false` 라 정책 자체가 없어서 `AccessDenied` 였다.
+///
+/// 두 목록이 다른 언어·다른 레포 영역에 있으므로 컴파일러가 검사하지 않는다 — 여기서 본다.
+#[test]
+fn bedrock_iam_covers_the_models_the_ui_offers() {
+    let ui = std::fs::read_to_string("../../web/src/components/settings/AiSection.tsx")
+        .expect("AiSection.tsx");
+    let vars = std::fs::read_to_string("../../infra/layers/40-compute/variables.tf")
+        .expect("variables.tf");
+
+    // `KNOWN_MODELS = [ … ]` 안의 문자열 리터럴을 뽑는다.
+    let block = ui
+        .split_once("const KNOWN_MODELS")
+        .expect("KNOWN_MODELS 가 없다 — 화면의 모델 목록 이름이 바뀌었다")
+        .1
+        .split_once(']')
+        .expect("KNOWN_MODELS 배열이 닫히지 않았다")
+        .0;
+    let offered: Vec<&str> = block
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| s.contains('.'))
+        .collect();
+    assert!(
+        offered.len() >= 2,
+        "화면 모델 목록을 못 읽었다 (파싱 결과 {offered:?}) — 이 검사가 무력해졌다"
+    );
+
+    let default_block = vars
+        .split_once("variable \"bedrock_model_ids\"")
+        .expect("bedrock_model_ids 변수가 없다")
+        .1;
+    for model in &offered {
+        assert!(
+            default_block.contains(model),
+            "화면은 `{model}` 을 제시하는데 `bedrock_model_ids` 기본값에 없다 — \
+             그 칩을 누르면 Tuning 이 403 이다"
+        );
+    }
+}

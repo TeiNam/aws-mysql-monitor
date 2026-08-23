@@ -1,4 +1,4 @@
-import { Check, Clock, Database, Pause, Play, RefreshCw, Server, X } from "lucide-react";
+import { Clock, Database, Pause, Play, RefreshCw, Server } from "lucide-react";
 import { useInstances } from "../hooks/useInstances";
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
@@ -10,6 +10,7 @@ import {
 } from "../components/CollectorControls";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { EnvChip } from "../components/Shell";
+import { InstanceCollectionStatus } from "../components/InstanceCollectionStatus";
 import {
   CELL_X,
   BTN,
@@ -30,7 +31,6 @@ import {
   canControlScope,
   envScope,
   instanceScope,
-  isInstancePaused,
   supportsScopedPause,
 } from "../lib/pause";
 import type { CollectorStatus, InstanceView } from "../lib/types";
@@ -132,28 +132,7 @@ export function RDSInstancePage() {
                           </span>
                         </td>
                         <td className={TD}>
-                          {/* 색만으로 구분하지 않는다 — 아이콘과 글자를 함께 둔다.
-                              **정지를 따로 말한다.** 멈춰 있는데 "수집" 이라고 적으면
-                              표가 거짓말을 하고, "제외" 로 접으면 필터에서 빠진 것과
-                              사람이 멈춘 것을 구분할 수 없다(대응이 다르다). */}
-                          {i.state === "pending" ? (
-                            // **"제외" 와 다르다.** 등록만 됐고 사람이 아직 시작하지 않았다.
-                            <span className="inline-flex items-center gap-1 text-blue-700">
-                              <Clock className="h-4 w-4" /> 대기
-                            </span>
-                          ) : !i.collectible ? (
-                            <span className="inline-flex items-center gap-1 text-gray-500">
-                              <X className="h-4 w-4" /> 제외
-                            </span>
-                          ) : isInstancePaused(pausedScopes, i) ? (
-                            <span className="inline-flex items-center gap-1 text-amber-700">
-                              <Pause className="h-4 w-4" /> 정지
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-green-700">
-                              <Check className="h-4 w-4" /> 수집
-                            </span>
-                          )}
+                          <InstanceCollectionStatus instance={i} pausedScopes={pausedScopes} />
                         </td>
                         <td className={TD}>
                           <span className="flex items-center gap-1">
