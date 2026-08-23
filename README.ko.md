@@ -143,6 +143,34 @@ CloudWatch(CPU·여유 메모리·스토리지, 15분) 옆에 자체 수집(연�
 [`infra/layers/`](infra/) 에 있고, 수동 절차를 다 적어 둔 이유는 그 Terraform 이
 무엇을 하는지 검토할 수 있어야 하기 때문이다.
 
+## 0. 설치 경로는 둘이다
+
+§1~8 은 **손으로 만드는** 경로다 — 콘솔·CLI 로 리소스를 하나씩 만든다. 이게 기준이다:
+앱이 무엇을 필요로 하고 각 권한을 왜 좁혔는지가 그대로 보인다.
+
+**Terraform** 경로도 있다. 같은 리소스를 만들지만 레이어별로 state 를 나눠 두고, 관리자가
+실제로 쓰는 것은 이쪽이다.
+
+| | 손으로 (§1~8) | Terraform (`infra/`) |
+|---|---|---|
+| 언제 | 평가용, 환경 하나, 또는 조직에 Terraform 이 없을 때 | 반복 가능하게, 환경 여러 개 |
+| 수고 | 리소스 20여 개를 손으로 | 레이어별 `terraform apply` |
+| 드리프트 | 사람이 관리한다 | state 가 관리한다 |
+| 레이어 | — | `00-bootstrap` → `10-foundation` → `(20/30/50/60)` → `40-compute` |
+
+레이어별 명령과 필수 변수는 [`infra/README.md`](infra/README.md) 에 있다. 그 경로에서 물리는
+두 가지만 여기 적는다:
+
+- **레이어 순서는 권고가 아니다.** `40-compute` 는 `10-foundation` 의 state 객체를 직접 읽으므로,
+  먼저 돌리면 `apply` 가 아니라 **`plan` 이 죽는다.**
+- **apply 입력값을 파일로 둔다.** Terraform state 는 루트 모듈 입력 변수를 저장하지 않는다.
+  한 번 잃으면 살아 있는 리소스에서 역구성해야 하고, `db_auth_resource_ids` 를 빠뜨린 apply 는
+  `dbuser:*/dbmon` 으로 폴백해 **계정의 모든 인스턴스에 DB 인증을 조용히 허용한다.**
+  `infra/layers/40-compute/dev.tfvars.example` 를 채워 두고 항상 `-var-file` 로 apply 한다.
+
+어느 경로든 §3(IAM)·§4(네트워크)를 꼼꼼히 읽는다 — **대상 DB 의 보안 그룹은 두 경로 모두
+이 프로젝트가 관리하지 않는다.**
+
 ## 1. 이미지
 
 `.github/workflows/release.yml` 이 `main` 푸시마다 발행한다.
@@ -257,8 +285,9 @@ docker run --rm dbmon:dev --version
 
 ```json
 { "Sid": "DiscoveryReadOnly", "Effect": "Allow",
-  "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters","rds:DescribeDBEngineVersions",
+  "Action": ["rds:DescribeDBInstances","rds:DescribeDBClusters",
              "rds:DescribeDBParameters","rds:DescribeDBParameterGroups",
+             "rds:DescribeDBClusterParameters","rds:DescribeEvents",
              "rds:DescribePendingMaintenanceActions","rds:ListTagsForResource"],
   "Resource": "*" }
 ```
@@ -274,31 +303,66 @@ docker run --rm dbmon:dev --version
 
 ```json
 { "Effect": "Allow", "Action": ["rds-db:connect"],
-  "Resource": "arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:*/dbmon" }
+  "Resource": ["arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:db-ABC123…/dbmon",
+               "arn:aws:rds-db:ap-northeast-2:123456789012:dbuser:cluster-XYZ789…/dbmon"] }
 ```
 
-`dbuser:*/dbmon` 은 "아무 인스턴스의 `dbmon` 계정" 이다. 비프로덕션 계정에서는
-`db-XXXX` 리소스 ID 를 열거하는 편이 낫다(`var.db_auth_resource_ids`) — 개발 배포가
-프로덕션 인스턴스에 닿지 못하게 된다.
+**리소스 ID 를 열거한다.** `dbuser:*/dbmon` 은 "이 계정 **모든** 인스턴스의 `dbmon` 계정"
+이고 프로덕션을 포함한다. Terraform 변수 `db_auth_resource_ids` 는 비워 두면 그 와일드카드로
+폴백하므로, 그 값을 빠뜨린 apply 가 조용히 범위를 넓힌다.
 
-> 여기 들어가는 것은 인스턴스 이름이 아니라 **`DbiResourceId`**(`db-ABC123…`) 다.
-> `aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'`
+> 여기 들어가는 것은 인스턴스 **이름이 아니다.**
+>
+> ```bash
+> # RDS 인스턴스 → DbiResourceId (db-…)
+> aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]' --output text
+> # Aurora → DbClusterResourceId (cluster-…)
+> aws rds describe-db-clusters  --query 'DBClusters[].[DBClusterIdentifier,DbClusterResourceId]' --output text
+> ```
+>
+> **Aurora 멤버는 *클러스터* 리소스 ID 로 인증한다.** 멤버의 `DbiResourceId` 를 쓰면 생성한
+> 토큰이 무효가 되고 `1045 Access denied` 로 실패한다 — 비밀번호가 틀렸을 때와 **같은
+> 오류**라서 원인을 찾는 데 몇 시간이 든다.
 
 ### 3.4 메트릭·슬로우로그
 
 ```json
-{ "Sid": "Metrics", "Effect": "Allow",
-  "Action": ["cloudwatch:GetMetricData"], "Resource": "*",
-  "Condition": { "StringEquals": { "cloudwatch:namespace": "AWS/RDS" } } }
+{ "Sid": "PutOwnMetrics", "Effect": "Allow",
+  "Action": ["cloudwatch:PutMetricData"], "Resource": "*",
+  "Condition": { "StringEquals": { "cloudwatch:namespace": "dbmon" } } }
 ```
 
 ```json
-{ "Sid": "SlowLogRead", "Effect": "Allow", "Action": ["logs:FilterLogEvents"],
-  "Resource": ["arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery:*",
-               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery"] }
+{ "Sid": "MetricsRead", "Effect": "Allow",
+  "Action": ["cloudwatch:GetMetricData"], "Resource": "*" }
 ```
 
-슬로우로그에는 **쿼리 리터럴이 들어 있다.** `/aws/rds/instance/*/slowquery` 는
+> ⚠ **`GetMetricData` 에 네임스페이스 조건을 걸지 않는다.** `cloudwatch:namespace` 조건 키는
+> `PutMetricData` 요청에는 실려 오지만 `GetMetricData` 에는 **실려 오지 않는다.** 그래서 그
+> 조건이 붙은 문은 절대 매치되지 않고 결과가 `implicitDeny` 다. 이 README 의 예전 판은 여기에
+> `StringEquals { "cloudwatch:namespace": "AWS/RDS" }` 를 싣고 있었다 — 그걸 따라 설치하면
+> CloudWatch 열이 영구히 비고 화면은 권한이 없다고 표시한다. `aws iam
+> simulate-principal-policy` 로 확인한다(로컬 개발은 관리자로 돌기 때문에 이 함정이 보이지 않는다).
+>
+> 노출 범위를 정직하게 적는다: 이 롤은 계정의 **모든** CloudWatch 지표를 읽을 수 있다. IAM
+> 정책으로는 좁힐 수 없고 권한 경계나 SCP 로 좁힌다. 코드가 실제로 조회하는 것은
+> `dbmon_core::cw_metrics` 의 카탈로그가 전부이고 `AWS/RDS` 뿐이다.
+
+```json
+{ "Sid": "SlowLogRead", "Effect": "Allow", "Action": ["logs:FilterLogEvents"],
+  "Resource": ["arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/instance/*/slowquery:*",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/cluster/*/slowquery",
+               "arn:aws:logs:ap-northeast-2:123456789012:log-group:/aws/rds/cluster/*/slowquery:*"] }
+```
+
+> ⚠ **`cluster` 형태가 Aurora 를 살린다.** Aurora 는 슬로우로그를 **클러스터 단위** 그룹
+> (`/aws/rds/cluster/<클러스터>/slowquery`)에 쓰고 **멤버마다 스트림이 하나**다. RDS 는
+> `/aws/rds/instance/<인스턴스>/slowquery` 다. `cluster` 형태를 빼면 Aurora 백필이 한 번도
+> 돌지 않고, 그 실패는 조용하다 — 인스턴스는 수집되는데 `rows_examined` 만 계속 빈다(정확
+> 지표는 슬로우로그에만 있다).
+
+슬로우로그에는 **쿼리 리터럴이 들어 있다.** `/aws/rds/{instance,cluster}/*/slowquery` 는
 `/aws/rds/*` 보다 훨씬 좁다 — 후자는 감사 로그(모든 문장이 남는다)까지 포함한다.
 
 로그 그룹이 아직 없으면(슬로우로그가 한 번도 쓰이지 않았거나 내보내기가 꺼졌거나)
@@ -435,8 +499,27 @@ ECS **실행** 롤은 이미지를 끌고 컨테이너 로그를 쓴다:
 |---|---|
 | 태스크 → RDS | DB 보안그룹에 **태스크 보안그룹 출처로 TCP 3306** 허용(CIDR 아님). 보안그룹 참조는 IP 가 바뀌어도 살아 있다. |
 | 태스크 → AWS API | NAT 게이트웨이, 또는 인터페이스 VPC 엔드포인트: `dynamodb`(게이트웨이), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, `s3`. 엔드포인트는 NAT 데이터 요금을 없애고 트래픽을 인터넷에서 뺀다. |
-| ALB → 태스크 | 타깃 그룹 8080, 헬스체크 경로 `/healthz`. |
-| 태스크 인바운드 | ALB 보안그룹에서만. 그 밖은 없다. |
+| ALB → 태스크 | 타깃 그룹 8080, 헬스체크 경로 **`/readyz`**. |
+| 태스크 인바운드 | ALB 보안그룹, **또는** ALB 없이 쓸 때는 관리자·VPN 보안그룹. 그 밖은 없다. |
+
+**ALB 없이 쓰는 것이 지원되고, 그게 더 싼 기본값이다.** ALB 는 시간당 과금이다. VPN 으로
+닿는 내부 도구라면 컨테이너 포트를 VPN 보안그룹에 열면 된다:
+
+```bash
+aws ec2 authorize-security-group-ingress --group-id <태스크-SG> \
+  --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,\
+UserIdGroupPairs=[{GroupId=<VPN-SG>,Description='from VPN to container port'}]"
+
+# 태스크의 사설 IP
+TASK=$(aws ecs list-tasks --cluster dbmon --service-name dbmon --query 'taskArns[0]' --output text)
+aws ecs describe-tasks --cluster dbmon --tasks "$TASK" \
+  --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text
+```
+
+> ⚠ **두 헬스체크를 바꿔 쓰면 안 된다.** **컨테이너** 헬스체크는 `/healthz`, **타깃 그룹**은
+> `/readyz` 다. standby 워커는 살아 있으면서 `/readyz` 에 503 을 준다(F1) — 컨테이너 체크를
+> `/readyz` 로 두면 ECS 가 standby 를 영원히 죽이고 다시 띄운다. 타깃 그룹을 `/healthz` 로
+> 두면 준비되지 않은 워커로 트래픽이 간다.
 
 **ALB 유휴 타임아웃은 300초 이상이어야 한다.** WebSocket 이 실시간 메트릭을 나르고, AI
 튜닝 요청이 30~100초 걸린다. 기본값 60초면 UI 가 계속 재접속하고 튜닝 버튼이 504 를
@@ -467,6 +550,7 @@ Aurora 는 발견한 인스턴스의 **라이터 엔드포인트**(클러스터 
       { "name": "DBMON__STORAGE__DATA_TABLE",      "value": "dbmon-data" },
       { "name": "DBMON__STORAGE__CONFIG_TABLE",    "value": "dbmon-config" },
       { "name": "DBMON__COLLECTOR__MONITOR_DB_USER", "value": "dbmon" },
+      { "name": "DBMON__COLLECTOR__LITERAL_POLICY",  "value": "masked" },
       { "name": "DBMON__DISCOVERY__ALLOWED_VPC_IDS", "value": "vpc-0123456789abcdef0" }
     ],
     "secrets": [
@@ -531,6 +615,17 @@ Aurora 는 발견한 인스턴스의 **라이터 엔드포인트**(클러스터 
 마스킹은 **단방향**이다. 나중에 `masked` 로 조여도 이미 저장된 원문은 남고, 반대로 풀어도
 이미 마스킹된 것은 복구되지 않는다. **앞으로 저장되는 레코드에만** 적용된다. 실행계획
 JSON 은 이 설정과 무관하게 항상 마스킹된다.
+
+> ⚠ **런타임 이미지에는 설정 파일이 없다.** 바이너리와 `web/dist` 만 담으므로 `environment` 에
+> 없는 값은 코드 기본값이 된다. `local/dbmon-aws.toml` 은 로컬 실행에만 적용된다 — 거기에만
+> 적어 둔 값은 배포에서 조용히 무시된다.
+>
+> 특히 물리는 것이 `DBMON__COLLECTOR__LITERAL_POLICY` 다. 기본값 `masked` 는 SQL 리터럴을 `?`
+> 로 바꿔 저장하고 **되돌릴 수 없다.** 원문이 필요하면 `full_restricted` 로 둔다(operator 이상
+> + 열람 시 감사 로그).
+>
+> 앱이 모르는 키를 주지 않는다 — 설정이 `deny_unknown_fields` 라 남는 키 하나가 무시되는 게
+> 아니라 **기동을 실패시킨다.**
 
 ## 6. DB 계정 (인스턴스별)
 
@@ -724,6 +819,37 @@ ECS 가 standby 를 영원히 죽이고 다시 띄운다. `/readyz` 를 쓰는 �
 **자체 CloudWatch 지표를 발행하는 코드는 아직 없다.** IAM 정책에 `PutMetricData` 가 있지만
 부르는 곳이 없어서 `collect_stale` 에 대한 CloudWatch 경보가 없다 — 이미 쓰는 신서틱
 체크에서 `/readyz` 를 폴링한다. FR-OPS-09 지표 발행은 로드맵에 있다.
+
+## 9. 안 될 때
+
+아래 표의 모든 줄은 실제 배포에서 겪은 것이다.
+
+| 증상 | 원인 | 볼 곳 |
+|---|---|---|
+| 태스크가 즉시 종료 | x86 이미지 (태스크는 Graviton/arm64) | 태스크 정지 사유 |
+| 기동 즉시 설정 오류로 종료 | 앱이 모르는 env 키 (`deny_unknown_fields`) | 로그 첫 줄 |
+| prd 아닌 환경에서 기동 거부 | `DBMON__DISCOVERY__ALLOWED_VPC_IDS` 가 비었다 (T-37) | 로그 |
+| 모든 요청이 401 | 공유 토큰이 주입되지 않았다 | `GET /api/auth/config` 의 `mode` |
+| SQL 이 전부 `?` | `LITERAL_POLICY` 를 안 줘서 코드 기본값 `masked` | 레코드의 `literal_policy` |
+| CloudWatch 열이 전부 `—` | `GetMetricData` 에 네임스페이스 조건 (§3.4) | `aws iam simulate-principal-policy` |
+| Aurora 만 `rows_examined` 가 빈다 | 슬로우로그 IAM 에 `cluster` 형태가 없다 (§3.4) | 백필 로그의 `no_source_instances` |
+| Tuning 이 `AccessDenied` | `bedrock:InvokeModel` 이 없거나 그 모델이 열거되지 않았다 | 화면에 뜨는 오류 원문 |
+| IAM DB 인증이 `1045` | Aurora 멤버의 `DbiResourceId` 를 클러스터 것 대신 썼다 (§3.3) | 정책의 `dbuser:` 값 |
+| 대상 DB 접속 타임아웃 | 대상 DB 보안그룹에 태스크 보안그룹 인바운드가 없다 | §4 |
+| standby 워커가 계속 재시작 | **컨테이너** 헬스체크가 `/readyz` 를 본다 | §4 |
+| 커서 페이지네이션이 1페이지에서 멈춘다 | 예전 빌드 — 커서의 필터 해시에 해석된 시간 구간이 들어 있었다 | 응답의 `next_cursor` |
+
+알아 둘 진단 두 개:
+
+```bash
+curl -s "$URL/readyz" | jq       # config_loaded / storage_ok / kms_denied / auth_mode_supported
+aws iam simulate-principal-policy --policy-source-arn <태스크-롤-ARN> \
+  --action-names cloudwatch:GetMetricData rds:DescribeDBInstances logs:FilterLogEvents \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text
+```
+
+**시뮬레이터가 권한 문제를 볼 수 있는 유일한 방법인 경우가 있다.** 로컬 개발은 관리자
+자격증명으로 돌기 때문에 조건 키 실수가 보이지 않는다.
 
 ## 로컬 개발
 
