@@ -301,36 +301,26 @@ impl TuningService {
     }
 }
 
-/// 분석할 테이블. 플랜의 참조 목록에서 만든다.
+/// 분석할 테이블. 플랜의 참조 목록을 **SQL 의 별칭 표로 풀어서** 만든다.
 ///
-/// # 별칭 주의
+/// # 플랜에는 별칭만 있다
 ///
-/// 플랜의 `table_name` 은 **별칭일 수 있다**(`FROM orders o` → `"o"`). 그런 이름은
-/// `information_schema` 에 없으므로 명세가 비고, 검증이 "스키마를 못 가져왔다" 를
-/// 권고에 적는다. SQL 파서 폴백은 [17](../../../docs/17-roadmap-tasks.md) M10-2 다.
+/// `EXPLAIN FORMAT=JSON` 의 `table_name` 은 별칭이고, `attached_condition` 의 3단 참조조차
+/// `스키마 . 별칭 . 컬럼` 이다(실측). 그래서 `referenced_tables` 가 `["shop.a", "shop.c"]`
+/// 로 저장돼 있었고, `information_schema` 에서 `shop.a` 를 찾다 못 찾아 **별칭을 쓴 쿼리는
+/// 전부 스키마·인덱스·카디널리티 없이 분석됐다.** 실제 SQL 은 대부분 별칭을 쓴다.
+///
+/// 조용히 degrade 되는 것이 이 결함의 성질이었다 — 모델이 SQL 원문과 플랜의 인덱스 이름
+/// 으로 그럴듯한 권고를 만들어 냈고, 화면은 "스키마를 못 가져왔다" 만 작게 적었다.
+///
+/// # SQL 이 없으면 예전처럼 동작한다
+///
+/// 리터럴 정책이 `off` 면 `sql_text` 가 없다. 그때는 플랜 이름을 그대로 쓴다 — 별칭이면
+/// 명세가 비고 그 사실이 권고에 적힌다(지금까지의 동작).
 fn wanted_tables(record: &SlowQuery) -> Vec<QualifiedTable> {
-    let default_schema = record.schema_name.clone();
-    let mut out: Vec<QualifiedTable> = Vec::new();
-    for raw in &record.plan.referenced_tables {
-        let (schema, name) = match raw.split_once('.') {
-            Some((s, n)) => (s.to_string(), n.to_string()),
-            // 스키마를 모르면 실행 당시의 기본 스키마다. 그것도 없으면 조회할 수 없다.
-            None => match &default_schema {
-                Some(s) => (s.clone(), raw.clone()),
-                None => continue,
-            },
-        };
-        if schema.is_empty() || name.is_empty() {
-            continue;
-        }
-        let t = QualifiedTable::new(schema, name);
-        if !out.contains(&t) {
-            out.push(t);
-        }
-        if out.len() >= MAX_TABLES {
-            break;
-        }
-    }
+    let mut out = dbmon_core::tuning::resolved_tables(record);
+    // 토큰이 선형으로 늘기 때문에 상한을 둔다. 걸리면 `tables_truncated` 로 말한다.
+    out.truncate(MAX_TABLES);
     out
 }
 
@@ -427,6 +417,49 @@ mod tests {
             without.is_empty(),
             "스키마를 알 수 없는 테이블을 조회 대상에 넣었다"
         );
+    }
+
+    /// **플랜이 준 별칭을 실제 테이블로 옮긴다.**
+    ///
+    /// 이게 없으면 `information_schema` 에서 `shop.a` 를 찾다 못 찾고, 별칭을 쓴 쿼리는
+    /// 전부 스키마·인덱스·카디널리티 **없이** 분석된다. 조용히 degrade 되는 것이 이
+    /// 결함의 성질이었다 — 모델이 SQL 원문과 플랜의 인덱스 이름으로 그럴듯한 권고를
+    /// 만들어 냈다(실배포에서 그렇게 돌고 있었다).
+    #[test]
+    fn plan_aliases_resolve_to_the_real_tables() {
+        let mut q = record(&["shop.a", "shop.c"], Some("shop"));
+        q.sql_text = Some(
+            "SELECT count ( * ) FROM order_items a \
+             STRAIGHT_JOIN customers c ON c . id % ? = a . id % ?"
+                .into(),
+        );
+        assert_eq!(
+            wanted_tables(&q),
+            vec![
+                QualifiedTable::new("shop", "order_items"),
+                QualifiedTable::new("shop", "customers"),
+            ]
+        );
+    }
+
+    /// SQL 이 스키마를 명시하면 **그쪽을 쓴다.** 플랜의 스키마는 별칭이 속한 곳이고,
+    /// `FROM other.orders o` 면 둘이 다르다.
+    #[test]
+    fn the_schema_from_the_sql_wins_over_the_plan() {
+        let mut q = record(&["shop.o"], Some("shop"));
+        q.sql_text = Some("SELECT * FROM other.orders o WHERE o . id = ?".into());
+        assert_eq!(
+            wanted_tables(&q),
+            vec![QualifiedTable::new("other", "orders")]
+        );
+    }
+
+    /// SQL 이 없으면(정책 `off`) 예전처럼 플랜 이름을 그대로 쓴다 — 기능이 죽지 않는다.
+    #[test]
+    fn without_sql_text_the_plan_name_is_used_as_before() {
+        let mut q = record(&["shop.a"], Some("shop"));
+        q.sql_text = None;
+        assert_eq!(wanted_tables(&q), vec![QualifiedTable::new("shop", "a")]);
     }
 
     #[test]

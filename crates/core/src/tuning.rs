@@ -54,6 +54,63 @@ impl QualifiedTable {
     }
 }
 
+/// 레코드가 실제로 건드린 테이블. **플랜의 별칭을 SQL 로 풀어서** 돌려준다.
+///
+/// # 왜 저장된 값을 그대로 쓰지 않는가
+///
+/// `plan.referenced_tables` 는 `EXPLAIN FORMAT=JSON` 이 말한 이름이고, 그건 **별칭**이다.
+/// `attached_condition` 의 3단 참조조차 `스키마 . 별칭 . 컬럼` 이므로 플랜만으로는 원래
+/// 이름을 알 수 없다(실측). 그래서 `["shop.a", "shop.c"]` 가 저장돼 있었다.
+///
+/// 판정을 **읽는 시점에** 한다. 그러면 이미 저장된 레코드도 함께 고쳐지고(백필이 필요 없다),
+/// 저장된 값은 "플랜이 말한 것" 이라는 뜻을 유지한다.
+///
+/// # 두 소비자가 같은 함수를 쓴다
+///
+/// 튜닝 컨텍스트(`information_schema` 조회 대상)와 플랜 화면의 `참조 테이블` 표시가
+/// 갈리면, 한쪽만 고쳐 놓고 다른 쪽이 계속 별칭을 보여 준다. 이 프로젝트에서 같은 부류가
+/// 여러 번 재발했다.
+///
+/// SQL 이 없으면(리터럴 정책 `off`) 플랜 이름을 그대로 쓴다 — 그때는 명세가 비고 그 사실이
+/// 권고에 적힌다.
+pub fn resolved_tables(q: &crate::slow_query::SlowQuery) -> Vec<QualifiedTable> {
+    // 정규화된 SQL 로도 된다 — canonical 은 리터럴만 `?` 로 바꾸고 이름은 남긴다.
+    let refs = q
+        .sql_text
+        .as_deref()
+        .map(dbmon_normalize::tables::table_refs)
+        .unwrap_or_default();
+
+    let mut out: Vec<QualifiedTable> = Vec::new();
+    for raw in &q.plan.referenced_tables {
+        let (plan_schema, plan_name) = match raw.split_once('.') {
+            Some((s, n)) => (Some(s.to_string()), n.to_string()),
+            None => (None, raw.clone()),
+        };
+        let resolved = dbmon_normalize::tables::resolve(&refs, &plan_name);
+        let name = resolved.map(|r| r.name.clone()).unwrap_or(plan_name);
+        // 스키마는 **SQL 이 명시한 쪽을 우선**한다 — 플랜의 스키마는 별칭이 속한 곳이고
+        // `FROM other.orders o` 면 둘이 다르다.
+        let schema = match resolved
+            .and_then(|r| r.schema.clone())
+            .or(plan_schema)
+            .or_else(|| q.schema_name.clone())
+        {
+            Some(s) => s,
+            // 스키마를 알 수 없으면 `information_schema` 에 물을 수 없다.
+            None => continue,
+        };
+        if schema.is_empty() || name.is_empty() {
+            continue;
+        }
+        let t = QualifiedTable::new(schema, name);
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 /// 인덱스 한 컬럼. **순서가 의미다** — 복합 인덱스의 앞뒤가 성능을 가른다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexColumn {

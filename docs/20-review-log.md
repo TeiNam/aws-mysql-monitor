@@ -3066,3 +3066,75 @@ opus-5 는 여전히 403 이다.
 **API 동작을 바꿨으면 배포하고 실제 엔드포인트를 눌러 본다.** 왕복이 있는 기능은 2페이지
 까지 따라간다. 모의 백엔드가 서버 규칙을 검증하지 않는 픽스처는 그 규칙에 대한 증거가
 아니다 — 커서·서명·해시처럼 서버가 판정하는 것은 프론트 테스트로 증명할 수 없다.
+
+
+---
+
+## 플랜은 별칭만 준다 — 튜닝이 조용히 스키마 없이 돌고 있었다 (2026-08-23)
+
+사용자 지적: "`orders o` 이렇게 되어 있어도 `o` 가 아니라 `orders` 를 읽어와야 하는 거
+아니냐". 맞다. **저장된 값이 별칭이었다.**
+
+```
+refs: ('shop.a', 'shop.c')
+  sql: SELECT count ( * ) FROM order_items a STRAIGHT_JOIN customers c ON …
+```
+
+`information_schema` 에서 `shop.a` 를 찾다가 못 찾으면 `table_specs` 가 빈 목록을
+돌려주고, 튜닝은 **DDL·인덱스·카디널리티 없이** 플랜만으로 분석한다. 실제 SQL 은 대부분
+별칭을 쓰므로 이 기능은 사실상 계속 degraded 모드였다.
+
+### 왜 못 알아챘나 — 그럴듯한 답이 나왔다
+
+방금 실배포에서 생성한 권고는 `order_items`·`idx_items_order`·`119,847행` 을 정확히
+짚었다. 모델이 **SQL 원문과 플랜의 인덱스 이름**으로 만들어 낸 것이다. 스키마를 못
+가져왔다는 사실은 권고 안에 작게 적혀 있었고, 결과가 그럴듯해서 아무도 그 줄을 읽지
+않았다. **degrade 가 조용한 것이 아니라, 그럴듯한 것이 문제다.**
+
+### 실측 — 플랜에는 원래 이름이 없다
+
+```
+EXPLAIN FORMAT=JSON
+SELECT COUNT(*) FROM order_items a STRAIGHT_JOIN customers c ON c.id % 13 = a.id % 13
+
+{"table_name": "a", "access_type": "index", "key": "idx_items_order"}
+{"table_name": "c", "attached_condition": "((`shop`.`c`.`id` % 13) = (`shop`.`a`.`id` % 13))"}
+```
+
+`attached_condition` 의 3단 참조조차 `스키마 . **별칭** . 컬럼` 이다. 그래서
+`walk::schema_hints`(3단 참조에서 스키마를 보강하려고 만든 것)도 별칭을 돌려준다.
+**플랜만으로는 알 수 없다** — SQL 텍스트에서 풀어야 한다.
+
+### 고친 것
+
+`normalize::tables` 를 만들었다. 렉서 토큰에서 `FROM`/`JOIN`/`STRAIGHT_JOIN`/`UPDATE` 뒤의
+`[스키마 .] 테이블 [AS] 별칭` 을 읽어 `별칭 → 테이블` 표를 만든다. SQL 파서를 들이지
+않는다 — 필요한 것이 그 표 한 장이다.
+
+| 다룬 것 | 남긴 천장 |
+|---|---|
+| 별칭·`AS`·스키마 한정·쉼표 목록 | 파생 테이블 내부(`FROM (SELECT …) x` 는 건너뛴다) |
+| 인덱스 힌트·`PARTITION` 절 건너뛰기 | |
+| 절단·깨진 SQL 에 패닉하지 않음 | |
+
+**판정은 읽는 시점에 한다.** 그러면 이미 저장된 4,800건도 함께 고쳐지고(백필 없음),
+저장된 `plan.referenced_tables` 는 "플랜이 말한 것" 이라는 뜻을 유지한다.
+
+`masked` 정책의 canonical 로도 된다 — 리터럴만 `?` 가 되고 테이블 이름·별칭은 남는다.
+정책이 `off` 면 SQL 이 없으므로 예전처럼 동작한다(기능이 죽지 않는다).
+
+### 소비자가 둘이었다
+
+튜닝의 `information_schema` 조회만 고치면 플랜 화면의 `참조 테이블: shop.a, shop.c` 가
+그대로 남는다. `dbmon_core::tuning::resolved_tables` 하나를 두 곳이 쓴다 — 한쪽만 고치는
+것이 이 프로젝트에서 여러 번 재발한 부류다.
+
+### 회귀
+
+`plan_aliases_resolve_to_the_real_tables` 와 `the_schema_from_the_sql_wins_over_the_plan`
+은 해석을 무력화하면 실패하고, **실패 메시지가 별칭을 그대로 보여준다**:
+
+```
+left:  [QualifiedTable { schema: "shop", name: "a" }, … name: "c" }]
+right: [QualifiedTable { schema: "shop", name: "order_items" }, … name: "customers" }]
+```

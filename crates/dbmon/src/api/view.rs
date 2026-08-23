@@ -194,6 +194,11 @@ pub struct PlanView {
     /// 조회 경로가 아직 없으므로 화면이 그 사실을 말해야 한다.
     pub s3_key: Option<String>,
     pub fingerprint: Option<String>,
+    /// **별칭을 푼 실제 테이블**이다 ([`dbmon_core::tuning::resolved_tables`]).
+    ///
+    /// 저장된 `plan.referenced_tables` 는 `EXPLAIN` 이 말한 이름이고 그건 별칭이다
+    /// (`FROM orders o` → `"o"`). 그걸 그대로 보여주면 화면이 `참조 테이블: shop.a, shop.c`
+    /// 라고 적는다 — 사용자가 모르는 이름이다. 튜닝의 스키마 조회와 **같은 함수**를 쓴다.
     pub referenced_tables: Vec<String>,
     /// 어떻게 얻은 플랜인가 (`current` 실행 중 캡처, `rerun` 사후 재실행 등).
     pub source: String,
@@ -215,7 +220,10 @@ impl PlanView {
             format_version: q.plan.format_version.clone(),
             s3_key: q.plan.s3_key.clone(),
             fingerprint: q.plan.fingerprint.clone(),
-            referenced_tables: q.plan.referenced_tables.clone(),
+            referenced_tables: dbmon_core::tuning::resolved_tables(q)
+                .iter()
+                .map(|t| t.qualified())
+                .collect(),
             source: format!("{:?}", q.plan.source).to_lowercase(),
             error: q.plan.error.clone(),
         }
