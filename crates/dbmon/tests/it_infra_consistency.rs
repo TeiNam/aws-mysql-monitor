@@ -164,17 +164,24 @@ fn shard_count_matches_the_design_document() {
     // **`doc.contains("64")` 는 무의미하다.** `64배 개선`·`u64`·`86400초` 에 걸린다.
     // 주입 실험으로 확인: 4·8·16·32·256·1024 로 바꿔도 통과했다.
     // 샤드를 명시하는 문맥을 찾아야 한다.
-    let doc = read("docs/05-collector.md");
+    // **설계 문서는 공개하지 않는다** — `.claude/docs/` 는 gitignore 된다. 클론·CI 에는
+    // 없으므로 부재를 견딘다. 있으면 검사하고, 없으면 아래 2의 거듭제곱 불변식만 본다.
+    //
+    // 문서가 없을 때 조용히 통과하는 것이 마음에 걸리지만, 대안은 둘 다 나쁘다:
+    // 설계 문서를 공개하거나(사용자가 원하지 않는다), CI 를 항상 실패시키거나.
     let n = dbmon_core::ports::stores::SHARD_COUNT;
-    let patterns = [
-        format!("SHARD_COUNT = {n}"),
-        format!("SHARD_COUNT({n})"),
-        format!("샤드 수 = SHARD_COUNT({n})"),
-    ];
-    assert!(
-        patterns.iter().any(|p| doc.contains(p)),
-        "05-collector.md 에 샤드 수 {n} 을 명시하는 문맥이 없다. 찾은 패턴: {patterns:?}"
-    );
+    let doc_path = repo_root().join(".claude/docs/05-collector.md");
+    if let Ok(doc) = std::fs::read_to_string(&doc_path) {
+        let patterns = [
+            format!("SHARD_COUNT = {n}"),
+            format!("SHARD_COUNT({n})"),
+            format!("샤드 수 = SHARD_COUNT({n})"),
+        ];
+        assert!(
+            patterns.iter().any(|p| doc.contains(p)),
+            "05-collector.md 에 샤드 수 {n} 을 명시하는 문맥이 없다. 찾은 패턴: {patterns:?}"
+        );
+    }
     // 2의 거듭제곱이어야 리샤딩이 단순하다.
     assert!(
         n.is_power_of_two(),
@@ -360,13 +367,13 @@ fn bedrock_iam_covers_the_models_the_ui_offers() {
     }
 }
 
-/// **설치 문서(README)의 IAM 정책이 `iam.tf` 와 갈리지 않아야 한다.**
+/// **설치 문서의 IAM 정책이 `iam.tf` 와 갈리지 않아야 한다.**
 ///
-/// `README.md`·`README.ko.md` 는 Terraform 없이 설치하는 사람이 **손으로 옮겨 쓰는** 문서다.
+/// `docs/install.md`·`docs/install.ko.md` 는 손으로 옮겨 쓰는 문서다.
 /// 거기 적힌 정책이 실제와 갈리면 문서를 따른 설치가 조용히 다르게 동작한다 — 권한이 좁으면
 /// 기능이 죽고, 넓으면 그 사실을 아무도 모른다.
 ///
-/// 실제로 갈려 있었다. README 가 이 정책을 싣고 있었다:
+/// 실제로 갈려 있었다. 이 안내가 다음 정책을 싣고 있었다:
 ///
 /// ```json
 /// { "Action": ["cloudwatch:GetMetricData"],
@@ -380,18 +387,20 @@ fn bedrock_iam_covers_the_models_the_ui_offers() {
 /// 정책 JSON 전체를 비교하지는 않는다(형식이 달라 의미 없는 실패가 난다). **의도를 담은
 /// 이름과 함정 경고**가 양쪽에 있는지 본다 — 그게 갈릴 때가 위험한 순간이다.
 #[test]
-fn the_readme_install_guide_matches_the_iam_policies() {
+fn the_install_guide_matches_the_iam_policies() {
     let iam = std::fs::read_to_string("../../infra/layers/40-compute/iam.tf").expect("iam.tf");
     let main_tf =
         std::fs::read_to_string("../../infra/layers/40-compute/main.tf").expect("main.tf");
+    // 설치 안내는 `docs/install*.md` 로 옮겼다 — README 는 링크만 갖는다. 설계 문서와 달리
+    // 이 둘은 **공개 대상**이므로 CI 에도 있고, 없으면 실패하는 것이 맞다.
     let readmes = [
         (
-            "README.md",
-            std::fs::read_to_string("../../README.md").expect("README.md"),
+            "docs/install.md",
+            std::fs::read_to_string("../../docs/install.md").expect("docs/install.md"),
         ),
         (
-            "README.ko.md",
-            std::fs::read_to_string("../../README.ko.md").expect("README.ko.md"),
+            "docs/install.ko.md",
+            std::fs::read_to_string("../../docs/install.ko.md").expect("docs/install.ko.md"),
         ),
     ];
 
@@ -413,13 +422,21 @@ fn the_readme_install_guide_matches_the_iam_policies() {
         //
         // 본문 어디에 그 문자열이 있는지가 아니라 **정책 블록 안에** 있는지를 본다 —
         // 함정을 설명하는 경고 문구에도 같은 문자열이 나오고, 그건 있어야 하는 것이다.
+        // **코드 블록 안에서, 문장 단위로 본다.** 두 범위를 겹쳐야 오탐이 없다:
+        //
+        // - 블록만 보면 → 같은 정책의 `PutMetricData`(조건이 **필요한** 액션)에 걸린다
+        // - 문장만 보면 → 청크가 블록을 넘어 **함정을 설명하는 경고 산문**까지 삼킨다
+        //
+        // 우리 예시는 문장마다 `Sid` 가 있으므로 블록 안에서 그걸 경계로 쓴다.
         for block in doc.split("```").skip(1).step_by(2) {
-            if block.contains("cloudwatch:GetMetricData") {
-                assert!(
-                    !block.contains("cloudwatch:namespace"),
-                    "{name} 의 정책 예시가 GetMetricData 에 네임스페이스 조건을 걸었다 — \
-                     그 조건 키는 이 액션의 요청에 실려 오지 않아 문이 절대 매치되지 않는다"
-                );
+            for stmt in block.split("\"Sid\"") {
+                if stmt.contains("cloudwatch:GetMetricData") {
+                    assert!(
+                        !stmt.contains("cloudwatch:namespace"),
+                        "{name} 의 정책 예시가 GetMetricData 에 네임스페이스 조건을 걸었다 — \
+                         그 조건 키는 이 액션의 요청에 실려 오지 않아 문이 절대 매치되지 않는다"
+                    );
+                }
             }
         }
 

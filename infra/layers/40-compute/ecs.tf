@@ -206,7 +206,7 @@ resource "aws_ecs_service" "app" {
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
 
-  # **active 1 + standby 1** ([ADR-018](../../../docs/03-decisions.md)).
+  # **active 1 + standby 1** ([ADR-018](../../../.claude/docs/03-decisions.md)).
   # 리스만으로는 split-brain 을 막지 못하므로 리더 1대만 수집하고 나머지는 standby 다.
   desired_count = var.desired_count
 

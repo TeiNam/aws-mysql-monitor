@@ -1,4 +1,4 @@
-//! 인스턴스 하나의 수집 루프 ([05 §1](../../../../docs/05-collector.md)).
+//! 인스턴스 하나의 수집 루프 ([05 §1](../../../../.claude/docs/05-collector.md)).
 //!
 //! # 정상 상태에서 tick 당 쿼리 1건
 //!
@@ -17,7 +17,7 @@
 //!
 //! # 플랜 수집 경로가 실측으로 뒤집혔다
 //!
-//! `EXPLAIN ... FOR CONNECTION` 은 RDS 에서 쓸 수 없다([19 §B](../../../../docs/19-m1-findings.md)).
+//! `EXPLAIN ... FOR CONNECTION` 은 RDS 에서 쓸 수 없다([19 §B](../../../../.claude/docs/19-m1-findings.md)).
 //! 그래서 순서가 이렇게 된다:
 //!
 //! 1. `FOR CONNECTION` 시도 — 자체 관리 MySQL 이면 성공한다 (가장 정확)

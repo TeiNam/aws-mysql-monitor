@@ -1,4 +1,4 @@
-//! 모니터링 계정 부트스트랩 (M3, [07](../../../../docs/07-credentials-bootstrap.md)).
+//! 모니터링 계정 부트스트랩 (M3, [07](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 이 모듈은 순수하다
 //!
@@ -20,7 +20,7 @@ pub mod sql;
 
 use grants::{GrantScope, GrantSet, SchemaNameMode};
 
-/// 권한 모드 ([07 §2.3](../../../../docs/07-credentials-bootstrap.md)).
+/// 권한 모드 ([07 §2.3](../../../../.claude/docs/07-credentials-bootstrap.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegeMode {
@@ -90,7 +90,7 @@ pub struct Desired {
     pub schemas: Vec<String>,
 }
 
-/// 전역 권한 — 모드와 무관하게 항상 같다 ([07 §2.2](../../../../docs/07-credentials-bootstrap.md)).
+/// 전역 권한 — 모드와 무관하게 항상 같다 ([07 §2.2](../../../../.claude/docs/07-credentials-bootstrap.md)).
 pub const GLOBAL_PRIVILEGES: &[&str] = &[
     "PROCESS",
     "REPLICATION CLIENT",
@@ -366,7 +366,7 @@ pub enum Action {
     /// 대상 DB 에 보낼 SQL. [`sql::Statement`] 가 비밀 유출을 타입으로 막는다.
     Sql(sql::Statement),
     /// RDS 설정 변경. **우리가 실행하지 않는다** — 명령을 보여준다
-    /// ([07 §2.1](../../../../docs/07-credentials-bootstrap.md), 기본값
+    /// ([07 §2.1](../../../../.claude/docs/07-credentials-bootstrap.md), 기본값
     /// `allow_rds_modify = false`).
     EnableIamAuth { instance_id: String },
 }

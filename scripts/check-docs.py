@@ -11,8 +11,20 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def markdown_files():
+    """검사 대상 마크다운.
+
+    공개 문서(`docs/` = 설치 안내, README 두 개, `infra/README.md`)와 **있으면** 설계 문서를
+    본다. 설계 문서는 `.claude/docs/` 로 옮겼고 그 경로는 gitignore 된다 — 클론·CI 에는
+    없으므로 부재를 견뎌야 한다. 없다고 실패하면 CI 가 항상 빨갛다.
+    """
     return sorted(
-        [*ROOT.glob("docs/*.md"), ROOT / "README.md", ROOT / "infra/README.md"]
+        [
+            *ROOT.glob("docs/*.md"),
+            *ROOT.glob(".claude/docs/*.md"),
+            ROOT / "README.md",
+            ROOT / "README.ko.md",
+            ROOT / "infra/README.md",
+        ]
     )
 
 
@@ -24,7 +36,12 @@ def check_links(files):
             target = m.group(1)
             if target.startswith(("http://", "https://", "mailto:")):
                 continue
-            if not (f.parent / target).resolve().exists():
+            resolved = (f.parent / target).resolve()
+            # **설계 문서로 가는 링크는 없어도 깨진 것이 아니다.** `.claude/` 는
+            # gitignore 되므로 클론·CI 에 없다 — 그걸 깨졌다고 하면 게이트가 항상 빨갛다.
+            if ".claude/docs/" in target and not resolved.exists():
+                continue
+            if not resolved.exists():
                 line = f.read_text()[: m.start()].count("\n") + 1
                 broken.append(f"{f.relative_to(ROOT)}:{line} → {target}")
     return broken

@@ -1,4 +1,4 @@
-//! `SHOW GRANTS` 파싱과 권한 집합 대수 ([07 §2.6](../../../../docs/07-credentials-bootstrap.md)).
+//! `SHOW GRANTS` 파싱과 권한 집합 대수 ([07 §2.6](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 왜 `SHOW GRANTS` 를 1차 소스로 쓰는가
 //!

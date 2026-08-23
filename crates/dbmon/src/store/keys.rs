@@ -1,4 +1,4 @@
-//! DynamoDB 키 구성 ([04 §2.2·2.3](../../../../docs/04-data-model.md)).
+//! DynamoDB 키 구성 ([04 §2.2·2.3](../../../../.claude/docs/04-data-model.md)).
 //!
 //! 키 문자열을 **한 곳에서만** 만든다. 쓰기와 읽기가 각자 만들면 한쪽만 바뀔 때
 //! 조회가 조용히 0건을 반환한다 — 이 프로젝트에서 "고쳤는데 아무도 안 부른다" 부류가
@@ -18,7 +18,7 @@ pub fn slow_query_pk(instance: &InstanceId, started_at_ms: i64) -> String {
 /// `<started_at_ms:013>#<thread_id>`
 ///
 /// **13자리 0 패딩이 필수다.** `S` 정렬 키는 사전순이라 `"1000" < "999"` 다
-/// ([04 §2.2a](../../../../docs/04-data-model.md)).
+/// ([04 §2.2a](../../../../.claude/docs/04-data-model.md)).
 ///
 /// 조회의 전역 정렬·페이지 재개가 **이 문자열의 사전순에 의존한다.** 그래서 조립을
 /// [`dbmon_core::slow_query::list_order_key`] 하나로 모았다 — 두 곳에서 만들면 정렬과

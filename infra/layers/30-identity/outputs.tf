@@ -43,7 +43,7 @@ output "next_steps" {
        aws cognito-idp admin-add-user-to-group --user-pool-id ${one(aws_cognito_user_pool.main[*].id)} \
          --username <email> --group-name dbmon-admin
     3) **서버 `USER` 레코드 생성** — 이게 없으면 로그인해도 권한이 없다 (fail-closed).
-       docs/08-security-auth.md §3 의 형식을 따른다. `sub` 는 admin-get-user 로 확인한다.
+       .claude/docs/08-security-auth.md §3 의 형식을 따른다. `sub` 는 admin-get-user 로 확인한다.
     4) 설정 화면에 user_pool_id·client_id·domain 을 넣고 방식을 `cognito` 로 바꾼다.
   EOT
 }

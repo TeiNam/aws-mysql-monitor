@@ -42,5 +42,14 @@ dbmon-ui.png
 
 # 하네스·도구가 만드는 것 — 이 프로젝트와 무관하다
 .agents/
-.claude/
 .code-review-graph/
+
+# `.claude/` 는 하네스 산출물 + **설계 문서**가 함께 산다.
+#
+# 공개하는 것은 설치 안내(`docs/install*.md`)와 README 뿐이다. 요구사항·ADR·데이터 모델·
+# 리뷰 로그·비용 산정은 개발 일지에 가까워서 공개 대상이 아니다 — `.claude/docs/` 에 두고
+# 소스 주석이 그 경로로 링크한다(공개본에서는 그 링크가 헛도는 것이 정상이다).
+#
+# ⚠ **히스토리에는 남아 있다.** 이 저장소를 그대로 public 으로 뒤집으면 과거 커밋에서 다
+# 보인다. 공개할 때는 `git filter-repo --path docs --invert-paths` 로 걸러낸 사본을 쓴다.
+.claude/

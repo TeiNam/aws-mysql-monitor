@@ -14,7 +14,7 @@
 //!
 //! 수집 리더(`LEADER#collect`)를 못 잡은 워커는 목표 샤드 수가 0 이고 데이터를 갖고 있지
 //! 않다. 실시간 지표·`in_flight` 방송이 워커 메모리에 있으므로 클라이언트는 **active 에
-//! 붙어야 한다**([05 §7.1](../../../docs/05-collector.md)).
+//! 붙어야 한다**([05 §7.1](../../../.claude/docs/05-collector.md)).
 //!
 //! ⚠ `/readyz` 503 은 **라우팅만** 막는다. 수집 소유권과는 무관하다 —
 //! 그 연결을 만드는 것은 샤드 리스의 리더 게이트다. 초기 설계는 이걸 혼동해
@@ -165,7 +165,7 @@ impl Readiness {
     /// 대신 `collect_stale` 로 **드러낸다.** `/healthz` 는 프로세스 생존만 보고
     /// (ECS 헬스체크가 그걸 쓴다 — standby 워커를 죽이지 않기 위해서다), 수집이 죽은
     /// 것은 이 필드로 외부에서 경보를 건다. 자체 CloudWatch 지표 발행은 아직 없다
-    /// ([17](../../docs/17-roadmap-tasks.md) FR-OPS-09).
+    /// ([17](../../.claude/docs/17-roadmap-tasks.md) FR-OPS-09).
     pub fn snapshot_at(&self, now_ms: i64) -> ReadyReport {
         let draining = self.draining.load(Ordering::Relaxed);
         let config_loaded = self.config_loaded.load(Ordering::Relaxed);

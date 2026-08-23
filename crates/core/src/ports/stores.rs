@@ -2,7 +2,7 @@
 //!
 //! 여기 있는 trait 는 **구현이 2개 이상**이다: 프로덕션(DynamoDB)과 테스트용 페이크.
 //! 테스트가 두 번째 구현이므로 trait 존재가 정당하다
-//! ([ADR-002](../../../docs/03-decisions.md)).
+//! ([ADR-002](../../../.claude/docs/03-decisions.md)).
 
 use crate::error::Result;
 use crate::ids::{InstanceId, RecordId};
@@ -68,7 +68,7 @@ pub trait SlowQueryStore: Send + Sync {
     async fn get(&self, id: &RecordId) -> Result<Option<SlowQuery>>;
 
     /// `(instance, thread_id, ±window, app_digest)` 보조 조회 — `record_id` 가 1초
-    /// 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../docs/05-collector.md)).
+    /// 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../.claude/docs/05-collector.md)).
     async fn find_merge_candidate(
         &self,
         instance: &InstanceId,
@@ -269,7 +269,7 @@ pub trait SettingsStore: Send + Sync {
     ) -> Result<crate::settings::AppSettings>;
 }
 
-/// 리스 — 샤드 소유권과 리더 선출 ([05 §7](../../../docs/05-collector.md)).
+/// 리스 — 샤드 소유권과 리더 선출 ([05 §7](../../../.claude/docs/05-collector.md)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub key: String,
@@ -290,7 +290,7 @@ pub const COLLECT_LEADER_KEY: &str = "LEADER#collect";
 /// cron 리더 리스 키. 수집 리더와 **별도**다 (스케일 축이 다르다).
 pub const CRON_LEADER_KEY: &str = "LEADER#cron";
 
-/// 사용자 레코드 저장소 — **RBAC 의 권위값** (T-20, [08 §3](../../../docs/08-security-auth.md)).
+/// 사용자 레코드 저장소 — **RBAC 의 권위값** (T-20, [08 §3](../../../.claude/docs/08-security-auth.md)).
 ///
 /// # 왜 토큰만으로 인가하지 않는가
 ///

@@ -1,4 +1,4 @@
-//! 식별자 타입 ([04 §1](../../../docs/04-data-model.md)).
+//! 식별자 타입 ([04 §1](../../../.claude/docs/04-data-model.md)).
 //!
 //! # M0-2a 결정: `instance_id` 에 **계정 ID 를 포함한다** (2026-08-19)
 //!
@@ -7,7 +7,7 @@
 //!               123456789012/ap-northeast-2/orders-prd-01
 //! ```
 //!
-//! [OPEN-Q-20](../../../docs/OPEN-QUESTIONS.md) 의 권고를 채택했다. 근거:
+//! [OPEN-Q-20](../../../.claude/docs/OPEN-QUESTIONS.md) 의 권고를 채택했다. 근거:
 //!
 //! - 이 값은 **모든 파티션 키에 들어간다**(`SQ#`, `DR#`, `EV#`, `MR#`, `UR#`, `HG#`, `SNAP#`).
 //!   나중에 바꾸려면 1차 키 포맷 변경 + 전 데이터 마이그레이션이다.
@@ -190,7 +190,7 @@ impl fmt::Display for ClusterId {
     }
 }
 
-/// `<instance_id>:<thread_id>:<started_at_sec>` ([04 §1.2](../../../docs/04-data-model.md)).
+/// `<instance_id>:<thread_id>:<started_at_sec>` ([04 §1.2](../../../.claude/docs/04-data-model.md)).
 ///
 /// **시각 성분은 초 단위로 floor 한다.** 밀리초를 넣으면 같은 실행이 소스마다 다른
 /// `record_id` 를 갖게 되어 (a) 3소스 병합이 키로 성립하지 않고, (b) 아카이브
@@ -210,7 +210,7 @@ impl RecordId {
     }
 
     /// `(instance_id, thread_id, started_at_sec)` 로 되돌린다.
-    /// [04 §7](../../../docs/04-data-model.md) 의 "키 인코딩 왕복" 검증 항목.
+    /// [04 §7](../../../.claude/docs/04-data-model.md) 의 "키 인코딩 왕복" 검증 항목.
     pub fn parts(&self) -> Result<(InstanceId, u64, i64), IdError> {
         let mut it = self.0.rsplitn(3, ':');
         let (Some(sec), Some(thread), Some(inst)) = (it.next(), it.next(), it.next()) else {
@@ -251,7 +251,7 @@ impl fmt::Display for RecordId {
 }
 
 /// 실행시간 구간. `GSI2PK` 에 들어가 "느린 것만" 조회의 스캔량을 줄인다
-/// ([04 §2.3](../../../docs/04-data-model.md)).
+/// ([04 §2.3](../../../.claude/docs/04-data-model.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DurBucket {

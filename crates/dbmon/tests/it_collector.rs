@@ -332,7 +332,7 @@ async fn dml_gets_approximate_plan_via_select_conversion() {
     kill_and_wait(running).await;
 }
 
-/// 우리 계정(`dbmon`)의 쿼리는 후보가 되지 않아야 한다 ([05 §10](../../../../docs/05-collector.md)).
+/// 우리 계정(`dbmon`)의 쿼리는 후보가 되지 않아야 한다 ([05 §10](../../../../.claude/docs/05-collector.md)).
 ///
 /// 자기 제외가 실패하면 1초 주기 `detect` 쿼리가 상위 N 후보·`_other`·커버리지·
 /// 계정 롤업을 전부 오염시킨다.

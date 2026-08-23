@@ -330,7 +330,7 @@ impl DynamoSlowQueryStore {
 
     /// `(instance, thread_id, ±window, app_digest)` 보조 조회.
     ///
-    /// `record_id` 가 1초 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../../docs/05-collector.md)).
+    /// `record_id` 가 1초 어긋났을 때 후보를 찾는다 ([05 §8.2](../../../../.claude/docs/05-collector.md)).
     /// 시작 시각이 날짜 경계를 걸칠 수 있으므로 **양쪽 날짜 파티션을 본다.**
     async fn find_merge_candidate_stored(
         &self,

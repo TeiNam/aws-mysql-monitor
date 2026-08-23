@@ -10,7 +10,7 @@
 //! 모든 문장에 `/* dbmon:<purpose> */` 주석을 붙인다. 이건 **사람이 읽는 용도**다 —
 //! `SHOW PROCESSLIST`·슬로우로그·감사 로그에서는 주석이 살아 있다.
 //! **다이제스트 통계에서는 주석이 제거되므로 자기 식별에 쓸 수 없다**
-//! ([ADR-005](../../../../docs/03-decisions.md)) — 그건 계정 기반으로 한다.
+//! ([ADR-005](../../../../.claude/docs/03-decisions.md)) — 그건 계정 기반으로 한다.
 
 /// 탐지 — 1초 주기. **정상 상태에서 tick 당 이 쿼리 1건만 나간다.**
 ///
@@ -52,7 +52,7 @@ LIMIT ?"
 
 /// 전문 SQL — 임계값 초과 스레드만.
 ///
-/// `INFO` 는 `varchar(21845)` 이고 65,535바이트에서 잘린다([19 §A](../../../../docs/19-m1-findings.md)).
+/// `INFO` 는 `varchar(21845)` 이고 65,535바이트에서 잘린다([19 §A](../../../../.claude/docs/19-m1-findings.md)).
 ///
 /// # 이 컬럼은 `utf8mb3` 다 — 4바이트 문자가 `?` 로 손실된다 (19 §A-2)
 ///
@@ -142,7 +142,7 @@ ORDER BY e.EVENT_ID DESC",
 /// 다이제스트 스냅샷 ① — **지표 컬럼만**. 큰 텍스트 컬럼을 제외한다.
 ///
 /// `LAST_SEEN` 필터와 컬럼 분리가 없으면 응답이 100배 커진다
-/// ([05 §2.5.3](../../../../docs/05-collector.md)): 필터 없이 전량을 매분 가져오면
+/// ([05 §2.5.3](../../../../.claude/docs/05-collector.md)): 필터 없이 전량을 매분 가져오면
 /// 인스턴스당 일 18GB, 500대면 일 9TB 다.
 ///
 /// `last_seen_gte` 가 `None` 이면 첫 스냅샷이다(기준선 수립).
@@ -291,7 +291,7 @@ pub const DB_NOW: &str = "/* dbmon:dbnow */ SELECT UNIX_TIMESTAMP(NOW(6))";
 pub const PING: &str = "/* dbmon:ping */ SELECT 1";
 
 /// 우리 문장의 다이제스트를 서버에 계산시킨다 — 자기 제외 화이트리스트용
-/// ([05 §10](../../../../docs/05-collector.md)).
+/// ([05 §10](../../../../.claude/docs/05-collector.md)).
 pub const STATEMENT_DIGEST: &str = "/* dbmon:selfdigest */ SELECT STATEMENT_DIGEST(?)";
 
 /// 대상 인스턴스의 **전역** `sql_mode`. 앱 세션이 상속하는 값이다.

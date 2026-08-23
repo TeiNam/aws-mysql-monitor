@@ -74,7 +74,7 @@ variable "mysql_engine_version" {
     생성 시점의 기본 마이너를 고르는 **플로팅**이다.
 
     이 플릿의 존재 이유가 다이제스트·절단 동작 측정이고 그 동작은 마이너 버전에
-    따라 갈릴 수 있다. [19](../../../docs/19-m1-findings.md) 의 실측이 8.4.11 이다.
+    따라 갈릴 수 있다. [19](../../../.claude/docs/19-m1-findings.md) 의 실측이 8.4.11 이다.
 
     사용 가능한 버전: `aws rds describe-db-engine-versions --engine mysql \
       --query 'DBEngineVersions[].EngineVersion'`

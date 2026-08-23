@@ -2,7 +2,7 @@
 //!
 //! 이 렉서는 **원문 SQL과 MySQL `DIGEST_TEXT` 양쪽**을 같은 규칙으로 처리한다.
 //! `app_digest` 의 목표는 `DIGEST_TEXT` 를 글자 단위로 재현하는 것이 아니라
-//! `normalize(원문) == normalize(DIGEST_TEXT)` 가 성립하는 것이다([05 §3.1](../../../docs/05-collector.md)).
+//! `normalize(원문) == normalize(DIGEST_TEXT)` 가 성립하는 것이다([05 §3.1](../../../.claude/docs/05-collector.md)).
 //! 그래서 정규 형식은 우리가 정할 수 있고, "토큰을 공백 1칸으로 이어붙인다"는
 //! 단순한 규칙으로 양쪽이 수렴한다.
 
@@ -425,7 +425,7 @@ impl<'a> Lexer<'a> {
 /// 대소문자만 다른 테이블을 두는 것은 실무에서 없다. 그룹핑 키의 정확도 손실이므로
 /// 데이터 손실이 아니다. 표시용 텍스트는 `digest_text` 를 따로 저장하므로 영향 없다.
 ///
-/// 초기 설계([05 §3.2](../../../docs/05-collector.md) 규칙 8)는 "식별자는 원본 대소문자
+/// 초기 설계([05 §3.2](../../../.claude/docs/05-collector.md) 규칙 8)는 "식별자는 원본 대소문자
 /// 유지"였다. 그 규칙으로는 위 표의 2·3행이 수렴하지 않아 M1-6 골든 코퍼스가 실패한다.
 fn fold_ident(word: &str) -> String {
     word.to_lowercase()

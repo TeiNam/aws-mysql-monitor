@@ -13,7 +13,7 @@
 //! `TYPE`, `VALUE`, `TEXT`, `USER`, `SOURCE`, `START`, `END`, `LEVEL`, `NAME` 등)는
 //! **절대 넣지 않는다** — 인용 없이 컬럼명으로 쓸 수 있는 단어들이다.
 //!
-//! 목록은 MySQL 8.0 / 8.4 의 예약어를 기준으로 한다([ADR-019](../../../docs/03-decisions.md)
+//! 목록은 MySQL 8.0 / 8.4 의 예약어를 기준으로 한다([ADR-019](../../../.claude/docs/03-decisions.md)
 //! 의 버전 하한). `INTERSECT`·`EXCEPT`(8.0.31+), `ARRAY`·`MEMBER`(8.0.17+),
 //! `SOURCE_BIND`(8.4) 를 포함한다.
 //!

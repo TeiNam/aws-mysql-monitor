@@ -1,6 +1,6 @@
 //! `EXPLAIN FORMAT=JSON` 파싱 · 리터럴 마스킹 · 플랜 지문 · 참조 테이블 추출.
 //!
-//! 순수 함수만 있다. `EXPLAIN` 을 실행하지 않는다([02 §5](../../../docs/02-architecture.md)).
+//! 순수 함수만 있다. `EXPLAIN` 을 실행하지 않는다([02 §5](../../../.claude/docs/02-architecture.md)).
 
 pub mod mask;
 pub mod walk;
@@ -105,7 +105,7 @@ pub struct ParsedPlan {
 /// `EXPLAIN FORMAT=JSON` 의 `table_name` 은 **별칭일 수 있다**(`FROM orders o` → `"o"`).
 /// 그래서 `referenced_tables` 는 확정 목록이 아니라 후보다. 어드바이저는 이 목록을
 /// `information_schema.TABLES` 로 검증하고, 검증에 실패한 이름은 SQL 파서 폴백으로 채운다
-/// ([17](../../../docs/17-roadmap-tasks.md) M10-2).
+/// ([17](../../../.claude/docs/17-roadmap-tasks.md) M10-2).
 pub fn parse(plan_json: &str, default_schema: Option<&str>) -> Result<ParsedPlan, ParseError> {
     let raw: serde_json::Value =
         serde_json::from_str(plan_json).map_err(|e| ParseError::InvalidJson(e.to_string()))?;

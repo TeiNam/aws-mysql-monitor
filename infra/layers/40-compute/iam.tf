@@ -180,7 +180,7 @@ resource "aws_iam_role_policy" "task_storage" {
         ]
       },
       {
-        # `Scan` 을 주지 않는다. [ADR-003](../../../docs/03-decisions.md) 이 금지한 접근이고,
+        # `Scan` 을 주지 않는다. [ADR-003](../../../.claude/docs/03-decisions.md) 이 금지한 접근이고,
         # 실수로 전체 스캔을 하면 비용이 폭발한다. 권한으로 막는다.
         Sid      = "DenyScan"
         Effect   = "Deny"
@@ -315,7 +315,7 @@ resource "aws_iam_role_policy" "task_discovery" {
 # IAM DB 인증 토큰. **비밀번호를 저장하지 않는 근거**다 (ADR-007).
 #
 # `dbuser:*/dbmon` 는 "모든 인스턴스의 dbmon 계정" 을 뜻한다. prd 인스턴스도 포함되므로
-# dev 에서는 `var.db_auth_resource_ids` 로 열거해 좁힌다 (T-37, [18 §6](../../../docs/18-dev-environment.md)).
+# dev 에서는 `var.db_auth_resource_ids` 로 열거해 좁힌다 (T-37, [18 §6](../../../.claude/docs/18-dev-environment.md)).
 resource "aws_iam_role_policy" "task_db_auth" {
   name = "dbmon-db-auth"
   role = aws_iam_role.task.id
@@ -440,7 +440,7 @@ resource "aws_iam_role_policy" "task_channel_secrets" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 부트스트랩 마스터 자격증명 (M3, docs/07-credentials-bootstrap.md §1)
+# 부트스트랩 마스터 자격증명 (M3, .claude/docs/07-credentials-bootstrap.md §1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # **이 정책이 이 태스크에게 가장 큰 능력을 준다.** 대상 DB 의 마스터 비밀번호를 읽고,

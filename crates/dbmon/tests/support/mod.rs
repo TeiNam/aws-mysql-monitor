@@ -8,7 +8,7 @@
 //! ⚠ 여기의 `with_danger_accept_invalid_certs` 는 **로컬 컨테이너 전용**이다.
 //! 컨테이너가 자체 서명 인증서를 자동 생성하기 때문이다.
 //! 프로덕션 경로(`dbmon::mysql`)에는 인증서 검증 비활성 옵션을 두지 않는다
-//! ([07](../../../../docs/07-credentials-bootstrap.md) M3-4, NFR-S-03).
+//! ([07](../../../../.claude/docs/07-credentials-bootstrap.md) M3-4, NFR-S-03).
 
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
@@ -352,7 +352,7 @@ pub async fn kill_query(conn: &mut Conn, connection_id: u64) {
 }
 
 /// 측정 결과를 사람이 읽을 표로 출력한다. 스파이크의 산출물은 pass/fail 이 아니라
-/// **문서에 옮길 수치**다 ([17](../../../../docs/17-roadmap-tasks.md) M1 완료 기준).
+/// **문서에 옮길 수치**다 ([17](../../../../.claude/docs/17-roadmap-tasks.md) M1 완료 기준).
 pub fn report(title: &str, rows: &[(String, String)]) {
     let width = rows
         .iter()

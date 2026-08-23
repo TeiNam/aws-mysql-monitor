@@ -1,4 +1,4 @@
-//! 운영자가 **화면에서 바꾸는 설정** ([04 §3](../../../docs/04-data-model.md) `CFG/GLOBAL`).
+//! 운영자가 **화면에서 바꾸는 설정** ([04 §3](../../../.claude/docs/04-data-model.md) `CFG/GLOBAL`).
 //!
 //! # 파일 설정과 무엇이 다른가
 //!
@@ -13,7 +13,7 @@
 //! # 비밀을 담지 않는다
 //!
 //! Slack 토큰·웹훅 URL 은 **Secrets Manager 참조(ARN)만** 저장한다
-//! ([10 §3.4](../../../docs/10-alerting.md)). 이 항목은 viewer 도 읽을 수 있고
+//! ([10 §3.4](../../../.claude/docs/10-alerting.md)). 이 항목은 viewer 도 읽을 수 있고
 //! DynamoDB 백업·CloudTrail 로도 흐르므로, 값 자체를 두면 통제할 수 없는 곳으로 퍼진다.
 //!
 //! # 낙관적 잠금
@@ -59,7 +59,7 @@ pub struct AppSettings {
 // 알림
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Slack 연결 방식 ([10 §3.1](../../../docs/10-alerting.md)).
+/// Slack 연결 방식 ([10 §3.1](../../../.claude/docs/10-alerting.md)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlackMode {
@@ -361,7 +361,7 @@ impl AuthSettings {
 // 부트스트랩 (M3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 모니터링 계정 부트스트랩 설정 ([07](../../../docs/07-credentials-bootstrap.md)).
+/// 모니터링 계정 부트스트랩 설정 ([07](../../../.claude/docs/07-credentials-bootstrap.md)).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BootstrapSettings {
@@ -437,7 +437,7 @@ pub struct AiSettings {
     pub enabled: bool,
     /// Bedrock 모델 ID 또는 추론 프로파일 ID.
     ///
-    /// **코드에 박지 않는다** ([11 §7](../../../docs/11-ai-advisor.md)) — 모델 교체가
+    /// **코드에 박지 않는다** ([11 §7](../../../.claude/docs/11-ai-advisor.md)) — 모델 교체가
     /// 배포 없이 되어야 하고, 리전마다 쓸 수 있는 프로파일이 다르다.
     pub model_id: String,
     /// Bedrock 을 부를 리전. 비어 있으면 워커 리전.

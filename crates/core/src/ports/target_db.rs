@@ -1,7 +1,7 @@
 //! 대상 MySQL 읽기 포트.
 //!
 //! **이 포트는 AWS 를 모른다.** IAM 토큰 발급은 [`super::AuthTokenProvider`] 로 분리했다
-//! ([02 §5](../../../docs/02-architecture.md) F31 정정).
+//! ([02 §5](../../../.claude/docs/02-architecture.md) F31 정정).
 //! 어댑터(`dbmon::mysql`)는 "비밀번호 문자열을 주는 무언가"만 알고, 그게 IAM 토큰인지
 //! Secrets Manager 값인지 모른다.
 //!
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 /// `performance_schema.processlist` 한 행 (경량 탐지 쿼리).
 ///
 /// **`INFO` 를 읽지 않는다.** 여기의 `INFO` 는 1024바이트 절단본이므로 무의미하다
-/// ([ADR-005](../../../docs/03-decisions.md)).
+/// ([ADR-005](../../../.claude/docs/03-decisions.md)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRow {
     pub id: u64,
@@ -48,7 +48,7 @@ pub struct ProbeResult {
 /// `information_schema.PROCESSLIST` 타깃 조회 — 전문 SQL.
 ///
 /// **`INFO` 는 `varchar(21845)` 이고 65,535바이트에서 절단된다** (M1-1 실측,
-/// [19 §A](../../../docs/19-m1-findings.md)). `LONGTEXT` 가 아니다.
+/// [19 §A](../../../.claude/docs/19-m1-findings.md)). `LONGTEXT` 가 아니다.
 /// `performance_schema` 의 1,024바이트보다 64배 넉넉하지만 무제한은 아니므로,
 /// 정확히 65,535바이트를 받으면 `sql_text_truncated = true` 로 표시한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +151,7 @@ pub struct DigestSnapshot {
 /// `EXPLAIN ... FOR CONNECTION` 실패 사유.
 ///
 /// **에러 메시지 문자열이 아니라 에러 코드로 분류한다.** `lc_messages` 설정에 따라
-/// 메시지가 번역되므로 문자열 매칭은 깨진다 ([05 §2.4](../../../docs/05-collector.md)).
+/// 메시지가 번역되므로 문자열 매칭은 깨진다 ([05 §2.4](../../../.claude/docs/05-collector.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanFailure {
     /// 1094 `ER_NO_SUCH_THREAD` — 스레드가 이미 종료됨. 폴백 시도 가능.
@@ -196,7 +196,7 @@ pub enum PlanFailure {
 
 impl PlanFailure {
     /// 실측으로 확정한 매핑 (MySQL 8.4.11 / 8.0.46,
-    /// [19 §B](../../../docs/19-m1-findings.md)).
+    /// [19 §B](../../../.claude/docs/19-m1-findings.md)).
     pub fn from_mysql_error_code(code: u16) -> Self {
         match code {
             1094 => Self::ThreadGone,
@@ -287,7 +287,7 @@ impl Excludes {
     /// 시스템 스키마 + 우리 계정을 기본으로 제외한다.
     ///
     /// **자기 제외가 실패하면** 1초 주기 `detect` 쿼리가 상위 N 후보·`_other`·
-    /// 커버리지·계정 롤업을 전부 오염시킨다 ([05 §10](../../../docs/05-collector.md)).
+    /// 커버리지·계정 롤업을 전부 오염시킨다 ([05 §10](../../../.claude/docs/05-collector.md)).
     pub fn with_defaults(monitor_user: &str) -> Self {
         Self {
             // **목록을 여기 리터럴로 두지 않는다.** 부트스트랩과 화면이 같은 판정을
@@ -340,7 +340,7 @@ pub trait TargetDb: Send + Sync {
     /// 실행 중 실행계획. **별도 연결에서** 실행해야 폴링이 밀리지 않는다.
     ///
     /// ⚠ RDS 에서는 항상 [`PlanFailure::Denied`] 다 — 타인 커넥션 explain 은 정적 전역
-    /// 권한 전체를 요구한다([19 §B](../../../docs/19-m1-findings.md)).
+    /// 권한 전체를 요구한다([19 §B](../../../.claude/docs/19-m1-findings.md)).
     /// 실질 기본 경로는 [`TargetDb::explain_rerun`] 이다.
     async fn explain_for_connection(&self, connection_id: u64) -> Result<ExplainOutcome>;
 

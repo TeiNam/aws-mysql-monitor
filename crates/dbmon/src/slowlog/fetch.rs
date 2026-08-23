@@ -4,7 +4,7 @@
 //!
 //! | 소스 | 용도 | 검증 |
 //! |---|---|---|
-//! | CloudWatch Logs `FilterLogEvents` | 프로덕션 ([05 §8.3](../../../../docs/05-collector.md)) | AWS 필요 |
+//! | CloudWatch Logs `FilterLogEvents` | 프로덕션 ([05 §8.3](../../../../.claude/docs/05-collector.md)) | AWS 필요 |
 //! | 로컬 파일 | 개발 — SSO 가 만료돼도 백필 경로를 돌린다 | 로컬 |
 //!
 //! **파서는 하나다.** 소스가 텍스트를 주고 [`super::parse`] 가 판정한다 — 소스마다
@@ -55,7 +55,7 @@ pub trait SlowLogFetcher: Send + Sync {
     ) -> Result<LogChunk>;
 }
 
-/// 슬로우로그가 실제로 쌓이는 자리 ([05 §8.3](../../../../docs/05-collector.md)).
+/// 슬로우로그가 실제로 쌓이는 자리 ([05 §8.3](../../../../.claude/docs/05-collector.md)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogSource {
     pub group: String,
@@ -66,7 +66,7 @@ pub struct LogSource {
     pub stream: Option<String>,
 }
 
-/// CloudWatch Logs 로그 그룹·스트림 ([05 §8.3](../../../../docs/05-collector.md)).
+/// CloudWatch Logs 로그 그룹·스트림 ([05 §8.3](../../../../.claude/docs/05-collector.md)).
 ///
 /// # Aurora 와 RDS 가 다르다 — 이걸 몰라서 Aurora 는 백필이 한 번도 돌지 않았다
 ///

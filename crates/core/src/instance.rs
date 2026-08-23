@@ -92,7 +92,7 @@ impl EngineVersion {
     }
 
     /// 바이너리 로그 위치 조회 문장. **유일하게 버전 분기가 필요한 문장이다**
-    /// ([05 §2.7](../../../docs/05-collector.md)).
+    /// ([05 §2.7](../../../.claude/docs/05-collector.md)).
     ///
     /// 8.4 에서 구 문장이 제거되었다. 아래 문자열은 MySQL 문법 토큰을 그대로 인용한 것이며
     /// 우리가 고른 이름이 아니다.
@@ -190,7 +190,7 @@ impl InstanceState {
     ///
     /// `Unreachable` 도 포함한다. 이 상태에서 태스크를 내리면 서킷 브레이커의
     /// half-open 재시도 주체가 사라져 **영구히 복구되지 않는다**
-    /// ([05 §6](../../../docs/05-collector.md)). 실제 쿼리 빈도는 태스크 안의
+    /// ([05 §6](../../../.claude/docs/05-collector.md)). 실제 쿼리 빈도는 태스크 안의
     /// 서킷 상태가 정한다 — 열려 있으면 60초에 1회다.
     ///
     /// `Pending` 은 **제외한다** — 등록만 됐고 아직 사람이 켜지 않은 상태다.
@@ -222,7 +222,7 @@ pub struct Instance {
     pub endpoint: Option<String>,
     pub port: u16,
     /// 이름 변경에도 불변인 RDS 내부 ID. `renamed_*` 추적의 기준
-    /// ([04 §1.3](../../../docs/04-data-model.md)).
+    /// ([04 §1.3](../../../.claude/docs/04-data-model.md)).
     pub dbi_resource_id: String,
     pub vpc_id: Option<String>,
     pub availability_zone: Option<String>,

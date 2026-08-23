@@ -1,7 +1,7 @@
 //! M1-6 / M1-13 — 다이제스트 정규화 검증 스파이크.
 //!
 //! `normalize` 크레이트의 존재 이유는 `normalize(원문) == normalize(DIGEST_TEXT)` 다
-//! ([ADR-011](../../../../docs/03-decisions.md)). 이 등가성이 3소스 조인 키의 근거이므로
+//! ([ADR-011](../../../../.claude/docs/03-decisions.md)). 이 등가성이 3소스 조인 키의 근거이므로
 //! **실제 MySQL 로 확인해야** 한다. 규칙표는 가설이었다.
 //!
 //! ```
@@ -87,7 +87,7 @@ async fn m1_6_normalize_converges_with_server_digest_text() {
 ///
 /// # 실측으로 뒤집힌 전제
 ///
-/// [04 §2.3](../../../../docs/04-data-model.md) 의 `DigestText.mysql_digests` 는
+/// [04 §2.3](../../../../.claude/docs/04-data-model.md) 의 `DigestText.mysql_digests` 는
 /// `{instance_id: mysql_digest}` — 인스턴스당 값 **하나**를 가정했다. 그런데
 /// MySQL 의 `DIGEST` 는 **식별자 대소문자를 구분한다**(`lower_case_table_names=0`):
 ///
@@ -179,7 +179,7 @@ async fn m1_6b_app_digest_is_coarser_than_mysql_digest() {
 /// M1-13 — `DIGEST_TEXT` 절단이 `DIGEST` 해시도 바꾸는가.
 ///
 /// 해시가 **같다면** `app_digest` 의 역할이 크게 줄어든다(크로스 인스턴스 그룹핑을
-/// `mysql_digest` 로 할 수 있다). 해시가 **다르다면** [ADR-011](../../../../docs/03-decisions.md)
+/// `mysql_digest` 로 할 수 있다). 해시가 **다르다면** [ADR-011](../../../../.claude/docs/03-decisions.md)
 /// 의 `app_digest` 가 필수다.
 #[tokio::test]
 async fn m1_13_digest_hash_across_max_digest_length() {
@@ -292,7 +292,7 @@ async fn m1_13b_truncated_digest_text_needs_mapping() {
 
 /// M1-16 — `information_schema.PROCESSLIST WHERE ID = ?` 의 비용.
 ///
-/// [ADR-005](../../../../docs/03-decisions.md) 의 대가 항목이다. 비싸면 심층 조회를
+/// [ADR-005](../../../../.claude/docs/03-decisions.md) 의 대가 항목이다. 비싸면 심층 조회를
 /// 후보 전체에 1회로 배치해야 한다.
 #[tokio::test]
 async fn m1_16_information_schema_processlist_cost() {

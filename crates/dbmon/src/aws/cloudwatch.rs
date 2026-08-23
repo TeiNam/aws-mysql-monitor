@@ -1,4 +1,4 @@
-//! CloudWatch 메트릭 어댑터 (`GetMetricData`) — [06 §2](../../../../docs/06-discovery-metrics.md).
+//! CloudWatch 메트릭 어댑터 (`GetMetricData`) — [06 §2](../../../../.claude/docs/06-discovery-metrics.md).
 //!
 //! # `GetMetricStatistics` 를 쓰지 않는다
 //!

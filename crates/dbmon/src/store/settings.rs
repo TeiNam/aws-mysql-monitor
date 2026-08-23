@@ -1,5 +1,5 @@
 //! DynamoDB 설정 어댑터 — `config_table` 의 `CFG/GLOBAL`
-//! ([04 §3](../../../../docs/04-data-model.md)).
+//! ([04 §3](../../../../.claude/docs/04-data-model.md)).
 //!
 //! # 문서 하나에 담는다
 //!

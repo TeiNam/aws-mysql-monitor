@@ -11,7 +11,7 @@ import { Field, TextField, Toggle, problemOf } from "./fields";
  * # 비밀은 여기 넣지 않는다
  *
  * 웹훅 URL·봇 토큰은 **Secrets Manager 에** 두고 그 이름/ARN 만 적는다
- * ([10 §3.4](../../../../docs/10-alerting.md)). 이 설정 항목은 viewer 도 읽을 수 있고
+ * ([10 §3.4](../../../../.claude/docs/10-alerting.md)). 이 설정 항목은 viewer 도 읽을 수 있고
  * DynamoDB 백업·CloudTrail 로도 흐르므로, 값을 두면 통제할 수 없는 곳으로 퍼진다.
  *
  * 서버는 저장된 참조를 가려서 보낸다(`••••abcd`). 그 문자열을 그대로 되돌려 보내면

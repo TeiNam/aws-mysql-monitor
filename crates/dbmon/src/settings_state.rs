@@ -4,7 +4,7 @@
 //!
 //! 설정을 읽는 곳이 셋이다: 탐색 루프(리전·계정), 인증 계층(로그인 방식), 화면.
 //! 앞의 둘은 **요청마다·tick 마다** 읽으므로 매번 DynamoDB 를 때리면 tick 안에 왕복이
-//! 하나 늘고, 리더 루프가 늦으면 리스를 놓친다([05 §7](../../../docs/05-collector.md)).
+//! 하나 늘고, 리더 루프가 늦으면 리스를 놓친다([05 §7](../../../.claude/docs/05-collector.md)).
 //!
 //! 04 §3 이 규정한 폴링 주기(30초)를 캐시 TTL 로 쓴다. 저장 직후에는 캐시를 무시하고
 //! 다시 읽으므로(`save`), **누른 사람에게는 즉시 반영**된다. 다른 워커는 최대 30초
@@ -22,7 +22,7 @@ use dbmon_core::ports::SettingsStore;
 use dbmon_core::settings::AppSettings;
 use dbmon_core::time::EpochMs;
 
-/// 캐시 유효 기간. [04 §3](../../../docs/04-data-model.md) 의 폴링 주기와 같다.
+/// 캐시 유효 기간. [04 §3](../../../.claude/docs/04-data-model.md) 의 폴링 주기와 같다.
 pub const CACHE_TTL_MS: i64 = 30_000;
 
 #[derive(Default)]

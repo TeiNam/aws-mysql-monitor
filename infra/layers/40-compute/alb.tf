@@ -2,10 +2,10 @@
 #
 # dev 접근 모델은 ECS Exec 또는 SSM 포트 포워딩이고, ALB($16/월) + ACM 인증서 +
 # Route53 레코드를 만들지 않아 **네트워크 비용이 $0** 이다
-# ([18 §4](../../../docs/18-dev-environment.md)).
+# ([18 §4](../../../.claude/docs/18-dev-environment.md)).
 #
 # 그 대가로 dev 에서 검증할 수 없는 것이 있다: ALB 헬스체크·등록 해제 지연·유휴
-# 타임아웃·WebSocket 업그레이드. → [OPEN-Q-21](../../../docs/OPEN-QUESTIONS.md).
+# 타임아웃·WebSocket 업그레이드. → [OPEN-Q-21](../../../.claude/docs/OPEN-QUESTIONS.md).
 # M12 에서 하루 apply 해 확인하고 destroy 한다(비용 $1 미만).
 
 resource "aws_security_group" "alb" {

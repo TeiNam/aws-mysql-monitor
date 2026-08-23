@@ -1,4 +1,4 @@
-//! in-flight 상태 머신 ([05 §4](../../../docs/05-collector.md), R4·R5).
+//! in-flight 상태 머신 ([05 §4](../../../.claude/docs/05-collector.md), R4·R5).
 //!
 //! ```text
 //!                  detect 에서 관측됨 (TIME >= threshold)
@@ -91,7 +91,7 @@ pub struct Tracked {
     /// # 왜 `max_time_secs` 로는 안 되는가
     ///
     /// `PROCESSLIST.TIME` 은 "**현재 상태**에 머문 시간" 이라 상태가 바뀌면 리셋된다
-    /// ([ADR](../../../docs/03-decisions.md)). 그래서 102초 도는 문장의 `TIME` 이 2초일
+    /// ([ADR](../../../.claude/docs/03-decisions.md)). 그래서 102초 도는 문장의 `TIME` 이 2초일
     /// 수 있고, 그때 실제 소요는 `TIMER_WAIT` 만 안다.
     ///
     /// 하트비트가 `max_time_secs × 1000` 을 쓰면 저장된 정밀값(102.9초)을 **17초로

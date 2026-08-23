@@ -230,7 +230,7 @@ export function forgetDenied(prev: LiveSnapshot, topics: readonly string[]): Liv
  * `record_id` 로 upsert 한다.
  *
  * 같은 레코드에 `inflight` → `finalized` 가 연달아 오고, `finalized` 가 **두 번**
- * 오기도 한다(뒤엣것이 정확한 값이다 — `docs/21-resume.md §3.1`). 그래서 뒤에 온
+ * 오기도 한다(뒤엣것이 정확한 값이다 — `.claude/docs/21-resume.md §3.1`). 그래서 뒤에 온
  * 값이 이긴다. 다만 **자리를 옮기지 않는다** — 갱신마다 행이 튀면 읽을 수 없다.
  */
 function upsertSlowQuery(

@@ -1,4 +1,4 @@
-//! 고아 `in_flight` 레코드 정리 (F4, [05 §4.5](../../../docs/05-collector.md)).
+//! 고아 `in_flight` 레코드 정리 (F4, [05 §4.5](../../../.claude/docs/05-collector.md)).
 //!
 //! # 왜 필요한가
 //!

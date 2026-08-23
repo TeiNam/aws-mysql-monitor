@@ -1,5 +1,5 @@
 //! 마스터 자격증명으로 대상 DB 를 읽고 부트스트랩 문장을 실행한다
-//! (M3-4·M3-5·M3-7, [07 §2](../../../../docs/07-credentials-bootstrap.md)).
+//! (M3-4·M3-5·M3-7, [07 §2](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 왜 풀을 쓰지 않는가
 //!

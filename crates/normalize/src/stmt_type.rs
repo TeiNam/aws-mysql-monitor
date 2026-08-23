@@ -1,4 +1,4 @@
-//! `statement_type` 판정 ([05 §3.5](../../../docs/05-collector.md)).
+//! `statement_type` 판정 ([05 §3.5](../../../.claude/docs/05-collector.md)).
 
 use crate::lexer::Tok;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ impl StatementType {
     }
 
     /// 사후 `EXPLAIN` 재실행 폴백을 허용할 문장인가
-    /// ([05 §2.4](../../../docs/05-collector.md): SELECT 만 재실행한다).
+    /// ([05 §2.4](../../../.claude/docs/05-collector.md): SELECT 만 재실행한다).
     pub fn is_replay_safe(self) -> bool {
         self == Self::Select
     }

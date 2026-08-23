@@ -1,6 +1,6 @@
 //! `dbmon` 실행 파일. **조립만 한다.**
 //!
-//! 역할은 기동 플래그로 고른다([02 §2](../../docs/02-architecture.md)).
+//! 역할은 기동 플래그로 고른다([02 §2](../../.claude/docs/02-architecture.md)).
 //! 구현체 주입은 여기서 1회 하고, 이후 모든 코드는 `core` 의 포트만 본다.
 
 use std::path::PathBuf;

@@ -5,7 +5,7 @@
 //! 초기 설계의 파이프라인은 `선행 저장 → (확정 시) 정규화·마스킹` 이었다.
 //! 그러면 `masked` 정책 인스턴스에서도 **선행 저장 시점에 원문이 DynamoDB 에 들어간다.**
 //! 확정되지 않은 고아 레코드는 영구히 마스킹되지 않은 상태로 남고, 그 사이 증분
-//! 내보내기가 아카이브로 옮긴다. [08 §6.1](../../../../docs/08-security-auth.md)의
+//! 내보내기가 아카이브로 옮긴다. [08 §6.1](../../../../.claude/docs/08-security-auth.md)의
 //! "소급 마스킹은 불가"와 결합되면 되돌릴 수 없다.
 //!
 //! → 이 모듈이 **모든 쓰기 경로**의 유일한 입구다. 선행 저장이든 확정이든 여기를 지난다.
@@ -153,7 +153,7 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
                 // 커서 버렸다" 를 구분할 수 있어야 한다.
                 //
                 // S3 오프로드가 원래 계획이었으나(`storage.plan_bucket`) 읽는 코드가
-                // 없어 설정만 존재했다 — 그 설정은 지웠다([17](../../../docs/17-roadmap-tasks.md)).
+                // 없어 설정만 존재했다 — 그 설정은 지웠다([17](../../../.claude/docs/17-roadmap-tasks.md)).
                 plan_parse_failed = false;
                 PlanBundle {
                     source: PlanSource::None,
