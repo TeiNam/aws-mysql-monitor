@@ -290,6 +290,25 @@ fn slowlog_iam_scope_matches_what_the_code_reads() {
         fetch.contains("/aws/rds/instance/{}/slowquery"),
         "로그 그룹 이름 규칙이 바뀌었다 — IAM 패턴도 함께 고쳐야 한다"
     );
+
+    // **Aurora 는 클러스터 그룹이다.** 코드가 그 형태를 만드는데 IAM 폴백에 없으면
+    // 권한이 막는다 — 반대로 IAM 에만 있고 코드가 안 만들면 백필이 조용히 0건이다.
+    // 실제로 후자였다: Aurora 1,961건이 merged 0 · slowlog 0 이었다.
+    assert!(
+        fetch.contains("/aws/rds/cluster/{}/slowquery"),
+        "Aurora 클러스터 그룹 이름을 만들지 않는다 — 그러면 Aurora 는 백필이 돌지 않는다"
+    );
+    assert!(
+        iam.contains("/aws/rds/cluster/*/slowquery"),
+        "IAM 폴백에 Aurora 클러스터 그룹이 없다 — 코드가 맞아도 권한이 막는다"
+    );
+
+    // 스트림을 좁히는 코드가 있어야 한다. 클러스터 그룹에는 멤버 스트림이 여럿이므로
+    // 필터가 없으면 한 멤버가 다른 멤버의 슬로우 쿼리를 자기 것으로 저장한다.
+    assert!(
+        fetch.contains("set_log_stream_names"),
+        "클러스터 그룹을 읽으면서 스트림을 좁히지 않는다 — 멤버 간 오귀속이 된다"
+    );
 }
 
 /// **화면이 제시하는 모델을 IAM 이 전부 허용해야 한다.**

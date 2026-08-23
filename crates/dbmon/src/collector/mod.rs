@@ -70,6 +70,12 @@ pub struct TickStats {
     pub over_entry_cap: bool,
     pub prefetch_saved: usize,
     pub finalized: usize,
+    /// 확정 시점에 **끝난 문장의 지표를 실제로 얻은** 수.
+    ///
+    /// `finalized` 와의 차이가 곧 `rows_examined` 를 모르는 레코드 수다 — 커넥션이 닫혀
+    /// 스레드가 사라졌거나 다이제스트를 몰라 가릴 수 없었던 것들이다. 이 수치가 계속 0 이면
+    /// 히스토리 조회가 조용히 죽은 것이다(그건 예전 상태와 구분되지 않는다).
+    pub finalized_with_history: usize,
     pub plans_for_connection: usize,
     pub plans_rerun: usize,
     pub plans_rerun_as_select: usize,
@@ -385,14 +391,32 @@ where
         }
 
         // ── 확정 ───────────────────────────────────────────────────────────
+        //
+        // **끝난 문장의 지표를 여기서 한 번 읽는다.**
+        //
+        // 예전 주석은 "스레드가 이미 사라졌으므로 새로 조회할 수 없다" 고 했다. 그건
+        // **커넥션이 닫혔을 때만** 참이다 — 풀링 커넥션은 살아 있고, 그 스레드의
+        // `events_statements_history` 가 방금 끝난 문장을 실제 값으로 들고 있다.
+        //
+        // 이걸 읽지 않으면 `rows_examined` 를 영구히 알 수 없다. 실행 중 값은 전부 0
+        // 이므로 버렸고(`exec_stats`), 슬로우로그가 도착하지 않으면 채워지지 않는다 —
+        // 실측 4,814건 중 2,016건(42%)이 그 상태였다.
+        //
+        // **실패해도 확정은 계속한다.** 지표는 있으면 좋은 것이고, 확정을 건너뛰면
+        // 레코드가 `in_flight` 고아로 남는다.
+        let history = self.finalize_history(&tick.finalized).await;
+
         for (tracked, reason) in &tick.finalized {
+            let stmt = pick_history(&history, tracked);
+            if stmt.is_some() {
+                stats.finalized_with_history += 1;
+            }
             let out = build(CaptureInput {
                 instance: &self.instance,
                 tracked,
-                // 확정 시점에는 스레드가 이미 사라졌으므로 새로 조회할 수 없다.
-                // 선행 저장이 이미 텍스트를 넣었고, `upsert_merged` 가 속성별로 병합한다.
+                // 텍스트는 선행 저장이 이미 넣었다. `upsert_merged` 가 속성별로 병합한다.
                 full_sql: None,
-                stmt: None,
+                stmt,
                 plan_json: None,
                 plan_source: PlanSource::None,
                 plan_error: None,
@@ -428,6 +452,38 @@ where
         self.heartbeat(now_ms, &mut stats).await;
 
         Ok(stats)
+    }
+
+    /// 확정 대상 스레드의 **끝난 문장** 지표를 한 번에 읽는다.
+    ///
+    /// 실패는 삼킨다 — 지표는 있으면 좋은 것이고, 확정 자체를 막으면 레코드가 `in_flight`
+    /// 고아로 남는다(그건 TTL 까지 "실행 중" 으로 보인다).
+    async fn finalize_history(
+        &self,
+        finalized: &[(dbmon_core::inflight::Tracked, FinalizeReason)],
+    ) -> Vec<dbmon_core::ports::target_db::StmtCurrentRow> {
+        // 다이제스트를 모르는 항목은 어차피 가릴 수 없다([`pick_history`]) — 물어볼
+        // 이유도 없다. 전부 그렇다면 조회를 아예 건너뛴다.
+        let ids: Vec<u64> = finalized
+            .iter()
+            .filter(|(t, _)| t.identity.digest.is_some())
+            .map(|(t, _)| t.thread_id)
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        match self.db.stmt_history(&ids).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(
+                    instance = %self.instance.id,
+                    threads = ids.len(),
+                    error = %e,
+                    "확정 시점 히스토리 조회 실패 — 지표 없이 확정한다"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// **아직 관측 중이라고 저장소에 다시 말한다.**
@@ -904,6 +960,32 @@ impl PlanResult {
             error: Some(f.as_str()),
         }
     }
+}
+
+/// 확정하려는 실행에 해당하는 히스토리 행을 고른다.
+///
+/// # 추측하지 않는다
+///
+/// 같은 커넥션의 히스토리에는 최근 문장 5개가 남는다. 그 중 우리 것을 가리는 근거는
+/// **다이제스트**다. 다이제스트를 모르면(심층 조회가 SQL 을 못 얻었거나 상한에 걸렸다)
+/// `None` 을 돌려준다 — 엉뚱한 문장의 지표를 붙이는 것은 지표가 없는 것보다 나쁘다.
+/// 이 프로젝트에서 "가장 가까운 행을 고른다" 는 교차 리뷰 24·25라운드에 블로커였다.
+///
+/// ponytail: 최신 일치 하나를 쓴다(SQL 은 `EVENT_ID DESC` 로 정렬해 준다). 남은 창은
+/// **같은 다이제스트가 같은 커넥션에서 1초 안에 다시 실행된 경우**이고, 그때 붙는 값은
+/// 같은 쿼리 형태의 다른 실행이다 — 무해하다. 정확히 하려면 `TIMER_START` 를 서버 기동
+/// 시각과 맞춰야 하고, 그 환산은 이 이득에 비해 비싸다.
+fn pick_history<'a>(
+    rows: &'a [dbmon_core::ports::target_db::StmtCurrentRow],
+    tracked: &dbmon_core::inflight::Tracked,
+) -> Option<&'a dbmon_core::ports::target_db::StmtCurrentRow> {
+    let want = tracked.identity.digest.as_deref()?;
+    rows.iter().find(|r| {
+        r.processlist_id == tracked.thread_id
+            && r.digest.as_deref() == Some(want)
+            // SQL 이 이미 걸렀지만 페이크·다른 어댑터가 안 걸를 수 있다.
+            && r.counters_are_final()
+    })
 }
 
 /// 심층 조회 대상 선정의 입력. **한 tick 의 후보 하나.**

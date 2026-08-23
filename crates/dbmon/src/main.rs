@@ -634,7 +634,7 @@ async fn backfill_round(
             );
         }
         let chunk = match fetcher
-            .fetch(&instance.id, since_ms, resume_token.as_deref())
+            .fetch(instance, since_ms, resume_token.as_deref())
             .await
         {
             Ok(c) => c,
@@ -645,6 +645,11 @@ async fn backfill_round(
             // 진짜 장애가 그 소음에 묻힌다 — 대신 사유를 한 번 말하고 세어 둔다.
             Err(dbmon_core::error::DomainError::Unsupported { reason, .. }) => {
                 total.no_source += 1;
+                if total.no_source_instances.len() < dbmon::slowlog::source::NO_SOURCE_SAMPLE {
+                    total
+                        .no_source_instances
+                        .push(instance.id.identifier().to_string());
+                }
                 tracing::info!(
                     instance = %instance.id.as_str(),
                     %reason,
@@ -1982,16 +1987,28 @@ fn spawn_leader_loop(
                                 Default::default()
                             }
                         };
-                        // **`no_source` 만으로는 로그를 내지 않는다.** 슬로우로그가
-                        // 꺼진 인스턴스가 있는 배포에서는 그 값이 매 주기 같으므로,
-                        // 그것만 보고 줄을 쌓으면 로그가 그 사실로 도배된다.
-                        if s.merged > 0 || s.errors > 0 || s.fetch_errors > 0 || s.incomplete > 0 {
+                        // **`no_source` 만인 라운드도 한 줄 남긴다.**
+                        //
+                        // 예전 조건은 `merged > 0 || errors > 0 || …` 였다. 그래서 전원이
+                        // `no_source` 인 배포는 **아무 줄도 남기지 않았고**, 백필이 도는지조차
+                        // 알 수 없었다 — Aurora 의 로그 그룹 이름을 틀리게 만들던 결함이 그
+                        // 침묵 뒤에서 1,961건의 정확 지표를 지웠다.
+                        //
+                        // 도배 걱정은 유효하지만 주기당 한 줄이고, 인스턴스 이름을 함께 남기면
+                        // "어느 쪽이 조용한가" 가 바로 보인다. 어느 것도 없을 때만 침묵한다.
+                        if s.merged > 0
+                            || s.errors > 0
+                            || s.fetch_errors > 0
+                            || s.incomplete > 0
+                            || s.no_source > 0
+                        {
                             tracing::info!(
                                 merged = s.merged,
                                 unnormalizable = s.unnormalizable,
                                 masking_degraded = s.masking_degraded,
                                 fetch_errors = s.fetch_errors,
                                 no_source = s.no_source,
+                                no_source_instances = ?s.no_source_instances,
                                 incomplete = s.incomplete,
                                 errors = s.errors,
                                 "슬로우로그 백필"

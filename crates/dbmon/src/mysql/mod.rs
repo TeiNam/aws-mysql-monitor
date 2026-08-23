@@ -657,30 +657,22 @@ impl TargetDb for TargetMysql {
                 ids.iter().map(|i| Value::from(*i)).collect(),
             )
             .await?;
-        Ok(rows
-            .iter()
-            .map(|r| StmtCurrentRow {
-                processlist_id: num(r, 0),
-                thread_id: num(r, 1),
-                event_name: opt(r, 2),
-                current_schema: opt(r, 3),
-                digest: opt(r, 4),
-                digest_text: opt(r, 5),
-                sql_text: opt(r, 6),
-                timer_wait_ps: opt(r, 7),
-                lock_time_ps: opt(r, 8),
-                rows_examined: opt(r, 9),
-                rows_sent: opt(r, 10),
-                rows_affected: opt(r, 11),
-                created_tmp_tables: opt(r, 12),
-                created_tmp_disk_tables: opt(r, 13),
-                select_full_join: opt(r, 14),
-                sort_merge_passes: opt(r, 15),
-                no_index_used: opt::<u8>(r, 16).map(|v| v != 0),
-                no_good_index_used: opt::<u8>(r, 17).map(|v| v != 0),
-                nesting_event_type: opt(r, 18),
-            })
-            .collect())
+        Ok(rows.iter().map(stmt_current_row).collect())
+    }
+
+    async fn stmt_history(&self, ids: &[u64]) -> Result<Vec<StmtCurrentRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // **`stmt_current` 와 컬럼이 같다** — 같은 매퍼를 쓴다. 두 곳에서 인덱스를 세면
+        // 한쪽만 컬럼을 추가할 때 조용히 어긋난다.
+        let rows: Vec<Row> = self
+            .query_hot(
+                sql::stmt_history(ids.len()),
+                ids.iter().map(|i| Value::from(*i)).collect(),
+            )
+            .await?;
+        Ok(rows.iter().map(stmt_current_row).collect())
     }
 
     async fn explain_for_connection(&self, connection_id: u64) -> Result<ExplainOutcome> {
@@ -813,6 +805,35 @@ impl TargetDb for TargetMysql {
 }
 
 /// `detect` 쿼리의 `LIMIT`. 설정에서 주입하는 것이 맞지만, 포트 시그니처를 넓히지 않기 위해
+/// `events_statements_current`·`events_statements_history` 한 행을 옮긴다.
+///
+/// **두 뷰가 같은 매퍼를 쓴다.** 컬럼 인덱스를 두 곳에서 세면 한쪽만 컬럼을 추가할 때
+/// 조용히 어긋난다 — 이 프로젝트에서 키·인덱스 불일치는 빈 결과로만 나타나 찾기 어렵다.
+fn stmt_current_row(r: &Row) -> StmtCurrentRow {
+    StmtCurrentRow {
+        processlist_id: num(r, 0),
+        thread_id: num(r, 1),
+        event_name: opt(r, 2),
+        current_schema: opt(r, 3),
+        digest: opt(r, 4),
+        digest_text: opt(r, 5),
+        sql_text: opt(r, 6),
+        timer_wait_ps: opt(r, 7),
+        lock_time_ps: opt(r, 8),
+        rows_examined: opt(r, 9),
+        rows_sent: opt(r, 10),
+        rows_affected: opt(r, 11),
+        created_tmp_tables: opt(r, 12),
+        created_tmp_disk_tables: opt(r, 13),
+        select_full_join: opt(r, 14),
+        sort_merge_passes: opt(r, 15),
+        no_index_used: opt::<u8>(r, 16).map(|v| v != 0),
+        no_good_index_used: opt::<u8>(r, 17).map(|v| v != 0),
+        nesting_event_type: opt(r, 18),
+        end_event_id: opt(r, 19),
+    }
+}
+
 fn digest_row(r: &Row) -> DigestSnapshotRow {
     DigestSnapshotRow {
         schema_name: opt(r, 0),

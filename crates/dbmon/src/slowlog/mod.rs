@@ -16,5 +16,7 @@ pub mod fetch;
 pub mod parse;
 pub mod source;
 
-pub use fetch::{CloudWatchFetcher, FileFetcher, LogChunk, SlowLogFetcher, slowquery_log_group};
+pub use fetch::{
+    CloudWatchFetcher, FileFetcher, LogChunk, LogSource, SlowLogFetcher, slowquery_log_source,
+};
 pub use parse::{ParseOutcome, SkipReason, SlowLogEntry, parse};

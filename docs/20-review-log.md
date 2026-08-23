@@ -3138,3 +3138,121 @@ SELECT COUNT(*) FROM order_items a STRAIGHT_JOIN customers c ON c.id % 13 = a.id
 left:  [QualifiedTable { schema: "shop", name: "a" }, … name: "c" }]
 right: [QualifiedTable { schema: "shop", name: "order_items" }, … name: "customers" }]
 ```
+
+
+---
+
+## `rows_examined = 0` 이 42%였다 — 세 겹의 원인 (2026-08-23)
+
+튜닝 모델이 "검사 행 0 은 실행계획과 모순되므로 계측 신뢰도가 낮다" 며 confidence 를 내렸다.
+그 지적을 따라가니 원인이 세 개였고, **셋 다 조용했다.**
+
+전수 4,814건:
+
+| capture_source | 인스턴스 | 행수 | 건수 |
+|---|---|---|---|
+| merged | `dbmon-seed-dev-mysql` | >0 | 2,725 |
+| slowlog | `dbmon-seed-dev-mysql` | >0 | 54 |
+| **processlist** | **`dbmon-seed-dev-aurora-2`** | **=0** | **1,961** |
+| processlist | `dbmon-seed-dev-mysql` | =0 | 64 |
+
+### ① 실행 중 카운터는 전부 0 인데 그걸 사실로 저장했다
+
+같은 문장을 실행 중과 완료 후에 읽었다 (Aurora MySQL 8.0):
+
+```text
+                   실행 중(current)   완료 후(history)
+ROWS_EXAMINED               0            120,005
+ROWS_SENT                   0                  5
+NO_INDEX_USED               1                  1     ← 옵티마이즈 시점, 유효하다
+TIMER_WAIT               4,059ms         7,418ms     ← 유효하다
+END_EVENT_ID             NULL                  4     ← 이 값이 유효성을 가른다
+```
+
+`opt(r, 9)` 는 MySQL 이 준 `0` 을 `Some(0)` 으로 옮긴다. `ExecStats` 의 필드는 전부
+`Option` 이라 "모른다" 를 표현할 수단이 **이미 있었는데** 쓰지 않았다.
+
+`END_EVENT_ID` 는 같은 뷰에 있었고 쿼리에서 선택만 안 했다. 이제 그걸 읽어
+실행 중이면 이벤트 카운터를 `None` 으로 둔다. `NO_INDEX_USED`·`TIMER_WAIT`·`LOCK_TIME` 은
+실행 중에도 유효하므로 그대로 쓴다 — 다 버리면 기능이 죽는다.
+
+`merge_stats` 의 `max_opt`·`any` 가 `None` 을 그대로 흡수하므로 병합과도 맞는다.
+
+**테스트가 이걸 놓친 이유:** `StmtCurrentRow` 픽스처가 전부 `..Default::default()` 였고
+카운터 흐름을 검사하는 테스트가 없었다. 게다가 통합 테스트는 `rows_examined.is_some()` 을
+"경로가 살아 있는가" 확인용으로 쓰면서 **주석에 "캡처 시점에 아직 0일 수 있다" 고 적어
+뒀다** — 결함을 알면서 그걸 통과 조건으로 삼은 셈이다.
+
+### ② 확정 시점에 다시 읽지 않았다
+
+확정 루프 주석: "스레드가 이미 사라졌으므로 새로 조회할 수 없다."
+
+**커넥션이 닫혔을 때만 참이다.** 풀링 커넥션은 살아 있고, 그 스레드의
+`events_statements_history` 가 방금 끝난 문장을 실제 값으로 들고 있다. 실측으로 확인했다 —
+`history` consumer 는 MySQL 8 기본 활성이고 스레드당 5개를 남긴다.
+
+확정 시점에 `stmt_history` 를 한 번 배치 조회하고, **다이제스트로** 우리 문장을 가른다.
+다이제스트를 모르면 `None` 이다 — 엉뚱한 문장의 지표를 붙이는 것은 지표가 없는 것보다
+나쁘고, "가장 가까운 행을 고른다" 는 24·25라운드에 블로커였다.
+
+`finalized_with_history` 를 센다. `finalized` 와의 차이가 곧 모르는 레코드 수이고, 이 값이
+계속 0 이면 조회가 조용히 죽은 것이다(그건 예전 상태와 구분되지 않는다).
+
+### ③ Aurora 는 백필이 **한 번도** 돌지 않았다
+
+체크포인트가 RDS 인스턴스 2개에만 있었다. Aurora 는 하나도 없었다.
+
+```rust
+// 예전 — 항상 인스턴스 형태
+format!("/aws/rds/instance/{}/slowquery", instance.identifier())
+```
+
+Aurora 는 슬로우로그를 **클러스터 그룹**에 쓴다. 실측한 실제 자리:
+
+```text
+로그 그룹:   /aws/rds/cluster/dbmon-seed-dev-aurora/slowquery
+로그 스트림: dbmon-seed-dev-aurora-2        ← 멤버마다 하나
+```
+
+없는 그룹을 조회하니 `ResourceNotFound` 였고, 그 실패는 `Unsupported` 로 분류돼 `info`
+한 줄로만 남았다. IAM 정책에는 **이미 클러스터 ARN 이 열거돼 있었다** — 인프라 쪽은
+알고 있었고 코드가 몰랐다.
+
+`slowquery_log_source(&Instance)` 가 `cluster_id` 를 보고 그룹을 정하고, Aurora 면
+**스트림을 멤버 이름으로 좁힌다.** 좁히지 않으면 라이터가 리더의 슬로우 쿼리를 자기
+것으로 저장한다 — `check_scope` 가 막으려는 오귀속과 같은 부류다.
+
+IAM 폴백에도 `cluster` 형태를 넣었다. 둘이 갈리는 것은
+`slowlog_iam_scope_matches_what_the_code_reads` 가 막는다.
+
+### ④ 침묵 자체도 결함이었다
+
+라운드 요약 로그의 조건이 `merged > 0 || errors > 0 || fetch_errors > 0 || incomplete > 0`
+이었다. Aurora 전용 배포는 **전원이 `no_source`** 라 그 라운드가 **아무 줄도 남기지
+않았다** — 백필이 도는지조차 알 수 없었다.
+
+`no_source > 0` 도 로그 조건에 넣고 인스턴스 이름을 최대 5개 함께 남긴다. 주기당 한 줄이고,
+그 한 줄이 있었으면 이 결함은 하루 안에 드러났다.
+
+### 회귀 — 넷 다 무력화하면 실패한다
+
+| 테스트 | 무력화하면 |
+|---|---|
+| `counters_from_a_running_statement_are_unknown_not_zero` | `Some(0)` 이 그대로 저장된다 |
+| `finalization_fills_metrics_from_statement_history` (페이크) | `finalized_with_history` 가 0 |
+| `finalization_reads_the_real_metrics_from_history` (**실제 MySQL**) | 확정 뒤에도 검사 행수를 모른다 |
+| `aurora_reads_the_cluster_group_and_filters_its_own_stream` | 인스턴스 형태 그룹을 만든다 |
+
+마지막 것은 도커 MySQL 에서 실제로 5.7초 쿼리를 돌려 확정까지 따라간다. 풀링 커넥션을
+재현하는 `run_then_idle` 헬퍼를 만들었다 — 기존 헬퍼는 문장이 끝나면 곧바로 끊어서
+히스토리가 스레드와 함께 사라졌다.
+
+### 남긴 것
+
+`plan.referenced_tables` 처럼 **이미 저장된 1,961건은 채워지지 않는다.** 실행 중 값이
+0 이었고 그 실행은 끝났다 — 히스토리에도 없다. TTL 로 빠질 때까지 `rows_examined` 는
+`None` 이다(예전에는 `0` 이었으니, 거짓말이 없어진 것이 개선이다).
+
+다이제스트 롤업(`DigestDelta.rows_examined`)에는 **시간별 합계**가 있다. `합계 ÷ exec_count`
+는 그 시간대 평균이고 개별 실행 값이 아니므로 그 자리에 넣지 않는다 — 별도 라벨로 튜닝
+컨텍스트에 넣는 것은 따로 의미가 있다(미구현).

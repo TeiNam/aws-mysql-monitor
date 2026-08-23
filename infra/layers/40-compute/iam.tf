@@ -293,13 +293,19 @@ resource "aws_iam_role_policy" "task_discovery" {
         Action = ["logs:FilterLogEvents"]
         # 슬로우로그에는 **SQL 리터럴이 들어간다** — 개인정보가 실릴 수 있다.
         #
-        # 열거된 그룹이 있으면 그것만. 없으면 인스턴스 슬로우로그 그룹으로 좁힌다:
-        # `/aws/rds/instance/*/slowquery` 는 `/aws/rds/*` 보다 훨씬 좁다 —
-        # 후자는 error/general/audit 로그와 클러스터 로그까지 포함한다.
-        # 특히 **audit 로그는 모든 문장을 담으므로** 노출 범위가 전혀 다르다.
+        # 열거된 그룹이 있으면 그것만. 없으면 슬로우로그 그룹으로 좁힌다:
+        # `/aws/rds/{instance,cluster}/*/slowquery` 는 `/aws/rds/*` 보다 훨씬 좁다 —
+        # 후자는 error/general/audit 로그까지 포함한다. 특히 **audit 로그는 모든 문장을
+        # 담으므로** 노출 범위가 전혀 다르다.
+        #
+        # **`cluster` 형태가 있어야 Aurora 가 된다.** Aurora 는 슬로우로그를 클러스터 단위
+        # 그룹(`/aws/rds/cluster/<클러스터>/slowquery`)에 쓴다 — 인스턴스 형태만 두면 코드가
+        # 맞아도 권한이 막는다. 그 반대(코드가 인스턴스 이름만 만들던 것)가 실제 결함이었다.
         Resource = length(var.slowlog_log_group_arns) > 0 ? var.slowlog_log_group_arns : [
           "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/instance/*/slowquery:*",
-          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/instance/*/slowquery"
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/instance/*/slowquery",
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/cluster/*/slowquery:*",
+          "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/rds/cluster/*/slowquery"
         ]
       },
     ]

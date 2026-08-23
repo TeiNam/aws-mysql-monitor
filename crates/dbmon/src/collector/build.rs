@@ -293,19 +293,30 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
     }
 }
 
+/// `events_statements_current` 한 행을 실행 통계로.
+///
+/// **실행 중인 문장의 이벤트 카운터는 버린다** ([`StmtCurrentRow::counters_are_final`]).
+/// MySQL 은 그때 0 을 주는데, 그걸 저장하면 "모른다" 가 "0행을 훑었다" 는 사실이 된다 —
+/// 화면은 `0` 을 보여주고 튜닝 모델은 실행계획과의 모순을 근거로 신뢰도를 내린다.
+///
+/// `None` 은 병합과도 맞는다: [`dbmon_core::merge`] 의 `max_opt`·`any` 가 나중에 도착한
+/// 실제 값을 그대로 채택한다(슬로우로그 병합, 또는 확정 시점의 히스토리 재조회).
 fn exec_stats(s: &StmtCurrentRow) -> ExecStats {
+    // 끝났으면 그대로, 아직이면 모른다.
+    let counter = |v: Option<u64>| if s.counters_are_final() { v } else { None };
     ExecStats {
-        rows_examined: s.rows_examined,
-        rows_sent: s.rows_sent,
-        rows_affected: s.rows_affected,
-        // `LOCK_TIME` 도 피코초다.
+        rows_examined: counter(s.rows_examined),
+        rows_sent: counter(s.rows_sent),
+        rows_affected: counter(s.rows_affected),
+        // **`LOCK_TIME` 은 실행 중에도 유효하다**(실측: 0.004ms). 피코초다.
         lock_time_ms: s.lock_time_ps.map(|ps| (ps / 1_000_000_000) as i64),
-        tmp_tables: s.created_tmp_tables,
-        tmp_disk_tables: s.created_tmp_disk_tables,
-        sort_merge_passes: s.sort_merge_passes,
+        tmp_tables: counter(s.created_tmp_tables),
+        tmp_disk_tables: counter(s.created_tmp_disk_tables),
+        sort_merge_passes: counter(s.sort_merge_passes),
+        // **옵티마이즈 시점에 정해진다** — 실행 중에도 유효하다(실측: 실행 중 `1`).
         no_index_used: s.no_index_used,
         no_good_index_used: s.no_good_index_used,
-        full_join: s.select_full_join.map(|v| v > 0),
+        full_join: counter(s.select_full_join).map(|v| v > 0),
     }
 }
 
@@ -542,6 +553,67 @@ mod tests {
         assert!(!out.masking_degraded, "DIGEST_TEXT 는 이미 마스킹돼 있다");
     }
 
+    /// **실행 중인 문장의 카운터를 사실로 저장하지 않는다.**
+    ///
+    /// MySQL 은 실행 중에 `ROWS_EXAMINED = 0` 을 준다(실측: 12만 행을 훑는 조인이
+    /// 완료 후 120,005). 그 0 을 저장하면 화면이 `0` 을 보여주고 튜닝 모델은 실행계획과의
+    /// 모순을 근거로 신뢰도를 내린다 — 실제로 전체 4,814건 중 2,016건이 그 상태였다.
+    ///
+    /// 이 테스트가 없어서 결함이 통과했다. 기존 픽스처는 전부 `end_event_id: None`
+    /// (실행 중)인데 카운터 흐름을 아무도 검사하지 않았다.
+    #[test]
+    fn counters_from_a_running_statement_are_unknown_not_zero() {
+        let (i, t, o) = (instance(), tracked(), ClockOffset::restored(0));
+
+        // ① 실행 중 — MySQL 이 주는 0 을 버린다.
+        let running = StmtCurrentRow {
+            rows_examined: Some(0),
+            rows_sent: Some(0),
+            rows_affected: Some(0),
+            created_tmp_tables: Some(0),
+            created_tmp_disk_tables: Some(0),
+            select_full_join: Some(0),
+            sort_merge_passes: Some(0),
+            // 이 둘은 옵티마이즈 시점에 정해진다 — 실행 중에도 유효하다.
+            no_index_used: Some(true),
+            no_good_index_used: Some(true),
+            lock_time_ps: Some(4_000_000),
+            end_event_id: None,
+            ..Default::default()
+        };
+        let mut inp = input(&i, &t, &o, LiteralPolicy::Masked, Some(RAW));
+        inp.stmt = Some(&running);
+        let s = build(inp).query.stats;
+        assert_eq!(s.rows_examined, None, "0 을 '0행을 훑었다' 로 저장했다");
+        assert_eq!(s.rows_sent, None);
+        assert_eq!(s.rows_affected, None);
+        assert_eq!(s.tmp_tables, None);
+        assert_eq!(s.tmp_disk_tables, None);
+        assert_eq!(s.sort_merge_passes, None);
+        assert_eq!(s.full_join, None);
+        // 실행 중에도 유효한 것은 남아야 한다 — 다 버리면 기능이 죽는다.
+        assert_eq!(s.no_index_used, Some(true));
+        assert_eq!(s.no_good_index_used, Some(true));
+        assert_eq!(s.lock_time_ms, Some(0), "LOCK_TIME 은 실행 중에도 유효하다");
+
+        // ② 완료 — 그대로 통과해야 한다.
+        let done = StmtCurrentRow {
+            rows_examined: Some(120_005),
+            rows_sent: Some(5),
+            created_tmp_disk_tables: Some(2),
+            select_full_join: Some(1),
+            end_event_id: Some(4),
+            ..Default::default()
+        };
+        let mut inp = input(&i, &t, &o, LiteralPolicy::Masked, Some(RAW));
+        inp.stmt = Some(&done);
+        let s = build(inp).query.stats;
+        assert_eq!(s.rows_examined, Some(120_005));
+        assert_eq!(s.rows_sent, Some(5));
+        assert_eq!(s.tmp_disk_tables, Some(2));
+        assert_eq!(s.full_join, Some(true));
+    }
+
     #[test]
     fn truncation_is_flagged_at_the_ceiling() {
         let (i, t, o) = (instance(), tracked(), ClockOffset::restored(0));
@@ -637,6 +709,10 @@ mod tests {
             timer_wait_ps: Some(4_213_000_000_000),
             lock_time_ps: Some(112_000_000),
             rows_examined: Some(8_213_445),
+            // **완료된 문장이다.** 실행 중이면 MySQL 이 `ROWS_EXAMINED = 0` 을 주므로
+            // 위 값과 함께 오는 조합이 존재하지 않는다(실측). `TIMER_WAIT` 는 양쪽에서
+            // 유효하니 이 테스트의 주장은 그대로 성립한다.
+            end_event_id: Some(4),
             ..Default::default()
         };
         let mut inp = input(&i, &t, &o, LiteralPolicy::Full, Some(RAW));

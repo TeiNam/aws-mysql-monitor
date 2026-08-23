@@ -269,6 +269,40 @@ pub async fn start_long_statements(
     })
 }
 
+/// 문장을 끝까지 실행하고 **커넥션을 유휴 상태로 살려 둔다.**
+///
+/// # 왜 필요한가 — 풀링 커넥션을 재현한다
+///
+/// `start_long_statements` 는 문장이 끝나면 곧바로 `disconnect` 한다. 그러면 서버가 스레드를
+/// 파괴하고 그 스레드의 `events_statements_history` 도 함께 사라진다 — 확정 시점에 정확
+/// 지표를 읽는 경로를 테스트할 수 없다.
+///
+/// 실제 애플리케이션은 커넥션을 풀에 돌려주므로 스레드가 살아 있고, 히스토리에 방금 끝난
+/// 문장이 실제 값으로 남는다(실측: `ROWS_EXAMINED` 0 → 120,005). 그 상황을 만든다.
+pub async fn run_then_idle(
+    target: Target,
+    cred: (&str, &str),
+    sql: impl Into<String>,
+    idle: std::time::Duration,
+) -> Option<RunningQuery> {
+    let sql = sql.into();
+    let mut conn = connect(target, cred).await?;
+    let connection_id: u64 = conn.query_first("SELECT CONNECTION_ID()").await.ok()??;
+    let handle = tokio::spawn(async move {
+        let _ = conn.query_drop(sql).await;
+        // **문장은 끝났고 커넥션은 살아 있다.** 여기서 SQL 을 더 보내면 그 문장이
+        // `events_statements_current` 를 차지하고 히스토리 자리도 밀려난다.
+        tokio::time::sleep(idle).await;
+        let _ = conn.disconnect().await;
+    });
+    Some(RunningQuery {
+        connection_id,
+        handle: Some(handle),
+        port: target.port,
+        cleaned: false,
+    })
+}
+
 /// 실행 중인 커넥션의 문장을 세 소스에서 각각 읽어 길이를 잰다 (M1-1).
 pub struct TextLengths {
     /// `performance_schema.processlist.INFO` — 1024바이트 절단이 예상된다.

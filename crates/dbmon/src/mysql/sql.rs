@@ -75,6 +75,24 @@ WHERE ID IN ({})",
 ///
 /// `TIMER_WAIT`·`LOCK_TIME` 은 **피코초**다. ms 변환은 1e9 로 나눈다
 /// (1세대의 흔한 버그: 마이크로초로 착각 → 1000배 오차).
+///
+/// # `END_EVENT_ID` 를 함께 읽는다 — 카운터가 유효한지 가르는 값이다
+///
+/// **실행 중인 문장의 카운터는 전부 0 이다.** 실측(Aurora MySQL 8.0, 4초 지점,
+/// 실제로는 1,900만 행을 훑는 조인):
+///
+/// ```text
+/// ROWS_EXAMINED=0  ROWS_SENT=0  ROWS_AFFECTED=0
+/// CREATED_TMP_TABLES=0  CREATED_TMP_DISK_TABLES=0
+/// SELECT_FULL_JOIN=0  SORT_MERGE_PASSES=0
+/// NO_INDEX_USED=1  NO_GOOD_INDEX_USED=1     ← 옵티마이즈 시점에 정해진다, 유효하다
+/// TIMER_WAIT=4059ms  LOCK_TIME=0.004ms      ← 유효하다
+/// END_EVENT_ID=NULL                          ← 아직 안 끝났다
+/// ```
+///
+/// `0` 을 그대로 저장하면 **"모른다" 가 "0행을 훑었다" 는 사실이 된다.** 실제로 그렇게
+/// 저장돼 있었고(전체의 42%), 튜닝 모델이 "검사 행 0 은 실행계획과 모순" 이라며 신뢰도를
+/// 내렸다. `ExecStats` 의 필드는 전부 `Option` 이므로 표현할 수단은 이미 있었다.
 pub fn stmt_current(id_count: usize) -> String {
     format!(
         "/* dbmon:stmtcurrent */
@@ -86,10 +104,37 @@ SELECT t.PROCESSLIST_ID, t.THREAD_ID,
        e.CREATED_TMP_TABLES, e.CREATED_TMP_DISK_TABLES,
        e.SELECT_FULL_JOIN, e.SORT_MERGE_PASSES,
        e.NO_INDEX_USED, e.NO_GOOD_INDEX_USED,
-       e.NESTING_EVENT_TYPE
+       e.NESTING_EVENT_TYPE, e.END_EVENT_ID
 FROM performance_schema.events_statements_current e
 JOIN performance_schema.threads t USING (THREAD_ID)
 WHERE t.PROCESSLIST_ID IN ({})",
+        placeholders(id_count)
+    )
+}
+
+/// 확정 시점의 **끝난** 문장 지표 (`events_statements_history`).
+///
+/// [`stmt_current`] 와 **컬럼이 같다** — 호출부가 같은 구조체로 받아 같은 조립 경로를 탄다.
+/// 뷰만 다르다.
+///
+/// `END_EVENT_ID IS NOT NULL` 로 끝난 것만 본다. 최신순으로 정렬해 호출부가 첫 일치를
+/// 고르게 한다 — 스레드당 5개가 남으므로(`..._history_size` 기본값) 그 안에 우리 문장이 있다.
+pub fn stmt_history(id_count: usize) -> String {
+    format!(
+        "/* dbmon:stmthistory */
+SELECT t.PROCESSLIST_ID, t.THREAD_ID,
+       e.EVENT_NAME, e.CURRENT_SCHEMA,
+       e.DIGEST, e.DIGEST_TEXT, e.SQL_TEXT,
+       e.TIMER_WAIT, e.LOCK_TIME,
+       e.ROWS_EXAMINED, e.ROWS_SENT, e.ROWS_AFFECTED,
+       e.CREATED_TMP_TABLES, e.CREATED_TMP_DISK_TABLES,
+       e.SELECT_FULL_JOIN, e.SORT_MERGE_PASSES,
+       e.NO_INDEX_USED, e.NO_GOOD_INDEX_USED,
+       e.NESTING_EVENT_TYPE, e.END_EVENT_ID
+FROM performance_schema.events_statements_history e
+JOIN performance_schema.threads t USING (THREAD_ID)
+WHERE t.PROCESSLIST_ID IN ({}) AND e.END_EVENT_ID IS NOT NULL
+ORDER BY e.EVENT_ID DESC",
         placeholders(id_count)
     )
 }
