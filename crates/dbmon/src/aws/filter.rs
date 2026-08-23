@@ -3,9 +3,9 @@
 //! # 이 파일이 막는 실패
 //!
 //! `rds:DescribeDBInstances` 는 리소스 수준 권한을 지원하지 않으므로 IAM 이
-//! `Resource: "*"` 다([19 §B](../../../../docs/19-m1-findings.md)). 즉 dev 배포도
+//! `Resource: "*"` 다([19 §B](../../../../.claude/docs/19-m1-findings.md)). 즉 dev 배포도
 //! **계정 안의 prd 인스턴스를 다 본다.** 이 계정에는 프로덕션 워크로드가 함께 있다
-//! ([18 §1](../../../../docs/18-dev-environment.md)).
+//! ([18 §1](../../../../.claude/docs/18-dev-environment.md)).
 //!
 //! 그래서 필터가 최후 방어선이다. 설정 검증이 `deployment_env != prd` 에서
 //! `allowed_vpc_ids` 를 필수로 만들고(`config.rs`), 이 파일이 그 필터를 적용한다.

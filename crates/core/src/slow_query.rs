@@ -1,4 +1,4 @@
-//! 개별 슬로우 쿼리 레코드 ([04 §2.3](../../../docs/04-data-model.md)).
+//! 개별 슬로우 쿼리 레코드 ([04 §2.3](../../../.claude/docs/04-data-model.md)).
 
 use crate::env::Env;
 use crate::ids::{ClusterId, DurBucket, InstanceId, RecordId};
@@ -7,7 +7,7 @@ use crate::time::EpochMs;
 use dbmon_normalize::StatementType;
 use serde::{Deserialize, Serialize};
 
-/// 리터럴 저장·노출 정책 ([08 §6.1](../../../docs/08-security-auth.md)).
+/// 리터럴 저장·노출 정책 ([08 §6.1](../../../.claude/docs/08-security-auth.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiteralPolicy {
@@ -108,7 +108,7 @@ impl CaptureSource {
 /// `ForConnection` 이 가장 정확하지만 **RDS 에서는 쓸 수 없다.**
 /// `EXPLAIN ... FOR CONNECTION` 은 타인 커넥션에 대해 **정적 전역 권한 전체**를 요구하고,
 /// RDS 는 마스터 유저에게도 `SUPER`·`FILE`·`SHUTDOWN` 을 주지 않는다
-/// ([19-m1-findings.md](../../../docs/19-m1-findings.md) B).
+/// ([19-m1-findings.md](../../../.claude/docs/19-m1-findings.md) B).
 /// → 실질 기본 경로는 `Rerun` 이다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,7 +178,7 @@ impl DurationSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlowQueryState {
-    /// 실행 중. 선행 저장된 상태 ([05 §4.3](../../../docs/05-collector.md)).
+    /// 실행 중. 선행 저장된 상태 ([05 §4.3](../../../.claude/docs/05-collector.md)).
     InFlight,
     /// 종료를 관측해 확정됨.
     Finalized,
@@ -264,7 +264,7 @@ pub struct SlowQuery {
     /// 4바이트 문자가 `?` 로 **손실됐을 수 있다.**
     ///
     /// `information_schema.PROCESSLIST.INFO` 는 `utf8mb3` 라 이모지·확장 CJK 를
-    /// `?` 한 바이트로 치환한다([19 §A-2](../../../docs/19-m1-findings.md) 실측).
+    /// `?` 한 바이트로 치환한다([19 §A-2](../../../.claude/docs/19-m1-findings.md) 실측).
     /// 무손실 소스(`events_statements_current.SQL_TEXT`)는 1,024바이트에서 잘리므로,
     /// 긴 SQL 에서는 **손실본을 쓸 수밖에 없다.**
     ///

@@ -1,7 +1,7 @@
 //! 에러 체계 (M0-7). 안정적인 `code` 문자열과 HTTP 매핑을 함께 가진다.
 //!
 //! `code` 는 **API 계약의 일부**다. 프론트엔드가 분기하므로 이름을 바꾸면 파괴적 변경이다
-//! ([13 §1.2](../../../docs/13-api-spec.md)).
+//! ([13 §1.2](../../../.claude/docs/13-api-spec.md)).
 
 use std::fmt;
 use thiserror::Error;

@@ -1,5 +1,5 @@
 //! 다이제스트 델타 계산과 시간 롤업
-//! ([05 §2.5.2](../../../docs/05-collector.md), [04 §2.3](../../../docs/04-data-model.md)).
+//! ([05 §2.5.2](../../../.claude/docs/05-collector.md), [04 §2.3](../../../.claude/docs/04-data-model.md)).
 //!
 //! # 단위 주의
 //!
@@ -136,7 +136,7 @@ impl DeltaKind {
 /// 델타를 계산한다.
 ///
 /// `prev_snapshot_ms` 는 **대상 DB 시각** 기준의 이전 스냅샷 시각이다
-/// (우리 시계를 쓰지 않는다 — [05 §2.5.3](../../../docs/05-collector.md)).
+/// (우리 시계를 쓰지 않는다 — [05 §2.5.3](../../../.claude/docs/05-collector.md)).
 pub fn compute_delta(
     prev: Option<&DigestSnapshotRow>,
     cur: &DigestSnapshotRow,
@@ -222,7 +222,7 @@ pub fn ps_to_ms(ps: u64) -> i64 {
     (ps / PS_PER_MS) as i64
 }
 
-/// 이전 스냅샷 보관 — 워커 메모리에만 둔다([02 §6](../../../docs/02-architecture.md)).
+/// 이전 스냅샷 보관 — 워커 메모리에만 둔다([02 §6](../../../.claude/docs/02-architecture.md)).
 #[derive(Debug, Default)]
 pub struct SnapshotCache {
     rows: BTreeMap<(Option<String>, String), DigestSnapshotRow>,

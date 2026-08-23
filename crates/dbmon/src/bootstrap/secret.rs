@@ -1,4 +1,4 @@
-//! 마스터 자격증명 소스 (M3-1·M3-2, [07 §1](../../../../docs/07-credentials-bootstrap.md)).
+//! 마스터 자격증명 소스 (M3-1·M3-2, [07 §1](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 두 경로만 만든다
 //!

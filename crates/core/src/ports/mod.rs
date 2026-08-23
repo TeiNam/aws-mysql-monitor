@@ -2,7 +2,7 @@
 //!
 //! 여기 없는 포트(`Notifier`, `LlmAdvisor`, `MetricSource`)는 해당 마일스톤에서 추가한다.
 //! 구현이 없는 trait 를 미리 선언하면 첫 구현 때 시그니처가 바뀌어 순수한 손실이다
-//! (YAGNI). 대신 [02 §10](../../../docs/02-architecture.md) 의 확장 지점 표가 자리를 지킨다.
+//! (YAGNI). 대신 [02 §10](../../../.claude/docs/02-architecture.md) 의 확장 지점 표가 자리를 지킨다.
 
 pub mod stores;
 pub mod target_db;
@@ -143,7 +143,7 @@ impl ArchiveTemplate {
     }
 }
 
-/// 마스터 자격증명 소스 ([07 §2](../../../docs/07-credentials-bootstrap.md)).
+/// 마스터 자격증명 소스 ([07 §2](../../../.claude/docs/07-credentials-bootstrap.md)).
 ///
 /// **초기 모니터링 계정 생성에만** 쓴다. 상시 보관하지 않는다.
 #[async_trait]

@@ -1,7 +1,7 @@
 //! 대상 MySQL 어댑터 — [`TargetDb`] 구현.
 //!
 //! **이 모듈은 AWS 를 모른다.** 접속 비밀은 [`dbmon_core::ports::AuthTokenProvider`] 가 준다
-//! ([02 §5](../../../../docs/02-architecture.md) F31).
+//! ([02 §5](../../../../.claude/docs/02-architecture.md) F31).
 //!
 //! # 풀을 두 개로 나눈다 (F7)
 //!
@@ -37,7 +37,7 @@ use sql::ExplainFormat;
 /// `information_schema.PROCESSLIST.INFO` 의 절단 지점 (바이트).
 ///
 /// `varchar(21845)` × utf8mb3 3바이트 = 65,535. 컬럼 정의에서 오는 값이라 설정으로
-/// 바뀌지 않는다([19 §A](../../../../docs/19-m1-findings.md)).
+/// 바뀌지 않는다([19 §A](../../../../.claude/docs/19-m1-findings.md)).
 pub const IS_PROCESSLIST_INFO_MAX_BYTES: usize = 65_535;
 
 #[derive(Debug, Clone, Copy)]
@@ -866,7 +866,7 @@ fn digest_row(r: &Row) -> DigestSnapshotRow {
 /// `information_schema` 가 준 SQL 텍스트가 절단됐는지 판정한다.
 ///
 /// 상한이 컬럼 정의에서 오는 고정값이라 **정확히 그 길이면 절단**이다
-/// ([19 §A](../../../../docs/19-m1-findings.md)).
+/// ([19 §A](../../../../.claude/docs/19-m1-findings.md)).
 pub fn is_info_truncated(info: &str) -> bool {
     info.len() >= IS_PROCESSLIST_INFO_MAX_BYTES
 }

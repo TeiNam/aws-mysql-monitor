@@ -77,7 +77,7 @@ variable "create_s3_gateway_endpoint" {
   description = <<-EOT
     S3 게이트웨이 엔드포인트를 **새로 만들 것인가.**
 
-    dev VPC 에는 이미 있다(`vpce-03eb8b8a5dbfad810`, [18 §2](../../../docs/18-dev-environment.md)).
+    dev VPC 에는 이미 있다(`vpce-03eb8b8a5dbfad810`, [18 §2](../../../.claude/docs/18-dev-environment.md)).
     한 라우트 테이블에 같은 서비스의 prefix-list 라우트를 두 번 넣을 수 없으므로
     `true` 로 두면 `RouteAlreadyExists` 로 **첫 apply 가 깨진다.**
   EOT

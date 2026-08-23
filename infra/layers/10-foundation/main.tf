@@ -122,10 +122,10 @@ resource "aws_kms_alias" "data" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DynamoDB — 단일 테이블 2개 ([04](../../../docs/04-data-model.md))
+# DynamoDB — 단일 테이블 2개 ([04](../../../.claude/docs/04-data-model.md))
 # ─────────────────────────────────────────────────────────────────────────────
 # 과금은 **온디맨드**. 쓰기가 정시 롤업 플러시로 버스트하므로 프로비저닝은 스로틀을 부른다
-# ([OPEN-Q-13](../../../docs/OPEN-QUESTIONS.md) 에서 3개월 후 재검토).
+# ([OPEN-Q-13](../../../.claude/docs/OPEN-QUESTIONS.md) 에서 3개월 후 재검토).
 resource "aws_dynamodb_table" "data" {
   name         = "dbmon-data-${var.environment}"
   billing_mode = "PAY_PER_REQUEST"
@@ -171,7 +171,7 @@ resource "aws_dynamodb_table" "data" {
   # `SlowQuery` 는 제거가 아니라 **교체**다. 확정된 레코드는 AP-3(다이제스트 → 최근 실행
   # 샘플)에서 여전히 보여야 한다. 제거하면 그 접근 패턴이 조용히 0건을 반환한다.
   # 한 항목은 `GSI1PK` 를 하나만 가질 수 있으므로 상태 전이로 두 패턴을 나눈다
-  # ([04 §2.3](../../../docs/04-data-model.md)).
+  # ([04 §2.3](../../../.claude/docs/04-data-model.md)).
   global_secondary_index {
     name = "GSI1"
     # provider 6.x 에서 GSI 의 `hash_key`/`range_key` 는 deprecated 다.

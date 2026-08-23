@@ -1,4 +1,4 @@
-//! 부트스트랩 어댑터 (M3, [07](../../../../docs/07-credentials-bootstrap.md)).
+//! 부트스트랩 어댑터 (M3, [07](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! 판정은 [`dbmon_core::bootstrap`] 에 있다. 이 모듈은 **IO 만** 한다:
 //!

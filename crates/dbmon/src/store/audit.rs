@@ -1,5 +1,5 @@
 //! DynamoDB 감사 어댑터 — `config_table` 의 `AUDIT#<yyyy-mm>` 파티션
-//! (FR-CRD-10, [07 §4](../../../../docs/07-credentials-bootstrap.md)).
+//! (FR-CRD-10, [07 §4](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 왜 조건부 쓰기를 쓰는가
 //!

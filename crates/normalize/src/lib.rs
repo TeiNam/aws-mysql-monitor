@@ -2,7 +2,7 @@
 //!
 //! # 왜 이 크레이트가 존재하는가
 //!
-//! 슬로우 쿼리는 세 소스에서 오는데 형태가 다르다([05 §3.1](../../../docs/05-collector.md)).
+//! 슬로우 쿼리는 세 소스에서 오는데 형태가 다르다([05 §3.1](../../../.claude/docs/05-collector.md)).
 //!
 //! ```text
 //! A  information_schema.PROCESSLIST.INFO    리터럴이 살아있는 원문
@@ -12,7 +12,7 @@
 //!
 //! 목표는 `canonical(A) == canonical(B) == canonical(C)` 이고,
 //! `app_digest = sha256(canonical)[..32]` 가 모든 그룹핑의 축이 된다
-//! ([ADR-011](../../../docs/03-decisions.md)).
+//! ([ADR-011](../../../.claude/docs/03-decisions.md)).
 //!
 //! **`DIGEST_TEXT` 를 글자 단위로 재현하는 것이 목표가 아니다.** 같은 함수를 양쪽에
 //! 적용하므로 정규 형식은 우리가 정하면 되고, 그래서 "토큰을 공백 1칸으로 잇는다"는

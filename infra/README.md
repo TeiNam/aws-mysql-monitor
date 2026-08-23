@@ -80,7 +80,7 @@ resource "aws_vpc" "target" { ... }
 ```
 
 `dev-vpc-01` 프라이빗 서브넷의 `0.0.0.0/0` 은 **blackhole** 이다(NAT 가 삭제되고 라우트만
-남았다). 우리가 만든 것이 아니므로 건드리지 않는다 → [18 §1](../docs/18-dev-environment.md).
+남았다). 우리가 만든 것이 아니므로 건드리지 않는다 → [18 §1](../.claude/docs/18-dev-environment.md).
 
 ## 계정 전역 설정은 관리하지 않는다
 
@@ -93,7 +93,7 @@ resource "aws_vpc" "target" { ... }
 - SCP · 조직 정책
 - 계정 수준 EBS 암호화 기본값
 
-→ [18 §6](../docs/18-dev-environment.md)
+→ [18 §6](../.claude/docs/18-dev-environment.md)
 
 ## 규약
 

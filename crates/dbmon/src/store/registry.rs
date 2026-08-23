@@ -2,7 +2,7 @@
 //!
 //! # 단일 파티션이다
 //!
-//! `PK = "INST"`, `SK = "<region>#<instance_id>"` ([04 §7](../../../../docs/04-data-model.md)).
+//! `PK = "INST"`, `SK = "<region>#<instance_id>"` ([04 §7](../../../../.claude/docs/04-data-model.md)).
 //! 500대 규모이므로 파티션 하나로 충분하고, **`Scan` 없이 전체 목록을 얻는 유일한 방법**
 //! 이다(IAM 이 `dynamodb:Scan` 을 Deny 한다).
 //!

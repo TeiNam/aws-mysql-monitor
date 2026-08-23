@@ -1,4 +1,4 @@
-//! API 인증 (M5, [08 §1](../../../../docs/08-security-auth.md) T-01).
+//! API 인증 (M5, [08 §1](../../../../.claude/docs/08-security-auth.md) T-01).
 //!
 //! # T-01 — `/healthz` 외 전 엔드포인트는 인증이 필요하다
 //!

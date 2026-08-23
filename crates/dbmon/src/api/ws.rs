@@ -1,4 +1,4 @@
-//! WebSocket 엔드포인트 ([09 §4.1](../../../../docs/09-frontend.md)).
+//! WebSocket 엔드포인트 ([09 §4.1](../../../../.claude/docs/09-frontend.md)).
 //!
 //! # 토큰을 URL 에 넣지 않는다 (T-13)
 //!

@@ -3,7 +3,7 @@
 //! # 왜 이것이 선택이 아닌가
 //!
 //! 실측 결과 `events_statements_current.ROWS_EXAMINED` 는 **실행 중 문장에 대해 0**
-//! 이다([19 §G2](../../../../docs/19-m1-findings.md)). 완료 후에도
+//! 이다([19 §G2](../../../../.claude/docs/19-m1-findings.md)). 완료 후에도
 //! `events_statements_history` 에는 남지 않는다(스레드 버퍼라 커넥션이 끊기면 사라진다).
 //! 다이제스트 누산기에는 있지만 그건 합계다.
 //!

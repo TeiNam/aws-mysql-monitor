@@ -2,7 +2,7 @@
 //!
 //! # 왜 직렬화 계층에서 강제하는가
 //!
-//! [08 §6.1](../../../../docs/08-security-auth.md) 이 `full_restricted` 를 안전하다고
+//! [08 §6.1](../../../../.claude/docs/08-security-auth.md) 이 `full_restricted` 를 안전하다고
 //! 보는 근거가 "**응답 직렬화 계층에서 강제하므로 새 엔드포인트에서 빠뜨릴 수
 //! 없다**" 다. 핸들러마다 판정하면 새 엔드포인트가 하나 생길 때마다 빠뜨릴 기회가
 //! 생기고, 그 실수는 개인정보 유출이다.
@@ -150,7 +150,7 @@ impl SlowQueryBroadcast {
     }
 }
 
-/// 목록 응답 ([13 §2](../../../../docs/13-api-spec.md)).
+/// 목록 응답 ([13 §2](../../../../.claude/docs/13-api-spec.md)).
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     pub items: Vec<SlowQueryView>,

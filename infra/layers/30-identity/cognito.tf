@@ -1,4 +1,4 @@
-# Cognito User Pool · App Client · Groups (M5, docs/08-security-auth.md §2)
+# Cognito User Pool · App Client · Groups (M5, .claude/docs/08-security-auth.md §2)
 #
 # # 무엇을 만들고 무엇을 안 만드는가
 #

@@ -1,4 +1,4 @@
-//! MySQL 식별자 인용 ([08 §7.1](../../../docs/08-security-auth.md) T-18).
+//! MySQL 식별자 인용 ([08 §7.1](../../../.claude/docs/08-security-auth.md) T-18).
 //!
 //! # 왜 core 에 있는가
 //!

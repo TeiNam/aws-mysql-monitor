@@ -1,4 +1,4 @@
-//! Bedrock Converse 어댑터 ([11 §7](../../../../docs/11-ai-advisor.md)).
+//! Bedrock Converse 어댑터 ([11 §7](../../../../.claude/docs/11-ai-advisor.md)).
 //!
 //! # 왜 tool-use 가 아니라 JSON 지시인가
 //!

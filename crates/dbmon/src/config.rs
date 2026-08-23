@@ -205,7 +205,7 @@ pub struct CollectorConfig {
     /// 슬로우 쿼리로 볼 실행시간(초). `PROCESSLIST.TIME` 이 초 단위라 정수다.
     pub slow_threshold_secs: u32,
     /// **탐지 쿼리 전용** 타임아웃. tick 예산(폴링 주기의 80%) 안에 들어야 한다
-    /// ([02 §7](../../../docs/02-architecture.md)).
+    /// ([02 §7](../../../.claude/docs/02-architecture.md)).
     ///
     /// 심층 조회·플랜과 **다른 값이다.** 초기 구현은 하나로 뭉쳤는데, 그러면
     /// 3초 타임아웃이 1초 케이던스를 넘어 tick 이 겹친다 (교차 검증이 잡았다).
@@ -221,9 +221,9 @@ pub struct CollectorConfig {
     pub deep_probe_limit: u32,
     pub digest_top_n: usize,
     pub digest_threshold_ms: i64,
-    /// 모니터링 DB 계정명. 자기 제외의 기준 ([05 §10](../../../docs/05-collector.md)).
+    /// 모니터링 DB 계정명. 자기 제외의 기준 ([05 §10](../../../.claude/docs/05-collector.md)).
     pub monitor_db_user: String,
-    /// 고아 `in_flight` 스윕 주기 (초). 기본 5분 ([05 §4.5](../../../docs/05-collector.md) F4).
+    /// 고아 `in_flight` 스윕 주기 (초). 기본 5분 ([05 §4.5](../../../.claude/docs/05-collector.md) F4).
     #[serde(default = "default_orphan_sweep_secs")]
     pub orphan_sweep_secs: u64,
     /// 슬로우로그 백필 주기 (초). 기본 1분.
@@ -232,7 +232,7 @@ pub struct CollectorConfig {
     /// 오래 비어 있다. 너무 빠르면 CloudWatch Logs API 레이트 리밋에 걸린다.
     #[serde(default = "default_backfill_secs")]
     pub backfill_secs: u64,
-    /// 리터럴 저장 정책 (FR-CAP-07, [OPEN-Q-15](../../../docs/OPEN-QUESTIONS.md)).
+    /// 리터럴 저장 정책 (FR-CAP-07, [OPEN-Q-15](../../../.claude/docs/OPEN-QUESTIONS.md)).
     ///
     /// # 왜 기본값이 `masked` 인가 — 의도된 이탈이다
     ///
@@ -325,7 +325,7 @@ impl Default for CollectorConfig {
 
 /// 탐색 필터 — **prd 혼재 계정 격리의 마지막 방어선** (T-37, M0-13f).
 ///
-/// 개발계 계정에 프로덕션 워크로드가 함께 있다([18 §6](../../../docs/18-dev-environment.md)).
+/// 개발계 계정에 프로덕션 워크로드가 함께 있다([18 §6](../../../.claude/docs/18-dev-environment.md)).
 /// 네트워크 격리가 1차 방어선이지만, IAM 의 `rds:DescribeDBInstances` 는 `Resource:"*"` 라
 /// prd 인스턴스도 **보인다.** 여기서 걸러야 레지스트리에 등록되지 않는다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,7 +582,7 @@ impl Config {
         }
     }
 
-    /// 값 범위와 **교차 검증** ([14 §8.9](../../../docs/14-infrastructure.md)).
+    /// 값 범위와 **교차 검증** ([14 §8.9](../../../.claude/docs/14-infrastructure.md)).
     ///
     /// 필수값 확인도 여기서 한다. 기본값 문서에 빈 자리표가 들어 있으므로 serde 의
     /// "missing field" 대신 **어느 값이 왜 필요한지** 말해 줄 수 있다.

@@ -1,4 +1,4 @@
-//! 재개 지점 저장 (`CKPT`, [04 §7](../../../../docs/04-data-model.md)).
+//! 재개 지점 저장 (`CKPT`, [04 §7](../../../../.claude/docs/04-data-model.md)).
 //!
 //! # 이것이 없으면 장애 구간이 영구히 빈다
 //!
@@ -31,7 +31,7 @@ pub struct DynamoCheckpointStore {
 
 /// 슬로우로그 백필의 잡 이름. 인스턴스별로 따로 진행한다.
 ///
-/// 이름 규칙은 [05 §8.3](../../../../docs/05-collector.md) 의 `cwlog#<instance_id>` 다.
+/// 이름 규칙은 [05 §8.3](../../../../.claude/docs/05-collector.md) 의 `cwlog#<instance_id>` 다.
 pub fn slowlog_job(instance: &dbmon_core::ids::InstanceId) -> String {
     format!("cwlog#{}", instance.as_str())
 }

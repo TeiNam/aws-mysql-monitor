@@ -1,5 +1,5 @@
 //! 시간 롤업: 임계값 → 상위 N → `_other`
-//! ([04 §2.3](../../../docs/04-data-model.md), FR-DGS-01b/01f, F6, F21, R9).
+//! ([04 §2.3](../../../.claude/docs/04-data-model.md), FR-DGS-01b/01f, F6, F21, R9).
 //!
 //! # 왜 `_other` 가 필요한가
 //!
@@ -44,7 +44,7 @@ impl Default for RollupConfig {
 }
 
 impl RollupConfig {
-    /// 설정 검증 ([14 §8.9](../../../docs/14-infrastructure.md)).
+    /// 설정 검증 ([14 §8.9](../../../.claude/docs/14-infrastructure.md)).
     pub fn validate(&self) -> Result<(), String> {
         if !(10..=2000).contains(&self.top_n) {
             return Err(format!(

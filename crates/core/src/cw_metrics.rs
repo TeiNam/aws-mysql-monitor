@@ -1,4 +1,4 @@
-//! CloudWatch 메트릭 카탈로그와 조회 규칙 ([06 §2](../../../docs/06-discovery-metrics.md)).
+//! CloudWatch 메트릭 카탈로그와 조회 규칙 ([06 §2](../../../.claude/docs/06-discovery-metrics.md)).
 //!
 //! # 왜 엔진별로 갈라야 하는가 (비용 문제다)
 //!

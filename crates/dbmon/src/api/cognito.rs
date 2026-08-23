@@ -1,4 +1,4 @@
-//! Cognito 액세스 토큰 검증 (M5, [08 §3](../../../../docs/08-security-auth.md) FR-AUT-07).
+//! Cognito 액세스 토큰 검증 (M5, [08 §3](../../../../.claude/docs/08-security-auth.md) FR-AUT-07).
 //!
 //! # 순수 판정과 IO 를 나눈다
 //!
@@ -614,7 +614,7 @@ impl CognitoVerifier {
         //
         // 이제 토큰은 `None` 을 주장하고 `intersect` 가 그 검사를 건너뛴다. 남는
         // 폐기 수단은 `revoked_after_ms` 이고, 권한을 바꿀 때 그것을 함께 세우는
-        // 것이 운영 규칙이다(docs/08-security-auth.md §3.1).
+        // 것이 운영 규칙이다(.claude/docs/08-security-auth.md §3.1).
         dbmon_core::rbac::AuthContext::intersect(&claims, &record).ok_or(AuthError::Invalid)
     }
 

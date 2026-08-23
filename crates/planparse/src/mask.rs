@@ -284,7 +284,7 @@ fn raw_matches_token_kind(raw: &str) -> bool {
 ///
 /// 반환값의 두 번째는 **마스킹 실패 건수**다. 0이 아니면 그만큼의 필드가 `<redacted>` 로
 /// 대체됐다는 뜻이며, 호출자는 카운터를 올려 관측 가능하게 만들어야 한다
-/// ([05 §3.4](../../../docs/05-collector.md)).
+/// ([05 §3.4](../../../.claude/docs/05-collector.md)).
 pub fn mask_plan(value: &Value) -> (Value, usize) {
     let mut redactions = 0;
     let out = walk(value, None, &mut redactions);

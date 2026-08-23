@@ -1,5 +1,5 @@
 //! 부트스트랩 감사 레코드 (M3-15, FR-CRD-10,
-//! [07 §4](../../../../docs/07-credentials-bootstrap.md)).
+//! [07 §4](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 무엇을 남기고 무엇을 남기지 않는가
 //!
@@ -73,7 +73,7 @@ pub struct AuditRecord {
     ///
     /// 한때 `"<sub> via <worker>"` 로 합쳤다. 그러면 같은 사용자가 다른 워커를 거칠 때
     /// actor 가 갈리고, `actor = <sub>` 조회가 실패하며 사용자별 집계가 워커별로
-    /// 쪼개진다. `actor` 는 조회·정렬 키다([13 §8](../../../../docs/13-api-spec.md)).
+    /// 쪼개진다. `actor` 는 조회·정렬 키다([13 §8](../../../../.claude/docs/13-api-spec.md)).
     pub actor: String,
     /// 어느 워커가 실행했는가. 진단용이고 **조회 키가 아니다.**
     pub worker_id: String,

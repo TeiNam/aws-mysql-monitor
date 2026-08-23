@@ -1,5 +1,5 @@
 //! DynamoDB 사용자 레코드 어댑터 — `config_table` 의 `USER#<sub>`
-//! ([08 §3](../../../../docs/08-security-auth.md) T-20·T-33).
+//! ([08 §3](../../../../.claude/docs/08-security-auth.md) T-20·T-33).
 //!
 //! # 앱은 이 키 범위에 쓰지 않는다
 //!
@@ -13,7 +13,7 @@
 //!
 //! 레코드 생성은 별도 관리 경로(admin 전용 핸들러가 `AssumeRole` 로 승격)의 일이며
 //! M5 의 남은 작업이다. 그때까지 레코드는 **사람이 콘솔·CLI 로 만든다** —
-//! `docs/08-security-auth.md` 에 형식을 적어 둔다.
+//! `.claude/docs/08-security-auth.md` 에 형식을 적어 둔다.
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;

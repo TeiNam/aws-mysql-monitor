@@ -1,5 +1,5 @@
 //! 시각 타입. **모든 시각은 UTC epoch millis 로 저장한다**
-//! ([04 §0](../../../docs/04-data-model.md)).
+//! ([04 §0](../../../.claude/docs/04-data-model.md)).
 //!
 //! 1세대는 KST 문자열을 저장해서 집계가 어려웠다. 표시 시각 변환은 프론트엔드에서만 한다.
 
@@ -53,7 +53,7 @@ impl HourBucket {
     }
 
     /// 이 버킷이 시작하는 시각. TTL 계산의 기준
-    /// (`ttl = hour 시작 + 35일`, [04 §2.3](../../../docs/04-data-model.md)).
+    /// (`ttl = hour 시작 + 35일`, [04 §2.3](../../../.claude/docs/04-data-model.md)).
     pub fn start_ms(&self) -> Option<EpochMs> {
         let b = self.0.as_bytes();
         if b.len() != 13 {
@@ -174,7 +174,7 @@ fn to_utc(ms: EpochMs) -> DateTime<Utc> {
 }
 
 /// 시각 공급자 포트. 테스트가 시간을 주입할 수 있어야 in-flight 상태 머신을
-/// 테이블 주도로 검증할 수 있다 ([15 §](../../../docs/15-testing.md), R5).
+/// 테이블 주도로 검증할 수 있다 ([15 §](../../../.claude/docs/15-testing.md), R5).
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> EpochMs;
 }

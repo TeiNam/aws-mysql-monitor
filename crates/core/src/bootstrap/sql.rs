@@ -1,4 +1,4 @@
-//! 부트스트랩 SQL 조립 ([08 §7.1](../../../../docs/08-security-auth.md) T-18, T-19).
+//! 부트스트랩 SQL 조립 ([08 §7.1](../../../../.claude/docs/08-security-auth.md) T-18, T-19).
 //!
 //! # 여기가 문자열로 SQL 을 만드는 유일한 곳이고, 마스터 권한으로 실행된다
 //!
@@ -237,7 +237,7 @@ pub fn is_safe_generated_password(pw: &str) -> bool {
     pw.len() >= 16 && pw.bytes().all(|b| PASSWORD_ALPHABET.contains(&b))
 }
 
-/// 수동 실행용 스크립트 (M3-14, [07 §5](../../../../docs/07-credentials-bootstrap.md)).
+/// 수동 실행용 스크립트 (M3-14, [07 §5](../../../../.claude/docs/07-credentials-bootstrap.md)).
 ///
 /// 앱에 마스터 권한을 주지 않는 조직을 위한 경로다. 문장은 [`Statement::redacted`] 를
 /// 쓴다 — 비밀번호가 든 문장은 사람이 값을 채워야 하고, 우리가 화면에 찍지 않는다.

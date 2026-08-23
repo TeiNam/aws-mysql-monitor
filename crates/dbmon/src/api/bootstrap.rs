@@ -1,5 +1,5 @@
 //! 부트스트랩 API (M3-6·M3-7·M3-14,
-//! [13 §2.7](../../../../docs/13-api-spec.md), [07 §2.7](../../../../docs/07-credentials-bootstrap.md)).
+//! [13 §2.7](../../../../.claude/docs/13-api-spec.md), [07 §2.7](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # 세 엔드포인트
 //!

@@ -1,4 +1,4 @@
-//! IAM DB Auth 토큰 발급 — [`AuthTokenProvider`] 구현 (M2-6, [07 §3](../../../../docs/07-credentials-bootstrap.md)).
+//! IAM DB Auth 토큰 발급 — [`AuthTokenProvider`] 구현 (M2-6, [07 §3](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # SDK 헬퍼가 없다
 //!

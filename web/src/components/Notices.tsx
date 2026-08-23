@@ -248,7 +248,7 @@ function CognitoLogin({ config }: { config: AuthConfig | undefined }) {
         <p className="mt-2 text-xs text-amber-700">
           <span className="font-mono">terraform -chdir=infra/layers/30-identity output</span> 의
           값을 넣는다. 로그인 뒤에도 401 이면 <span className="font-mono">USER#&lt;sub&gt;</span>{" "}
-          레코드가 없는 것이다(fail-closed) — docs/08-security-auth.md §3.1 참조.
+          레코드가 없는 것이다(fail-closed) — .claude/docs/08-security-auth.md §3.1 참조.
         </p>
       </div>
     );

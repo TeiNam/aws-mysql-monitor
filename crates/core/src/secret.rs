@@ -95,7 +95,7 @@ impl ExpiringSecret {
     /// 만료 `margin_ms` 전이면 갱신해야 한다.
     ///
     /// IAM 토큰은 **연결 수립 시점**에만 쓰이므로 기존 연결은 만료돼도 유지된다.
-    /// 갱신이 필요한 건 새 연결을 만들 때뿐이다 ([05 §5](../../../docs/05-collector.md)).
+    /// 갱신이 필요한 건 새 연결을 만들 때뿐이다 ([05 §5](../../../.claude/docs/05-collector.md)).
     pub fn needs_refresh(&self, now_ms: crate::time::EpochMs, margin_ms: i64) -> bool {
         now_ms + margin_ms >= self.expires_at_ms
     }

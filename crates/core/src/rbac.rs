@@ -1,4 +1,4 @@
-//! 역할·스코프 인가 ([08 §3](../../../docs/08-security-auth.md), FR-AUT-08).
+//! 역할·스코프 인가 ([08 §3](../../../.claude/docs/08-security-auth.md), FR-AUT-08).
 //!
 //! # 토큰 클레임과 서버 레코드의 **교집합**을 쓴다 (T-20)
 //!
@@ -50,7 +50,7 @@ impl Role {
     /// # `dbmon-` 접두어를 **요구한다**
     ///
     /// 실제 Cognito 그룹 이름은 `dbmon-admin`·`dbmon-operator`·`dbmon-viewer` 다
-    /// ([08 §4.1](../../../docs/08-security-auth.md)). 접두어가 붙는 이유는 사용자 풀이
+    /// ([08 §4.1](../../../.claude/docs/08-security-auth.md)). 접두어가 붙는 이유는 사용자 풀이
     /// 다른 앱과 공유될 수 있어서다 — `admin` 이라는 그룹은 어느 앱의 admin 인지
     /// 말해 주지 않는다.
     ///
@@ -95,7 +95,7 @@ impl AuthContext {
     /// - 리터럴 열람: **둘 다 참일 때만**
     ///
     /// 서버 레코드가 없으면 `None` — 등록되지 않은 사용자는 토큰이 유효해도 거부한다
-    /// (승인 대기 목록 모델, [OPEN-Q-18](../../../docs/OPEN-QUESTIONS.md)).
+    /// (승인 대기 목록 모델, [OPEN-Q-18](../../../.claude/docs/OPEN-QUESTIONS.md)).
     pub fn intersect(token: &TokenClaims, server: &UserRecord) -> Option<Self> {
         if server.disabled {
             return None;

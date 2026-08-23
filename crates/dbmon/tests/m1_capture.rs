@@ -1,6 +1,6 @@
 //! M1-1 ~ M1-4, M1-17 — 캡처 경로 검증 스파이크.
 //!
-//! **[ADR-005](../../../../docs/03-decisions.md) 의 핵심 전제를 확인한다**:
+//! **[ADR-005](../../../../.claude/docs/03-decisions.md) 의 핵심 전제를 확인한다**:
 //! `information_schema.PROCESSLIST.INFO` 는 절단되지 않고,
 //! `performance_schema.processlist.INFO` 는 1024바이트에서 잘린다.
 //! 이게 1세대의 실제 버그를 고치는 방법이므로 틀리면 설계가 바뀐다.
@@ -161,7 +161,7 @@ async fn m1_1b_sql_text_length_follows_parameter() {
 
 /// M1-2 / M1-3 — `EXPLAIN ... FOR CONNECTION` 이 SELECT·UPDATE·DELETE 에서 동작하는가.
 ///
-/// [ADR-006](../../../../docs/03-decisions.md): 1세대는 사후 `EXPLAIN` 재실행이라 DML 플랜을
+/// [ADR-006](../../../../.claude/docs/03-decisions.md): 1세대는 사후 `EXPLAIN` 재실행이라 DML 플랜을
 /// 포기했다. 실행 중 플랜 수집이 되면 DML 까지 커버한다.
 #[tokio::test]
 async fn m1_2_explain_for_connection_covers_dml() {
@@ -256,7 +256,7 @@ async fn m1_2_explain_for_connection_covers_dml() {
     report("M1-2 / M1-3 EXPLAIN FOR CONNECTION", &rows);
 }
 
-/// 실패 코드 분류표를 실측으로 확정한다 ([05 §2.4](../../../../docs/05-collector.md)).
+/// 실패 코드 분류표를 실측으로 확정한다 ([05 §2.4](../../../../.claude/docs/05-collector.md)).
 #[tokio::test]
 async fn m1_2b_explain_failure_error_codes() {
     let mut probe = conn_or_skip!(MYSQL84, ROOT);
@@ -538,7 +538,7 @@ async fn m1_4b_readonly_fallback_paths() {
 /// M1-17 — `sys.innodb_lock_waits` 의 컬럼명과 절단을 실측한다.
 ///
 /// 설계는 컬럼명을 `locked_type` / `locked_table_schema` 로 적었고,
-/// `waiting_query` 는 **64자로 잘린다**고 경고했다([05 §2.8](../../../../docs/05-collector.md)).
+/// `waiting_query` 는 **64자로 잘린다**고 경고했다([05 §2.8](../../../../.claude/docs/05-collector.md)).
 #[tokio::test]
 async fn m1_17_innodb_lock_waits_columns_and_truncation() {
     let mut probe = conn_or_skip!(MYSQL84, ROOT);

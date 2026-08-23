@@ -50,7 +50,7 @@ function apply(snapshot: LiveSnapshot, ...msgs: ServerMessage[]): LiveSnapshot {
 describe("슬로우 쿼리 upsert", () => {
   it("같은 record_id 를 덮어쓰고 자리를 옮기지 않는다", () => {
     // `finalized` 가 두 번 오는 것이 관측된 동작이고, 뒤엣것이 정확한 값이다
-    // (docs/21-resume.md §3.1). 행이 매번 맨 위로 튀면 표를 읽을 수 없다.
+    // (.claude/docs/21-resume.md §3.1). 행이 매번 맨 위로 튀면 표를 읽을 수 없다.
     const older = broadcast({ record_id: "a:1:1", started_at_ms: NOW - 1000 });
     const newer = broadcast({ record_id: "b:2:2" });
     const s = apply(

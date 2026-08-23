@@ -1,4 +1,4 @@
-//! 시계 오프셋 추정 (F14, [05 §4.2](../../../docs/05-collector.md)).
+//! 시계 오프셋 추정 (F14, [05 §4.2](../../../.claude/docs/05-collector.md)).
 //!
 //! # 왜 필요한가
 //!
@@ -7,7 +7,7 @@
 //!
 //! | 영향 | 결과 |
 //! |---|---|
-//! | ±2초 병합 창 ([05 §8.2](../../../docs/05-collector.md)) | **상시 실패** → 모든 레코드가 이중화된다 |
+//! | ±2초 병합 창 ([05 §8.2](../../../.claude/docs/05-collector.md)) | **상시 실패** → 모든 레코드가 이중화된다 |
 //! | `record_id` 의 초 성분 | 갈라진다 → 멱등성이 깨진다 |
 //! | `hour_bucket` · `date_part` · `dur_bucket` | 경계 배정이 틀어져 파티션이 어긋난다 |
 //!
@@ -28,7 +28,7 @@ const ALPHA: f64 = 0.2;
 pub const WARN_THRESHOLD_MS: i64 = 1_000;
 /// 이 값을 넘으면 `CLOCK_SKEW` 이벤트 + 알림. 사람이 봐야 한다.
 pub const ALERT_THRESHOLD_MS: i64 = 5_000;
-/// 기본 병합 창 ([05 §8.2](../../../docs/05-collector.md)).
+/// 기본 병합 창 ([05 §8.2](../../../.claude/docs/05-collector.md)).
 pub const BASE_MERGE_WINDOW_MS: i64 = 2_000;
 
 /// **같은 실행의 두 시작 추정이 어긋날 수 있는 최대 폭 (1초).**

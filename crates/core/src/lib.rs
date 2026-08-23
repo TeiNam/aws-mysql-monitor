@@ -5,7 +5,7 @@
 //! **이 크레이트는 I/O 를 하지 않는다.** AWS SDK · MySQL 드라이버 · HTTP 서버에 대한
 //! 의존성이 없고, 앞으로도 없어야 한다. `dbmon::aws` / `dbmon::mysql` 이 여기의 trait 를
 //! 구현하고, 조립은 `main.rs` 에서 1회 한다
-//! ([02 §3](../../../docs/02-architecture.md)).
+//! ([02 §3](../../../.claude/docs/02-architecture.md)).
 //!
 //! → 테스트에서 AWS·MySQL 없이 도메인 로직을 전부 검증할 수 있다.
 //! 그게 SSO 만료와 무관하게 개발을 이어갈 수 있는 근거이기도 하다.
@@ -64,7 +64,7 @@ pub use secret::{Secret, SecretString};
 pub use time::{Clock, DatePart, EpochMs, HourBucket, SystemClock, TimeRange};
 
 /// DynamoDB 항목 스키마 버전. 읽기 시 하위호환 처리의 기준
-/// ([04 §0](../../../docs/04-data-model.md)).
+/// ([04 §0](../../../.claude/docs/04-data-model.md)).
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// 핫 티어 보관 경계. 이보다 오래된 조회는 아카이브로 라우팅된다.
@@ -73,7 +73,7 @@ pub const HOT_TIER_DAYS: i64 = 31;
 /// DynamoDB TTL. 핫 경계보다 4일 길다 — 아카이브 잡 실패에 여유를 준다.
 pub const HOT_TTL_DAYS: i64 = 35;
 
-/// 조회를 어디로 보낼지 ([04 §5](../../../docs/04-data-model.md)).
+/// 조회를 어디로 보낼지 ([04 §5](../../../.claude/docs/04-data-model.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryRoute {
     /// 전 구간이 핫 티어 안.

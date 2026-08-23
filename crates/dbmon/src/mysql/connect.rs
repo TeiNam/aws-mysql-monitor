@@ -1,4 +1,4 @@
-//! 대상 접속 옵션 조립 (M2-6, [07 §3.3](../../../../docs/07-credentials-bootstrap.md)).
+//! 대상 접속 옵션 조립 (M2-6, [07 §3.3](../../../../.claude/docs/07-credentials-bootstrap.md)).
 //!
 //! # RDS CA 번들을 바이너리에 심는다
 //!
