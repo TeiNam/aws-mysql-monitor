@@ -3,10 +3,10 @@ import {
   BarChart3,
   CloudCog,
   Database,
-  ExternalLink,
   Gauge,
   Globe,
   LineChart,
+  Scale,
   Server,
   Settings,
   Share2,
@@ -21,7 +21,27 @@ import { liveClient } from "../lib/live";
 import type { ConnState } from "../lib/live-reduce";
 import { ALL_REGIONS, regionOfInstanceId, useRegionPicker } from "../lib/region-scope";
 import { regionLabel } from "../lib/regions";
+import { GithubMark } from "./GithubMark";
 import { PAGE } from "./ui";
+
+/** 공개 저장소 주소. 푸터가 출처를 말하는 유일한 자리다. */
+const REPO_SLUG = "TeiNam/aws-mysql-monitor";
+const REPO_URL = `https://github.com/${REPO_SLUG}`;
+
+/**
+ * 표시할 라이선스와 그 근거 위치.
+ *
+ * # 지금은 `LICENSE` 파일이 없다
+ *
+ * README 가 "Not yet licensed. Until a `LICENSE` file lands, all rights reserved" 라고
+ * 적어 뒀고, `Cargo.toml` 은 `Proprietary` 다. 화면에 `MIT` 같은 것을 적으면 **없는 허가를
+ * 준 것처럼 읽힌다** — 공개 저장소에서 그건 되돌리기 어렵다.
+ *
+ * 그래서 지금은 있는 사실만 말하고 README 의 라이선스 절을 가리킨다. 라이선스를 정하면
+ * 이 두 상수와 `LICENSE` 파일만 바꾸면 된다.
+ */
+const LICENSE_LABEL = "All rights reserved";
+const LICENSE_HREF = "#license";
 
 /**
  * 탭을 바꾸면 **화면 맨 위에서 시작한다.**
@@ -156,18 +176,35 @@ export function Shell() {
       </main>
 
       <footer className="mt-auto bg-white shadow-inner">
-        <div className={`${PAGE} flex flex-col items-center gap-1 py-4 text-sm text-gray-600`}>
-          <span>MySQL 슬로우 쿼리 모니터 — Rust + React</span>
-          <span className="flex items-center gap-2">
-            Created by TeiNam
+        {/* **공개 저장소로 전환할 것을 전제로 둔다.** 이름·출처·라이선스를 화면에서 바로
+            읽을 수 있어야 한다 — 스크린샷만 돌아다닐 때 그게 유일한 단서다. */}
+        <div
+          className={`${PAGE} flex flex-col items-center gap-1.5 py-4 text-sm text-gray-600`}
+        >
+          <span className="font-medium text-gray-700">
+            AWS Aurora &amp; RDS MySQL Slow Query Monitor
+          </span>
+          <span className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
+            <span>Rust + React · Created by TeiNam</span>
             <a
-              href="https://github.com/TeiNam"
+              href={REPO_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-gray-500 hover:text-gray-800"
-              aria-label="GitHub"
+              className="inline-flex items-center gap-1.5 hover:text-gray-900"
             >
-              <ExternalLink className="h-4 w-4" />
+              <GithubMark />
+              {REPO_SLUG}
+            </a>
+            {/* **라이선스를 링크로 둔다.** 문구만 적으면 근거를 확인할 곳이 없다.
+                `LICENSE` 가 들어오면 [`LICENSE_LABEL`] 한 줄과 이 경로만 바꾼다. */}
+            <a
+              href={`${REPO_URL}${LICENSE_HREF}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 hover:text-gray-900"
+            >
+              <Scale className="h-4 w-4" />
+              {LICENSE_LABEL}
             </a>
           </span>
         </div>
