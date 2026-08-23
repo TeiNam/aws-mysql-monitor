@@ -509,7 +509,7 @@ cat > /tmp/storage.json <<JSON
     "Action": ["kms:Decrypt","kms:GenerateDataKey","kms:DescribeKey"],
     "Resource": "$KEY_ARN",
     "Condition": { "StringLike": { "kms:ViaService": [
-      "dynamodb.$AWS_REGION.amazonaws.com", "s3.$AWS_REGION.amazonaws.com" ]}}}
+      "dynamodb.$AWS_REGION.amazonaws.com" ]}}}
 ]}
 JSON
 aws iam put-role-policy --role-name "dbmon-$ENV-ecs-task" \
@@ -615,7 +615,7 @@ aws iam simulate-principal-policy --policy-source-arn "$ROLE" \
 | Direction | Rule |
 |---|---|
 | Task → RDS | DB security group: allow **TCP 3306 from the task security group** (not a CIDR). Security-group references survive IP changes. |
-| Task → AWS APIs | NAT gateway, or interface VPC endpoints for `dynamodb` (gateway), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, `s3`. Endpoints avoid NAT data charges and keep traffic off the internet. |
+| Task → AWS APIs | NAT gateway, or interface VPC endpoints for `dynamodb` (gateway), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, plus the **S3 gateway endpoint** (ECR stores image layers in S3 — the app itself never touches S3). Endpoints avoid NAT data charges and keep traffic off the internet. |
 | ALB → Task | Target group on 8080, health check path **`/readyz`**. |
 | Task inbound | The ALB security group, **or** an admin/VPN security group when running without an ALB. Nothing else. |
 

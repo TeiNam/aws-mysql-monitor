@@ -16,7 +16,6 @@ flowchart LR
     db[("RDS / Aurora<br/>MySQL 8.0+")]
     cw["CloudWatch<br/>Logs · Metrics"]
     ddb[("DynamoDB<br/>records · settings")]
-    s3[("S3<br/>large plans")]
     br["Bedrock<br/>tuning advice"]
 
     app -->|"discover — RDS API"| db
@@ -24,12 +23,11 @@ flowchart LR
     cw  -->|"slow log backfill"| app
     cw  -->|"CPU · mem · storage, 15m"| app
     app --> ddb
-    app --> s3
     app -->|"on button press only"| br
 
     classDef aws fill:#fff3e0,stroke:#e8871a,color:#7a4a00
     classDef own fill:#e8f1fb,stroke:#2f6fb5,color:#123a63
-    class db,cw,ddb,s3,br aws
+    class db,cw,ddb,br aws
     class ui,app own
 ```
 

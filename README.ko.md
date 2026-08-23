@@ -16,7 +16,6 @@ flowchart LR
     db[("RDS / Aurora<br/>MySQL 8.0+")]
     cw["CloudWatch<br/>Logs · Metrics"]
     ddb[("DynamoDB<br/>기록 · 설정")]
-    s3[("S3<br/>큰 실행계획")]
     br["Bedrock<br/>튜닝 권고"]
 
     app -->|"탐색 — RDS API"| db
@@ -24,12 +23,11 @@ flowchart LR
     cw  -->|"슬로우로그 백필"| app
     cw  -->|"CPU · 메모리 · 스토리지, 15분"| app
     app --> ddb
-    app --> s3
     app -->|"버튼을 누를 때만"| br
 
     classDef aws fill:#fff3e0,stroke:#e8871a,color:#7a4a00
     classDef own fill:#e8f1fb,stroke:#2f6fb5,color:#123a63
-    class db,cw,ddb,s3,br aws
+    class db,cw,ddb,br aws
     class ui,app own
 ```
 

@@ -504,7 +504,7 @@ cat > /tmp/storage.json <<JSON
     "Action": ["kms:Decrypt","kms:GenerateDataKey","kms:DescribeKey"],
     "Resource": "$KEY_ARN",
     "Condition": { "StringLike": { "kms:ViaService": [
-      "dynamodb.$AWS_REGION.amazonaws.com", "s3.$AWS_REGION.amazonaws.com" ]}}}
+      "dynamodb.$AWS_REGION.amazonaws.com" ]}}}
 ]}
 JSON
 aws iam put-role-policy --role-name "dbmon-$ENV-ecs-task" \
@@ -609,7 +609,7 @@ aws iam simulate-principal-policy --policy-source-arn "$ROLE" \
 | 방향 | 규칙 |
 |---|---|
 | 태스크 → RDS | DB 보안그룹에 **태스크 보안그룹 출처로 TCP 3306** 허용(CIDR 아님). 보안그룹 참조는 IP 가 바뀌어도 살아 있다. |
-| 태스크 → AWS API | NAT 게이트웨이, 또는 인터페이스 VPC 엔드포인트: `dynamodb`(게이트웨이), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, `s3`. 엔드포인트는 NAT 데이터 요금을 없애고 트래픽을 인터넷에서 뺀다. |
+| 태스크 → AWS API | NAT 게이트웨이, 또는 인터페이스 VPC 엔드포인트: `dynamodb`(게이트웨이), `rds`, `monitoring`, `logs`, `secretsmanager`, `bedrock-runtime`, `sts`, `ecr.api`, `ecr.dkr`, 그리고 **S3 게이트웨이 엔드포인트**(ECR 이 이미지 레이어를 S3 에 두기 때문이다 — 앱 자체는 S3 를 쓰지 않는다). 엔드포인트는 NAT 데이터 요금을 없애고 트래픽을 인터넷에서 뺀다. |
 | ALB → 태스크 | 타깃 그룹 8080, 헬스체크 경로 **`/readyz`**. |
 | 태스크 인바운드 | ALB 보안그룹, **또는** ALB 없이 쓸 때는 관리자·VPN 보안그룹. 그 밖은 없다. |
 

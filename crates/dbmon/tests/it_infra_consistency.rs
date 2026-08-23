@@ -440,6 +440,24 @@ fn the_install_guide_matches_the_iam_policies() {
             }
         }
 
+        // **쓸 수 없는 권한이 다시 들어오지 않게 한다.**
+        //
+        // `KmsUse` 의 `kms:ViaService` 에 S3 가 있었지만 이 롤에는 **S3 액션이 하나도
+        // 없다**(플랜 오프로드를 지웠다). 쓸 수 없는 경로를 열어 두면 침해 시 열람 범위만
+        // 넓어진다 — 같은 정책이 `Scan` 을 막는 것과 같은 이유다.
+        assert!(
+            !iam.contains("s3.${var.region}.amazonaws.com"),
+            "iam.tf 의 KmsUse 에 S3 경로가 다시 들어왔다 — 이 롤에는 S3 액션이 없다"
+        );
+        for stmt in doc.split("```").skip(1).step_by(2) {
+            if stmt.contains("kms:ViaService") {
+                assert!(
+                    !stmt.contains("s3."),
+                    "{name} 의 KmsUse 예시에 S3 경로가 있다 — 앱은 S3 를 쓰지 않는다"
+                );
+            }
+        }
+
         // Aurora 를 살리는 두 가지.
         assert!(
             doc.contains("/aws/rds/cluster/*/slowquery"),
