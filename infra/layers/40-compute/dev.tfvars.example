@@ -30,3 +30,15 @@ enable_bootstrap      = true
 
 # 기본값 `masked` 는 `?` 로 저장하고 **되돌릴 수 없다**. 원문이 필요하면 여기서 바꾼다.
 literal_policy = "full_restricted"
+
+# 설정 화면의 `ai.enabled` 와 **함께 움직여야 한다.** 설정은 켜져 있는데 이게 거짓이면
+# 정책이 아예 없어서 Tuning 버튼이 `AccessDenied` 를 낸다.
+enable_ai_tuning = true
+
+# `AiSection.tsx` 의 `KNOWN_MODELS` 와 같은 목록으로 둔다 — 빠진 모델의 바로가기 칩은
+# 눌리는데 호출이 403 이고, 그건 항상 실패하는 선택지다.
+bedrock_model_ids = [
+  "global.anthropic.claude-sonnet-5",
+  "global.anthropic.claude-opus-5",
+  "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+]

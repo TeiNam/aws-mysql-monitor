@@ -388,9 +388,18 @@ variable "bedrock_model_ids" {
 
     **열거한다.** `*` 로 열면 계정의 모든 모델(단가가 전혀 다른 이미지·비디오 모델
     포함)을 부를 수 있다. 화면에서 고른 모델이 여기 없으면 호출이 AccessDenied 다.
+
+    기본값은 설정 화면의 모델 바로가기(`web/src/components/settings/AiSection.tsx` 의
+    `KNOWN_MODELS`)와 **같은 목록**이다. 하나라도 빠지면 그 칩은 눌리는데 호출이 403 이고,
+    그건 항상 실패하는 선택지다. 두 목록이 갈리는 것은
+    `it_infra_consistency` 의 `bedrock_iam_covers_the_models_the_ui_offers` 가 막는다.
   EOT
   type        = list(string)
-  default     = ["global.anthropic.claude-sonnet-5"]
+  default = [
+    "global.anthropic.claude-sonnet-5",
+    "global.anthropic.claude-opus-5",
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+  ]
 }
 
 # ── 알림 채널 ───────────────────────────────────────────────────────────────

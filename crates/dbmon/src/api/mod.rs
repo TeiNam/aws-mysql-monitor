@@ -556,9 +556,6 @@ async fn list_slow_queries(
     let now_ms = SystemClock.now_ms();
 
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let to_ms = p.to_ms.unwrap_or(now_ms);
-    let from_ms = p.from_ms.unwrap_or(to_ms - DEFAULT_RANGE_MS);
-    let range = checked_range(from_ms, to_ms)?;
 
     // **환경 스코프를 여기서 교집합한다.** 요청이 무엇을 요구하든 사용자의
     // 스코프 밖은 볼 수 없다.
@@ -575,16 +572,7 @@ async fn list_slow_queries(
 
     // **커서를 검증한다.** 필터는 요청에서 다시 유도해 해시를 비교한다 —
     // 커서에 담긴 필터를 그대로 쓰면 위 스코프 검사가 건너뛰어진다.
-    let filters = cursor::filters_hash(&[
-        ("instance", p.instance.as_deref().unwrap_or("")),
-        // **필터가 바뀌면 커서는 무효다.** 빠뜨리면 `orders` 로 만든 커서를 다른
-        // 이름 조각에 그대로 쓸 수 있고, 그러면 위치가 다른 집합을 가리킨다.
-        ("instance_like", p.instance_like.as_deref().unwrap_or("")),
-        ("from", &from_ms.to_string()),
-        ("to", &to_ms.to_string()),
-        ("env", p.env.as_deref().unwrap_or("")),
-        ("limit", &limit.to_string()),
-    ]);
+    let filters = list_filters_hash(&p, limit);
     let seek = match p.cursor.as_deref() {
         Some(raw) => {
             let c = cursor::Cursor::decode(raw, &state.cursor_key, &ctx.subject, &filters, now_ms)
@@ -595,6 +583,18 @@ async fn list_slow_queries(
             )
         }
         None => None,
+    };
+
+    // **재개하면 커서가 들고 온 창을 쓴다.** 요청의 `from`/`to` 는 무시한다 —
+    // 커서는 서명돼 있으므로 창을 넓힐 수 없고, 여기서 `checked_range` 로 다시 검사한다.
+    // 1페이지는 요청값(없으면 최근 24시간)으로 창을 정한다.
+    let range = match &seek {
+        Some(s) => checked_range(s.from_ms, s.to_ms)?,
+        None => {
+            let to_ms = p.to_ms.unwrap_or(now_ms);
+            let from_ms = p.from_ms.unwrap_or(to_ms - DEFAULT_RANGE_MS);
+            checked_range(from_ms, to_ms)?
+        }
     };
 
     // **재개하면 읽을 구간의 위쪽을 커서 시점으로 좁힌다.**
@@ -659,6 +659,10 @@ async fn list_slow_queries(
             sub: ctx.subject.clone(),
             filters_hash: filters.clone(),
             position: cursor::Position {
+                // **좁힌 읽기 구간이 아니라 창 전체를 담는다.** 좁힌 쪽을 담으면 창이
+                // 페이지마다 줄어들어 열이 스스로를 잘라먹는다.
+                from_ms: range.from_ms(),
+                to_ms: range.to_ms(),
                 started_at_ms: v.started_at_ms,
                 thread_id: v.thread_id,
                 instance_id: v.instance_id.clone(),
@@ -1117,6 +1121,29 @@ fn redistributed(
     }
     let bigger = (share + (ceiling - used) / hungry).min(per_instance);
     (bigger > share).then_some(bigger)
+}
+
+/// 목록 필터의 해시. 커서를 이 해시에 묶어 **필터 바꿔치기로 스코프를 우회하지 못하게** 한다.
+///
+/// # 시간 구간은 넣지 않는다
+///
+/// 처음에는 넣었다. 그래서 **커서가 한 번도 쓰이지 못했다** — `to_ms` 의 기본값이 `now_ms`
+/// 라 요청마다 해시가 달라지고 2페이지가 전부 `invalid_cursor` 였다(실배포에서 확인). 단위
+/// 테스트도 프론트 테스트도 이걸 놓쳤다: 둘 다 핸들러의 **파라미터 기본값**을 거치지 않았다.
+///
+/// 구간은 대신 커서가 들고 다닌다([`cursor::Position`]). 서명돼 있으므로 넓힐 수 없고,
+/// 되돌린 구간은 `checked_range` 로 다시 검사한다. **권한에 걸리는 필터(`env`)는 여기 남는다.**
+///
+/// 핸들러와 테스트가 같은 함수를 쓴다 — 해시 입력이 갈리면 그게 곧 이 결함이다.
+fn list_filters_hash(p: &ListParams, limit: usize) -> String {
+    cursor::filters_hash(&[
+        ("instance", p.instance.as_deref().unwrap_or("")),
+        // **필터가 바뀌면 커서는 무효다.** 빠뜨리면 `orders` 로 만든 커서를 다른
+        // 이름 조각에 그대로 쓸 수 있고, 그러면 위치가 다른 집합을 가리킨다.
+        ("instance_like", p.instance_like.as_deref().unwrap_or("")),
+        ("env", p.env.as_deref().unwrap_or("")),
+        ("limit", &limit.to_string()),
+    ])
 }
 
 /// 목록의 **총순서**: 순서 키 내림, 같으면 인스턴스 id 오름.
@@ -2140,6 +2167,46 @@ mod tests {
         assert_eq!(0usize.clamp(1, MAX_LIMIT), 1);
     }
 
+    /// **필터 해시가 벽시계에 의존하면 커서는 한 번도 쓰이지 못한다.**
+    ///
+    /// 실배포에서 2페이지가 전부 `invalid_cursor` 였다. `to_ms` 기본값이 `now_ms` 였고 그게
+    /// 해시에 들어가 있었다 — 같은 요청을 1초 뒤에 보내면 다른 해시가 나온다. 페이지네이션
+    /// 테스트도 프론트 테스트도 이걸 놓쳤다(둘 다 핸들러의 파라미터 기본값을 안 거쳤다).
+    ///
+    /// 그래서 **해시 입력에 시각이 없다**는 것을 여기서 못 박는다.
+    #[test]
+    fn the_filters_hash_does_not_depend_on_the_wall_clock() {
+        let params = |from: Option<i64>, to: Option<i64>| ListParams {
+            limit: Some(50),
+            cursor: None,
+            instance: Some("acct/region/db".into()),
+            instance_like: None,
+            from_ms: from,
+            to_ms: to,
+            env: Some("dev".into()),
+        };
+        // 요청이 구간을 주지 않았을 때 핸들러가 넣는 것은 `now_ms` 다 — 그게 해시에
+        // 들어가면 같은 필터가 매 초 다른 해시를 낸다.
+        assert_eq!(
+            list_filters_hash(&params(None, None), 50),
+            list_filters_hash(&params(Some(1), Some(2)), 50),
+            "구간이 해시에 섞였다 — 커서가 다음 요청에서 무효가 된다"
+        );
+        // 권한에 걸리는 필터는 반드시 남아야 한다.
+        let mut other = params(None, None);
+        other.env = Some("prd".into());
+        assert_ne!(
+            list_filters_hash(&params(None, None), 50),
+            list_filters_hash(&other, 50),
+            "env 가 해시에서 빠졌다 — 커서로 다른 환경을 읽을 수 있다"
+        );
+        // 페이지 크기가 바뀌면 위치의 뜻이 달라진다.
+        assert_ne!(
+            list_filters_hash(&params(None, None), 50),
+            list_filters_hash(&params(None, None), 100)
+        );
+    }
+
     /// **페이지네이션이 모든 행을 정확히 한 번 낸다.**
     ///
     /// `MAX_LIMIT` 은 페이지 크기이고 천장이 아니다 — 커서로 그 뒤까지 간다. 이 테스트가
@@ -2288,6 +2355,8 @@ mod tests {
                 break;
             };
             seek = Some(cursor::Position {
+                from_ms: full.from_ms(),
+                to_ms: full.to_ms(),
                 started_at_ms: last.started_at_ms,
                 thread_id: last.thread_id,
                 instance_id: last.instance_id.clone(),

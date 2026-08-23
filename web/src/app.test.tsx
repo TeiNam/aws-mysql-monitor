@@ -30,6 +30,8 @@ let authMode = "local-token";
 let emptyButTruncated = false;
 /** 서버가 커서로 두 창을 나눠 주는 상황. 첫 창이 상한이고 두 번째가 끝이다. */
 let pagedWindows = false;
+/** 사람이 이 인스턴스의 수집을 멈춘 상황. */
+let pausedThisInstance = false;
 /** 설정을 읽지 못한 상황(손상된 문서·저장소 장애). */
 let settingsLoadError: string | null = null;
 
@@ -317,7 +319,9 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
       json({
         paused: false,
         paused_since_ms: null,
-        paused_scopes: [],
+        paused_scopes: pausedThisInstance
+          ? [{ scope: `id:${INSTANCE}`, since_ms: Date.now() }]
+          : [],
         is_leader: true,
         collecting: 1,
         last_tick_ms: Date.now(),
@@ -352,6 +356,7 @@ beforeEach(() => {
   authMode = "local-token";
   emptyButTruncated = false;
   pagedWindows = false;
+  pausedThisInstance = false;
   settingsLoadError = null;
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
@@ -464,6 +469,26 @@ describe("MySQL Monitor", () => {
  * 타입만 맞으면 컴파일은 통과하므로, 표가 두 응답의 필드를 실제로 읽는지 DOM 에서 본다.
  */
 describe("플릿 메트릭", () => {
+  /**
+   * **정지를 눌렀으면 이 표도 정지라고 말해야 한다.**
+   *
+   * `InstanceView.state` 는 등록부 생애 주기이고 정지는 그 위에 겹치는 별개의 사실이다.
+   * 이 표가 `state` 만 찍고 있어서, RDS 화면에서 수집을 멈춰도 계속 `collecting` 으로
+   * 보였다 — 표가 거짓말을 하면 사람이 "안 멈췄다" 고 판단하고 다시 누른다.
+   */
+  it("사람이 멈춘 인스턴스를 collecting 으로 보여주지 않는다", async () => {
+    await renderApp("/metrics");
+    expect(await screen.findByText("mysql84-local")).toBeDefined();
+    expect(await screen.findByText("수집")).toBeDefined();
+    cleanup();
+
+    pausedThisInstance = true;
+    await renderApp("/metrics");
+    expect(await screen.findByText("mysql84-local")).toBeDefined();
+    expect(await screen.findByText("정지")).toBeDefined();
+    expect(screen.queryByText("collecting")).toBeNull();
+  });
+
   it("CloudWatch 값과 실시간 지표를 한 행에 채운다", async () => {
     await renderApp("/metrics");
     expect(await screen.findByText("mysql84-local")).toBeDefined();

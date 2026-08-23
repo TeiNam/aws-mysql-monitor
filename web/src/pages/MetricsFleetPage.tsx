@@ -5,6 +5,8 @@ import { useNavigate } from "react-router";
 import { Card } from "../components/Card";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { PageHeader } from "../components/PageHeader";
+import { useCollectorStatus } from "../components/CollectorControls";
+import { InstanceCollectionStatus } from "../components/InstanceCollectionStatus";
 import { EnvChip } from "../components/Shell";
 import { Sparkline } from "../components/Sparkline";
 import {
@@ -60,6 +62,11 @@ export function MetricsFleetPage() {
   // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
   // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
   const instances = useInstances();
+  // **정지는 등록부 상태와 별개다.** 이걸 읽지 않으면 사람이 멈춘 인스턴스가
+  // 계속 `collecting` 으로 보인다 — RDS 화면에서 정지를 눌렀는데 이 표가
+  // 아무것도 달라지지 않던 결함이다.
+  const collector = useCollectorStatus();
+  const pausedScopes = collector.data?.paused_scopes ?? [];
   const fleet = useQuery({
     queryKey: queryKeys.fleetMetrics,
     queryFn: ({ signal }) => fetchFleetMetrics(signal),
@@ -127,7 +134,9 @@ export function MetricsFleetPage() {
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>QPS</th>
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>Slow/s</th>
                   <th className={`${TH} ${COL_TIGHT}`}>QPS 추이</th>
-                  <th className={`${TH} ${COL_TIGHT}`}>State</th>
+                  {/* RDS 화면과 **같은 이름·같은 컴포넌트**다. 여기서만 `State` 로
+                      두고 등록부 값을 찍었더니 정지를 눌러도 `collecting` 이었다. */}
+                  <th className={`${TH} ${COL_TIGHT}`}>Real-time</th>
                 </tr>
               </thead>
               <tbody className={TBODY}>
@@ -208,7 +217,9 @@ export function MetricsFleetPage() {
                             label={`${i.name} QPS 추이`}
                           />
                         </td>
-                        <td className={TD}>{i.state}</td>
+                        <td className={TD}>
+                          <InstanceCollectionStatus instance={i} pausedScopes={pausedScopes} />
+                        </td>
                       </tr>
                     );
                   })

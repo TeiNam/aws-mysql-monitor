@@ -55,8 +55,23 @@ pub struct Cursor {
 /// 총순서는 `(순서 키 내림, 인스턴스 id 오름)` 이다. 순서 키만으로는 총순서가 아니다 —
 /// 같은 `(started_at_ms, thread_id)` 가 인스턴스마다 하나씩 있을 수 있고, 그러면 경계에서
 /// 어느 쪽이 앞인지 정해지지 않아 행이 중복되거나 사라진다.
+///
+/// # 시간 구간도 함께 담는다
+///
+/// 처음에는 구간을 필터 해시에 넣었다. **그러면 커서가 한 번도 쓰이지 못한다** —
+/// `to_ms` 의 기본값이 `now_ms` 라 요청마다 해시가 달라지고 2페이지가 전부
+/// `invalid_cursor` 다(실배포에서 확인했다). 구간을 클라이언트가 매번 고정 시각으로
+/// 명시해야 페이지가 이어지는 API 는 그 자체로 결함이다 — 화면의 "최근 24시간" 은
+/// 새로고침마다 움직여야 한다.
+///
+/// 그래서 **커서가 자기 창을 들고 다닌다.** 페이지 열은 고정된 창 위를 걷고, 사이에 들어온
+/// 새 행은 1페이지에만 나타난다. 커서는 서명돼 있으므로 창을 넓힐 수 없고, 되돌린 창도
+/// `checked_range` 로 다시 검사한다. 환경 스코프처럼 **권한에 걸리는 필터는 해시에 남는다.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
+    /// 이 페이지 열이 걷는 창. 재개할 때 요청의 `from`/`to` 대신 이걸 쓴다.
+    pub from_ms: EpochMs,
+    pub to_ms: EpochMs,
     pub started_at_ms: EpochMs,
     pub thread_id: u64,
     pub instance_id: String,
@@ -68,24 +83,32 @@ impl Position {
         dbmon_core::slow_query::list_order_key(self.started_at_ms, self.thread_id)
     }
 
-    /// `<started_at_ms>|<thread_id>|<instance_id>`.
+    /// `<from_ms>|<to_ms>|<started_at_ms>|<thread_id>|<instance_id>`.
     ///
-    /// 인스턴스 id 를 **맨 뒤에** 둔다. 앞의 둘은 숫자라 `|` 를 가질 수 없고, 뒤는 무엇이
+    /// 인스턴스 id 를 **맨 뒤에** 둔다. 앞의 넷은 숫자라 `|` 를 가질 수 없고, 뒤는 무엇이
     /// 들어와도 `splitn` 이 살아남는다([`Cursor::encode`] 와 같은 이유).
     pub fn encode(&self) -> String {
         format!(
-            "{}|{}|{}",
-            self.started_at_ms, self.thread_id, self.instance_id
+            "{}|{}|{}|{}|{}",
+            self.from_ms, self.to_ms, self.started_at_ms, self.thread_id, self.instance_id
         )
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        let mut parts = raw.splitn(3, '|');
-        let (ms, thread_id, instance_id) = (parts.next()?, parts.next()?, parts.next()?);
+        let mut parts = raw.splitn(5, '|');
+        let (from_ms, to_ms, ms, thread_id, instance_id) = (
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+        );
         if instance_id.is_empty() {
             return None;
         }
         Some(Self {
+            from_ms: from_ms.parse().ok()?,
+            to_ms: to_ms.parse().ok()?,
             started_at_ms: ms.parse().ok()?,
             thread_id: thread_id.parse().ok()?,
             instance_id: instance_id.to_string(),
@@ -376,6 +399,8 @@ mod tests {
 
     fn pos(ms: EpochMs, thread_id: u64, instance: &str) -> Position {
         Position {
+            from_ms: NOW - 86_400_000,
+            to_ms: NOW,
             started_at_ms: ms,
             thread_id,
             instance_id: instance.into(),
@@ -399,9 +424,11 @@ mod tests {
             "",
             "|",
             "1|2",
-            "a|2|inst",
-            "1|b|inst",
-            "1|2|",
+            "1|2|3|4",
+            "1|2|a|4|inst",
+            "1|2|3|b|inst",
+            "1|2|3|4|",
+            "a|2|3|4|inst",
             &"9".repeat(40),
         ] {
             assert!(Position::parse(raw).is_none(), "{raw:?} 를 통과시켰다");
