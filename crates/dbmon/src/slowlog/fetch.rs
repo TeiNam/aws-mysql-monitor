@@ -306,13 +306,21 @@ impl SlowLogFetcher for CloudWatchFetcher {
                 // 온다. 그걸 의존 서비스 장애로 올리면 **매 백필 주기마다 경고가
                 // 쌓이고** 재시도 대상으로 분류된다 — 없는 그룹을 계속 두드린다.
                 if e.code() == Some("ResourceNotFoundException") {
+                    // **그룹이 없다고 단정하지 않는다.** 스트림을 지정했으면 그 스트림이
+                    // 없을 때도 같은 오류가 온다. Aurora 는 클러스터 그룹을 멤버들이
+                    // 공유하므로, 슬로우 쿼리가 없던 리더 하나만 없는 것이 정상이다 —
+                    // 그때 "로그 내보내기가 꺼져 있다" 고 말하면 운영자를 엉뚱한 곳으로
+                    // 보낸다(실측: 리더 `aurora-1` 이 그렇게 보고됐다).
+                    let where_ = match &streams {
+                        Some(s) => format!("로그 그룹 `{group}` 의 스트림 `{}`", s.join(",")),
+                        None => format!("로그 그룹 `{group}`"),
+                    };
                     return dbmon_core::error::DomainError::Unsupported {
                         what: "slowlog_group".into(),
-                        // 그룹 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게
-                        // 유일한 단서다.
+                        // 이름을 남긴다 — 스크럽이 메시지를 지우므로 이게 유일한 단서다.
                         reason: format!(
-                            "로그 그룹 `{group}` 이 없다 — 슬로우로그가 아직 쓰이지 \
-                                 않았거나 로그 내보내기가 꺼져 있다"
+                            "{where_} 이 없다 — 이 인스턴스에 슬로우 쿼리가 아직 없거나 \
+                                 로그 내보내기가 꺼져 있다"
                         ),
                     };
                 }
