@@ -809,7 +809,8 @@ aws ecs create-cluster --cluster-name "dbmon-$ENV"
 **이미지** — 태스크가 Graviton 이므로 `--platform linux/arm64` 가 필수다.
 
 ```bash
-TAG="v0.1.0-$(git rev-parse --short HEAD)"     # `latest` 는 쓰지 않는다
+# 버전은 `Cargo.toml` 이 정본이다 — 손으로 적으면 `--version` 과 갈린다.
+TAG="v$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/[" ]/,"");sub(/version=/,"");print;exit}' Cargo.toml)-$(git rev-parse --short HEAD)"     # `latest` 는 쓰지 않는다
 REPO="$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/dbmon-$ENV"
 
 aws ecr get-login-password --region "$AWS_REGION" \

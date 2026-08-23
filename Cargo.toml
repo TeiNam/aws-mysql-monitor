@@ -3,7 +3,18 @@ members = ["crates/normalize", "crates/planparse", "crates/core", "crates/dbmon"
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+# **이 값이 버전의 정본이다.** `clap` 이 `--version` 을 여기서 만들고, 컨테이너 이미지
+# 태그(`v<버전>-<sha>`)와 GHCR 의 semver 태그가 이걸 따라야 한다.
+#
+# | 자리 | 올리는 때 |
+# |---|---|
+# | major | 운영자가 손을 대야 하는 변경 — 설정 키 제거·이름 변경, IAM 정책 추가 요구, 저장 형식 비호환 |
+# | minor | 기능 추가. 기존 설정·IAM 으로 그대로 돌아간다 |
+# | patch | 버그 수정·문서. 동작이 좁아지지 않는다 |
+#
+# 릴리스 태그(`v1.2.3`)는 이 값과 **같아야 한다.** 다르면 `release.yml` 이 거부한다 —
+# 코드가 `1.0.0` 이라고 말하면서 `1.2.0` 으로 발행되면 어느 이미지가 무엇인지 알 수 없다.
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Proprietary"

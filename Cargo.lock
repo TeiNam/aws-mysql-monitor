@@ -969,7 +969,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "dbmon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "dbmon-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "dbmon-normalize"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "sha2",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "dbmon-planparse"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dbmon-normalize",
  "serde",
