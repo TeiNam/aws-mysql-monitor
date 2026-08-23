@@ -375,7 +375,7 @@ viewer 역할로는 변경 API가 403.
 | # | 태스크 | 수용 기준 |
 |---|---|---|
 | M10-1 | Terraform: `bedrock` 모듈 (Guardrail) + `dbmon-ai` IAM 정책 | |
-| M10-2 | 참조 테이블 추출 (플랜 우선, SQL 파서 폴백) | 픽스처 30개 |
+| M10-2 | 참조 테이블 추출 (플랜 우선, SQL 파서 폴백) | **완료.** 플랜은 별칭만 준다(실측) — `EXPLAIN` 의 `attached_condition` 조차 `스키마 . 별칭 . 컬럼` 이다. `normalize::tables` 가 `FROM`/`JOIN` 토큰에서 `별칭 → 테이블` 을 만들고 읽는 시점에 푼다(`resolved_tables`). 남은 것: 파생 테이블 내부 |
 | M10-3 | 스키마 컨텍스트 수집 (`SHOW CREATE TABLE`, STATISTICS, TABLES, COLUMN_STATISTICS) | 테이블 10개 상한, 15분 캐시 |
 | M10-4 | `schema_fingerprint` 계산 | 인덱스 변경 → 변경, 행수 변경 → 불변 |
 | M10-5 | **결정론적 규칙 엔진 16종** ([11 §4](11-ai-advisor.md)) | 테이블 주도 테스트 |

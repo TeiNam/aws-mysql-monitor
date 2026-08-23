@@ -28,6 +28,7 @@ pub mod lexer;
 pub mod postcondition;
 pub mod rewrite;
 pub mod stmt_type;
+pub mod tables;
 
 pub use canonical::MAX_CANONICAL_CHARS;
 pub use postcondition::{LiteralResidue, check_no_literals};
