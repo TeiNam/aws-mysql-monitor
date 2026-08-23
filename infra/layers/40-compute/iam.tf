@@ -200,14 +200,15 @@ resource "aws_iam_role_policy" "task_storage" {
         Action   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
         Resource = local.foundation.kms_key_arn
         Condition = {
-          # **`StringLike` 를 쓴다.** DynamoDB 는 `dynamodb.<region>.amazonaws.com` 이지만
-          # S3 는 요청 경로에 따라 값이 달라질 수 있어 `StringEquals` 로 좁히면
-          # 프로덕션에서만 거부되는 함정이 생긴다 (ADR-012).
+          # **DynamoDB 만 남긴다.** 예전에는 `s3.<region>.amazonaws.com` 도 있었는데,
+          # 이 롤에는 **S3 액션이 하나도 없다**(플랜 오프로드를 지웠다). 쓸 수 없는 경로를
+          # 열어 두면 침해 시 열람 범위만 넓어진다 — 이 정책이 `Scan` 을 막는 것과 같은 이유다.
+          # 오프로드를 구현할 때 S3 액션과 함께 다시 넣는다.
+          #
+          # `StringLike` 는 그대로 쓴다. `StringEquals` 로 좁히면 값이 요청 경로에 따라
+          # 달라지는 서비스에서 프로덕션에서만 거부되는 함정이 생긴다 (ADR-012).
           StringLike = {
-            "kms:ViaService" = [
-              "dynamodb.${var.region}.amazonaws.com",
-              "s3.${var.region}.amazonaws.com",
-            ]
+            "kms:ViaService" = ["dynamodb.${var.region}.amazonaws.com"]
           }
         }
       },
