@@ -49,16 +49,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 mysql_async = { version = "0.36", default-features = false, features = ["default-rustls"] }
 zeroize = { version = "1", features = ["derive"] }
-zstd = "0.13"
-hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.9"
-regex = "1"
 futures = "0.3"
-rand = "0.9"
 
 # AWS SDK — DynamoDB 어댑터 (M2-4)
 #

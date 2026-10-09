@@ -1137,7 +1137,6 @@ dependencies = [
  "hex",
  "mysql_async",
  "percent-encoding",
- "rand",
  "reqwest",
  "rustls",
  "serde",
