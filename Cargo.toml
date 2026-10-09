@@ -16,7 +16,11 @@ resolver = "3"
 # 코드가 `1.0.0` 이라고 말하면서 `1.2.0` 으로 발행되면 어느 이미지가 무엇인지 알 수 없다.
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+# resolver 3 은 이 값보다 높은 Rust 를 요구하는 버전을 **고르지 않는다.** 1.85 로 두었을 때
+# AWS SDK 가 1년 넘게 묶였고 `time` 보안 패치(RUSTSEC-2026-0009)도 함께 막혔다.
+# `cargo update --verbose` 에 `requires Rust …` 가 보이면 올릴 때다.
+# 1.95 = AWS SDK(1.94.1)와 `Atomic*::try_update`(1.95) 중 높은 쪽.
+rust-version = "1.95"
 license = "Proprietary"
 
 [workspace.dependencies]
