@@ -315,14 +315,14 @@ impl TargetMysql {
         // **형식은 세션 상태다.** 같은 커넥션에서 먼저 올려야 다음 `EXPLAIN` 에 적용된다.
         // 실패해도 계획 수집을 포기하지 않는다 — v1 로 받으면 되고, 어느 형식으로
         // 받았는지는 저장 레코드의 `format_version` 이 말한다.
-        if self.explain_json_v2 {
-            if let Err(e) = conn.query_drop(sql::EXPLAIN_JSON_V2).await {
-                tracing::debug!(
-                    instance = %self.label,
-                    code = ?server_error_code(&e),
-                    "계획 JSON v2 를 켤 수 없다 — v1 로 받는다"
-                );
-            }
+        if self.explain_json_v2
+            && let Err(e) = conn.query_drop(sql::EXPLAIN_JSON_V2).await
+        {
+            tracing::debug!(
+                instance = %self.label,
+                code = ?server_error_code(&e),
+                "계획 JSON v2 를 켤 수 없다 — v1 로 받는다"
+            );
         }
 
         if let Some(use_stmt) = schema.and_then(sql::use_schema) {

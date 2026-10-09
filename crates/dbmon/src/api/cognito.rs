@@ -496,17 +496,17 @@ impl JwksCache {
         let cached = s.keys.get(kid).cloned();
         let stale = now_ms.saturating_sub(s.fetched_at_ms) > JWKS_TTL_MS;
 
-        if let Some(k) = cached.clone() {
-            if !stale {
-                return KeyLookup::Fresh(k);
-            }
+        if let Some(k) = cached.clone()
+            && !stale
+        {
+            return KeyLookup::Fresh(k);
         }
 
         // 캐시에 없거나 낡았다 — 갱신을 시도해도 되는가 (**전역** 예산).
-        if let Some(last) = s.last_attempt_ms {
-            if now_ms.saturating_sub(last) < JWKS_REFRESH_MIN_INTERVAL_MS {
-                return KeyLookup::RateLimited(cached);
-            }
+        if let Some(last) = s.last_attempt_ms
+            && now_ms.saturating_sub(last) < JWKS_REFRESH_MIN_INTERVAL_MS
+        {
+            return KeyLookup::RateLimited(cached);
         }
         s.last_attempt_ms = Some(now_ms);
         match cached {

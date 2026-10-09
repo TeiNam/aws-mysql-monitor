@@ -144,13 +144,12 @@ pub fn table_refs(sql: &str) -> Vec<TableRef> {
         if matches!(toks.get(i), Some(Tok::Kw(k)) if k == "AS") {
             i += 1;
         }
-        if let Some(tok) = toks.get(i) {
-            if !is_alias_stop(tok) {
-                if let Tok::Ident(a) = tok {
-                    alias = Some(a.clone());
-                    i += 1;
-                }
-            }
+        if let Some(tok) = toks.get(i)
+            && !is_alias_stop(tok)
+            && let Tok::Ident(a) = tok
+        {
+            alias = Some(a.clone());
+            i += 1;
         }
 
         out.push(TableRef {

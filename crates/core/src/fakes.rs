@@ -911,7 +911,7 @@ impl FakeTargetDb {
 
     fn should_fail(counter: &AtomicUsize) -> bool {
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 n.checked_sub(1).or(Some(0))
             })
             .is_ok_and(|prev| prev > 0)
