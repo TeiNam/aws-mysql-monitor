@@ -464,14 +464,13 @@ impl Bootstrapper {
         map.retain(|_, p| p.expires_at_ms > now_ms);
         // **상한을 넘으면 가장 먼저 만료될 것을 버린다.** 새 계획을 거부하면
         // 화면이 막히고, 무한히 쌓으면 메모리 경로가 된다.
-        if map.len() >= MAX_PENDING_PLANS {
-            if let Some(oldest) = map
+        if map.len() >= MAX_PENDING_PLANS
+            && let Some(oldest) = map
                 .iter()
                 .min_by_key(|(_, p)| p.expires_at_ms)
                 .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
+        {
+            map.remove(&oldest);
         }
         map.insert(id, pending);
     }

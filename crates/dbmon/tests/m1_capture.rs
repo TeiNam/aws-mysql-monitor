@@ -78,10 +78,10 @@ async fn m1_1_information_schema_processlist_info_is_not_truncated() {
                 is_truncated_above_ceiling = true;
             }
         }
-        if let Some(len) = m.ps_processlist_info {
-            if (len as usize) < actual {
-                ps_truncated_somewhere = true;
-            }
+        if let Some(len) = m.ps_processlist_info
+            && (len as usize) < actual
+        {
+            ps_truncated_somewhere = true;
         }
     }
 

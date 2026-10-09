@@ -168,11 +168,11 @@ impl Counters {
         self.total_time_ms += view.duration_ms;
         self.max_time_ms = self.max_time_ms.max(view.duration_ms);
         // 실시간 캡처만으로 만든 레코드의 행 수는 **측정값이 아니다.**
-        if let Some(rows) = view.rows_examined {
-            if view.capture_source != "processlist" {
-                self.rows_examined_sum += rows;
-                self.rows_examined_n += 1;
-            }
+        if let Some(rows) = view.rows_examined
+            && view.capture_source != "processlist"
+        {
+            self.rows_examined_sum += rows;
+            self.rows_examined_n += 1;
         }
         match classify(&view.statement_type, view.sql_text.as_deref()) {
             Kind::Read => self.read += 1,

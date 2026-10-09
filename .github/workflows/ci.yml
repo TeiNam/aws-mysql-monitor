@@ -46,6 +46,22 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # ── 의존성 보안 권고: Cargo.lock 을 RustSec DB 와 대조한다 ──────────────────
+  #
+  # 이게 없어서 취약점 6건이 몇 달 묵었다(PR #12). 새 권고는 코드가 그대로여도 생기므로
+  # 무관한 PR 도 빨개질 수 있다 — 그게 의도다. `aws-sdk-*` 를 기본 feature 로 하나
+  # 더 들이면 레거시 TLS 스택(h2 0.3·rustls-webpki 0.101)이 돌아오는데, 그것도 여기서
+  # 걸린다. 경고(unmaintained·unsound)는 실패로 치지 않는다(`cargo audit` 기본값).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   # ── 단위 테스트: Docker 불필요 ────────────────────────────────────────────
   unit:
     runs-on: ubuntu-latest

@@ -31,7 +31,6 @@ base64.workspace = true
 aws-sigv4.workspace = true
 percent-encoding.workspace = true
 aws-credential-types.workspace = true
-aws-smithy-runtime-api.workspace = true
 serde_dynamo.workspace = true
 dbmon-normalize.workspace = true
 dbmon-planparse.workspace = true
@@ -47,12 +46,9 @@ thiserror.workspace = true
 clap.workspace = true
 toml.workspace = true
 async-trait.workspace = true
-zeroize.workspace = true
 futures.workspace = true
-rand.workspace = true
 mysql_async.workspace = true
 chrono.workspace = true
-hex.workspace = true
 sha2.workspace = true
 
 [lints.rust]

@@ -110,15 +110,15 @@ impl AuthContext {
         //
         // 토큰이 버전을 **주장하지 않으면**(`None`) 이 검사를 건너뛴다 — 없는 정보로
         // 판정을 흉내내지 않는다. 그때 남는 폐기 수단은 `revoked_after_ms` 다.
-        if let Some(v) = token.claims_version {
-            if v != server.claims_version {
-                return None;
-            }
+        if let Some(v) = token.claims_version
+            && v != server.claims_version
+        {
+            return None;
         }
-        if let Some(revoked_after) = server.revoked_after_ms {
-            if token.issued_at_ms <= revoked_after {
-                return None;
-            }
+        if let Some(revoked_after) = server.revoked_after_ms
+            && token.issued_at_ms <= revoked_after
+        {
+            return None;
         }
         // **그룹이 비어 있으면 권한이 없다** (교차 리뷰가 잡은 결함).
         //

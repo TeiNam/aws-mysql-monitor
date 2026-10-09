@@ -60,7 +60,8 @@ RUN ldd /dbmon | tee /dbmon.ldd
 # ─────────────────────────────────────────────────────────────────────────────
 FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime
 
-# `ca-certificates` 는 AWS SDK 의 TLS 검증에 필요하다.
+# `ca-certificates` 는 AWS SDK 와 JWKS 조회(reqwest)의 TLS 검증에 필요하다 — 둘 다 시스템
+# CA 를 신뢰 루트로 쓴다. MySQL 은 임베드한 RDS CA 번들만 쓰므로 이것과 무관하다.
 # `tzdata` 는 리포트 시간대 계산(`report_timezone`, 기본 Asia/Seoul)에 필요하다.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata \

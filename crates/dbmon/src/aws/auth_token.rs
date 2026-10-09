@@ -644,11 +644,11 @@ pub async fn build_target_auth(config: &crate::config::Config) -> TargetAuth {
     use super::auth_token::{IamAuthTokenProvider, StaticPasswordProvider};
     use aws_config::BehaviorVersion;
 
-    if config.deployment_env == dbmon_core::env::Env::Dev {
-        if let Some(p) = StaticPasswordProvider::from_env() {
-            tracing::info!("대상 인증: 고정 비밀번호 (dev 폴백)");
-            return TargetAuth::Shared(Arc::new(p));
-        }
+    if config.deployment_env == dbmon_core::env::Env::Dev
+        && let Some(p) = StaticPasswordProvider::from_env()
+    {
+        tracing::info!("대상 인증: 고정 비밀번호 (dev 폴백)");
+        return TargetAuth::Shared(Arc::new(p));
     }
 
     let mut by_region: std::collections::BTreeMap<String, Arc<dyn AuthTokenProvider>> =
