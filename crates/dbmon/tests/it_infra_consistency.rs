@@ -542,3 +542,28 @@ fn the_version_has_a_single_source_of_truth() {
         );
     }
 }
+
+/// **태그 없는 발행(`main` 푸시·수동)이 실제로 발행해야 한다.**
+///
+/// `version-gate` 는 태그 푸시에서만 돌고 나머지에서는 skip 된다. 잡의 기본 조건
+/// `success()` 는 조상 잡의 skip 까지 보므로, `if:` 가 없는 `publish` 는 `build` 가 성공해도
+/// skip 된다. PR #11~#12 동안 main 푸시가 그렇게 한 번도 발행하지 않았고 워크플로는 초록이었다.
+#[test]
+fn publish_does_not_inherit_the_skipped_version_gate() {
+    let release = read(".github/workflows/release.yml");
+    let job = release
+        .split_once("\n  publish:\n")
+        .expect("release.yml 에 publish 잡이 없다")
+        .1;
+    // 들여쓰기 2칸의 다음 키(다음 잡)까지가 이 잡이다.
+    let cond = job
+        .lines()
+        .take_while(|l| l.is_empty() || l.starts_with("   ") || l.trim_start().starts_with('#'))
+        .find_map(|l| l.strip_prefix("    if:"))
+        .expect("publish 에 `if:` 가 없다 — skip 된 version-gate 를 물려받아 main 푸시에서 발행하지 않는다");
+    assert!(
+        (cond.contains("always()") || cond.contains("!cancelled()"))
+            && cond.contains("needs.build.result == 'success'"),
+        "publish 는 조상의 skip 을 무시하고 build 의 성공만 봐야 한다: {cond}"
+    );
+}

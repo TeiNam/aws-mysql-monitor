@@ -130,7 +130,12 @@ jobs:
 
   # ── 매니페스트 병합 + 태그 ────────────────────────────────────────────────
   publish:
+    # **여기도 조건이 있어야 한다.** 기본 조건 `success()` 는 **조상** 잡의 skip 까지 본다 —
+    # build 가 성공해도 version-gate 가 skip 이면 publish 가 skip 된다. 이 줄이 없던 동안
+    # (PR #11~#12) main 푸시는 초록으로 끝나면서 한 번도 발행하지 않았다. 게이트가 실패하면
+    # build 가 skip 되므로 여기서도 막히고, matrix 한쪽만 실패해도 result 가 success 가 아니다.
     needs: build
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
