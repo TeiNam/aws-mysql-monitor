@@ -681,7 +681,10 @@ mod tests {
     fn ca_bundle_matches_its_pinned_digest() {
         use sha2::{Digest, Sha256};
 
-        let actual = format!("{:x}", Sha256::digest(RDS_CA_BUNDLE));
+        let actual = Sha256::digest(RDS_CA_BUNDLE)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         assert_eq!(
             actual, RDS_CA_BUNDLE_SHA256,
             "CA 번들이 바뀌었다 — 의도한 갱신이면 RDS_CA_BUNDLE_SHA256 과 \

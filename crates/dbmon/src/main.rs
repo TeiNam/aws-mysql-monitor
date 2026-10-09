@@ -2585,8 +2585,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     //
                     // ⚠ **셸은 캐시하지 않는다.** `index.html` 은 해시가 붙은 자산
                     // 이름을 담으므로, 낡은 셸이 캐시되면 배포 뒤 **삭제된 파일을
-                    // 가리켜 빈 화면**이 된다. `ServeFile` 은 `Last-Modified` 만
-                    // 주므로 브라우저가 휴리스틱으로 캐시할 수 있다.
+                    // 가리켜 빈 화면**이 된다. `ServeFile` 은 `Cache-Control` 없이
+                    // `Last-Modified`·`ETag` 만 주므로 브라우저가 휴리스틱으로 캐시할 수
+                    // 있다. `no-cache` 는 매번 재검증하게 하고, 그 재검증은 `ETag` 로 304 다.
                     let shell = axum::routing::any_service(ServeFile::new(dir.join("index.html")))
                         .layer(SetResponseHeaderLayer::overriding(
                             axum::http::header::CACHE_CONTROL,

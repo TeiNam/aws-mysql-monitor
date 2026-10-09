@@ -347,15 +347,20 @@ pub struct HttpJwksSource {
 
 /// 프로세스 기본 CryptoProvider 를 설치한다. **여러 번 불러도 안전하다.**
 ///
-/// # 왜 필요한가 (실배포에서 잡힌 결함)
+/// # 왜 있는가 (실배포에서 잡힌 결함)
 ///
-/// `mysql_async` 와 AWS SDK 가 rustls 를 `aws-lc-rs` 로 쓰고, `reqwest` 의
-/// `rustls-tls-webpki-roots` 는 `ring` 을 켠다. 둘이 함께 있으면 rustls 가 기본
+/// `mysql_async` 와 AWS SDK 가 rustls 를 `aws-lc-rs` 로 쓰고, reqwest 0.12 의
+/// `rustls-tls-webpki-roots` 는 `ring` 을 켰다. 둘이 함께 있으면 rustls 가 기본
 /// 프로바이더를 정하지 못해 **첫 TLS 연결에서 패닉한다.**
 ///
 /// 그래서 reqwest 를 `-no-provider` feature 로 바꿨는데, 그러면 이번에는 reqwest 가
-/// "No provider set" 으로 패닉한다 — 프로바이더가 하나뿐이어도 `reqwest` 는
-/// **명시적 설치**를 요구한다. ECS 배포가 그 패닉으로 세 번 재시작하고 롤백됐다.
+/// "No provider set" 으로 패닉했다 — 프로바이더가 하나뿐이어도 **명시적 설치**를
+/// 요구했다. ECS 배포가 그 패닉으로 세 번 재시작하고 롤백됐다.
+///
+/// reqwest 0.13 의 `rustls` feature 는 프로세스 기본이 없으면 `aws-lc-rs` 를 스스로
+/// 고르므로 이 호출이 없어도 패닉하지 않는다. 그래도 둔다 — 설치해 두면 rustls 를 쓰는
+/// 다른 쪽(`mysql_async` 의 `ClientConfig::builder()`)도 feature 로 프로바이더를
+/// 추정하지 않는다.
 ///
 /// # 왜 테스트가 못 잡았나
 ///

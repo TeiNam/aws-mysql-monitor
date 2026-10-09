@@ -356,7 +356,7 @@ impl CurrentState {
             h.update(b"role|");
             h.update(r.as_bytes());
         }
-        format!("{:x}", h.finalize())
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -513,7 +513,7 @@ impl Plan {
             h.update(format!("{b:?}").as_bytes());
             h.update(b"\n");
         }
-        format!("{:x}", h.finalize())
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 

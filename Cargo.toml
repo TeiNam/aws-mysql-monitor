@@ -30,7 +30,7 @@ dbmon-planparse = { path = "crates/planparse" }
 dbmon-core = { path = "crates/core" }
 
 # 순수 크레이트(normalize/planparse)가 쓰는 것 — I/O 의존성 없음
-sha2 = "0.10"
+sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
@@ -44,16 +44,15 @@ tokio = { version = "1", features = ["full", "test-util"] }
 axum = { version = "0.8", features = ["ws"] }
 # `fs` 는 SPA 산출물(`web/dist`) 정적 서빙, `set-header` 는 그 응답의
 # `Cache-Control`(셸은 no-cache, 해시 자산은 immutable)에 필요하다.
-tower-http = { version = "0.6", features = ["trace", "cors", "fs", "set-header"] }
+tower-http = { version = "0.7", features = ["fs", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-mysql_async = { version = "0.36", default-features = false, features = ["default-rustls"] }
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
 zeroize = { version = "1", features = ["derive"] }
-base64 = "0.22"
-hex = "0.4"
+base64 = "0.23"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-toml = "0.9"
+toml = "1"
 futures = "0.3"
 
 # AWS SDK — DynamoDB 어댑터 (M2-4)
@@ -65,27 +64,25 @@ futures = "0.3"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # ⚠ **기본 feature 를 끈다.** 기본값의 `rustls` 는 레거시 커넥터(hyper 0.14 + rustls 0.21 +
 # ring)를 같이 끌어온다 — 최신 SDK 에서도 그렇다. 그 스택의 h2 0.3·rustls-webpki 0.101 에
-# RUSTSEC 권고가 걸려 있고 그 줄에는 고친 버전이 없다. 필요한 건 `default-https-client`
-# (hyper 1 + rustls 0.23 + aws-lc-rs) 하나다. `aws-config` 는 기본값에 레거시가 없다.
+# RUSTSEC 권고가 걸려 있고 그 줄에는 고친 버전이 없다. HTTP 는 `default-https-client`
+# (hyper 1 + rustls 0.23 + aws-lc-rs)가 맡는다. `aws-config` 는 기본값에 레거시가 없다.
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-rds = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-# JWKS 조회 전용. `rustls`·`webpki-roots` 는 mysql_async 를 통해 이미 트리에 있어서
-# 추가 비용이 거의 없다. `default-features = false` 로 native-tls 를 배제한다 —
-# 시스템 OpenSSL 을 요구하면 ARM64 컨테이너 이미지가 커진다.
+# JWKS 조회 전용. `default-features = false` 로 native-tls 를 배제한다 — 시스템 OpenSSL 을
+# 요구하면 ARM64 컨테이너 이미지가 커진다.
 #
-# ⚠ **`-no-provider` 를 써야 한다.** 그냥 `rustls-tls-webpki-roots` 는 rustls 의
-# `ring` feature 를 켜고, `mysql_async` 는 `aws-lc-rs` 를 켠다 — 둘이 함께 있으면
-# rustls 가 프로세스 기본 프로바이더를 정하지 못해 **첫 TLS 연결에서 패닉한다**
-# ("Could not automatically determine the process-level CryptoProvider").
-# 통합 테스트 8개가 그렇게 죽었다.
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls-webpki-roots-no-provider",
-  "json",
-] }
+# ⚠ 0.13 부터 신뢰 루트가 번들(webpki-roots)이 아니라 **시스템 CA** 다
+# (`rustls-platform-verifier`). 런타임 이미지의 `ca-certificates` 를 빼면 JWKS 조회가 깨진다.
+#
+# `rustls` 는 `aws-lc-rs` 를 쓰고, 프로세스 기본 프로바이더가 없으면 그것을 스스로 고른다.
+# 0.12 는 두 함정 사이에 있었다 — `rustls-tls-webpki-roots` 는 rustls 의 `ring` 을 켜서
+# `mysql_async` 의 `aws-lc-rs` 와 겹쳐 **첫 TLS 연결에서 패닉했고**(통합 테스트 8개),
+# `-no-provider` 는 설치를 잊으면 "No provider set" 으로 패닉했다(ECS 롤백).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # RSA 서명 검증(JWKS RS256). **`ring` 이 아니라 이것을 쓴다** — AWS SDK·mysql_async 가
 # 이미 이 프로바이더를 쓰므로, `ring` 을 더하면 위와 같은 프로바이더 충돌이 된다.
 # API 는 `ring` 과 호환된다(aws-lc-rs 가 그렇게 설계됐다).
@@ -96,7 +93,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 aws-sigv4 = { version = "1", features = ["http1"] }
 percent-encoding = "2"
 aws-credential-types = "1"
-aws-smithy-runtime-api = { version = "1", features = ["client"] }
 serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"] }
 
 [profile.release]

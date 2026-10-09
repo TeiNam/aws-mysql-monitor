@@ -152,7 +152,11 @@ pub fn filters_hash(pairs: &[(&str, &str)]) -> String {
     sorted.sort();
     let mut h = Sha256::new();
     h.update(sorted.join("&").as_bytes());
-    format!("{:x}", h.finalize())[..16].to_string()
+    h.finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn sign(key: &[u8], payload: &str) -> String {
@@ -180,7 +184,11 @@ fn sign(key: &[u8], payload: &str) -> String {
     let mut outer = Sha256::new();
     outer.update(opad);
     outer.update(inner);
-    format!("{:x}", outer.finalize())
+    outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn b64(input: &str) -> String {
