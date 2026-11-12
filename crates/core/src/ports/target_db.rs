@@ -302,6 +302,38 @@ impl Excludes {
     }
 }
 
+/// InnoDB 행 락 대기 한 건 (`performance_schema.data_lock_waits`).
+///
+/// ⚠ **SQL 은 원문이다** — 리터럴이 살아 있다. 저장·표시 전에 반드시 마스킹한다.
+///
+/// # 왜 블로커의 문장을 따로 모으는가
+///
+/// 블로커는 대개 **유휴**(`Sleep`)다 — 락을 잡은 문장은 이미 끝났고 처리목록의 `INFO` 는
+/// NULL 이다(8.0.46·8.4.11 실측). 그 문장은 블로커 트랜잭션에 딸린 history 에만 남는다.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LockWaitRow {
+    pub waiting_pid: u64,
+    /// 대기자의 처리목록 `TIME` (초).
+    pub waiting_time_s: Option<u64>,
+    /// 대기자의 현재 문장 (`events_statements_current.SQL_TEXT`).
+    pub waiting_sql: Option<String>,
+    /// 대기자가 **요청한** 락의 대상 (`data_locks`). 키 값(`LOCK_DATA`)은 읽지 않는다 — 리터럴이다.
+    pub locked_schema: Option<String>,
+    pub locked_table: Option<String>,
+    pub locked_index: Option<String>,
+    pub lock_mode: Option<String>,
+    /// 백그라운드 스레드가 블로커면 처리목록 ID 가 없다.
+    pub blocking_pid: Option<u64>,
+    pub blocking_user: Option<String>,
+    pub blocking_host: Option<String>,
+    /// `Sleep` 이면 유휴 상태로 트랜잭션을 쥐고 있는 것이다.
+    pub blocking_command: Option<String>,
+    pub blocking_time_s: Option<u64>,
+    /// 블로커 트랜잭션이 실행한 문장, 오래된 순. **스레드별 history 크기**
+    /// (`performance_schema_events_statements_history_size`, 기본 10)까지만 남는다.
+    pub blocking_statements: Vec<String>,
+}
+
 #[async_trait]
 pub trait TargetDb: Send + Sync {
     /// 1초 주기 경량 탐지. **정상 상태에서 tick 당 이 쿼리 1건만 나간다.**
@@ -410,6 +442,16 @@ pub trait TargetDb: Send + Sync {
     /// 기본 구현은 빈 문자열 — 위험 없음으로 본다.
     async fn target_sql_mode(&self) -> Result<String> {
         Ok(String::new())
+    }
+
+    /// 행 락 대기와 블로커. `waiting_pids` 가 비면 전부, 아니면 그 대기자만 본다.
+    ///
+    /// 수집기는 슬로우 쿼리로 잡힌 문장이 **락의 피해자인지** 이걸로 가린다 — 실행 중에는
+    /// `LOCK_TIME` 이 0 이고 처리목록 `STATE` 는 `updating` 이라 다른 단서가 없다.
+    ///
+    /// 기본 구현은 빈 결과다 — "대기 없음" 으로 읽히므로 **실제 어댑터는 반드시 구현한다.**
+    async fn lock_waits(&self, _waiting_pids: &[u64]) -> Result<Vec<LockWaitRow>> {
+        Ok(Vec::new())
     }
 }
 

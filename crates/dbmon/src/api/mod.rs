@@ -25,6 +25,7 @@ pub mod bootstrap;
 pub mod cognito;
 pub mod cursor;
 pub mod hub;
+pub mod locks;
 pub mod metrics;
 pub mod settings;
 pub mod topic;
@@ -147,6 +148,8 @@ pub struct ApiState {
     /// AI 튜닝 서비스. **`None` 이면 이 워커가 대상 DB·모델에 닿을 수 없는 구성이다**
     /// (자격증명이 없다) — 그때는 422 로 거부하고 화면이 사유를 말한다.
     pub tuning: Option<Arc<crate::tuning::TuningService>>,
+    /// 락·트랜잭션 스냅샷. 튜닝과 같은 이유로 `None` 이면 422 다.
+    pub locks: Option<Arc<crate::locks::LockService>>,
     /// 파일 설정이 **인증 끄기**를 허용하는가 (`api.allow_auth_disable`).
     ///
     /// 두 곳의 명시적 허용이 필요하다: 이 값과 운영 설정(`auth.mode = off`).
@@ -200,6 +203,7 @@ pub fn router(state: ApiState) -> axum::Router {
         )
         .route("/api/metrics/fleet", get(metrics_fleet))
         .route("/api/metrics/instance/{id}", get(metrics_instance))
+        .route("/api/instances/{id}/locks", get(locks::get_locks))
         .route("/api/collector/status", get(collector_status))
         .route("/api/collector/pause", axum::routing::post(collector_pause))
         .route(

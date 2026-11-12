@@ -134,18 +134,23 @@ impl TuningService {
         if wanted.is_empty() {
             return Vec::new();
         }
-        match self.connect(instance).await {
-            Ok(db) => match db.table_specs(&wanted).await {
-                Ok(specs) => specs,
-                Err(e) => {
-                    tracing::warn!(
-                        instance = %instance.id.as_str(),
-                        error = %crate::telemetry::Scrubbed(&e),
-                        "스키마 명세 조회 실패 — 플랜만으로 분석한다"
-                    );
-                    Vec::new()
+        match TargetMysql::on_demand(&self.auth, &self.config, instance, "tuning").await {
+            Ok(db) => {
+                let specs = db.table_specs(&wanted).await;
+                // **닫는다.** 버리면 대상 DB 에 `Aborted_clients` 가 쌓인다.
+                db.disconnect().await;
+                match specs {
+                    Ok(specs) => specs,
+                    Err(e) => {
+                        tracing::warn!(
+                            instance = %instance.id.as_str(),
+                            error = %crate::telemetry::Scrubbed(&e),
+                            "스키마 명세 조회 실패 — 플랜만으로 분석한다"
+                        );
+                        Vec::new()
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(
                     instance = %instance.id.as_str(),
@@ -155,45 +160,6 @@ impl TuningService {
                 Vec::new()
             }
         }
-    }
-
-    /// 대상 DB 연결. 수집 태스크와 **같은 경로**를 쓴다(IAM 토큰 + 터널 오버라이드).
-    async fn connect(&self, instance: &Instance) -> Result<TargetMysql> {
-        let db_user = self.config.collector.monitor_db_user.clone();
-        let host = instance
-            .endpoint
-            .clone()
-            .ok_or_else(|| DomainError::InvalidInput {
-                field: "endpoint".into(),
-                reason: "엔드포인트가 없다".into(),
-            })?;
-        let provider = self
-            .auth
-            .for_instance(&instance.id, &self.config.aws.account_id)
-            .ok_or_else(|| DomainError::Unavailable {
-                dependency: "target-auth",
-                // **다른 리전·계정 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
-                // 정책 오류처럼 보여 추적이 오래 걸린다.
-                reason: format!(
-                    "{}/{} 에 쓸 인증 공급자가 없다",
-                    instance.id.account(),
-                    instance.id.region()
-                ),
-            })?;
-        let secret = provider.token(&host, instance.port, &db_user).await?;
-        let via = self.config.collector.tunnel_for(instance.id.identifier());
-        let opts = crate::mysql::connect::target_opts(
-            instance,
-            &db_user,
-            secret.expose(),
-            self.config.deployment_env,
-            via,
-        )?;
-        TargetMysql::from_config(
-            opts,
-            &self.config.collector,
-            format!("tuning:{}", instance.id.identifier()),
-        )
     }
 
     async fn bedrock(&self, ai: &AiSettings) -> Result<BedrockClient> {

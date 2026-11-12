@@ -13,8 +13,8 @@ pub use stores::{
     SHARD_COUNT, SettingsStore, SlowQueryStore, StoredKey, UserStore, shard_key, shard_of,
 };
 pub use target_db::{
-    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
-    ProcessRow, StmtCurrentRow, TargetDb,
+    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, LockWaitRow, PlanFailure,
+    ProbeResult, ProcessRow, StmtCurrentRow, TargetDb,
 };
 
 use crate::error::Result;

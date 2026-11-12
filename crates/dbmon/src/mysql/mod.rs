@@ -24,8 +24,8 @@ use std::time::Duration;
 use dbmon_core::digest::DigestSnapshotRow;
 use dbmon_core::error::{DomainError, Result};
 use dbmon_core::ports::target_db::{
-    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
-    ProcessRow, StmtCurrentRow, TargetDb,
+    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, LockWaitRow, PlanFailure,
+    ProbeResult, ProcessRow, StmtCurrentRow, TargetDb,
 };
 use dbmon_core::time::EpochMs;
 use mysql_async::prelude::*;
@@ -801,6 +801,225 @@ impl TargetDb for TargetMysql {
             .query_hot(sql::GLOBAL_SQL_MODE.to_string(), Vec::new())
             .await?;
         Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    async fn lock_waits(&self, waiting_pids: &[u64]) -> Result<Vec<LockWaitRow>> {
+        let mut params: Vec<Value> = waiting_pids.iter().map(|p| Value::from(*p)).collect();
+        params.push(Value::from(LOCK_WAITS_LIMIT));
+        let rows: Vec<Row> = self
+            .query_hot(sql::lock_waits(waiting_pids.len()), params)
+            .await?;
+        let mut waits: Vec<(LockWaitRow, Option<u64>)> = rows
+            .iter()
+            .map(|r| (lock_wait_row(r), opt::<u64>(r, 12)))
+            .collect();
+
+        // 블로커가 무엇을 했는지 — 대개 유휴라 처리목록에는 없다.
+        let mut blockers: Vec<u64> = waits.iter().filter_map(|(_, t)| *t).collect();
+        blockers.sort_unstable();
+        blockers.dedup();
+        let statements = self.trx_statements(&blockers).await?;
+        for (row, thread) in &mut waits {
+            if let Some(stmts) = thread.and_then(|t| statements.get(&t)) {
+                row.blocking_statements = stmts.clone();
+            }
+        }
+        Ok(waits.into_iter().map(|(row, _)| row).collect())
+    }
+}
+
+/// 행 락 대기 조회의 폭주 방어 상한. 대기 하나가 블로커마다 한 행이다.
+pub const LOCK_WAITS_LIMIT: u64 = 200;
+
+fn lock_wait_row(r: &Row) -> LockWaitRow {
+    LockWaitRow {
+        waiting_pid: num(r, 0),
+        waiting_time_s: opt(r, 1),
+        waiting_sql: opt(r, 2),
+        locked_schema: opt(r, 3),
+        locked_table: opt(r, 4),
+        locked_index: opt(r, 5),
+        lock_mode: opt(r, 6),
+        blocking_pid: opt(r, 7),
+        blocking_user: opt(r, 8),
+        blocking_host: opt(r, 9),
+        blocking_command: opt(r, 10),
+        blocking_time_s: opt(r, 11),
+        blocking_statements: Vec::new(),
+    }
+}
+
+/// 진행 중인 트랜잭션 한 건 (`INNODB_TRX` + 처리목록). **SQL 은 원문이다.**
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrxRow {
+    pub pid: Option<u64>,
+    pub state: Option<String>,
+    pub age_s: Option<u64>,
+    pub rows_locked: Option<u64>,
+    pub rows_modified: Option<u64>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub db: Option<String>,
+    /// `Sleep` 이면 **유휴로 트랜잭션을 쥐고 있다.**
+    pub command: Option<String>,
+    pub time_s: Option<u64>,
+    /// 실행 중이면 그 문장, 유휴면 마지막 문장.
+    pub current_sql: Option<String>,
+    /// 이 트랜잭션이 실행한 문장, 오래된 순 (스레드별 history 크기까지).
+    pub statements: Vec<String>,
+}
+
+/// 메타데이터 락 한 건 — 대기가 걸린 테이블의 보유자·대기자. **SQL 은 원문이다.**
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MdlRow {
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub lock_type: Option<String>,
+    pub lock_duration: Option<String>,
+    /// `GRANTED` 또는 `PENDING`.
+    pub lock_status: Option<String>,
+    pub pid: Option<u64>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub command: Option<String>,
+    pub time_s: Option<u64>,
+    pub sql: Option<String>,
+}
+
+/// 락·트랜잭션 화면 — **트레이트가 아니라 고유 메서드다** ([`Self::table_specs`] 와 같은 판단).
+///
+/// 사람이 화면을 열었을 때만 돈다. 수집 루프가 쓰는 것은 [`TargetDb::lock_waits`] 뿐이다.
+impl TargetMysql {
+    /// 사람이 누른 요청 하나를 위한 연결. 수집 태스크와 **같은 경로**(IAM 토큰 + 터널
+    /// 오버라이드)다. 다 쓰면 [`Self::disconnect`] 로 닫는다 — 버리면 대상 DB 에
+    /// `Aborted_clients` 가 쌓인다.
+    pub async fn on_demand(
+        auth: &crate::aws::auth_token::TargetAuth,
+        config: &crate::config::Config,
+        instance: &dbmon_core::instance::Instance,
+        purpose: &str,
+    ) -> Result<Self> {
+        let db_user = config.collector.monitor_db_user.clone();
+        let host = instance
+            .endpoint
+            .clone()
+            .ok_or_else(|| DomainError::InvalidInput {
+                field: "endpoint".into(),
+                reason: "엔드포인트가 없다".into(),
+            })?;
+        let provider = auth
+            .for_instance(&instance.id, &config.aws.account_id)
+            .ok_or_else(|| DomainError::Unavailable {
+                dependency: "target-auth",
+                // **다른 리전·계정 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
+                // 정책 오류처럼 보여 추적이 오래 걸린다.
+                reason: format!(
+                    "{}/{} 에 쓸 인증 공급자가 없다",
+                    instance.id.account(),
+                    instance.id.region()
+                ),
+            })?;
+        let secret = provider.token(&host, instance.port, &db_user).await?;
+        let via = config.collector.tunnel_for(instance.id.identifier());
+        let opts = connect::target_opts(
+            instance,
+            &db_user,
+            secret.expose(),
+            config.deployment_env,
+            via,
+        )?;
+        Self::from_config(
+            opts,
+            &config.collector,
+            format!("{purpose}:{}", instance.id.identifier()),
+        )
+    }
+
+    /// `min_age_s` 초 이상 열려 있는 트랜잭션, 오래된 순.
+    pub async fn transactions(&self, min_age_s: u64, limit: u64) -> Result<Vec<TrxRow>> {
+        let rows: Vec<Row> = self
+            .query_hot(
+                sql::TRANSACTIONS.to_string(),
+                vec![Value::from(min_age_s), Value::from(limit)],
+            )
+            .await?;
+        let mut trx: Vec<(TrxRow, Option<u64>)> = rows
+            .iter()
+            .map(|r| {
+                let row = TrxRow {
+                    pid: opt(r, 0),
+                    state: opt(r, 1),
+                    age_s: opt(r, 2),
+                    rows_locked: opt(r, 3),
+                    rows_modified: opt(r, 4),
+                    user: opt(r, 5),
+                    host: opt(r, 6),
+                    db: opt(r, 7),
+                    command: opt(r, 8),
+                    time_s: opt(r, 9),
+                    current_sql: opt(r, 11),
+                    statements: Vec::new(),
+                };
+                (row, opt::<u64>(r, 10))
+            })
+            .collect();
+        let threads: Vec<u64> = trx.iter().filter_map(|(_, t)| *t).collect();
+        let statements = self.trx_statements(&threads).await?;
+        for (row, thread) in &mut trx {
+            if let Some(stmts) = thread.and_then(|t| statements.get(&t)) {
+                row.statements = stmts.clone();
+            }
+        }
+        Ok(trx.into_iter().map(|(row, _)| row).collect())
+    }
+
+    /// 대기가 걸린 테이블의 메타데이터 락.
+    pub async fn metadata_lock_waits(&self, limit: u64) -> Result<Vec<MdlRow>> {
+        let rows: Vec<Row> = self
+            .query_hot(
+                sql::METADATA_LOCK_WAITS.to_string(),
+                vec![Value::from(limit)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| MdlRow {
+                schema: opt(r, 0),
+                table: opt(r, 1),
+                lock_type: opt(r, 2),
+                lock_duration: opt(r, 3),
+                lock_status: opt(r, 4),
+                pid: opt(r, 5),
+                user: opt(r, 6),
+                host: opt(r, 7),
+                command: opt(r, 8),
+                time_s: opt(r, 9),
+                sql: opt(r, 10),
+            })
+            .collect())
+    }
+
+    /// 스레드별로 진행 중인 트랜잭션의 문장. 스레드가 없으면 조회하지 않는다.
+    async fn trx_statements(
+        &self,
+        threads: &[u64],
+    ) -> Result<std::collections::BTreeMap<u64, Vec<String>>> {
+        let mut by_thread = std::collections::BTreeMap::<u64, Vec<String>>::new();
+        if threads.is_empty() {
+            return Ok(by_thread);
+        }
+        let rows: Vec<(u64, Option<String>)> = self
+            .query_hot(
+                sql::trx_statements(threads.len()),
+                threads.iter().map(|t| Value::from(*t)).collect(),
+            )
+            .await?;
+        for (thread, text) in rows {
+            if let Some(text) = text {
+                by_thread.entry(thread).or_default().push(text);
+            }
+        }
+        Ok(by_thread)
     }
 }
 

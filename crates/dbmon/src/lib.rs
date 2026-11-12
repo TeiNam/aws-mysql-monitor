@@ -16,6 +16,7 @@ pub mod control;
 pub mod discovery;
 pub mod entropy;
 pub mod health;
+pub mod locks;
 pub mod metrics;
 pub mod mysql;
 pub mod orphan;
