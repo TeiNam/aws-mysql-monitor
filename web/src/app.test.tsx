@@ -576,6 +576,40 @@ describe("플릿 메트릭", () => {
     expect(await screen.findByText("5")).toBeDefined();
     expect(screen.queryByText(/5 \//)).toBeNull();
   });
+
+  /**
+   * **락 대기가 있으면 "누가 막는가" 로 바로 간다.** 숫자만 있으면 다음 질문을 하러 다른
+   * 화면을 찾아야 한다. 데드락은 RDS MySQL 의 CloudWatch 에 없어서 직접 센 값을 보여 준다.
+   */
+  it("락 대기 숫자는 락 탭으로 가고 데드락/초를 보여 준다", async () => {
+    await renderApp("/metrics");
+    expect(await screen.findByText("mysql84-local")).toBeDefined();
+
+    const socket = FakeSocket.latest();
+    socket.makeReady();
+    socket.deliver({
+      t: "status",
+      instance_id: INSTANCE,
+      metrics: {
+        at_ms: Date.now(),
+        qps: 1,
+        slow_per_sec: 0,
+        threads_running: 3,
+        threads_connected: 5,
+        max_connections: 60,
+        lock_waits: 2,
+        deadlocks_per_sec: 0.2,
+        lock_timeouts_per_sec: 0,
+        rate_gap_reason: null,
+      },
+    });
+
+    const link = await screen.findByRole("link", { name: "2" });
+    expect(link.getAttribute("href")).toBe(
+      `/instance?instance=${encodeURIComponent(INSTANCE)}&tab=locks`,
+    );
+    expect(screen.getByText("0.2")).toBeDefined();
+  });
 });
 
 describe("인증 거부", () => {

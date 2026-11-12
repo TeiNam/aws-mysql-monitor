@@ -287,7 +287,18 @@ UNION ALL
 -- 이름이 상태 변수와 겹치지 않으므로(소문자) 같은 맵에 담아도 충돌하지 않는다.
 SELECT VARIABLE_NAME, VARIABLE_VALUE
 FROM performance_schema.global_variables
-WHERE VARIABLE_NAME = 'max_connections'";
+WHERE VARIABLE_NAME = 'max_connections'
+UNION ALL
+-- **데드락·락 타임아웃 카운터는 상태 변수에 없다.** `INNODB_METRICS` 에만 있다(기본
+-- enabled, Database Insights 의 `innodb_deadlocks` 도 이것을 읽는다). RDS MySQL 은
+-- CloudWatch 에 `Deadlocks` 가 없어서 이게 유일한 출처다.
+--
+-- `PROCESS` 권한이 필요하다 — 없으면 이 문장 전체가 실패한다. 탐지(처리목록)가 이미
+-- 같은 권한을 요구하므로 새 요구는 아니다. 문자셋(utf8mb3)·타입(BIGINT)이 위 갈래와
+-- 달라도 합쳐진다(8.0.46·8.4.11 실측).
+SELECT NAME, COUNT
+FROM information_schema.INNODB_METRICS
+WHERE NAME IN ('lock_deadlocks','lock_timeouts')";
 
 /// 대상 DB 시각. `probe` 가 0행일 때 시계 오프셋을 갱신한다.
 pub const DB_NOW: &str = "/* dbmon:dbnow */ SELECT UNIX_TIMESTAMP(NOW(6))";

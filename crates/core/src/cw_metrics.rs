@@ -159,8 +159,9 @@ const DETAIL_RDS: &[MetricSpec] = &[
 
 /// Aurora MySQL 에만 있는 것.
 ///
-/// `Deadlocks`·`EngineUptime` 이 여기 있다 — **RDS MySQL 에는 없다.** 데드락은
-/// `SHOW ENGINE INNODB STATUS` 파싱으로, 재시작은 자체 수집 `Uptime` 델타로 얻는다.
+/// `Deadlocks`·`EngineUptime` 이 여기 있다 — **RDS MySQL 에는 없다.** 데드락은 자체 수집
+/// (`INNODB_METRICS.lock_deadlocks`, 5초 상태 쿼리의 `deadlocks_per_sec`)으로, 재시작은 자체
+/// 수집 `Uptime` 델타로 얻는다.
 const DETAIL_AURORA: &[MetricSpec] = &[
     m("EngineCPUUtilization", "엔진 CPU", Percent, Average),
     m("BufferCacheHitRatio", "버퍼 캐시 적중", Percent, Average),

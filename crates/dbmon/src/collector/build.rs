@@ -621,7 +621,11 @@ mod tests {
         assert_eq!(s.rows_sent, Some(5));
         assert_eq!(s.tmp_disk_tables, Some(2));
         assert_eq!(s.full_join, Some(true));
-        assert_eq!(s.lock_time_ms, Some(4_919), "끝난 문장의 LOCK_TIME 은 행 락 대기를 포함한다");
+        assert_eq!(
+            s.lock_time_ms,
+            Some(4_919),
+            "끝난 문장의 LOCK_TIME 은 행 락 대기를 포함한다"
+        );
     }
 
     #[test]

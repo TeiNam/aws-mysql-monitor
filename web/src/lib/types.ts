@@ -288,6 +288,12 @@ export interface LiveMetrics {
    */
   max_connections: number | null;
   lock_waits: number | null;
+  /**
+   * 초당 데드락·락 타임아웃 (`INNODB_METRICS`). **RDS MySQL 에는 CloudWatch 에 이 값이
+   * 없다** — Aurora 만 `Deadlocks` 가 있다. 구 서버는 보내지 않으므로 `null` 이다.
+   */
+  deadlocks_per_sec: number | null;
+  lock_timeouts_per_sec: number | null;
   rate_gap_reason: string | null;
 }
 

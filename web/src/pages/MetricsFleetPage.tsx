@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Database, Gauge } from "lucide-react";
 import { useMemo } from "react";
-import { useNavigate } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { Card } from "../components/Card";
 import { EmptyRow, ErrorNotice, Note, Pending } from "../components/Notices";
 import { PageHeader } from "../components/PageHeader";
@@ -13,6 +13,7 @@ import {
   CELL_ICON,
   COL_TIGHT,
   COL_TIGHT_CAPPED,
+  LINK,
   TABLE,
   TBODY,
   TD,
@@ -45,7 +46,7 @@ import {
  *
  * | 값 | 출처 | 신선도 | 비용 |
  * |---|---|---|---|
- * | 연결·QPS·슬로우/초·스레드·락 대기 | **자체 수집** (WS 스냅샷) | 5초 | 0 |
+ * | 연결·QPS·슬로우/초·스레드·락 대기·데드락/초 | **자체 수집** (WS 스냅샷) | 5초 | 0 |
  * | CPU·여유 메모리·스토리지/볼륨 | CloudWatch | 15분 | 엔진별 3메트릭 |
  *
  * 연결 수는 CloudWatch 에도 있지만(`DatabaseConnections`) **쓰지 않는다** — 자체 수집이
@@ -131,6 +132,7 @@ export function MetricsFleetPage() {
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>Conn</th>
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>Threads</th>
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>Lock</th>
+                  <th className={`${TH_NUM} ${COL_TIGHT}`}>Deadlock/s</th>
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>QPS</th>
                   <th className={`${TH_NUM} ${COL_TIGHT}`}>Slow/s</th>
                   <th className={`${TH} ${COL_TIGHT}`}>QPS 추이</th>
@@ -141,7 +143,7 @@ export function MetricsFleetPage() {
               </thead>
               <tbody className={TBODY}>
                 {rows.length === 0 ? (
-                  <EmptyRow colSpan={12}>
+                  <EmptyRow colSpan={13}>
                     등록된 인스턴스가 없다. 탐색이 아직 돌지 않았거나 필터가 전부 제외했다.
                   </EmptyRow>
                 ) : (
@@ -208,7 +210,31 @@ export function MetricsFleetPage() {
                           {formatConn(m?.threads_connected ?? null, m?.max_connections ?? null)}
                         </td>
                         <td className={TD_NUM}>{fmtInt(m?.threads_running)}</td>
-                        <td className={TD_NUM}>{fmtInt(m?.lock_waits)}</td>
+                        {/* **락 대기가 있으면 "누가 막는가" 로 바로 간다.** 숫자만 있으면
+                            다음 질문을 하러 다른 화면을 찾아야 한다. 행 클릭(메트릭)과
+                            겹치지 않게 전파를 끊는다. */}
+                        <td className={TD_NUM}>
+                          {(m?.lock_waits ?? 0) > 0 ? (
+                            <Link
+                              to={`/instance?instance=${encodeURIComponent(i.id)}&tab=locks`}
+                              onClick={(e) => e.stopPropagation()}
+                              className={`${LINK} ${severityClass("warn")}`}
+                              title="행 락 대기 — 누가 막고 있는지 본다"
+                            >
+                              {fmtInt(m?.lock_waits)}
+                            </Link>
+                          ) : (
+                            fmtInt(m?.lock_waits)
+                          )}
+                        </td>
+                        <td
+                          className={`${TD_NUM} ${
+                            (m?.deadlocks_per_sec ?? 0) > 0 ? severityClass("crit") : ""
+                          }`}
+                          title={`락 타임아웃 ${fmtRate(m?.lock_timeouts_per_sec)}/s`}
+                        >
+                          {fmtRate(m?.deadlocks_per_sec)}
+                        </td>
                         <td className={TD_NUM}>{fmtRate(m?.qps)}</td>
                         <td className={TD_NUM}>{fmtRate(m?.slow_per_sec)}</td>
                         <td className={TD}>
@@ -247,11 +273,13 @@ export function MetricsFleetPage() {
           </p>
         )}
         <Note>
-          <strong>두 출처를 한 줄에 놓는다.</strong> 연결·QPS·스레드는{" "}
+          <strong>두 출처를 한 줄에 놓는다.</strong> 연결·QPS·스레드·락·데드락은{" "}
           <strong>자체 수집</strong>(5초, 비용 0)이고, CPU·메모리·스토리지는{" "}
           <strong>CloudWatch</strong>(15분)다. CloudWatch 는 1~3분 지연되므로 두 열의 값이
           어긋나 보일 수 있다 — 실시간은 왼쪽을 본다. 행을 누르면 그 인스턴스의 전체
-          메트릭으로 간다.
+          메트릭으로, <strong>Lock</strong> 숫자를 누르면 누가 막고 있는지로 간다. 데드락은
+          RDS MySQL 의 CloudWatch 에 없어서 <span className="font-mono">INNODB_METRICS</span>{" "}
+          로 직접 센다.
         </Note>
       </Card>
     </div>
