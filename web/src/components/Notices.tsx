@@ -28,6 +28,14 @@ const MESSAGES: Record<string, string> = {
   not_found: "그런 레코드가 없다. 보존 기간이 지났거나 스코프 밖이다.",
   store_unavailable: "저장소(DynamoDB)에 닿지 못했다. 서버 로그를 봐야 한다.",
   malformed_response: "서버 응답 형식이 예상과 다르다. 프론트와 백엔드 버전이 어긋났을 수 있다.",
+  invalid_instance_id: "인스턴스 id 형식이 잘못됐다.",
+  instance_not_found: "그런 인스턴스가 없다. 삭제됐거나 환경 스코프 밖이다.",
+  locks_unavailable: "이 서버 구성에서는 대상 DB 에 붙을 수 없어 락을 조회하지 못한다.",
+  target_unavailable: "대상 DB 에 닿지 못했다(연결·조회 실패). 서버 로그에 사유가 있다.",
+  // 1045(로그인 거부)도 여기로 온다 — 권한만 말하면 IAM 인증 문제를 GRANT 에서 찾게 된다.
+  target_forbidden:
+    "대상 DB 가 모니터링 계정을 거부했다 — 로그인(IAM 인증)과 권한(performance_schema SELECT·PROCESS)을 확인한다.",
+  target_timeout: "대상 DB 가 제한 시간(15초) 안에 답하지 않았다.",
 };
 
 interface ErrorNoticeProps {

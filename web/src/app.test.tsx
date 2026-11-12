@@ -34,6 +34,10 @@ let pagedWindows = false;
 let pausedThisInstance = false;
 /** 설정을 읽지 못한 상황(손상된 문서·저장소 장애). */
 let settingsLoadError: string | null = null;
+/** 락 조회가 실패한 상황 — 오류 코드. */
+let locksError: string | null = null;
+/** 화면이 보낸 요청. **묻지 말아야 할 것을 묻지 않았는지** 보려고 남긴다. */
+let requested: string[] = [];
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -76,8 +80,56 @@ const pagedRecord = (threadId: number) => ({
   thread_id: threadId,
 });
 
+/** 유휴 블로커 하나가 행 하나를 쥐고, 다른 세션이 그 행을 기다린다. */
+const BLOCKER_STATEMENTS = [
+  "SELECT * FROM orders WHERE id = ? FOR UPDATE",
+  "UPDATE orders SET memo = ? WHERE id = ?",
+];
+const LOCKS = {
+  instance_id: INSTANCE,
+  captured_at_ms: NOW_MS,
+  lock_waits: [
+    {
+      waiting_pid: 34,
+      waiting_time_s: 12,
+      waiting_sql: "UPDATE orders SET status = ? WHERE id = ?",
+      locked_table: "shop.orders",
+      locked_index: "PRIMARY",
+      lock_mode: "X,REC_NOT_GAP",
+      blocking_pid: 31,
+      blocking_user: "app",
+      blocking_host: "10.0.1.5",
+      blocking_command: "Sleep",
+      blocking_time_s: 40,
+      blocking_idle: true,
+      blocking_statements: BLOCKER_STATEMENTS,
+    },
+  ],
+  transactions: [
+    {
+      pid: 31,
+      state: "RUNNING",
+      age_s: 45,
+      rows_locked: 1,
+      rows_modified: 1,
+      user: "app",
+      host: "10.0.1.5",
+      db: "shop",
+      command: "Sleep",
+      time_s: 40,
+      idle: true,
+      current_sql: null,
+      statements: BLOCKER_STATEMENTS,
+    },
+  ],
+  metadata_locks: [],
+  truncated: false,
+  sql_withheld: 1,
+};
+
 function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
+  requested = [...requested, url];
   // **`/api/auth/config` 는 401 이 되지 않는다.** 서버에서 인증 없이 답하는 세 경로 중
   // 하나다(`/healthz`·`/readyz`·이것) — 로그인하기 전에 로그인 방법을 알아야 하기
   // 때문이다. 이걸 막아 두면 토큰 안내가 `mode` 를 못 받아 **항상 기본 문구**로
@@ -94,6 +146,18 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
     return Promise.resolve(
       json({ account_id: "000000000000", region: "ap-northeast-2", deployment_env: "dev" }),
     );
+  }
+  // **목록보다 먼저 본다** — `/api/instances` 접두에 걸리면 목록이 락 응답으로 간다.
+  if (url.startsWith(`/api/instances/${encodeURIComponent(INSTANCE)}/locks`)) {
+    if (locksError !== null) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: locksError }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(json(LOCKS));
   }
   if (url.startsWith("/api/instances")) {
     return Promise.resolve(
@@ -358,6 +422,8 @@ beforeEach(() => {
   pagedWindows = false;
   pausedThisInstance = false;
   settingsLoadError = null;
+  locksError = null;
+  requested = [];
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
   // `unauthorized` 가 되면 다음 테스트에서 아예 접속하지 않는다(그게 프로덕션
@@ -810,5 +876,42 @@ describe("다이제스트·통계·플랜·인스턴스 화면", () => {
     expect(screen.getByText("수집 정지")).toBeDefined();
     // 표의 행마다 개별 정지 버튼이 있다.
     expect(screen.getByRole("button", { name: /^정지$/ })).toBeDefined();
+  });
+});
+
+describe("인스턴스 락 탭", () => {
+  const LOCKS_PATH = `/instance?instance=${encodeURIComponent(INSTANCE)}&tab=locks`;
+
+  /**
+   * **블로커가 무엇을 실행했는지가 이 탭의 이유다.** 처리목록에서 블로커는 `Sleep` 일 뿐이고
+   * Database Insights 도 MySQL 에서는 쥐고 있는 쪽을 보여주지 않는다.
+   */
+  it("유휴 블로커와 그 트랜잭션 문장을 보여 주고, CloudWatch 는 묻지 않는다", async () => {
+    await renderApp(LOCKS_PATH);
+    expect(await screen.findByText("shop.orders")).toBeDefined();
+    // 대기 표의 블로커와 트랜잭션 표의 같은 세션 — 두 곳 모두 유휴다.
+    expect(screen.getAllByText("유휴")).toHaveLength(2);
+    expect(screen.getByText(/1건은 숨겼다/)).toBeDefined();
+    // 메트릭 전용 조작은 숨고, **CloudWatch 를 부르지 않는다**(요청 수로 과금된다).
+    expect(screen.queryByLabelText("조회 범위")).toBeNull();
+    expect(requested.some((u) => u.startsWith("/api/metrics/instance"))).toBe(false);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "문장 2개" })[0]);
+    const dialog = await screen.findByRole("dialog");
+    // 포매터가 줄을 바꿔 놓으므로 공백 종류는 보지 않는다.
+    expect(dialog.textContent).toMatch(/FOR\s+UPDATE/);
+    expect(dialog.textContent).toContain("memo");
+    fireEvent.click(screen.getByRole("button", { name: "닫기" }));
+
+    // 메트릭 탭으로 돌아가면 범위 고르기가 다시 나온다.
+    fireEvent.click(screen.getByRole("tab", { name: "메트릭" }));
+    expect(await screen.findByLabelText("조회 범위")).toBeDefined();
+  });
+
+  it("대상 DB 가 거부하면 무엇을 확인할지 말한다", async () => {
+    locksError = "target_forbidden";
+    await renderApp(LOCKS_PATH);
+    expect(await screen.findByText(/모니터링 계정을 거부했다/)).toBeDefined();
+    expect(screen.getByText("target_forbidden")).toBeDefined();
   });
 });

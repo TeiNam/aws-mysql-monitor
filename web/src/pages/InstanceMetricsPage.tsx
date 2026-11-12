@@ -3,11 +3,12 @@ import { Clock, Gauge } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { useInstances } from "../hooks/useInstances";
 import { Card } from "../components/Card";
+import { LocksPanel } from "../components/LocksPanel";
 import { ErrorNotice, Note, Pending } from "../components/Notices";
 import { PageHeader } from "../components/PageHeader";
 import { EnvChip } from "../components/Shell";
 import { Sparkline } from "../components/Sparkline";
-import { LABEL, SELECT } from "../components/ui";
+import { LABEL, SELECT, TAB_LIST, TAB_OFF, TAB_ON } from "../components/ui";
 import { fetchInstanceMetrics, queryKeys } from "../lib/api";
 import { fmtListTime } from "../lib/format";
 import { formatMetric } from "../lib/metrics";
@@ -22,6 +23,18 @@ const RANGES = [
   { label: "2주", ms: 14 * 86_400_000 },
   { label: "30일", ms: 30 * 86_400_000 },
 ] as const;
+
+/**
+ * 화면 탭. **URL 에 둔다**(`?tab=locks`) — 플릿 표의 락 대기 숫자가 이 탭으로 바로 들어온다.
+ *
+ * 위쪽 내비에 탭을 더하지 않은 이유: 1280px 에서 머리말이 겹치고, 락은 **인스턴스 하나**를
+ * 보는 일이라 인스턴스 고르기를 이 화면과 같이 쓴다.
+ */
+const TABS = [
+  { id: "metrics", label: "메트릭" },
+  { id: "locks", label: "락·트랜잭션" },
+] as const;
+type Tab = (typeof TABS)[number]["id"];
 
 /**
  * 인스턴스 하나의 CloudWatch 메트릭 전체.
@@ -41,6 +54,7 @@ export function InstanceMetricsPage() {
   const [params, setParams] = useSearchParams();
   const selected = params.get("instance") ?? "";
   const rangeMs = Number.parseInt(params.get("range") ?? "", 10) || RANGES[1].ms;
+  const tab: Tab = params.get("tab") === "locks" ? "locks" : "metrics";
 
   // **머리말의 리전 범위가 적용된 목록**이다(`useInstances`). 화면마다 직접
   // 조회하면 리전 필터를 한 곳만 빠뜨려도 그 화면에서 범위 밖이 보인다.
@@ -61,7 +75,8 @@ export function InstanceMetricsPage() {
   const metrics = useQuery({
     queryKey: queryKeys.instanceMetrics(picked ?? "", rangeMs),
     queryFn: ({ signal }) => fetchInstanceMetrics(picked ?? "", rangeMs, signal),
-    enabled: picked !== undefined,
+    // **락 탭에서는 묻지 않는다** — CloudWatch 는 요청 수로 과금된다.
+    enabled: picked !== undefined && tab === "metrics",
     // 서버가 60초 창으로 캐시한다 — 그보다 자주 물어도 CloudWatch 를 다시 때리지 않는다.
     refetchInterval: 60_000,
   });
@@ -75,7 +90,10 @@ export function InstanceMetricsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Instance Detail" subtitle="= CloudWatch 전체 메트릭 =" />
+      <PageHeader
+        title="Instance Detail"
+        subtitle={tab === "locks" ? "= 락·트랜잭션 (대상 DB 직접 조회) =" : "= CloudWatch 전체 메트릭 ="}
+      />
 
       <Card
         title={
@@ -101,25 +119,27 @@ export function InstanceMetricsPage() {
                 ))}
               </select>
             </label>
-            <label className={LABEL}>
-              <Clock className="h-4 w-4 text-gray-500" />
-              <select
-                className={SELECT}
-                value={String(rangeMs)}
-                onChange={(e) => update("range", e.target.value)}
-                aria-label="조회 범위"
-              >
-                {RANGES.map((r) => (
-                  <option key={r.ms} value={r.ms}>
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {tab === "locks" ? null : (
+              <label className={LABEL}>
+                <Clock className="h-4 w-4 text-gray-500" />
+                <select
+                  className={SELECT}
+                  value={String(rangeMs)}
+                  onChange={(e) => update("range", e.target.value)}
+                  aria-label="조회 범위"
+                >
+                  {RANGES.map((r) => (
+                    <option key={r.ms} value={r.ms}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
           </>
         }
         note={
-          metrics.data === undefined ? (
+          tab === "locks" ? undefined : metrics.data === undefined ? (
             <>엔진에 맞는 메트릭만 조회한다 — 없는 메트릭은 요청하지 않는다(빈 값에도 과금된다).</>
           ) : (
             <>
@@ -155,6 +175,21 @@ export function InstanceMetricsPage() {
           )
         }
       >
+        <div className={TAB_LIST} role="tablist" aria-label="인스턴스 보기">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={tab === t.id}
+              className={tab === t.id ? TAB_ON : TAB_OFF}
+              // 기본 탭은 주소에 남기지 않는다 — 기존 링크·북마크와 같은 주소가 된다.
+              onClick={() => update("tab", t.id === "metrics" ? "" : t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
         {instances.error !== null ? (
           // 목록을 못 읽었다. 이 화면의 모든 판정이 그 목록에 기대므로 먼저 말한다.
           <ErrorNotice error={instances.error} onRetry={() => void instances.refetch()} />
@@ -163,6 +198,12 @@ export function InstanceMetricsPage() {
             주소로 지정한 인스턴스가 목록에 없다 — 삭제됐거나 환경 스코프 밖이다.{" "}
             <strong>다른 인스턴스의 메트릭을 대신 보여주지 않는다.</strong>
           </Note>
+        ) : tab === "locks" ? (
+          picked === undefined ? (
+            <Pending label="인스턴스 목록을 불러오는 중…" />
+          ) : (
+            <LocksPanel instanceId={picked} />
+          )
         ) : metrics.error !== null ? (
           <ErrorNotice error={metrics.error} onRetry={() => void metrics.refetch()} />
         ) : metrics.isPending || metrics.data === undefined ? (

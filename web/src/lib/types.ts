@@ -550,3 +550,71 @@ export interface InstanceMetricsResponse {
   from_ms: number;
   to_ms: number;
 }
+
+/**
+ * 락 탭 한 장. `crates/dbmon/src/locks.rs` 의 `LockSnapshot`.
+ *
+ * **SQL 은 언제나 마스킹된 정규 텍스트다** — 저장 정책과 무관하다. 마스킹을 믿을 수 없는
+ * 문장은 `null` 로 빠지고 그 수가 `sql_withheld` 에 남는다.
+ */
+export interface LockSnapshot {
+  instance_id: string;
+  captured_at_ms: number;
+  lock_waits: LockWaitView[];
+  transactions: TransactionView[];
+  metadata_locks: MetadataLockView[];
+  /** 상한에 걸려 일부만 실었다. */
+  truncated: boolean;
+  sql_withheld: number;
+}
+
+export interface LockWaitView {
+  waiting_pid: number;
+  waiting_time_s: number | null;
+  waiting_sql: string | null;
+  /** `스키마.테이블`. */
+  locked_table: string | null;
+  locked_index: string | null;
+  lock_mode: string | null;
+  blocking_pid: number | null;
+  blocking_user: string | null;
+  blocking_host: string | null;
+  blocking_command: string | null;
+  blocking_time_s: number | null;
+  /** 블로커가 **유휴(`Sleep`)로 트랜잭션을 쥐고 있다** — 커밋을 잊은 코드 경로가 대개 이것이다. */
+  blocking_idle: boolean;
+  /** 블로커 트랜잭션이 실행한 문장, 오래된 순. */
+  blocking_statements: string[];
+}
+
+export interface TransactionView {
+  pid: number | null;
+  state: string | null;
+  age_s: number | null;
+  rows_locked: number | null;
+  rows_modified: number | null;
+  user: string | null;
+  host: string | null;
+  db: string | null;
+  command: string | null;
+  time_s: number | null;
+  /** 문장은 끝났는데 커밋하지 않았다. */
+  idle: boolean;
+  current_sql: string | null;
+  statements: string[];
+}
+
+export interface MetadataLockView {
+  /** `스키마.테이블`. */
+  table: string | null;
+  lock_type: string | null;
+  lock_duration: string | null;
+  lock_status: string | null;
+  pending: boolean;
+  pid: number | null;
+  user: string | null;
+  host: string | null;
+  command: string | null;
+  time_s: number | null;
+  sql: string | null;
+}
