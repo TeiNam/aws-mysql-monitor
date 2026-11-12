@@ -920,10 +920,13 @@ SHOW GRANTS FOR 'dbmon'@'10.1.%';
 
 `REPLICATION CLIENT`, `SHOW DATABASES`, and `SELECT ON sys.*` used to be in this list.
 The collector never issues a query that needs them — it reads
-`performance_schema.{processlist,events_statements_current,events_statements_summary_by_digest,
-global_status,global_variables}`, `information_schema.{PROCESSLIST,STATISTICS,TABLES}`,
-and `SHOW CREATE TABLE`. A monitoring account that gets compromised should see as little
-as the job allows.
+`performance_schema.{processlist,threads,events_statements_current,events_statements_history,
+events_statements_summary_by_digest,events_transactions_current,data_locks,data_lock_waits,
+metadata_locks,global_status,global_variables}`,
+`information_schema.{PROCESSLIST,STATISTICS,TABLES,INNODB_TRX,INNODB_METRICS}`, and
+`SHOW CREATE TABLE`. The lock tab reads `performance_schema` directly instead of the `sys`
+lock views, which would need `EXECUTE` on `sys`. A monitoring account that gets compromised
+should see as little as the job allows.
 
 Notes that cost time if you miss them:
 
