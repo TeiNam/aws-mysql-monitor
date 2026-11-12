@@ -136,6 +136,25 @@ export interface SlowQueryView {
   lock_time_ms: number | null;
   has_plan: boolean;
   abandoned_reason: string | null;
+  /** 행 락 대기 중에 관측한 블로커. 구 서버는 보내지 않는다(`undefined`). */
+  lock_wait?: LockWaitCapture | null;
+}
+
+/**
+ * `crates/core/src/slow_query.rs` 의 `LockWaitCapture` — 이 실행을 막고 있던 세션.
+ * 문장은 정규 텍스트만 담기고, 정책이 `off` 면 비어 있다.
+ */
+export interface LockWaitCapture {
+  observed_at_ms: number;
+  locked_table: string | null;
+  locked_index: string | null;
+  lock_mode: string | null;
+  blocking_pid: number | null;
+  blocking_user: string | null;
+  blocking_host: string | null;
+  blocking_command: string | null;
+  blocking_time_s: number | null;
+  blocking_statements: string[];
 }
 
 export interface ListResponse {
@@ -288,6 +307,12 @@ export interface LiveMetrics {
    */
   max_connections: number | null;
   lock_waits: number | null;
+  /**
+   * 초당 데드락·락 타임아웃 (`INNODB_METRICS`). **RDS MySQL 에는 CloudWatch 에 이 값이
+   * 없다** — Aurora 만 `Deadlocks` 가 있다. 구 서버는 보내지 않으므로 `null` 이다.
+   */
+  deadlocks_per_sec: number | null;
+  lock_timeouts_per_sec: number | null;
   rate_gap_reason: string | null;
 }
 
@@ -543,4 +568,77 @@ export interface InstanceMetricsResponse {
   period_adjusted: boolean;
   from_ms: number;
   to_ms: number;
+}
+
+/**
+ * 락 탭 한 장. `crates/dbmon/src/locks.rs` 의 `LockSnapshot`.
+ *
+ * **SQL 은 언제나 마스킹된 정규 텍스트다** — 저장 정책과 무관하다. 마스킹을 믿을 수 없는
+ * 문장은 `null` 로 빠지고 그 수가 `sql_withheld` 에 남는다.
+ */
+export interface LockSnapshot {
+  instance_id: string;
+  captured_at_ms: number;
+  lock_waits: LockWaitView[];
+  transactions: TransactionView[];
+  metadata_locks: MetadataLockView[];
+  /** 상한에 걸려 일부만 실었다. */
+  truncated: boolean;
+  sql_withheld: number;
+  /**
+   * SQL 을 **전부 뺀** 이유. `policy_off` — 배포가 SQL 을 다루지 않는다,
+   * `insufficient_role` — 원문 정책인데 리터럴 열람 권한이 없다. 슬로우 쿼리 SQL 과 같은 경계다.
+   */
+  sql_hidden: "policy_off" | "insufficient_role" | null;
+}
+
+export interface LockWaitView {
+  waiting_pid: number;
+  waiting_time_s: number | null;
+  waiting_sql: string | null;
+  /** `스키마.테이블`. */
+  locked_table: string | null;
+  locked_index: string | null;
+  lock_mode: string | null;
+  blocking_pid: number | null;
+  blocking_user: string | null;
+  blocking_host: string | null;
+  blocking_command: string | null;
+  blocking_time_s: number | null;
+  /** 블로커가 **유휴(`Sleep`)로 트랜잭션을 쥐고 있다** — 커밋을 잊은 코드 경로가 대개 이것이다. */
+  blocking_idle: boolean;
+  /** 블로커 트랜잭션이 실행한 문장, 오래된 순. */
+  blocking_statements: string[];
+}
+
+export interface TransactionView {
+  pid: number | null;
+  state: string | null;
+  age_s: number | null;
+  rows_locked: number | null;
+  rows_modified: number | null;
+  user: string | null;
+  host: string | null;
+  db: string | null;
+  command: string | null;
+  time_s: number | null;
+  /** 문장은 끝났는데 커밋하지 않았다. */
+  idle: boolean;
+  current_sql: string | null;
+  statements: string[];
+}
+
+export interface MetadataLockView {
+  /** `스키마.테이블`. */
+  table: string | null;
+  lock_type: string | null;
+  lock_duration: string | null;
+  lock_status: string | null;
+  pending: boolean;
+  pid: number | null;
+  user: string | null;
+  host: string | null;
+  command: string | null;
+  time_s: number | null;
+  sql: string | null;
 }

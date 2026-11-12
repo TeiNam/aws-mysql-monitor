@@ -11,7 +11,7 @@
 //! 반드시 거치고, 그 변환이 [`AuthContext::may_view_literals`] 를 묻는다.
 
 use dbmon_core::rbac::AuthContext;
-use dbmon_core::slow_query::{LiteralPolicy, SlowQuery};
+use dbmon_core::slow_query::{LiteralPolicy, LockWaitCapture, SlowQuery};
 use dbmon_core::time::EpochMs;
 use serde::Serialize;
 
@@ -52,6 +52,9 @@ pub struct SlowQueryView {
     pub lock_time_ms: Option<i64>,
     pub has_plan: bool,
     pub abandoned_reason: Option<String>,
+    /// 행 락 대기 중에 관측한 블로커. **역할로 가리지 않는다** — 문장은 정규 텍스트만
+    /// 저장된다([`LockWaitCapture`]). 계정·호스트는 `db_user` 와 같은 급이다.
+    pub lock_wait: Option<LockWaitCapture>,
 }
 
 impl SlowQueryView {
@@ -95,7 +98,33 @@ impl SlowQueryView {
             lock_time_ms: q.stats.lock_time_ms,
             has_plan: q.plan.has_plan(),
             abandoned_reason: q.abandoned_reason.clone(),
+            // 블로커 문장도 같은 경계 안에 둔다 — 정규 텍스트여도, 이 정책에서 권한 없는 사람은
+            // 지금까지 SQL 을 전혀 보지 못했다.
+            lock_wait: q.lock_wait.clone().map(|w| {
+                match sql_hidden_reason(q.literal_policy, ctx) {
+                    Some(_) => LockWaitCapture {
+                        blocking_statements: Vec::new(),
+                        ..w
+                    },
+                    None => w,
+                }
+            }),
         }
+    }
+}
+
+/// 이 사람에게 **SQL 을 보이지 않아야 하는** 이유. 원문이든 정규 텍스트든 같은 규칙이다.
+///
+/// 원문 정책(`full`·`full_restricted`)에서 리터럴 열람 권한이 없는 사람은 `sql_text` 가 가려져
+/// SQL 을 **전혀** 보지 못한다. 정규 텍스트를 내보내는 경로(락 화면·블로커 문장)가 그 경계를
+/// 넓히면 안 된다. `off` 는 배포가 SQL 을 다루지 않기로 한 것이다.
+pub fn sql_hidden_reason(policy: LiteralPolicy, ctx: &AuthContext) -> Option<&'static str> {
+    if policy.stores_nothing() {
+        Some("policy_off")
+    } else if policy.stores_literals() && !ctx.may_view_literals(policy) {
+        Some("insufficient_role")
+    } else {
+        None
     }
 }
 
@@ -283,6 +312,72 @@ mod tests {
         let v = SlowQueryView::from_record(&q, &ctx(Role::Viewer, false));
         assert_eq!(v.sql_text.as_deref(), Some("SELECT a FROM t WHERE id = ?"));
         assert_eq!(v.sql_redacted_reason, None);
+    }
+
+    /// **블로커 문장도 `sql_text` 와 같은 경계다.** 정규 텍스트여도 원문 정책에서 권한 없는
+    /// 사람은 SQL 을 보지 않았다 — 누가 막았는지는 남긴다.
+    #[test]
+    fn blocker_statements_follow_the_sql_boundary() {
+        let mut q = record(LiteralPolicy::FullRestricted, Some("SELECT 1"));
+        q.lock_wait = Some(LockWaitCapture {
+            observed_at_ms: 1,
+            locked_table: Some("shop.orders".into()),
+            locked_index: None,
+            lock_mode: None,
+            blocking_pid: Some(31),
+            blocking_user: Some("app".into()),
+            blocking_host: None,
+            blocking_command: Some("Sleep".into()),
+            blocking_time_s: Some(3),
+            blocking_statements: vec!["UPDATE orders SET memo = ? WHERE id = ?".into()],
+        });
+        let viewer = SlowQueryView::from_record(&q, &ctx(Role::Viewer, false));
+        let w = viewer.lock_wait.expect("블로커는 남긴다");
+        assert!(
+            w.blocking_statements.is_empty(),
+            "권한 없는 사람에게 문장이 나갔다"
+        );
+        assert_eq!(w.blocking_pid, Some(31));
+
+        let operator = SlowQueryView::from_record(&q, &ctx(Role::Operator, true));
+        assert_eq!(
+            operator
+                .lock_wait
+                .expect("블로커")
+                .blocking_statements
+                .len(),
+            1
+        );
+
+        q.literal_policy = LiteralPolicy::Masked;
+        let viewer = SlowQueryView::from_record(&q, &ctx(Role::Viewer, false));
+        assert_eq!(
+            viewer.lock_wait.expect("블로커").blocking_statements.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sql_is_hidden_under_off_and_from_raw_policy_outsiders() {
+        let viewer = ctx(Role::Viewer, false);
+        let reader = ctx(Role::Operator, true);
+        assert_eq!(
+            sql_hidden_reason(LiteralPolicy::Off, &reader),
+            Some("policy_off")
+        );
+        assert_eq!(
+            sql_hidden_reason(LiteralPolicy::FullRestricted, &viewer),
+            Some("insufficient_role")
+        );
+        assert_eq!(
+            sql_hidden_reason(LiteralPolicy::Full, &viewer),
+            Some("insufficient_role")
+        );
+        assert_eq!(
+            sql_hidden_reason(LiteralPolicy::FullRestricted, &reader),
+            None
+        );
+        assert_eq!(sql_hidden_reason(LiteralPolicy::Masked, &viewer), None);
     }
 
     /// 저장 자체가 안 된 경우와 권한 부족을 **구분해서** 알린다.

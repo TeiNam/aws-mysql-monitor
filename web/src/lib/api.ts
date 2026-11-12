@@ -27,6 +27,7 @@ import type {
   InstanceStats,
   InstanceView,
   ListResponse,
+  LockSnapshot,
   PlanView,
   SettingsProblem,
   SettingsView,
@@ -220,6 +221,24 @@ export function fetchInstanceMetrics(
   );
 }
 
+/**
+ * 지금 누가 누구를 막고 있나. **서버가 대상 DB 에 붙어 조회한다**(3초 캐시).
+ *
+ * 배열을 확인한다 — 하나라도 없으면 표가 `undefined.map` 으로 화면 전체를 죽인다.
+ */
+export async function fetchInstanceLocks(
+  instanceId: string,
+  signal: AbortSignal | null,
+): Promise<LockSnapshot> {
+  const body = await apiGet<LockSnapshot>(
+    `/api/instances/${encodeURIComponent(instanceId)}/locks`,
+    signal,
+  );
+  const hasArrays = [body.lock_waits, body.transactions, body.metadata_locks].every(Array.isArray);
+  if (!hasArrays) throw new ApiError(200, "malformed_response");
+  return body;
+}
+
 export function fetchCollectorStatus(signal: AbortSignal | null): Promise<CollectorStatus> {
   return apiGet<CollectorStatus>("/api/collector/status", signal).then(withArrayDefaults);
 }
@@ -400,4 +419,5 @@ export const queryKeys = {
   tuning: (id: string) => ["tuning", id] as const,
   /** 범위가 키에 들어간다 — 안 넣으면 범위를 바꿔도 앞 결과가 그려진다. */
   instanceMetrics: (id: string, rangeMs: number) => ["instance-metrics", id, rangeMs] as const,
+  instanceLocks: (id: string) => ["instance-locks", id] as const,
 };

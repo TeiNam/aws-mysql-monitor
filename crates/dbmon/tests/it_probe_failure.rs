@@ -14,6 +14,7 @@ use dbmon_core::env::{Env, EnvResolution};
 use dbmon_core::fakes::{FakeClock, FakeSlowQueryStore, FakeTargetDb};
 use dbmon_core::ids::InstanceId;
 use dbmon_core::instance::{Engine, EngineVersion, Instance, InstanceState};
+use dbmon_core::ports::LockWaitRow;
 use dbmon_core::slow_query::{LiteralPolicy, SlowQueryState};
 
 const ACCOUNT: &str = "123456789012";
@@ -114,6 +115,79 @@ async fn deep_probe_failure_does_not_lose_finalizations() {
         "실행시간이 유실됐다 (실제 {}ms)",
         thread1.duration_ms
     );
+}
+
+/// **락 피해자는 실행 중에만 알아볼 수 있다** — `LOCK_TIME` 은 끝나야 더해진다. 선행 저장이
+/// 블로커를 함께 남겨야 한다.
+#[tokio::test]
+async fn a_lock_victim_is_saved_with_its_blocker() {
+    let db = FakeTargetDb::new()
+        .with_threads(&[(7, 3)])
+        .with_running_stmt(7, "d-update");
+    *db.lock_waits.lock().unwrap() = vec![LockWaitRow {
+        waiting_pid: 7,
+        locked_schema: Some("shop".into()),
+        locked_table: Some("orders".into()),
+        blocking_pid: Some(31),
+        blocking_command: Some("Sleep".into()),
+        blocking_statements: vec!["UPDATE orders SET memo = 'kim@example.com' WHERE id = 1".into()],
+        ..Default::default()
+    }];
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store.clone(),
+        clock,
+        params(),
+    );
+
+    let t = c.detect_tick().await.expect("tick");
+    assert_eq!(t.prefetch_saved, 1);
+
+    let saved = store.all();
+    let q = saved.iter().find(|q| q.thread_id == 7).expect("선행 저장");
+    let w = q.lock_wait.as_ref().expect("블로커를 남겨야 한다");
+    assert_eq!(w.blocking_pid, Some(31));
+    assert_eq!(w.locked_table.as_deref(), Some("shop.orders"));
+    assert_eq!(w.blocking_statements.len(), 1);
+    assert!(
+        !w.blocking_statements[0].contains("kim@example.com"),
+        "블로커 문장의 리터럴이 저장됐다: {:?}",
+        w.blocking_statements
+    );
+}
+
+/// 락 대기 조회는 보조 정보다 — **실패해도 선행 저장은 한다.** 실패를 전파하면 슬로우
+/// 쿼리 자체가 저장되지 않는다.
+#[tokio::test]
+async fn a_failed_lock_wait_lookup_does_not_block_the_prefetch_save() {
+    let db = FakeTargetDb::new()
+        .with_threads(&[(7, 3)])
+        .with_running_stmt(7, "d-update");
+    db.fail_lock_waits(1);
+    let store = Arc::new(FakeSlowQueryStore::default());
+    let clock = FakeClock::new(1_755_500_400_000);
+    let mut c = InstanceCollector::new(
+        instance("orders-prd-01"),
+        db,
+        store.clone(),
+        clock,
+        params(),
+    );
+
+    let t = c.detect_tick().await.expect("tick");
+    assert_eq!(
+        t.deep_probe_failed, 0,
+        "보조 조회 실패를 심층 조회 실패로 셌다"
+    );
+    assert_eq!(
+        t.prefetch_saved, 1,
+        "블로커를 못 읽었다고 슬로우 쿼리를 버렸다"
+    );
+    let saved = store.all();
+    assert!(saved.iter().all(|q| q.lock_wait.is_none()));
 }
 
 /// `stmt_current` 실패도 같아야 한다.

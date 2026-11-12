@@ -1229,6 +1229,7 @@ pub(crate) mod tests {
             last_seen_at_ms: None,
             abandoned_reason: None,
             long_running: false,
+            lock_wait: None,
         }
     }
 

@@ -910,10 +910,13 @@ SHOW GRANTS FOR 'dbmon'@'10.1.%';
 
 `REPLICATION CLIENT`·`SHOW DATABASES`·`SELECT ON sys.*` 는 전에 이 목록에 있었다.
 수집기가 그것을 필요로 하는 쿼리를 하나도 던지지 않는다 — 읽는 것은
-`performance_schema.{processlist,events_statements_current,events_statements_summary_by_digest,
-global_status,global_variables}`, `information_schema.{PROCESSLIST,STATISTICS,TABLES}`,
-그리고 `SHOW CREATE TABLE` 이다. 모니터링 계정이 침해됐을 때 보이는 범위는 일에
-필요한 만큼이어야 한다.
+`performance_schema.{processlist,threads,events_statements_current,events_statements_history,
+events_statements_summary_by_digest,events_transactions_current,data_locks,data_lock_waits,
+metadata_locks,global_status,global_variables}`,
+`information_schema.{PROCESSLIST,STATISTICS,TABLES,INNODB_TRX,INNODB_METRICS}`, 그리고
+`SHOW CREATE TABLE` 이다. 락 탭은 `sys` 의 락 뷰 대신 `performance_schema` 를 직접
+읽는다 — `sys` 뷰는 `sys` 에 `EXECUTE` 가 있어야 한다. 모니터링 계정이 침해됐을 때
+보이는 범위는 일에 필요한 만큼이어야 한다.
 
 놓치면 시간을 잡아먹는 것들:
 

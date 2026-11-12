@@ -22,6 +22,7 @@ import { PlanTable } from "../components/PlanTable";
 import { displayDurationMs, isRunning } from "../lib/elapsed";
 import { useRunningNow } from "../lib/useRunningNow";
 import { TuningPanel } from "../components/TuningPanel";
+import { LockWaitBadge, LockWaitDetail } from "../components/LockWait";
 import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
 import {
@@ -33,6 +34,9 @@ import {
   COL_TIGHT_CAPPED,
   MONO,
   TABLE,
+  TAB_LIST,
+  TAB_OFF,
+  TAB_ON,
   TBODY,
   TD,
   TD_NUM,
@@ -359,6 +363,7 @@ function PlanDetail({
           </Item>
           <Item label="State">
             <StateBadge state={query.state} reason={query.abandoned_reason} />
+            <LockWaitBadge query={query} />
           </Item>
           <Item label="Thread">{query.thread_id}</Item>
           <Item label="Execution Time">
@@ -390,6 +395,7 @@ function PlanDetail({
             {formatSql(query.sql_text)}
           </pre>
         )}
+        <LockWaitDetail query={query} />
       </Card>
 
       <Card
@@ -493,12 +499,7 @@ function PlanTabs({ json }: { json: string }) {
     <button
       type="button"
       onClick={() => setTab(id)}
-      // **선택 상태를 색만으로 말하지 않는다** — 밑줄과 `aria-selected` 를 함께 쓴다.
-      className={`-mb-px border-b-2 px-3 py-1.5 text-sm font-medium ${
-        tab === id
-          ? "border-blue-500 text-blue-700"
-          : "border-transparent text-gray-500 hover:text-gray-800"
-      }`}
+      className={tab === id ? TAB_ON : TAB_OFF}
       role="tab"
       aria-selected={tab === id}
     >
@@ -508,7 +509,7 @@ function PlanTabs({ json }: { json: string }) {
 
   return (
     <div>
-      <div className="mb-3 flex gap-1 border-b border-gray-200" role="tablist" aria-label="계획 보기 방식">
+      <div className={TAB_LIST} role="tablist" aria-label="계획 보기 방식">
         {button("plan", "plan")}
         {button("graph", "그래프")}
       </div>

@@ -86,9 +86,14 @@ WHERE ID IN ({})",
 /// CREATED_TMP_TABLES=0  CREATED_TMP_DISK_TABLES=0
 /// SELECT_FULL_JOIN=0  SORT_MERGE_PASSES=0
 /// NO_INDEX_USED=1  NO_GOOD_INDEX_USED=1     ← 옵티마이즈 시점에 정해진다, 유효하다
-/// TIMER_WAIT=4059ms  LOCK_TIME=0.004ms      ← 유효하다
+/// TIMER_WAIT=4059ms                          ← 유효하다
+/// LOCK_TIME=0.004ms                          ← 테이블 잠금분뿐이다
 /// END_EVENT_ID=NULL                          ← 아직 안 끝났다
 /// ```
+///
+/// **`LOCK_TIME` 에는 InnoDB 행 락 대기가 끝나야 더해진다.** 실측(8.0.46·8.4.11): 행 락을
+/// 3초 기다리는 동안 `LOCK_TIME=0`, 끝난 뒤 4,919ms(총 4,924ms). 실행 중인 문장이 락을
+/// 기다리는지는 이 값이 아니라 `data_lock_waits` 가 말한다.
 ///
 /// `0` 을 그대로 저장하면 **"모른다" 가 "0행을 훑었다" 는 사실이 된다.** 실제로 그렇게
 /// 저장돼 있었고(전체의 42%), 튜닝 모델이 "검사 행 0 은 실행계획과 모순" 이라며 신뢰도를
@@ -138,6 +143,105 @@ ORDER BY e.EVENT_ID DESC",
         placeholders(id_count)
     )
 }
+
+/// 행 락 대기 — 대기자, 대기자가 요청한 락, 블로커 (`data_lock_waits`).
+///
+/// **`sys.innodb_lock_waits` 를 쓰지 않는다.** 그 뷰는 sys 저장 함수를 불러서 호출자에게
+/// `EXECUTE ON sys.*` 가 필요하고 모니터링 계정에는 그게 없다 — `SELECT`·`PROCESS` 만 가진
+/// 계정이 8.0.46·8.4.11 에서 `ERROR 1356` 을 받았다. 원본 테이블은 추가 권한 없이 된다.
+///
+/// `data_locks` 는 **요청한 락 한 건만** 키(`ENGINE_LOCK_ID`)로 찾는다 — 통째로 읽으면 큰
+/// 트랜잭션 하나에 수백만 행이다. 키 값(`LOCK_DATA`)은 읽지 않는다. 리터럴이다.
+///
+/// `pid_count` 가 0 이면 전부, 아니면 그 대기자만 본다(수집기가 슬로우 쿼리 후보로 묻는다).
+pub fn lock_waits(pid_count: usize) -> String {
+    let filter = if pid_count == 0 {
+        String::new()
+    } else {
+        format!("WHERE wt.PROCESSLIST_ID IN ({})\n", placeholders(pid_count))
+    };
+    format!(
+        "/* dbmon:lockwaits */
+SELECT wt.PROCESSLIST_ID, wt.PROCESSLIST_TIME,
+       (SELECT e.SQL_TEXT FROM performance_schema.events_statements_current e
+         WHERE e.THREAD_ID = w.REQUESTING_THREAD_ID ORDER BY e.EVENT_ID DESC LIMIT 1),
+       rl.OBJECT_SCHEMA, rl.OBJECT_NAME, rl.INDEX_NAME, rl.LOCK_MODE,
+       bt.PROCESSLIST_ID, bt.PROCESSLIST_USER, bt.PROCESSLIST_HOST,
+       bt.PROCESSLIST_COMMAND, bt.PROCESSLIST_TIME, w.BLOCKING_THREAD_ID
+FROM performance_schema.data_lock_waits w
+JOIN performance_schema.threads wt ON wt.THREAD_ID = w.REQUESTING_THREAD_ID
+LEFT JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID
+LEFT JOIN performance_schema.data_locks rl
+  ON rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID AND rl.ENGINE = w.ENGINE
+{filter}ORDER BY wt.PROCESSLIST_TIME DESC
+LIMIT ?"
+    )
+}
+
+/// 진행 중인 트랜잭션에 딸린 문장 — 블로커·유휴 트랜잭션이 **무엇을 했는지**.
+///
+/// 블로커는 대개 유휴다. 락을 잡은 문장은 끝났고 처리목록 `INFO` 는 NULL 이다. 그 문장은
+/// 문장 이벤트의 `NESTING_EVENT_ID` 가 트랜잭션 이벤트를 가리키는 history 에만 남는다.
+/// 끝난 트랜잭션의 문장을 섞지 않도록 `ACTIVE` 만 본다.
+///
+/// **`GROUP_CONCAT` 으로 묶지 않는다** — `group_concat_max_len` 기본값(1,024바이트)에서
+/// 잘리고, 구분자가 SQL 안에 있으면 나눌 수 없다. 행으로 받아 호출부가 묶는다.
+pub fn trx_statements(thread_count: usize) -> String {
+    format!(
+        "/* dbmon:trxstatements */
+SELECT s.THREAD_ID, s.SQL_TEXT
+FROM performance_schema.events_transactions_current tx
+JOIN performance_schema.events_statements_history s
+  ON s.THREAD_ID = tx.THREAD_ID AND s.NESTING_EVENT_ID = tx.EVENT_ID
+WHERE tx.THREAD_ID IN ({}) AND tx.STATE = 'ACTIVE'
+ORDER BY s.THREAD_ID, s.EVENT_ID",
+        placeholders(thread_count)
+    )
+}
+
+/// 오래된 트랜잭션 — **유휴로 트랜잭션을 쥔 세션**을 찾는다.
+///
+/// 처리목록 탐지는 실행 중인 문장만 본다(`COMMAND NOT IN ('Sleep', …)`). 락과 history list
+/// 의 원인은 대개 그 반대다 — 문장은 끝났는데 커밋하지 않은 세션. 바인딩은 최소 나이(초)와
+/// 상한이다.
+pub const TRANSACTIONS: &str = "/* dbmon:transactions */
+SELECT trx.trx_mysql_thread_id, trx.trx_state,
+       TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()),
+       trx.trx_rows_locked, trx.trx_rows_modified,
+       p.USER, p.HOST, p.DB, p.COMMAND, p.TIME, t.THREAD_ID,
+       (SELECT e.SQL_TEXT FROM performance_schema.events_statements_current e
+         WHERE e.THREAD_ID = t.THREAD_ID ORDER BY e.EVENT_ID DESC LIMIT 1)
+FROM information_schema.INNODB_TRX trx
+LEFT JOIN performance_schema.processlist p ON p.ID = trx.trx_mysql_thread_id
+LEFT JOIN performance_schema.threads t ON t.PROCESSLIST_ID = trx.trx_mysql_thread_id
+WHERE trx.trx_mysql_thread_id <> CONNECTION_ID()
+  AND trx.trx_started <= NOW() - INTERVAL ? SECOND
+ORDER BY trx.trx_started
+LIMIT ?";
+
+/// 메타데이터 락 — **대기가 걸린 테이블만**, 보유자와 대기자를 함께.
+///
+/// 전형: 열린 트랜잭션의 `SHARED_READ`(유휴) 뒤에서 `ALTER` 가 `EXCLUSIVE PENDING`, 그 뒤의
+/// 모든 쿼리가 `PENDING` 으로 줄을 선다. 처리목록은 대기자만 보여 준다(`Waiting for table
+/// metadata lock`) — 쥐고 있는 쪽은 `Sleep` 이다.
+///
+/// **정렬이 상한의 우선순위다.** 테이블마다 보유자(`GRANTED`)를 먼저, 오래된 순으로 둔다 —
+/// 상한에 걸려도 범인(오래 쥔 유휴 보유자)과 줄 맨 앞의 대기자(대개 DDL)가 남고, 잘리는 것은
+/// 그 뒤에 줄 선 쿼리들이다. 대기자를 먼저 두면 줄이 길 때 범인이 잘린다.
+pub const METADATA_LOCK_WAITS: &str = "/* dbmon:mdlwaits */
+SELECT ml.OBJECT_SCHEMA, ml.OBJECT_NAME, ml.LOCK_TYPE, ml.LOCK_DURATION, ml.LOCK_STATUS,
+       t.PROCESSLIST_ID, t.PROCESSLIST_USER, t.PROCESSLIST_HOST,
+       t.PROCESSLIST_COMMAND, t.PROCESSLIST_TIME,
+       (SELECT e.SQL_TEXT FROM performance_schema.events_statements_current e
+         WHERE e.THREAD_ID = ml.OWNER_THREAD_ID ORDER BY e.EVENT_ID DESC LIMIT 1)
+FROM performance_schema.metadata_locks ml
+JOIN performance_schema.threads t ON t.THREAD_ID = ml.OWNER_THREAD_ID
+WHERE ml.OBJECT_TYPE = 'TABLE'
+  AND (ml.OBJECT_SCHEMA, ml.OBJECT_NAME) IN (
+        SELECT OBJECT_SCHEMA, OBJECT_NAME FROM performance_schema.metadata_locks
+        WHERE LOCK_STATUS = 'PENDING' AND OBJECT_TYPE = 'TABLE')
+ORDER BY ml.OBJECT_SCHEMA, ml.OBJECT_NAME, ml.LOCK_STATUS, t.PROCESSLIST_TIME DESC
+LIMIT ?";
 
 /// 다이제스트 스냅샷 ① — **지표 컬럼만**. 큰 텍스트 컬럼을 제외한다.
 ///
@@ -282,7 +386,19 @@ UNION ALL
 -- 이름이 상태 변수와 겹치지 않으므로(소문자) 같은 맵에 담아도 충돌하지 않는다.
 SELECT VARIABLE_NAME, VARIABLE_VALUE
 FROM performance_schema.global_variables
-WHERE VARIABLE_NAME = 'max_connections'";
+WHERE VARIABLE_NAME = 'max_connections'
+UNION ALL
+-- **데드락·락 타임아웃 카운터는 상태 변수에 없다.** `INNODB_METRICS` 에만 있다(기본
+-- enabled, Database Insights 의 `innodb_deadlocks` 도 이것을 읽는다). RDS MySQL 은
+-- CloudWatch 에 `Deadlocks` 가 없어서 이게 유일한 출처다.
+--
+-- `PROCESS` 권한이 필요하다 — 없으면 **이 문장 전체가 1227 로 실패한다.** 새로 줄 권한은
+-- 없다: 부트스트랩이 주고, 없으면 탐지도 자기 스레드만 봐서 아무것도 못 찾는다(설치
+-- 문서). 다만 실패 모양이 다르다 — 탐지는 조용히 비고, 이 조회는 시끄럽게 실패한다.
+-- 문자셋(utf8mb3)·타입(BIGINT)이 위 갈래와 달라도 합쳐진다(8.0.46·8.4.11 실측).
+SELECT NAME, COUNT
+FROM information_schema.INNODB_METRICS
+WHERE NAME IN ('lock_deadlocks','lock_timeouts')";
 
 /// 대상 DB 시각. `probe` 가 0행일 때 시계 오프셋을 갱신한다.
 pub const DB_NOW: &str = "/* dbmon:dbnow */ SELECT UNIX_TIMESTAMP(NOW(6))";
@@ -583,9 +699,54 @@ mod tests {
             STATEMENT_DIGEST.into(),
             explain_for_connection(1, ExplainFormat::Json),
             explain_rerun("SELECT 1", ExplainFormat::Json),
+            lock_waits(0),
+            lock_waits(2),
+            trx_statements(1),
+            TRANSACTIONS.into(),
+            METADATA_LOCK_WAITS.into(),
         ] {
             assert!(q.contains("/* dbmon:"), "태그가 없다: {q}");
         }
+    }
+
+    /// 락 조회는 **추가 권한 없이** 돌아야 하고 리터럴을 읽으면 안 된다.
+    #[test]
+    fn lock_queries_avoid_sys_views_and_lock_data() {
+        for q in [
+            lock_waits(0),
+            trx_statements(2),
+            TRANSACTIONS.into(),
+            METADATA_LOCK_WAITS.into(),
+        ] {
+            // sys 뷰는 `EXECUTE ON sys.*` 를 요구한다(8.0.46·8.4.11 에서 ERROR 1356).
+            assert!(
+                !q.contains("sys."),
+                "sys 뷰를 쓰면 모니터링 계정에서 실패한다: {q}"
+            );
+            // 키 값은 리터럴이다.
+            assert!(!q.contains("LOCK_DATA"), "{q}");
+        }
+        // **`data_locks` 를 통째로 읽지 않는다** — 요청한 락 한 건만 키로 찾는다.
+        assert!(lock_waits(0).contains("rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID"));
+        assert!(
+            TRANSACTIONS.contains("<> CONNECTION_ID()"),
+            "자기 자신을 빼야 한다"
+        );
+    }
+
+    #[test]
+    fn lock_waits_filters_by_waiter_only_when_asked() {
+        let all = lock_waits(0);
+        assert!(!all.contains("WHERE wt.PROCESSLIST_ID IN"), "{all}");
+        assert_eq!(all.matches('?').count(), 1, "LIMIT 만 바인딩한다: {all}");
+
+        let some = lock_waits(3);
+        assert!(
+            some.contains("WHERE wt.PROCESSLIST_ID IN (?, ?, ?)"),
+            "{some}"
+        );
+        assert_eq!(some.matches('?').count(), 3 + 1);
+        assert!(trx_statements(2).contains("tx.THREAD_ID IN (?, ?)"));
     }
 }
 

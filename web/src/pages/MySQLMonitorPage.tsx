@@ -28,6 +28,7 @@ import { EnvChip } from "../components/Shell";
 import { displayDurationMs, isRunning } from "../lib/elapsed";
 import { useRunningNow } from "../lib/useRunningNow";
 import { SqlModal } from "../components/SqlModal";
+import { LockWaitBadge, LockWaitDetail } from "../components/LockWait";
 import { StateBadge } from "../components/StateBadge";
 import {
   BTN_GHOST,
@@ -357,6 +358,7 @@ export function MySQLMonitorPage() {
                         </td>
                         <td className={`${TD} ${COL_TIGHT}`}>
                           <StateBadge state={q.state} reason={q.abandoned_reason} />
+                          <LockWaitBadge query={q} />
                         </td>
                         <td className={`${TD_NUM} ${COL_TIGHT}`}>
                           <span className="flex items-center justify-end">
@@ -423,7 +425,9 @@ export function MySQLMonitorPage() {
           reason={openSql.sql_redacted_reason}
           truncated={openSql.sql_text_truncated}
           onClose={() => setOpenSql(null)}
-        />
+        >
+          <LockWaitDetail query={openSql} />
+        </SqlModal>
       )}
     </div>
   );

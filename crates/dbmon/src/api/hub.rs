@@ -153,6 +153,8 @@ mod tests {
             threads_connected: None,
             max_connections: None,
             lock_waits: None,
+            deadlocks_per_sec: None,
+            lock_timeouts_per_sec: None,
             rate_gap_reason: None,
         }
     }

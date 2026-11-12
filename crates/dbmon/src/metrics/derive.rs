@@ -70,6 +70,13 @@ pub struct LiveMetrics {
     pub max_connections: Option<u64>,
     /// InnoDB 행 락 대기 중 (게이지).
     pub lock_waits: Option<u64>,
+    /// 초당 데드락 (`INNODB_METRICS.lock_deadlocks`).
+    ///
+    /// **RDS MySQL 에는 이 값의 CloudWatch 메트릭이 없다** — Aurora 에만 `Deadlocks` 가 있다.
+    /// 그래서 엔진과 무관하게 자체 수집한다.
+    pub deadlocks_per_sec: Option<f64>,
+    /// 초당 락 대기 타임아웃 (`INNODB_METRICS.lock_timeouts`) — 앱에는 1205 로 보인다.
+    pub lock_timeouts_per_sec: Option<f64>,
     /// 비율을 내지 못한 이유. 화면이 "—" 와 "0" 을 구분하게 한다.
     pub rate_gap_reason: Option<&'static str>,
 }
@@ -87,6 +94,8 @@ pub fn derive(prev: Option<&StatusSample>, cur: &StatusSample) -> LiveMetrics {
         // 변수도 같은 맵에 담겨 온다(`sql::GLOBAL_STATUS` 의 UNION).
         max_connections: cur.counter("max_connections"),
         lock_waits: cur.counter("Innodb_row_lock_current_waits"),
+        deadlocks_per_sec: None,
+        lock_timeouts_per_sec: None,
         rate_gap_reason: None,
     };
 
@@ -118,6 +127,9 @@ pub fn derive(prev: Option<&StatusSample>, cur: &StatusSample) -> LiveMetrics {
     LiveMetrics {
         qps: per_sec("Queries"),
         slow_per_sec: per_sec("Slow_queries"),
+        // 변수명이 소문자다(`sql::GLOBAL_STATUS` 의 `INNODB_METRICS` 갈래).
+        deadlocks_per_sec: per_sec("lock_deadlocks"),
+        lock_timeouts_per_sec: per_sec("lock_timeouts"),
         ..gauges
     }
 }
@@ -181,6 +193,42 @@ mod tests {
         // 1500 질의 / 5초 = 300 QPS
         assert_eq!(m.qps, Some(300.0));
         assert_eq!(m.rate_gap_reason, None);
+    }
+
+    /// 데드락·락 타임아웃은 `INNODB_METRICS` 의 누적 카운터라 QPS 와 같은 방식으로 비율을 낸다.
+    /// RDS MySQL 에는 CloudWatch `Deadlocks` 가 없어서 이게 유일한 출처다.
+    #[test]
+    fn deadlocks_and_lock_timeouts_become_per_second_rates() {
+        let (a, b) = pair(
+            1_000,
+            &[
+                ("lock_deadlocks", "7"),
+                ("lock_timeouts", "2"),
+                ("Uptime", "100"),
+            ],
+            6_000,
+            &[
+                ("lock_deadlocks", "8"),
+                ("lock_timeouts", "2"),
+                ("Uptime", "105"),
+            ],
+        );
+        let m = derive(Some(&a), &b);
+        assert_eq!(m.deadlocks_per_sec, Some(0.2), "1건 / 5초");
+        assert_eq!(
+            m.lock_timeouts_per_sec,
+            Some(0.0),
+            "0 은 '없다' 다 — 비율은 있다"
+        );
+    }
+
+    /// 권한이 없거나 구 서버라 카운터가 안 오면 `0` 이 아니라 **모른다**다.
+    #[test]
+    fn missing_innodb_metrics_are_unknown_not_zero() {
+        let (a, b) = pair(1_000, &[("Uptime", "100")], 6_000, &[("Uptime", "105")]);
+        let m = derive(Some(&a), &b);
+        assert_eq!(m.deadlocks_per_sec, None);
+        assert_eq!(m.lock_timeouts_per_sec, None);
     }
 
     /// **첫 샘플에는 비율이 없다.** `0.0` 을 주면 "쿼리가 없다" 로 오해된다.

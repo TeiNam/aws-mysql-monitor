@@ -2424,6 +2424,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             // 조회 API 상태. **역할과 무관하게 만든다** — `role=collector` 도 저장소를
             // 갖고 있고, 로컬 개발에서는 한 프로세스가 둘을 겸한다.
             let bind_is_loopback = dbmon::api::auth::is_loopback_bind(&config.http.bind);
+            // 사람이 누를 때 대상 DB 에 붙는 서비스들(튜닝·락)이 **같은 인증 경로**를 쓴다.
+            let target_auth = Arc::new(dbmon::aws::auth_token::build_target_auth(&config).await);
+            let shared_config = Arc::new(config.clone());
             api_state = Some(dbmon::api::ApiState {
                 store: Arc::clone(&stores.slow_query),
                 registry: Arc::clone(&stores.registry),
@@ -2448,9 +2451,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                     registry: Arc::clone(&stores.registry),
                     advice: Arc::clone(&stores.advice),
                     settings: Arc::clone(&stores.settings),
-                    auth: Arc::new(dbmon::aws::auth_token::build_target_auth(&config).await),
-                    config: Arc::new(config.clone()),
+                    auth: Arc::clone(&target_auth),
+                    config: Arc::clone(&shared_config),
                 })),
+                // **지금 누가 누구를 막나** — 화면을 열었을 때만 대상 DB 에 붙는다.
+                locks: Some(Arc::new(dbmon::locks::LockService::new(
+                    Arc::clone(&target_auth),
+                    Arc::clone(&shared_config),
+                ))),
                 // **Cognito 검증기** (M5). HTTPS 클라이언트를 못 만들면 `None` 이고
                 // 화면이 "아직 준비되지 않았다" 를 말한다.
                 //

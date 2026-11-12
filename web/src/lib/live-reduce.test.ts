@@ -38,6 +38,8 @@ function metrics(overrides: Partial<LiveMetrics> = {}): LiveMetrics {
     threads_connected: 5,
     max_connections: 100,
     lock_waits: 0,
+    deadlocks_per_sec: 0,
+    lock_timeouts_per_sec: 0,
     rate_gap_reason: null,
     ...overrides,
   };
@@ -400,6 +402,8 @@ describe("프레임 파싱", () => {
         threads_connected: null,
     max_connections: null,
         lock_waits: null,
+        deadlocks_per_sec: null,
+        lock_timeouts_per_sec: null,
         rate_gap_reason: null,
       },
     });

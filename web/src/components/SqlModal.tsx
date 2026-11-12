@@ -1,5 +1,5 @@
 import { Check, Copy, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { formatSql } from "../lib/sql";
 import type { SqlRedactedReason } from "../lib/types";
 import { BTN_GHOST } from "./ui";
@@ -10,6 +10,8 @@ interface SqlModalProps {
   /** SQL 이 없는 이유. **`not_stored` 와 `insufficient_role` 을 구분해 말한다.** */
   reason?: SqlRedactedReason | null;
   truncated?: boolean;
+  /** SQL 아래에 붙는 내용 (락 대기 상세 등). */
+  children?: ReactNode;
   onClose: () => void;
 }
 
@@ -23,7 +25,7 @@ interface SqlModalProps {
  * 참조 구현은 행을 클릭하면 화면 오른쪽에 고정 패널을 띄웠다. 여기서는 가운데
  * 모달로 두고 `Esc`·바깥 클릭으로 닫는다 — 키보드만으로도 닫을 수 있어야 한다.
  */
-export function SqlModal({ title, sql, reason, truncated, onClose }: SqlModalProps) {
+export function SqlModal({ title, sql, reason, truncated, children, onClose }: SqlModalProps) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -106,6 +108,7 @@ export function SqlModal({ title, sql, reason, truncated, onClose }: SqlModalPro
           {truncated === true ? (
             <p className="mt-2 text-xs text-amber-700">저장 한계로 잘렸다 — 뒷부분이 없다.</p>
           ) : null}
+          {children}
         </div>
       </div>
     </div>

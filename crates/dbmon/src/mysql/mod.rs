@@ -24,8 +24,8 @@ use std::time::Duration;
 use dbmon_core::digest::DigestSnapshotRow;
 use dbmon_core::error::{DomainError, Result};
 use dbmon_core::ports::target_db::{
-    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
-    ProcessRow, StmtCurrentRow, TargetDb,
+    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, LockWaitRow, PlanFailure,
+    ProbeResult, ProcessRow, StmtCurrentRow, TargetDb,
 };
 use dbmon_core::time::EpochMs;
 use mysql_async::prelude::*;
@@ -138,7 +138,7 @@ impl TargetMysql {
     /// 테스트에서만 쓴다.
     #[cfg(any(test, feature = "testing"))]
     pub fn connect(base: Opts, timeouts: Timeouts, label: impl Into<String>) -> Result<Self> {
-        Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label)
+        Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label, COLLECTOR_POOLS)
     }
 
     /// **설정에서 만든다. 프로덕션 조립은 이것만 쓴다.**
@@ -151,6 +151,15 @@ impl TargetMysql {
         cfg: &crate::config::CollectorConfig,
         label: impl Into<String>,
     ) -> Result<Self> {
+        Self::from_config_sized(base, cfg, label, COLLECTOR_POOLS)
+    }
+
+    fn from_config_sized(
+        base: Opts,
+        cfg: &crate::config::CollectorConfig,
+        label: impl Into<String>,
+        sizes: PoolSizes,
+    ) -> Result<Self> {
         let timeouts = Timeouts::derive(
             cfg.connect_timeout_ms,
             cfg.detect_timeout_ms,
@@ -158,7 +167,7 @@ impl TargetMysql {
             cfg.bulk_query_timeout_ms,
             cfg.detect_interval_ms,
         );
-        Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label)
+        Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label, sizes)
     }
 
     fn connect_with_limit(
@@ -166,9 +175,10 @@ impl TargetMysql {
         timeouts: Timeouts,
         detect_limit: u64,
         label: impl Into<String>,
+        sizes: PoolSizes,
     ) -> Result<Self> {
-        let hot = pool(base.clone(), 2, 4, timeouts.query)?;
-        let bulk = pool(base, 1, 2, timeouts.bulk_query)?;
+        let hot = pool(base.clone(), sizes.hot.0, sizes.hot.1, timeouts.query)?;
+        let bulk = pool(base, sizes.bulk.0, sizes.bulk.1, timeouts.bulk_query)?;
         Ok(Self {
             hot,
             bulk,
@@ -375,6 +385,29 @@ impl TargetMysql {
         let _ = self.bulk.disconnect().await;
     }
 }
+
+/// 풀 크기 `(최소, 최대)`.
+#[derive(Debug, Clone, Copy)]
+struct PoolSizes {
+    hot: (usize, usize),
+    bulk: (usize, usize),
+}
+
+/// 수집 태스크 — 오래 살고, 탐지와 심층 조회가 겹친다.
+const COLLECTOR_POOLS: PoolSizes = PoolSizes {
+    hot: (2, 4),
+    bulk: (1, 2),
+};
+
+/// 사람이 누른 요청 하나 — 조회가 차례로 돌므로 **연결 하나**를 다시 쓴다. 대상 DB 가 가장 약할
+/// 때 열리는 화면이라 붙는 수를 줄인다.
+///
+/// **최소가 0 이면 안 된다.** `inactive_connection_ttl` 이 0(기본)이면 풀은 돌려받은 연결을
+/// `min` 개만 남기고 바로 닫는다 — 최소 0 에서는 조회마다 새 연결이었다(실측: 스냅샷 하나에 3).
+const ON_DEMAND_POOLS: PoolSizes = PoolSizes {
+    hot: (1, 1),
+    bulk: (1, 1),
+};
 
 fn pool(base: Opts, min: usize, max: usize, query_timeout: Duration) -> Result<Pool> {
     let constraints = PoolConstraints::new(min, max).ok_or_else(|| DomainError::InvalidInput {
@@ -801,6 +834,250 @@ impl TargetDb for TargetMysql {
             .query_hot(sql::GLOBAL_SQL_MODE.to_string(), Vec::new())
             .await?;
         Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    async fn lock_waits(&self, waiting_pids: &[u64]) -> Result<Vec<LockWaitRow>> {
+        let mut params: Vec<Value> = waiting_pids.iter().map(|p| Value::from(*p)).collect();
+        params.push(Value::from(LOCK_WAITS_LIMIT));
+        let rows: Vec<Row> = self
+            .query_hot(sql::lock_waits(waiting_pids.len()), params)
+            .await?;
+        let mut waits: Vec<(LockWaitRow, Option<u64>)> = rows
+            .iter()
+            .map(|r| (lock_wait_row(r), opt::<u64>(r, 12)))
+            .collect();
+
+        // 블로커가 무엇을 했는지 — 대개 유휴라 처리목록에는 없다.
+        let mut blockers: Vec<u64> = waits.iter().filter_map(|(_, t)| *t).collect();
+        blockers.sort_unstable();
+        blockers.dedup();
+        let statements = self.trx_statements(&blockers).await?;
+        for (row, thread) in &mut waits {
+            if let Some(stmts) = thread.and_then(|t| statements.get(&t)) {
+                row.blocking_statements = stmts.clone();
+            }
+        }
+        Ok(waits.into_iter().map(|(row, _)| row).collect())
+    }
+}
+
+/// 행 락 대기 조회의 폭주 방어 상한. 대기 하나가 블로커마다 한 행이다.
+pub const LOCK_WAITS_LIMIT: u64 = 200;
+
+fn lock_wait_row(r: &Row) -> LockWaitRow {
+    LockWaitRow {
+        waiting_pid: num(r, 0),
+        waiting_time_s: opt(r, 1),
+        waiting_sql: opt(r, 2),
+        locked_schema: opt(r, 3),
+        locked_table: opt(r, 4),
+        locked_index: opt(r, 5),
+        lock_mode: opt(r, 6),
+        blocking_pid: opt(r, 7),
+        blocking_user: opt(r, 8),
+        blocking_host: opt(r, 9),
+        blocking_command: opt(r, 10),
+        blocking_time_s: opt(r, 11),
+        blocking_statements: Vec::new(),
+    }
+}
+
+/// 진행 중인 트랜잭션 한 건 (`INNODB_TRX` + 처리목록). **SQL 은 원문이다.**
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrxRow {
+    pub pid: Option<u64>,
+    pub state: Option<String>,
+    pub age_s: Option<u64>,
+    pub rows_locked: Option<u64>,
+    pub rows_modified: Option<u64>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub db: Option<String>,
+    /// `Sleep` 이면 **유휴로 트랜잭션을 쥐고 있다.**
+    pub command: Option<String>,
+    pub time_s: Option<u64>,
+    /// 실행 중이면 그 문장, 유휴면 마지막 문장.
+    pub current_sql: Option<String>,
+    /// 이 트랜잭션이 실행한 문장, 오래된 순 (스레드별 history 크기까지).
+    pub statements: Vec<String>,
+}
+
+/// 메타데이터 락 한 건 — 대기가 걸린 테이블의 보유자·대기자. **SQL 은 원문이다.**
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MdlRow {
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub lock_type: Option<String>,
+    pub lock_duration: Option<String>,
+    /// `GRANTED` 또는 `PENDING`.
+    pub lock_status: Option<String>,
+    pub pid: Option<u64>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub command: Option<String>,
+    pub time_s: Option<u64>,
+    pub sql: Option<String>,
+}
+
+/// 락·트랜잭션 화면 — **트레이트가 아니라 고유 메서드다** ([`Self::table_specs`] 와 같은 판단).
+///
+/// 사람이 화면을 열었을 때만 돈다. 수집 루프가 쓰는 것은 [`TargetDb::lock_waits`] 뿐이다.
+/// 사람이 누른 요청 하나를 위한 연결 ([`TargetMysql::on_demand`]).
+///
+/// **어떻게 끝나도 닫는다** — 다 써서 버릴 때도, 요청 기한이나 브라우저가 끊어 future 가
+/// 취소될 때도. 취소 경로에서는 `await` 할 수 없으므로 런타임에 닫기를 넘긴다. 닫지 않고
+/// 버리면 대상 DB 에 `Aborted_clients` 가 쌓인다(`Pool` 을 그냥 버리면 그렇다).
+pub struct OnDemandConn(Option<TargetMysql>);
+
+impl std::ops::Deref for OnDemandConn {
+    type Target = TargetMysql;
+    fn deref(&self) -> &TargetMysql {
+        // `None` 은 `drop` 안에서만 생긴다.
+        self.0.as_ref().expect("닫은 연결을 쓰지 않는다")
+    }
+}
+
+impl Drop for OnDemandConn {
+    fn drop(&mut self) {
+        let Some(db) = self.0.take() else { return };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(db.disconnect());
+        }
+    }
+}
+
+impl TargetMysql {
+    /// 사람이 누른 요청 하나를 위한 연결. 수집 태스크와 **같은 경로**(IAM 토큰 + 터널
+    /// 오버라이드)다. 돌려받은 [`OnDemandConn`] 이 버려질 때 닫힌다.
+    pub async fn on_demand(
+        auth: &crate::aws::auth_token::TargetAuth,
+        config: &crate::config::Config,
+        instance: &dbmon_core::instance::Instance,
+        purpose: &str,
+    ) -> Result<OnDemandConn> {
+        let db_user = config.collector.monitor_db_user.clone();
+        let host = instance
+            .endpoint
+            .clone()
+            .ok_or_else(|| DomainError::InvalidInput {
+                field: "endpoint".into(),
+                reason: "엔드포인트가 없다".into(),
+            })?;
+        let provider = auth
+            .for_instance(&instance.id, &config.aws.account_id)
+            .ok_or_else(|| DomainError::Unavailable {
+                dependency: "target-auth",
+                // **다른 리전·계정 공급자로 대신하지 않는다** — 서명이 틀린 토큰은 IAM
+                // 정책 오류처럼 보여 추적이 오래 걸린다.
+                reason: format!(
+                    "{}/{} 에 쓸 인증 공급자가 없다",
+                    instance.id.account(),
+                    instance.id.region()
+                ),
+            })?;
+        let secret = provider.token(&host, instance.port, &db_user).await?;
+        let via = config.collector.tunnel_for(instance.id.identifier());
+        let opts = connect::target_opts(
+            instance,
+            &db_user,
+            secret.expose(),
+            config.deployment_env,
+            via,
+        )?;
+        Self::from_config_sized(
+            opts,
+            &config.collector,
+            format!("{purpose}:{}", instance.id.identifier()),
+            ON_DEMAND_POOLS,
+        )
+        .map(|db| OnDemandConn(Some(db)))
+    }
+
+    /// `min_age_s` 초 이상 열려 있는 트랜잭션, 오래된 순.
+    pub async fn transactions(&self, min_age_s: u64, limit: u64) -> Result<Vec<TrxRow>> {
+        let rows: Vec<Row> = self
+            .query_hot(
+                sql::TRANSACTIONS.to_string(),
+                vec![Value::from(min_age_s), Value::from(limit)],
+            )
+            .await?;
+        let mut trx: Vec<(TrxRow, Option<u64>)> = rows
+            .iter()
+            .map(|r| {
+                let row = TrxRow {
+                    pid: opt(r, 0),
+                    state: opt(r, 1),
+                    age_s: opt(r, 2),
+                    rows_locked: opt(r, 3),
+                    rows_modified: opt(r, 4),
+                    user: opt(r, 5),
+                    host: opt(r, 6),
+                    db: opt(r, 7),
+                    command: opt(r, 8),
+                    time_s: opt(r, 9),
+                    current_sql: opt(r, 11),
+                    statements: Vec::new(),
+                };
+                (row, opt::<u64>(r, 10))
+            })
+            .collect();
+        let threads: Vec<u64> = trx.iter().filter_map(|(_, t)| *t).collect();
+        let statements = self.trx_statements(&threads).await?;
+        for (row, thread) in &mut trx {
+            if let Some(stmts) = thread.and_then(|t| statements.get(&t)) {
+                row.statements = stmts.clone();
+            }
+        }
+        Ok(trx.into_iter().map(|(row, _)| row).collect())
+    }
+
+    /// 대기가 걸린 테이블의 메타데이터 락.
+    pub async fn metadata_lock_waits(&self, limit: u64) -> Result<Vec<MdlRow>> {
+        let rows: Vec<Row> = self
+            .query_hot(
+                sql::METADATA_LOCK_WAITS.to_string(),
+                vec![Value::from(limit)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| MdlRow {
+                schema: opt(r, 0),
+                table: opt(r, 1),
+                lock_type: opt(r, 2),
+                lock_duration: opt(r, 3),
+                lock_status: opt(r, 4),
+                pid: opt(r, 5),
+                user: opt(r, 6),
+                host: opt(r, 7),
+                command: opt(r, 8),
+                time_s: opt(r, 9),
+                sql: opt(r, 10),
+            })
+            .collect())
+    }
+
+    /// 스레드별로 진행 중인 트랜잭션의 문장. 스레드가 없으면 조회하지 않는다.
+    async fn trx_statements(
+        &self,
+        threads: &[u64],
+    ) -> Result<std::collections::BTreeMap<u64, Vec<String>>> {
+        let mut by_thread = std::collections::BTreeMap::<u64, Vec<String>>::new();
+        if threads.is_empty() {
+            return Ok(by_thread);
+        }
+        let rows: Vec<(u64, Option<String>)> = self
+            .query_hot(
+                sql::trx_statements(threads.len()),
+                threads.iter().map(|t| Value::from(*t)).collect(),
+            )
+            .await?;
+        for (thread, text) in rows {
+            if let Some(text) = text {
+                by_thread.entry(thread).or_default().push(text);
+            }
+        }
+        Ok(by_thread)
     }
 }
 

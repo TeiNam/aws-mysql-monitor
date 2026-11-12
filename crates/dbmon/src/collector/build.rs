@@ -21,10 +21,10 @@ use dbmon_core::clock_offset::ClockOffset;
 use dbmon_core::ids::RecordId;
 use dbmon_core::inflight::{FinalizeReason, Tracked};
 use dbmon_core::instance::Instance;
-use dbmon_core::ports::target_db::StmtCurrentRow;
+use dbmon_core::ports::target_db::{LockWaitRow, StmtCurrentRow};
 use dbmon_core::slow_query::{
-    CaptureSource, ExecStats, LiteralPolicy, PlanBundle, PlanSource, SlowQuery, SlowQueryState,
-    UNKNOWN_DIGEST_PREFIX,
+    CaptureSource, ExecStats, LiteralPolicy, LockWaitCapture, PlanBundle, PlanSource, SlowQuery,
+    SlowQueryState, UNKNOWN_DIGEST_PREFIX,
 };
 use dbmon_core::time::EpochMs;
 use dbmon_normalize::{DIGEST_ALGO_VERSION, StatementType, normalize};
@@ -60,6 +60,8 @@ pub struct CaptureInput<'a> {
     pub offset: &'a ClockOffset,
     pub owner_worker: &'a str,
     pub owner_epoch: Option<u64>,
+    /// 이 스레드가 지금 행 락을 기다린다 — 그 블로커. 선행 저장에서만 묻는다.
+    pub lock_wait: Option<&'a LockWaitRow>,
 }
 
 /// 조립 결과. **관측 가능한 부작용을 함께 반환한다** — 조용히 강등하면 안 된다.
@@ -93,6 +95,7 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
         offset,
         owner_worker,
         owner_epoch,
+        lock_wait,
     } = input;
 
     // ── SQL 텍스트와 다이제스트 ────────────────────────────────────────────
@@ -286,10 +289,36 @@ pub fn build(input: CaptureInput<'_>) -> BuildOutcome {
                 .filter(|r| !r.observed_end())
                 .map(|r| r.as_str().to_string()),
             long_running: finalize_reason == Some(FinalizeReason::TooLong),
+            lock_wait: lock_wait.map(|w| capture_lock_wait(w, now_ms, effective_policy)),
         },
         masking_degraded,
         plan_redactions,
         plan_parse_failed,
+    }
+}
+
+/// 블로커를 저장할 모양으로. **문장은 정규 텍스트만** — 마스킹을 믿을 수 없는 문장은 버리고,
+/// 정책이 아무것도 저장하지 않으면 담지 않는다(락 화면과 같은 [`crate::locks::masked_sql`]).
+fn capture_lock_wait(w: &LockWaitRow, now_ms: EpochMs, policy: LiteralPolicy) -> LockWaitCapture {
+    let blocking_statements = if policy.stores_nothing() {
+        Vec::new()
+    } else {
+        w.blocking_statements
+            .iter()
+            .filter_map(|s| crate::locks::masked_sql(s))
+            .collect()
+    };
+    LockWaitCapture {
+        observed_at_ms: now_ms,
+        locked_table: crate::locks::qualified(w.locked_schema.clone(), w.locked_table.clone()),
+        locked_index: w.locked_index.clone(),
+        lock_mode: w.lock_mode.clone(),
+        blocking_pid: w.blocking_pid,
+        blocking_user: w.blocking_user.clone(),
+        blocking_host: w.blocking_host.clone(),
+        blocking_command: w.blocking_command.clone(),
+        blocking_time_s: w.blocking_time_s,
+        blocking_statements,
     }
 }
 
@@ -308,8 +337,10 @@ fn exec_stats(s: &StmtCurrentRow) -> ExecStats {
         rows_examined: counter(s.rows_examined),
         rows_sent: counter(s.rows_sent),
         rows_affected: counter(s.rows_affected),
-        // **`LOCK_TIME` 은 실행 중에도 유효하다**(실측: 0.004ms). 피코초다.
-        lock_time_ms: s.lock_time_ps.map(|ps| (ps / 1_000_000_000) as i64),
+        // **`LOCK_TIME` 도 끝나야 믿는다.** 실행 중 값은 테이블 잠금 획득분뿐이고 InnoDB 행 락
+        // 대기는 문장이 끝날 때 더해진다 — 실측(8.0.46·8.4.11): 3초 대기 중 0, 끝난 뒤
+        // 4,919ms. 남기면 끝을 못 본 레코드에 "락 대기 0ms" 가 굳는다. 피코초다.
+        lock_time_ms: counter(s.lock_time_ps).map(|ps| (ps / 1_000_000_000) as i64),
         tmp_tables: counter(s.created_tmp_tables),
         tmp_disk_tables: counter(s.created_tmp_disk_tables),
         sort_merge_passes: counter(s.sort_merge_passes),
@@ -482,10 +513,53 @@ mod tests {
             offset,
             owner_worker: "task-abc",
             owner_epoch: Some(3),
+            lock_wait: None,
         }
     }
 
     const RAW: &str = "SELECT * FROM users WHERE ssn = '900101-1234567' AND id = 42";
+
+    /// **블로커 문장도 저장 경로다.** 원문 정책이어도 정규 텍스트만 담고, `off` 면 담지 않는다.
+    #[test]
+    fn blocker_statements_are_canonical_and_dropped_under_off() {
+        let (i, t, o) = (instance(), tracked(), ClockOffset::restored(0));
+        let wait = LockWaitRow {
+            waiting_pid: t.thread_id,
+            locked_schema: Some("shop".into()),
+            locked_table: Some("orders".into()),
+            blocking_pid: Some(31),
+            blocking_command: Some("Sleep".into()),
+            blocking_statements: vec![
+                "UPDATE orders SET memo = 'kim@example.com' WHERE id = 1".into(),
+                // 1,024바이트에서 잘려 인용부호가 닫히지 않았다 — 마스킹을 믿을 수 없다.
+                "SELECT * FROM users WHERE ssn = '900101-12".into(),
+            ],
+            ..Default::default()
+        };
+
+        let full = build(CaptureInput {
+            lock_wait: Some(&wait),
+            ..input(&i, &t, &o, LiteralPolicy::Full, Some(RAW))
+        });
+        let w = full.query.lock_wait.expect("블로커");
+        assert_eq!(w.locked_table.as_deref(), Some("shop.orders"));
+        assert_eq!(w.blocking_pid, Some(31));
+        assert_eq!(w.observed_at_ms, 1_004_500);
+        assert_eq!(w.blocking_statements.len(), 1, "못 믿는 문장은 버린다");
+        assert!(
+            !w.blocking_statements[0].contains("kim@example.com"),
+            "{:?}",
+            w.blocking_statements
+        );
+
+        let off = build(CaptureInput {
+            lock_wait: Some(&wait),
+            ..input(&i, &t, &o, LiteralPolicy::Off, Some(RAW))
+        });
+        let w = off.query.lock_wait.expect("누가 막았는지는 남긴다");
+        assert!(w.blocking_statements.is_empty(), "off 정책에 SQL 을 담았다");
+        assert_eq!(w.blocking_pid, Some(31));
+    }
 
     #[test]
     fn full_policy_stores_raw_text() {
@@ -594,7 +668,13 @@ mod tests {
         // 실행 중에도 유효한 것은 남아야 한다 — 다 버리면 기능이 죽는다.
         assert_eq!(s.no_index_used, Some(true));
         assert_eq!(s.no_good_index_used, Some(true));
-        assert_eq!(s.lock_time_ms, Some(0), "LOCK_TIME 은 실행 중에도 유효하다");
+        // **`LOCK_TIME` 은 아니다.** 행 락 대기는 문장이 끝날 때 더해진다 — 실측(8.0.46·
+        // 8.4.11): 3초 대기 중 0, 끝난 뒤 4,919ms. 0 을 남기면 끝을 못 본 레코드에
+        // "락 대기 0ms" 가 사실로 굳는다.
+        assert_eq!(
+            s.lock_time_ms, None,
+            "실행 중 LOCK_TIME 0 을 '락 대기 없음' 으로 저장했다"
+        );
 
         // ② 완료 — 그대로 통과해야 한다.
         let done = StmtCurrentRow {
@@ -602,6 +682,7 @@ mod tests {
             rows_sent: Some(5),
             created_tmp_disk_tables: Some(2),
             select_full_join: Some(1),
+            lock_time_ps: Some(4_919_000_000_000),
             end_event_id: Some(4),
             ..Default::default()
         };
@@ -612,6 +693,11 @@ mod tests {
         assert_eq!(s.rows_sent, Some(5));
         assert_eq!(s.tmp_disk_tables, Some(2));
         assert_eq!(s.full_join, Some(true));
+        assert_eq!(
+            s.lock_time_ms,
+            Some(4_919),
+            "끝난 문장의 LOCK_TIME 은 행 락 대기를 포함한다"
+        );
     }
 
     #[test]
@@ -804,6 +890,7 @@ mod tests {
             offset: &o,
             owner_worker: "w1",
             owner_epoch: Some(1),
+            lock_wait: None,
         });
         assert_eq!(
             out.query.ended_at_ms,

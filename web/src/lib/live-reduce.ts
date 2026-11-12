@@ -376,6 +376,9 @@ function normalizeMetrics(raw: Record<string, unknown>): LiveMetrics | null {
     // 칠하지 않는다(모수 없이 포화를 판정할 수 없다).
     max_connections: numberOrNull(raw.max_connections),
     lock_waits: numberOrNull(raw.lock_waits),
+    // **구 서버는 보내지 않는다** → `null`. `0` 으로 채우면 "데드락이 없다" 가 된다.
+    deadlocks_per_sec: numberOrNull(raw.deadlocks_per_sec),
+    lock_timeouts_per_sec: numberOrNull(raw.lock_timeouts_per_sec),
     rate_gap_reason: typeof raw.rate_gap_reason === "string" ? raw.rate_gap_reason : null,
   };
 }

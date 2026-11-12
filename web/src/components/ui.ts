@@ -99,3 +99,16 @@ export const MONO = "font-mono text-xs";
 export const LINK = "text-blue-600 hover:text-blue-800 hover:underline underline-offset-2";
 /** 셀 안의 아이콘. 참조 구현과 같은 크기·간격. */
 export const CELL_ICON = "w-4 h-4 mr-1 flex-shrink-0 text-gray-400";
+
+/**
+ * 탭. **선택 상태를 색만으로 말하지 않는다** — 밑줄과 `aria-selected` 를 함께 쓴다.
+ * 계획 화면(표·그래프)과 인스턴스 화면(메트릭·락)이 같은 모양이어야 한다.
+ */
+export const TAB_LIST = "mb-3 flex gap-1 border-b border-gray-200";
+const TAB = "-mb-px border-b-2 px-3 py-1.5 text-sm font-medium";
+export const TAB_ON = `${TAB} border-blue-500 text-blue-700`;
+export const TAB_OFF = `${TAB} border-transparent text-gray-500 hover:text-gray-800`;
+
+/** 주의 배지(유휴 블로커·락 대기). **색만으로 말하지 않는다** — 글자가 함께 간다. */
+export const BADGE_WARN =
+  "rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap bg-amber-50 text-amber-800 ring-1 ring-amber-200";

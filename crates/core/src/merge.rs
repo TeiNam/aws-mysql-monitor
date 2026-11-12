@@ -24,7 +24,8 @@
 use crate::slow_query::UNKNOWN_DIGEST_PREFIX;
 use crate::slow_query::duration_rank;
 use crate::slow_query::{
-    CaptureSource, DurationSource, ExecStats, LiteralPolicy, PlanBundle, SlowQuery, SlowQueryState,
+    CaptureSource, DurationSource, ExecStats, LiteralPolicy, LockWaitCapture, PlanBundle,
+    SlowQuery, SlowQueryState,
 };
 use crate::time::EpochMs;
 use dbmon_normalize::StatementType;
@@ -134,7 +135,26 @@ pub fn merge(existing: &SlowQuery, incoming: &SlowQuery) -> SlowQuery {
         // 그 의심을 없애 주지 않는다. 지우면 `merge(q, q)` 의 멱등성도 깨진다.
         abandoned_reason: pick_opt_str(&existing.abandoned_reason, &incoming.abandoned_reason),
         long_running: existing.long_running || incoming.long_running,
+        lock_wait: merge_lock_wait(existing, incoming, policy),
     }
+}
+
+/// **블로커는 지우지 않는다** — `None` 은 "그 관측에서 대기가 없었다" 일 뿐이다. 둘 다 있으면
+/// 나중 관측이 이긴다(`Ord`, 첫 필드가 관측 시각). 고정 정책이 아무것도 저장하지 않으면
+/// 문장을 버린다 — `sql_text` 와 같은 규칙이다(F2).
+///
+/// 정책이 레코드마다 오간 이력(`full`→`off`→`full`)에서는 `sql_text` 와 같이 결합법칙이 깨진다.
+/// 다만 **문장을 더 버리는 쪽으로만** 틀린다 — 가장 이른 정책이 `off` 면 어떤 순서로 합쳐도
+/// 마지막 병합이 문장을 버린다. 블로커가 누구인지는 순서와 무관하다(테스트로 고정).
+fn merge_lock_wait(a: &SlowQuery, b: &SlowQuery, policy: LiteralPolicy) -> Option<LockWaitCapture> {
+    let chosen = a.lock_wait.clone().max(b.lock_wait.clone())?;
+    if policy.stores_nothing() {
+        return Some(LockWaitCapture {
+            blocking_statements: Vec::new(),
+            ..chosen
+        });
+    }
+    Some(chosen)
 }
 
 /// 종료를 실제로 관측한 쪽이 이긴다. `Abandoned` 는 "관측이 끊겼다"이므로
@@ -1081,6 +1101,7 @@ mod tests {
             last_seen_at_ms: None,
             abandoned_reason: None,
             long_running: false,
+            lock_wait: None,
         }
     }
 
@@ -1176,6 +1197,95 @@ mod tests {
         off.sql_text = None;
         let with_text = base();
         assert_eq!(merge(&off, &with_text).sql_text, None);
+    }
+
+    fn capture(observed_at_ms: EpochMs, pid: u64) -> LockWaitCapture {
+        LockWaitCapture {
+            observed_at_ms,
+            locked_table: Some("shop.orders".into()),
+            locked_index: Some("PRIMARY".into()),
+            lock_mode: Some("X,REC_NOT_GAP".into()),
+            blocking_pid: Some(pid),
+            blocking_user: Some("app".into()),
+            blocking_host: None,
+            blocking_command: Some("Sleep".into()),
+            blocking_time_s: Some(3),
+            blocking_statements: vec!["UPDATE orders SET memo = ? WHERE id = ?".into()],
+        }
+    }
+
+    /// **블로커는 실행 중에만 보인다** — 끝난 뒤 온 레코드(`None`)가 지우면 다시는 알 수 없다.
+    #[test]
+    fn lock_wait_survives_later_records_and_the_latest_observation_wins() {
+        let mut early = base();
+        early.lock_wait = Some(capture(1_000, 31));
+        let mut late = base();
+        late.lock_wait = Some(capture(2_000, 32));
+        let none = base();
+
+        for (a, b) in [(&early, &none), (&none, &early)] {
+            assert_eq!(
+                merge(a, b).lock_wait,
+                early.lock_wait,
+                "끝난 레코드가 블로커를 지웠다"
+            );
+        }
+        for (a, b) in [(&early, &late), (&late, &early)] {
+            assert_eq!(merge(a, b).lock_wait, late.lock_wait, "나중 관측이 이긴다");
+        }
+
+        // 고정 정책이 아무것도 저장하지 않으면 **문장만** 버린다 — 누가 막았는지는 남긴다.
+        let mut off = early.clone();
+        off.literal_policy = LiteralPolicy::Off;
+        let kept = merge(&off, &late).lock_wait.expect("블로커");
+        assert!(
+            kept.blocking_statements.is_empty(),
+            "off 정책에 SQL 이 들어왔다"
+        );
+        assert_eq!(kept.blocking_pid, Some(32));
+    }
+
+    /// 정책이 레코드마다 오간 이력에서도 **어떤 순서로 합치든** 블로커는 같고, 가장 이른 정책이
+    /// `off` 면 문장이 남지 않는다(결합법칙이 깨지는 방향은 문장을 더 버리는 쪽뿐이다).
+    #[test]
+    fn lock_wait_holds_the_pinned_policy_in_every_merge_order() {
+        let rec = |policy: LiteralPolicy, at: EpochMs, lw: Option<LockWaitCapture>| {
+            let mut q = base();
+            q.literal_policy = policy;
+            q.literal_policy_at_ms = at;
+            q.lock_wait = lw;
+            q
+        };
+        let pool = [
+            rec(LiteralPolicy::Full, 20, Some(capture(2_000, 41))),
+            rec(LiteralPolicy::Off, 10, None),
+            rec(LiteralPolicy::Masked, 0, Some(capture(1_000, 40))),
+            rec(LiteralPolicy::Full, 30, None),
+            rec(LiteralPolicy::Off, 5, Some(capture(3_000, 42))),
+        ];
+        let pid = |w: &Option<LockWaitCapture>| w.as_ref().and_then(|w| w.blocking_pid);
+        for a in &pool {
+            for b in &pool {
+                for c in &pool {
+                    let left = merge(&merge(a, b), c).lock_wait;
+                    let right = merge(a, &merge(b, c)).lock_wait;
+                    assert_eq!(pid(&left), pid(&right), "블로커가 병합 순서에 달렸다");
+
+                    let earliest = [a, b, c]
+                        .into_iter()
+                        .min_by_key(|q| q.literal_policy_at_ms)
+                        .expect("세 레코드");
+                    if earliest.literal_policy.stores_nothing() {
+                        for w in [&left, &right].into_iter().flatten() {
+                            assert!(
+                                w.blocking_statements.is_empty(),
+                                "off 가 고정됐는데 문장이 남았다"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

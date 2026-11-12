@@ -235,6 +235,33 @@ impl PlanBundle {
     }
 }
 
+/// 이 실행이 **행 락을 기다리는 중에** 관측됐다 — 그때 막고 있던 세션(블로커).
+///
+/// 실행 중에는 `LOCK_TIME` 이 0 이고(행 락 대기는 문장이 끝나야 더해진다) 처리목록 상태도
+/// `updating` 같은 평범한 값이라 피해자라는 단서가 이것뿐이다. 블로커는 대개 커밋을 잊은
+/// 유휴 세션이라 **그때 붙잡지 않으면 다시는 알 수 없다.**
+///
+/// **API 가 그대로 내보낸다**(`SlowQueryView`) — 리터럴이 살아 있는 값을 넣지 않는다. 블로커
+/// 문장은 정책과 무관하게 정규 텍스트만 담고, 정책이 `off` 면 담지 않는다.
+///
+/// 필드 순서가 병합 순서다(`Ord`) — **나중 관측**이 이긴다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LockWaitCapture {
+    pub observed_at_ms: EpochMs,
+    /// `스키마.테이블`.
+    pub locked_table: Option<String>,
+    pub locked_index: Option<String>,
+    pub lock_mode: Option<String>,
+    pub blocking_pid: Option<u64>,
+    pub blocking_user: Option<String>,
+    pub blocking_host: Option<String>,
+    pub blocking_command: Option<String>,
+    pub blocking_time_s: Option<u64>,
+    /// 블로커 트랜잭션이 실행한 문장(정규 텍스트), 오래된 순.
+    #[serde(default)]
+    pub blocking_statements: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlowQuery {
     pub record_id: RecordId,
@@ -297,6 +324,12 @@ pub struct SlowQuery {
     pub abandoned_reason: Option<String>,
     /// `TRACKING` 최대 지속시간을 넘겨 강제 확정됨.
     pub long_running: bool,
+    /// 행 락 대기 중에 관측한 블로커 ([`LockWaitCapture`]).
+    ///
+    /// `default`: 이 필드가 없던 시절의 레코드가 남아 있다. `skip`: 대부분의 실행은 락과
+    /// 무관하다 — 레코드마다 빈 속성을 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_wait: Option<LockWaitCapture>,
 }
 
 impl SlowQuery {
