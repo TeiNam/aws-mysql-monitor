@@ -308,8 +308,10 @@ fn exec_stats(s: &StmtCurrentRow) -> ExecStats {
         rows_examined: counter(s.rows_examined),
         rows_sent: counter(s.rows_sent),
         rows_affected: counter(s.rows_affected),
-        // **`LOCK_TIME` 은 실행 중에도 유효하다**(실측: 0.004ms). 피코초다.
-        lock_time_ms: s.lock_time_ps.map(|ps| (ps / 1_000_000_000) as i64),
+        // **`LOCK_TIME` 도 끝나야 믿는다.** 실행 중 값은 테이블 잠금 획득분뿐이고 InnoDB 행 락
+        // 대기는 문장이 끝날 때 더해진다 — 실측(8.0.46·8.4.11): 3초 대기 중 0, 끝난 뒤
+        // 4,919ms. 남기면 끝을 못 본 레코드에 "락 대기 0ms" 가 굳는다. 피코초다.
+        lock_time_ms: counter(s.lock_time_ps).map(|ps| (ps / 1_000_000_000) as i64),
         tmp_tables: counter(s.created_tmp_tables),
         tmp_disk_tables: counter(s.created_tmp_disk_tables),
         sort_merge_passes: counter(s.sort_merge_passes),
@@ -594,7 +596,13 @@ mod tests {
         // 실행 중에도 유효한 것은 남아야 한다 — 다 버리면 기능이 죽는다.
         assert_eq!(s.no_index_used, Some(true));
         assert_eq!(s.no_good_index_used, Some(true));
-        assert_eq!(s.lock_time_ms, Some(0), "LOCK_TIME 은 실행 중에도 유효하다");
+        // **`LOCK_TIME` 은 아니다.** 행 락 대기는 문장이 끝날 때 더해진다 — 실측(8.0.46·
+        // 8.4.11): 3초 대기 중 0, 끝난 뒤 4,919ms. 0 을 남기면 끝을 못 본 레코드에
+        // "락 대기 0ms" 가 사실로 굳는다.
+        assert_eq!(
+            s.lock_time_ms, None,
+            "실행 중 LOCK_TIME 0 을 '락 대기 없음' 으로 저장했다"
+        );
 
         // ② 완료 — 그대로 통과해야 한다.
         let done = StmtCurrentRow {
@@ -602,6 +610,7 @@ mod tests {
             rows_sent: Some(5),
             created_tmp_disk_tables: Some(2),
             select_full_join: Some(1),
+            lock_time_ps: Some(4_919_000_000_000),
             end_event_id: Some(4),
             ..Default::default()
         };
@@ -612,6 +621,7 @@ mod tests {
         assert_eq!(s.rows_sent, Some(5));
         assert_eq!(s.tmp_disk_tables, Some(2));
         assert_eq!(s.full_join, Some(true));
+        assert_eq!(s.lock_time_ms, Some(4_919), "끝난 문장의 LOCK_TIME 은 행 락 대기를 포함한다");
     }
 
     #[test]

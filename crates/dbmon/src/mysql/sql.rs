@@ -86,9 +86,14 @@ WHERE ID IN ({})",
 /// CREATED_TMP_TABLES=0  CREATED_TMP_DISK_TABLES=0
 /// SELECT_FULL_JOIN=0  SORT_MERGE_PASSES=0
 /// NO_INDEX_USED=1  NO_GOOD_INDEX_USED=1     ← 옵티마이즈 시점에 정해진다, 유효하다
-/// TIMER_WAIT=4059ms  LOCK_TIME=0.004ms      ← 유효하다
+/// TIMER_WAIT=4059ms                          ← 유효하다
+/// LOCK_TIME=0.004ms                          ← 테이블 잠금분뿐이다
 /// END_EVENT_ID=NULL                          ← 아직 안 끝났다
 /// ```
+///
+/// **`LOCK_TIME` 에는 InnoDB 행 락 대기가 끝나야 더해진다.** 실측(8.0.46·8.4.11): 행 락을
+/// 3초 기다리는 동안 `LOCK_TIME=0`, 끝난 뒤 4,919ms(총 4,924ms). 실행 중인 문장이 락을
+/// 기다리는지는 이 값이 아니라 `data_lock_waits` 가 말한다.
 ///
 /// `0` 을 그대로 저장하면 **"모른다" 가 "0행을 훑었다" 는 사실이 된다.** 실제로 그렇게
 /// 저장돼 있었고(전체의 42%), 튜닝 모델이 "검사 행 0 은 실행계획과 모순" 이라며 신뢰도를
