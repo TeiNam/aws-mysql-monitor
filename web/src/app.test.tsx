@@ -896,7 +896,10 @@ describe("인스턴스 락 탭", () => {
     expect(screen.queryByLabelText("조회 범위")).toBeNull();
     expect(requested.some((u) => u.startsWith("/api/metrics/instance"))).toBe(false);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "문장 2개" })[0]);
+    // 대기 표의 블로커와 트랜잭션 표의 같은 세션 — 같은 문장 목록이다.
+    const statementButtons = screen.getAllByRole("button", { name: "문장 2개" });
+    expect(statementButtons).toHaveLength(2);
+    fireEvent.click(statementButtons[0] as HTMLElement);
     const dialog = await screen.findByRole("dialog");
     // 포매터가 줄을 바꿔 놓으므로 공백 종류는 보지 않는다.
     expect(dialog.textContent).toMatch(/FOR\s+UPDATE/);
