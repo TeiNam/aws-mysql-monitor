@@ -137,8 +137,8 @@ impl TuningService {
         match TargetMysql::on_demand(&self.auth, &self.config, instance, "tuning").await {
             Ok(db) => {
                 let specs = db.table_specs(&wanted).await;
-                // **닫는다.** 버리면 대상 DB 에 `Aborted_clients` 가 쌓인다.
-                db.disconnect().await;
+                // 닫기는 `OnDemandConn` 이 맡는다 — 이 future 가 취소돼도 닫힌다.
+                drop(db);
                 match specs {
                     Ok(specs) => specs,
                     Err(e) => {

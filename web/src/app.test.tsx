@@ -127,6 +127,7 @@ const LOCKS = {
   metadata_locks: [],
   truncated: false,
   sql_withheld: 1,
+  sql_hidden: null,
 };
 
 /** 수집기가 실행 중에 붙잡은 블로커 (`LockWaitCapture`). */
@@ -168,7 +169,8 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
     if (locksError !== null) {
       return Promise.resolve(
         new Response(JSON.stringify({ error: locksError }), {
-          status: 502,
+          // 서버는 재시도로 낫지 않는 거부를 4xx(424)로 준다.
+          status: 424,
           headers: { "content-type": "application/json" },
         }),
       );

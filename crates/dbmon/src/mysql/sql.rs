@@ -224,6 +224,10 @@ LIMIT ?";
 /// 전형: 열린 트랜잭션의 `SHARED_READ`(유휴) 뒤에서 `ALTER` 가 `EXCLUSIVE PENDING`, 그 뒤의
 /// 모든 쿼리가 `PENDING` 으로 줄을 선다. 처리목록은 대기자만 보여 준다(`Waiting for table
 /// metadata lock`) — 쥐고 있는 쪽은 `Sleep` 이다.
+///
+/// **정렬이 상한의 우선순위다.** 테이블마다 보유자(`GRANTED`)를 먼저, 오래된 순으로 둔다 —
+/// 상한에 걸려도 범인(오래 쥔 유휴 보유자)과 줄 맨 앞의 대기자(대개 DDL)가 남고, 잘리는 것은
+/// 그 뒤에 줄 선 쿼리들이다. 대기자를 먼저 두면 줄이 길 때 범인이 잘린다.
 pub const METADATA_LOCK_WAITS: &str = "/* dbmon:mdlwaits */
 SELECT ml.OBJECT_SCHEMA, ml.OBJECT_NAME, ml.LOCK_TYPE, ml.LOCK_DURATION, ml.LOCK_STATUS,
        t.PROCESSLIST_ID, t.PROCESSLIST_USER, t.PROCESSLIST_HOST,
@@ -388,9 +392,10 @@ UNION ALL
 -- enabled, Database Insights 의 `innodb_deadlocks` 도 이것을 읽는다). RDS MySQL 은
 -- CloudWatch 에 `Deadlocks` 가 없어서 이게 유일한 출처다.
 --
--- `PROCESS` 권한이 필요하다 — 없으면 이 문장 전체가 실패한다. 탐지(처리목록)가 이미
--- 같은 권한을 요구하므로 새 요구는 아니다. 문자셋(utf8mb3)·타입(BIGINT)이 위 갈래와
--- 달라도 합쳐진다(8.0.46·8.4.11 실측).
+-- `PROCESS` 권한이 필요하다 — 없으면 **이 문장 전체가 1227 로 실패한다.** 새로 줄 권한은
+-- 없다: 부트스트랩이 주고, 없으면 탐지도 자기 스레드만 봐서 아무것도 못 찾는다(설치
+-- 문서). 다만 실패 모양이 다르다 — 탐지는 조용히 비고, 이 조회는 시끄럽게 실패한다.
+-- 문자셋(utf8mb3)·타입(BIGINT)이 위 갈래와 달라도 합쳐진다(8.0.46·8.4.11 실측).
 SELECT NAME, COUNT
 FROM information_schema.INNODB_METRICS
 WHERE NAME IN ('lock_deadlocks','lock_timeouts')";

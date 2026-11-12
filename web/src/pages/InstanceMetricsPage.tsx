@@ -179,9 +179,11 @@ export function InstanceMetricsPage() {
           {TABS.map((t) => (
             <button
               key={t.id}
+              id={`instance-tab-${t.id}`}
               type="button"
               role="tab"
               aria-selected={tab === t.id}
+              aria-controls="instance-tabpanel"
               className={tab === t.id ? TAB_ON : TAB_OFF}
               // 기본 탭은 주소에 남기지 않는다 — 기존 링크·북마크와 같은 주소가 된다.
               onClick={() => update("tab", t.id === "metrics" ? "" : t.id)}
@@ -190,31 +192,34 @@ export function InstanceMetricsPage() {
             </button>
           ))}
         </div>
-        {instances.error !== null ? (
-          // 목록을 못 읽었다. 이 화면의 모든 판정이 그 목록에 기대므로 먼저 말한다.
-          <ErrorNotice error={instances.error} onRetry={() => void instances.refetch()} />
-        ) : missing ? (
-          <Note>
-            주소로 지정한 인스턴스가 목록에 없다 — 삭제됐거나 환경 스코프 밖이다.{" "}
-            <strong>다른 인스턴스의 메트릭을 대신 보여주지 않는다.</strong>
-          </Note>
-        ) : tab === "locks" ? (
-          picked === undefined ? (
-            <Pending label="인스턴스 목록을 불러오는 중…" />
+        {/* 패널 하나를 탭이 바꿔 낀다 — 스크린리더가 지금 패널이 어느 탭의 것인지 읽는다. */}
+        <div role="tabpanel" id="instance-tabpanel" aria-labelledby={`instance-tab-${tab}`}>
+          {instances.error !== null ? (
+            // 목록을 못 읽었다. 이 화면의 모든 판정이 그 목록에 기대므로 먼저 말한다.
+            <ErrorNotice error={instances.error} onRetry={() => void instances.refetch()} />
+          ) : missing ? (
+            <Note>
+              주소로 지정한 인스턴스가 목록에 없다 — 삭제됐거나 환경 스코프 밖이다.{" "}
+              <strong>다른 인스턴스의 메트릭을 대신 보여주지 않는다.</strong>
+            </Note>
+          ) : tab === "locks" ? (
+            picked === undefined ? (
+              <Pending label="인스턴스 목록을 불러오는 중…" />
+            ) : (
+              <LocksPanel instanceId={picked} />
+            )
+          ) : metrics.error !== null ? (
+            <ErrorNotice error={metrics.error} onRetry={() => void metrics.refetch()} />
+          ) : metrics.isPending || metrics.data === undefined ? (
+            <Pending label="메트릭을 불러오는 중…" />
           ) : (
-            <LocksPanel instanceId={picked} />
-          )
-        ) : metrics.error !== null ? (
-          <ErrorNotice error={metrics.error} onRetry={() => void metrics.refetch()} />
-        ) : metrics.isPending || metrics.data === undefined ? (
-          <Pending label="메트릭을 불러오는 중…" />
-        ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {metrics.data.series.map((s) => (
-              <MetricTile key={s.name} series={s} fetchFailed={metrics.data.failed !== undefined} />
-            ))}
-          </div>
-        )}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {metrics.data.series.map((s) => (
+                <MetricTile key={s.name} series={s} fetchFailed={metrics.data.failed !== undefined} />
+              ))}
+            </div>
+          )}
+        </div>
       </Card>
     </div>
   );

@@ -138,7 +138,7 @@ impl TargetMysql {
     /// 테스트에서만 쓴다.
     #[cfg(any(test, feature = "testing"))]
     pub fn connect(base: Opts, timeouts: Timeouts, label: impl Into<String>) -> Result<Self> {
-        Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label)
+        Self::connect_with_limit(base, timeouts, DEFAULT_DETECT_LIMIT, label, COLLECTOR_POOLS)
     }
 
     /// **설정에서 만든다. 프로덕션 조립은 이것만 쓴다.**
@@ -151,6 +151,15 @@ impl TargetMysql {
         cfg: &crate::config::CollectorConfig,
         label: impl Into<String>,
     ) -> Result<Self> {
+        Self::from_config_sized(base, cfg, label, COLLECTOR_POOLS)
+    }
+
+    fn from_config_sized(
+        base: Opts,
+        cfg: &crate::config::CollectorConfig,
+        label: impl Into<String>,
+        sizes: PoolSizes,
+    ) -> Result<Self> {
         let timeouts = Timeouts::derive(
             cfg.connect_timeout_ms,
             cfg.detect_timeout_ms,
@@ -158,7 +167,7 @@ impl TargetMysql {
             cfg.bulk_query_timeout_ms,
             cfg.detect_interval_ms,
         );
-        Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label)
+        Self::connect_with_limit(base, timeouts, u64::from(cfg.detect_limit), label, sizes)
     }
 
     fn connect_with_limit(
@@ -166,9 +175,10 @@ impl TargetMysql {
         timeouts: Timeouts,
         detect_limit: u64,
         label: impl Into<String>,
+        sizes: PoolSizes,
     ) -> Result<Self> {
-        let hot = pool(base.clone(), 2, 4, timeouts.query)?;
-        let bulk = pool(base, 1, 2, timeouts.bulk_query)?;
+        let hot = pool(base.clone(), sizes.hot.0, sizes.hot.1, timeouts.query)?;
+        let bulk = pool(base, sizes.bulk.0, sizes.bulk.1, timeouts.bulk_query)?;
         Ok(Self {
             hot,
             bulk,
@@ -375,6 +385,29 @@ impl TargetMysql {
         let _ = self.bulk.disconnect().await;
     }
 }
+
+/// 풀 크기 `(최소, 최대)`.
+#[derive(Debug, Clone, Copy)]
+struct PoolSizes {
+    hot: (usize, usize),
+    bulk: (usize, usize),
+}
+
+/// 수집 태스크 — 오래 살고, 탐지와 심층 조회가 겹친다.
+const COLLECTOR_POOLS: PoolSizes = PoolSizes {
+    hot: (2, 4),
+    bulk: (1, 2),
+};
+
+/// 사람이 누른 요청 하나 — 조회가 차례로 돌므로 **연결 하나**를 다시 쓴다. 대상 DB 가 가장 약할
+/// 때 열리는 화면이라 붙는 수를 줄인다.
+///
+/// **최소가 0 이면 안 된다.** `inactive_connection_ttl` 이 0(기본)이면 풀은 돌려받은 연결을
+/// `min` 개만 남기고 바로 닫는다 — 최소 0 에서는 조회마다 새 연결이었다(실측: 스냅샷 하나에 3).
+const ON_DEMAND_POOLS: PoolSizes = PoolSizes {
+    hot: (1, 1),
+    bulk: (1, 1),
+};
 
 fn pool(base: Opts, min: usize, max: usize, query_timeout: Duration) -> Result<Pool> {
     let constraints = PoolConstraints::new(min, max).ok_or_else(|| DomainError::InvalidInput {
@@ -889,16 +922,39 @@ pub struct MdlRow {
 /// 락·트랜잭션 화면 — **트레이트가 아니라 고유 메서드다** ([`Self::table_specs`] 와 같은 판단).
 ///
 /// 사람이 화면을 열었을 때만 돈다. 수집 루프가 쓰는 것은 [`TargetDb::lock_waits`] 뿐이다.
+/// 사람이 누른 요청 하나를 위한 연결 ([`TargetMysql::on_demand`]).
+///
+/// **어떻게 끝나도 닫는다** — 다 써서 버릴 때도, 요청 기한이나 브라우저가 끊어 future 가
+/// 취소될 때도. 취소 경로에서는 `await` 할 수 없으므로 런타임에 닫기를 넘긴다. 닫지 않고
+/// 버리면 대상 DB 에 `Aborted_clients` 가 쌓인다(`Pool` 을 그냥 버리면 그렇다).
+pub struct OnDemandConn(Option<TargetMysql>);
+
+impl std::ops::Deref for OnDemandConn {
+    type Target = TargetMysql;
+    fn deref(&self) -> &TargetMysql {
+        // `None` 은 `drop` 안에서만 생긴다.
+        self.0.as_ref().expect("닫은 연결을 쓰지 않는다")
+    }
+}
+
+impl Drop for OnDemandConn {
+    fn drop(&mut self) {
+        let Some(db) = self.0.take() else { return };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(db.disconnect());
+        }
+    }
+}
+
 impl TargetMysql {
     /// 사람이 누른 요청 하나를 위한 연결. 수집 태스크와 **같은 경로**(IAM 토큰 + 터널
-    /// 오버라이드)다. 다 쓰면 [`Self::disconnect`] 로 닫는다 — 버리면 대상 DB 에
-    /// `Aborted_clients` 가 쌓인다.
+    /// 오버라이드)다. 돌려받은 [`OnDemandConn`] 이 버려질 때 닫힌다.
     pub async fn on_demand(
         auth: &crate::aws::auth_token::TargetAuth,
         config: &crate::config::Config,
         instance: &dbmon_core::instance::Instance,
         purpose: &str,
-    ) -> Result<Self> {
+    ) -> Result<OnDemandConn> {
         let db_user = config.collector.monitor_db_user.clone();
         let host = instance
             .endpoint
@@ -928,11 +984,13 @@ impl TargetMysql {
             config.deployment_env,
             via,
         )?;
-        Self::from_config(
+        Self::from_config_sized(
             opts,
             &config.collector,
             format!("{purpose}:{}", instance.id.identifier()),
+            ON_DEMAND_POOLS,
         )
+        .map(|db| OnDemandConn(Some(db)))
     }
 
     /// `min_age_s` 초 이상 열려 있는 트랜잭션, 오래된 순.

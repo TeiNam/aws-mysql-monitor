@@ -585,6 +585,11 @@ export interface LockSnapshot {
   /** 상한에 걸려 일부만 실었다. */
   truncated: boolean;
   sql_withheld: number;
+  /**
+   * SQL 을 **전부 뺀** 이유. `policy_off` — 배포가 SQL 을 다루지 않는다,
+   * `insufficient_role` — 원문 정책인데 리터럴 열람 권한이 없다. 슬로우 쿼리 SQL 과 같은 경계다.
+   */
+  sql_hidden: "policy_off" | "insufficient_role" | null;
 }
 
 export interface LockWaitView {

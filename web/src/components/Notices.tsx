@@ -36,6 +36,9 @@ const MESSAGES: Record<string, string> = {
   target_forbidden:
     "대상 DB 가 모니터링 계정을 거부했다 — 로그인(IAM 인증)과 권한(performance_schema SELECT·PROCESS)을 확인한다.",
   target_timeout: "대상 DB 가 제한 시간(15초) 안에 답하지 않았다.",
+  instance_not_collectible:
+    "수집 대상이 아닌 인스턴스다(삭제·제외·미지원) — 모니터링 계정이 없을 수 있어 대상 DB 에 붙지 않는다.",
+  instance_paused: "수집이 정지된 인스턴스다 — 정지 중에는 대상 DB 에 붙지 않는다. RDS 화면에서 재개한다.",
 };
 
 interface ErrorNoticeProps {

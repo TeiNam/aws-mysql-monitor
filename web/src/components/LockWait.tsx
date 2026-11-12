@@ -36,8 +36,9 @@ export function LockWaitDetail({ query }: { query: SlowQueryView }) {
       <h4 className="text-sm font-medium text-amber-900">락 대기</h4>
       <p className="mt-1 text-xs text-amber-800">{reason}</p>
       {w === null ? (
+        // 이유를 단정하지 않는다 — 관측 뒤에 대기가 시작됐을 수도, 조회가 실패했을 수도 있다.
         <p className="mt-1 text-xs text-gray-600">
-          블로커는 관측하지 못했다 — 대기가 실행 중 관측 사이에 끝났다.
+          블로커는 관측하지 못했다 — 수집기가 이 실행을 볼 때 대기 중이 아니었거나 조회하지 못했다.
         </p>
       ) : (
         <>
@@ -60,7 +61,9 @@ export function LockWaitDetail({ query }: { query: SlowQueryView }) {
           </dl>
           {w.blocking_statements.length === 0 ? (
             <p className="mt-2 text-xs text-gray-600">
-              블로커가 실행한 문장은 남지 않았다 — 정책이 SQL 을 저장하지 않거나 이력에서 밀려났다.
+              {query.sql_redacted_reason === "insufficient_role"
+                ? "블로커가 실행한 문장은 리터럴 열람 권한이 있어야 보인다(원문 정책)."
+                : "블로커가 실행한 문장은 남지 않았다 — 정책이 SQL 을 저장하지 않거나 이력에서 밀려났다."}
             </p>
           ) : (
             <>

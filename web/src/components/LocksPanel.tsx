@@ -90,6 +90,14 @@ function SnapshotNote({ snap }: { snap: LockSnapshot }) {
       {snap.truncated ? (
         <strong className="ml-2 text-amber-700">⚠ 조회 상한에 걸려 일부만 보인다.</strong>
       ) : null}
+      {snap.sql_hidden === null ? null : (
+        <strong className="ml-2 text-amber-700">
+          ⚠ SQL 을 보이지 않는다 —{" "}
+          {snap.sql_hidden === "policy_off"
+            ? "이 배포는 SQL 을 다루지 않는다(literal_policy=off)."
+            : "원문 정책이라 리터럴 열람 권한이 있어야 보인다."}
+        </strong>
+      )}
       {snap.sql_withheld > 0 ? (
         <span className="ml-2 text-amber-700">
           ⚠ 마스킹을 믿을 수 없는 SQL {fmtInt(snap.sql_withheld)}건은 숨겼다(잘려서 인용부호가
