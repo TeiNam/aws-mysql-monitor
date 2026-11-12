@@ -22,6 +22,7 @@ import { PlanTable } from "../components/PlanTable";
 import { displayDurationMs, isRunning } from "../lib/elapsed";
 import { useRunningNow } from "../lib/useRunningNow";
 import { TuningPanel } from "../components/TuningPanel";
+import { LockWaitBadge, LockWaitDetail } from "../components/LockWait";
 import { StateBadge } from "../components/StateBadge";
 import { EnvChip } from "../components/Shell";
 import {
@@ -362,6 +363,7 @@ function PlanDetail({
           </Item>
           <Item label="State">
             <StateBadge state={query.state} reason={query.abandoned_reason} />
+            <LockWaitBadge query={query} />
           </Item>
           <Item label="Thread">{query.thread_id}</Item>
           <Item label="Execution Time">
@@ -393,6 +395,7 @@ function PlanDetail({
             {formatSql(query.sql_text)}
           </pre>
         )}
+        <LockWaitDetail query={query} />
       </Card>
 
       <Card

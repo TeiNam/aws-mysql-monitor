@@ -21,6 +21,7 @@ import type { LockSnapshot, LockWaitView, MetadataLockView, TransactionView } fr
 import { EmptyRow, ErrorNotice, Note, Pending } from "./Notices";
 import { SqlModal } from "./SqlModal";
 import {
+  BADGE_WARN,
   CELL_X,
   COL_GROW,
   COL_TIGHT,
@@ -66,7 +67,8 @@ export function LocksPanel({ instanceId }: { instanceId: string }) {
       <Transactions rows={snap.transactions} onShow={setOpenSql} />
       <MetadataLocks rows={snap.metadata_locks} onShow={setOpenSql} />
       <Note>
-        SQL 은 저장 정책과 무관하게 <strong>항상 마스킹된</strong> 정규 텍스트다. 서버가 문장을
+        SQL 은 저장 정책과 무관하게 <strong>항상 마스킹된</strong> 정규 텍스트다. 유휴 세션의 SQL 은
+        지금 도는 것이 아니라 <strong>마지막으로 끝낸 문장</strong>이다. 서버가 문장을
         1,024바이트에서 자르고(
         <span className="font-mono">performance_schema_max_sql_text_length</span>
         ), 블로커가 실행한 문장은 스레드당 최근 문장(기본 10개,{" "}
@@ -168,7 +170,7 @@ function Transactions({ rows, onShow }: { rows: TransactionView[]; onShow: ShowS
           <th className={TH}>DB</th>
           <th className={TH}>세션</th>
           <th className={TH}>문장</th>
-          <th className={`${TH} ${COL_GROW}`}>실행 중인 SQL</th>
+          <th className={`${TH} ${COL_GROW}`}>현재/마지막 SQL</th>
         </tr>
       }
     >
@@ -299,10 +301,7 @@ function Session({
 
 function WarnBadge({ title, children }: { title?: string; children: ReactNode }) {
   return (
-    <span
-      className="rounded bg-amber-50 px-1.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-amber-200"
-      title={title}
-    >
+    <span className={BADGE_WARN} title={title}>
       {children}
     </span>
   );

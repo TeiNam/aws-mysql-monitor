@@ -136,6 +136,25 @@ export interface SlowQueryView {
   lock_time_ms: number | null;
   has_plan: boolean;
   abandoned_reason: string | null;
+  /** 행 락 대기 중에 관측한 블로커. 구 서버는 보내지 않는다(`undefined`). */
+  lock_wait?: LockWaitCapture | null;
+}
+
+/**
+ * `crates/core/src/slow_query.rs` 의 `LockWaitCapture` — 이 실행을 막고 있던 세션.
+ * 문장은 정규 텍스트만 담기고, 정책이 `off` 면 비어 있다.
+ */
+export interface LockWaitCapture {
+  observed_at_ms: number;
+  locked_table: string | null;
+  locked_index: string | null;
+  lock_mode: string | null;
+  blocking_pid: number | null;
+  blocking_user: string | null;
+  blocking_host: string | null;
+  blocking_command: string | null;
+  blocking_time_s: number | null;
+  blocking_statements: string[];
 }
 
 export interface ListResponse {

@@ -12,7 +12,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeSocket } from "./lib/fake-socket";
@@ -36,6 +36,8 @@ let pausedThisInstance = false;
 let settingsLoadError: string | null = null;
 /** 락 조회가 실패한 상황 — 오류 코드. */
 let locksError: string | null = null;
+/** 목록의 쿼리가 행 락 대기 중에 관측된 상황(블로커가 붙어 있다). */
+let lockVictim = false;
 /** 화면이 보낸 요청. **묻지 말아야 할 것을 묻지 않았는지** 보려고 남긴다. */
 let requested: string[] = [];
 
@@ -127,6 +129,20 @@ const LOCKS = {
   sql_withheld: 1,
 };
 
+/** 수집기가 실행 중에 붙잡은 블로커 (`LockWaitCapture`). */
+const LOCK_WAIT = {
+  observed_at_ms: NOW_MS,
+  locked_table: "shop.orders",
+  locked_index: "PRIMARY",
+  lock_mode: "X,REC_NOT_GAP",
+  blocking_pid: 31,
+  blocking_user: "app",
+  blocking_host: "10.0.1.5",
+  blocking_command: "Sleep",
+  blocking_time_s: 40,
+  blocking_statements: BLOCKER_STATEMENTS,
+};
+
 function fakeBackend(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
   requested = [...requested, url];
@@ -191,6 +207,10 @@ function fakeBackend(input: RequestInfo | URL): Promise<Response> {
     );
   }
   if (url.startsWith("/api/slow-queries") || url.startsWith("/api/plans")) {
+    if (lockVictim) {
+      const victim = { ...RECORD, lock_wait: LOCK_WAIT };
+      return Promise.resolve(json({ items: [victim], next_cursor: null, has_more: false, total: 1, server_now_ms: NOW_MS }));
+    }
     if (emptyButTruncated) {
       return Promise.resolve(json({ items: [], next_cursor: null, has_more: true, total: 0, server_now_ms: NOW_MS }));
     }
@@ -423,6 +443,7 @@ beforeEach(() => {
   pausedThisInstance = false;
   settingsLoadError = null;
   locksError = null;
+  lockVictim = false;
   requested = [];
   FakeSocket.install();
   // **모듈 상태를 리셋한다.** `liveClient` 는 싱글턴이라 한 테스트에서
@@ -502,6 +523,26 @@ describe("MySQL Monitor", () => {
    * `Pagination` 이 하는데 그건 0건에서 렌더되지 않으므로, 표 안에서 말해야 한다 —
    * 안 그러면 조사하던 사람이 "문제 없음" 으로 결론 낸다.
    */
+  /**
+   * **느린 이유가 쿼리가 아니라 남의 락이면** 플랜을 들여다볼 일이 아니다. 목록에서 가르고,
+   * 막고 있던 세션과 그 문장을 행에서 바로 본다.
+   */
+  it("락 대기 피해자는 목록에 표시되고, 행을 누르면 블로커가 보인다", async () => {
+    lockVictim = true;
+    await renderApp("/mysql");
+    const badge = await screen.findByText("락 대기");
+    expect(badge.getAttribute("title")).toContain("PID 31");
+
+    fireEvent.click(screen.getByText(SQL));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toContain("shop.orders");
+    expect(dialog.textContent).toContain("app@10.0.1.5");
+    expect(dialog.textContent).toContain("memo");
+    expect(within(dialog).getByRole("link", { name: /락 탭/ }).getAttribute("href")).toBe(
+      `/instance?instance=${encodeURIComponent(INSTANCE)}&tab=locks`,
+    );
+  });
+
   it("서버가 상한에 걸려 0건을 주면 '기록이 없다' 로 말하지 않는다", async () => {
     emptyButTruncated = true;
     await renderApp("/mysql");

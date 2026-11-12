@@ -120,6 +120,7 @@ fn sample(thread_id: u64, started_at_ms: i64) -> SlowQuery {
         last_seen_at_ms: Some(started_at_ms + 3_000),
         abandoned_reason: None,
         long_running: false,
+        lock_wait: None,
     }
 }
 

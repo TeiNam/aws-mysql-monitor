@@ -433,6 +433,8 @@ where
                 offset: &self.offset,
                 owner_worker: &self.params.worker_id,
                 owner_epoch: self.epoch,
+                // 끝난 문장은 더 기다리지 않는다 — 블로커는 선행 저장이 잡는다.
+                lock_wait: None,
             });
             stats.masking_degraded += usize::from(out.masking_degraded);
             match self.store.upsert_merged(&out.query).await {
@@ -682,12 +684,16 @@ where
         // 레코드가 저장되고 tick 은 `Ok` 를 반환해 헬스·서킷도 정상으로 본다.
         let full = self.db.full_sql(targets).await?;
         let stmts = self.db.stmt_current(targets).await?;
+        let waits = self.lock_waits_of(targets).await;
 
         let plan_deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(self.params.plan_budget_ms);
         for id in targets {
             let f = full.iter().find(|r| r.id == *id);
             let s = stmts.iter().find(|r| r.processlist_id == *id);
+            // shortcut: 블로커가 여럿이면(공유 락 여럿이 막는 경우) 첫 행만 남긴다 — 그런 대기가
+            // 흔해지면 목록으로 바꾼다.
+            let w = waits.iter().find(|r| r.waiting_pid == *id);
             self.tracker.record_deep_probe(
                 *id,
                 s.and_then(|s| s.digest.clone()),
@@ -744,6 +750,7 @@ where
                     offset: &self.offset,
                     owner_worker: &self.params.worker_id,
                     owner_epoch: self.epoch,
+                    lock_wait: w,
                 })
             }) else {
                 continue;
@@ -774,6 +781,28 @@ where
         }
 
         Ok(())
+    }
+
+    /// 대상 스레드 중 **행 락을 기다리는 것**과 그 블로커.
+    ///
+    /// 실행 중에는 `LOCK_TIME` 이 0 이라 피해자라는 단서가 이것뿐이다([`LockWaitCapture`]).
+    /// **실패는 삼킨다** — 보조 정보라 없어도 선행 저장은 옳다. 권한 문제라면 락 탭이
+    /// 같은 조회로 `target_forbidden` 을 보여준다.
+    ///
+    /// [`LockWaitCapture`]: dbmon_core::slow_query::LockWaitCapture
+    async fn lock_waits_of(&self, targets: &[u64]) -> Vec<dbmon_core::ports::LockWaitRow> {
+        match self.db.lock_waits(targets).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(
+                    instance = %self.instance.id,
+                    threads = targets.len(),
+                    error = %e,
+                    "락 대기 조회 실패 — 블로커 없이 선행 저장한다"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// 플랜을 얻는다. 세 경로를 순서대로 시도한다.
@@ -912,6 +941,7 @@ where
                 offset: &self.offset,
                 owner_worker: &self.params.worker_id,
                 owner_epoch: self.epoch,
+                lock_wait: None,
             });
             if self.store.upsert_merged(&out.query).await.is_ok() {
                 stats.finalized += 1;

@@ -188,6 +188,8 @@ pub fn to_slow_query(
         last_seen_at_ms: None,
         abandoned_reason: None,
         long_running: false,
+        // 슬로우로그는 끝난 뒤에 온다 — 그때 블로커는 알 수 없다.
+        lock_wait: None,
     })
 }
 

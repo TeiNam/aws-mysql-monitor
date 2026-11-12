@@ -394,6 +394,10 @@ fn absorb(mut winner: SlowQueryView, loser: &SlowQueryView) -> SlowQueryView {
     if winner.abandoned_reason.is_none() {
         winner.abandoned_reason = loser.abandoned_reason.clone();
     }
+    // **블로커는 실행 중 레코드에만 있다** — 끝난 뒤 온 슬로우로그 쌍둥이가 이기면 사라진다.
+    if winner.lock_wait.is_none() {
+        winner.lock_wait = loser.lock_wait.clone();
+    }
     winner
 }
 
@@ -594,6 +598,7 @@ mod tests {
             lock_time_ms: Some(0),
             has_plan: true,
             abandoned_reason: None,
+            lock_wait: None,
         };
         overrides(&mut v);
         v
@@ -668,6 +673,19 @@ mod tests {
             v.rows_sent = Some(0);
             v.schema_name = Some("shop".into());
             v.abandoned_reason = Some("owner_lost".into());
+            // 블로커는 실행 중에만 관측된다.
+            v.lock_wait = Some(dbmon_core::slow_query::LockWaitCapture {
+                observed_at_ms: 1_500,
+                locked_table: Some("shop.orders".into()),
+                locked_index: Some("PRIMARY".into()),
+                lock_mode: Some("X,REC_NOT_GAP".into()),
+                blocking_pid: Some(31),
+                blocking_user: Some("app".into()),
+                blocking_host: Some("10.0.1.5".into()),
+                blocking_command: Some("Sleep".into()),
+                blocking_time_s: Some(40),
+                blocking_statements: vec!["UPDATE orders SET memo = ? WHERE id = ?".into()],
+            });
         });
         let truth = view(|v| {
             v.state = "finalized".into();
@@ -705,11 +723,16 @@ mod tests {
             "실행 중 캡처의 0 을 측정값으로 채웠다 — 평균이 깎인다"
         );
         assert_eq!(kept.rows_sent, None);
+        assert_eq!(
+            kept.lock_wait, ghost.lock_wait,
+            "실행 중에만 잡히는 블로커를 버렸다"
+        );
 
         // 반대 순서도 같아야 한다.
         let (out2, _) = dedupe_executions(vec![truth, ghost]);
         assert_eq!(out2[0].has_plan, out[0].has_plan);
         assert_eq!(out2[0].rows_examined, out[0].rows_examined);
+        assert_eq!(out2[0].lock_wait, out[0].lock_wait);
 
         // **동순위면 계획이 있는 쪽을 남긴다** — 그래야 계획이 화면에서 사라지지 않는다.
         let plain = view(|v| {

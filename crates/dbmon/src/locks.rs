@@ -123,7 +123,7 @@ fn is_idle(command: Option<&str>) -> bool {
     command == Some("Sleep")
 }
 
-fn qualified(schema: Option<String>, table: Option<String>) -> Option<String> {
+pub(crate) fn qualified(schema: Option<String>, table: Option<String>) -> Option<String> {
     match (schema, table) {
         (Some(s), Some(t)) => Some(format!("{s}.{t}")),
         (None, t) => t,

@@ -11,7 +11,7 @@
 //! 반드시 거치고, 그 변환이 [`AuthContext::may_view_literals`] 를 묻는다.
 
 use dbmon_core::rbac::AuthContext;
-use dbmon_core::slow_query::{LiteralPolicy, SlowQuery};
+use dbmon_core::slow_query::{LiteralPolicy, LockWaitCapture, SlowQuery};
 use dbmon_core::time::EpochMs;
 use serde::Serialize;
 
@@ -52,6 +52,9 @@ pub struct SlowQueryView {
     pub lock_time_ms: Option<i64>,
     pub has_plan: bool,
     pub abandoned_reason: Option<String>,
+    /// 행 락 대기 중에 관측한 블로커. **역할로 가리지 않는다** — 문장은 정규 텍스트만
+    /// 저장된다([`LockWaitCapture`]). 계정·호스트는 `db_user` 와 같은 급이다.
+    pub lock_wait: Option<LockWaitCapture>,
 }
 
 impl SlowQueryView {
@@ -95,6 +98,7 @@ impl SlowQueryView {
             lock_time_ms: q.stats.lock_time_ms,
             has_plan: q.plan.has_plan(),
             abandoned_reason: q.abandoned_reason.clone(),
+            lock_wait: q.lock_wait.clone(),
         }
     }
 }

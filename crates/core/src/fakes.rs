@@ -14,8 +14,8 @@ use crate::ids::{InstanceId, RecordId};
 use crate::instance::Instance;
 use crate::merge::merge;
 use crate::ports::target_db::{
-    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, PlanFailure, ProbeResult,
-    ProcessRow, StmtCurrentRow, TargetDb,
+    DigestSnapshot, DigestTextRow, Excludes, ExplainOutcome, FullSqlRow, LockWaitRow, PlanFailure,
+    ProbeResult, ProcessRow, StmtCurrentRow, TargetDb,
 };
 use crate::ports::{
     DigestStore, DigestTextEntry, InstanceRegistry, LEASE_TTL_MS, Lease, LeaseStore,
@@ -786,6 +786,10 @@ pub struct FakeTargetDb {
     pub status_vars: Mutex<BTreeMap<String, String>>,
     /// `global_status` 를 앞으로 n 번 실패시킨다.
     fail_global_status: AtomicUsize,
+    /// `lock_waits` 가 돌려줄 행. 요청한 대기자만 걸러 준다.
+    pub lock_waits: Mutex<Vec<LockWaitRow>>,
+    /// `lock_waits` 를 앞으로 n 번 실패시킨다.
+    fail_lock_waits: AtomicUsize,
     /// 호출 횟수 (경로가 실제로 돌았는지 확인용).
     pub full_sql_calls: AtomicUsize,
     pub explain_calls: AtomicUsize,
@@ -909,6 +913,10 @@ impl FakeTargetDb {
         self.fail_stmt_current.store(n, Ordering::SeqCst);
     }
 
+    pub fn fail_lock_waits(&self, n: usize) {
+        self.fail_lock_waits.store(n, Ordering::SeqCst);
+    }
+
     fn should_fail(counter: &AtomicUsize) -> bool {
         counter
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -1007,6 +1015,20 @@ impl TargetDb for FakeTargetDb {
 
     async fn db_now_ms(&self) -> Result<EpochMs> {
         Ok(0)
+    }
+
+    async fn lock_waits(&self, waiting_pids: &[u64]) -> Result<Vec<LockWaitRow>> {
+        if Self::should_fail(&self.fail_lock_waits) {
+            return Err(DomainError::Forbidden {
+                action: "lock_waits: injected 1142".into(),
+            });
+        }
+        let rows = self.lock_waits.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|w| waiting_pids.is_empty() || waiting_pids.contains(&w.waiting_pid))
+            .cloned()
+            .collect())
     }
 
     async fn ping(&self) -> Result<()> {
